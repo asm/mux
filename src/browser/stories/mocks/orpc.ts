@@ -634,6 +634,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   };
 
   let layoutPresets = initialLayoutPresets ?? DEFAULT_LAYOUT_PRESETS_CONFIG;
+  let telemetryEnabled = true;
 
   const mockStats: ChatStats = {
     consumers: [],
@@ -776,6 +777,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           chatTranscriptFullWidth,
           muxGovernorEnrolled,
           llmDebugLogs: false,
+          telemetryEnabled,
         }),
       saveConfig: (input: {
         taskSettings?: unknown;
@@ -818,6 +820,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       updateAgentAiDefaults: (input: { agentAiDefaults: unknown }) => {
         agentAiDefaults = normalizeAgentAiDefaults(input.agentAiDefaults);
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateTelemetryEnabled: (input: { enabled: boolean }) => {
+        telemetryEnabled = input.enabled;
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
