@@ -1555,7 +1555,15 @@ export const workspace = {
         fileParts: z.array(FilePartSchema).optional(),
       }),
     }),
-    output: ResultSchema(z.object({}), SendMessageErrorSchema),
+    output: ResultSchema(
+      z.object({
+        // Class model applied by skill routing — lets the frontend attribute
+        // send telemetry to the model that actually streams. Absent when no
+        // routing occurred or the send was queued for later dispatch.
+        routedModel: z.string().optional(),
+      }),
+      SendMessageErrorSchema
+    ),
   },
   answerAskUserQuestion: {
     input: z
