@@ -234,6 +234,9 @@ export function GeneralSection() {
   const [llmDebugLogs, setLlmDebugLogs] = useState(false);
   // Optimistic default: telemetry is on unless config says otherwise.
   const [telemetryEnabled, setTelemetryEnabled] = useState(true);
+  // Env hard-off (MUX_DISABLE_TELEMETRY, CI): the switch renders disabled
+  // instead of pretending the config toggle controls anything.
+  const [telemetryDisabledByEnv, setTelemetryDisabledByEnv] = useState(false);
   const archiveBehaviorLoadNonceRef = useRef(0);
   const archiveBehaviorRef = useRef<CoderWorkspaceArchiveBehavior>(DEFAULT_CODER_ARCHIVE_BEHAVIOR);
   const worktreeArchiveBehaviorRef = useRef<WorktreeArchiveBehavior>(
@@ -305,6 +308,7 @@ export function GeneralSection() {
 
         if (telemetryEnabledNonce === telemetryEnabledLoadNonceRef.current) {
           setTelemetryEnabled(cfg.telemetryEnabled !== false);
+          setTelemetryDisabledByEnv(cfg.telemetryDisabledByEnv === true);
         }
       })
       .catch(() => {
@@ -459,7 +463,9 @@ export function GeneralSection() {
         // Coerce the chain back to Promise<void>.
       })
       .catch(() => {
-        // Best-effort persistence.
+        // A privacy control must never read "off" while collection continues:
+        // on a failed write, revert the optimistic state to the backend truth.
+        setTelemetryEnabled(!checked);
       });
   };
 
@@ -885,6 +891,12 @@ export function GeneralSection() {
               aria-label="Toggle API Debug Logs"
             />
           </div>
+        </div>
+      </div>
+
+      <div>
+        <h3 className="text-foreground mb-4 text-sm font-medium">Privacy</h3>
+        <div className="divide-border-light divide-y">
           <div className="flex items-center justify-between py-3">
             <div className="flex-1 pr-4">
               <div className="text-foreground text-sm">Usage Telemetry</div>
@@ -898,11 +910,18 @@ export function GeneralSection() {
                 >
                   What is collected
                 </a>
+                {telemetryDisabledByEnv && (
+                  <span className="text-warning block">
+                    Disabled by the environment (MUX_DISABLE_TELEMETRY / CI) — this switch has no
+                    effect until that is removed.
+                  </span>
+                )}
               </div>
             </div>
             <Switch
-              checked={telemetryEnabled}
+              checked={telemetryEnabled && !telemetryDisabledByEnv}
               onCheckedChange={handleTelemetryEnabledChange}
+              disabled={telemetryDisabledByEnv}
               aria-label="Toggle Usage Telemetry"
             />
           </div>
