@@ -86,6 +86,7 @@ import { normalizeUserPreferences } from "@/common/config/schemas/userPreference
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { isValidModelFormat, normalizeSelectedModel } from "@/common/utils/ai/models";
 import { sanitizeModelFallbacks } from "@/common/utils/ai/modelFallbacks";
+import { sanitizeModelClasses } from "@/common/utils/ai/skillModelClasses";
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
 import {
   normalizeRuntimeEnablement,
@@ -1139,6 +1140,7 @@ export const router = (authToken?: string) => {
             routeOverrides: config.routeOverrides,
             minThinkingLevelByModel: config.minThinkingLevelByModel,
             modelFallbacks: config.modelFallbacks,
+            modelClasses: config.modelClasses,
             defaultModel: config.defaultModel,
             advisorModelString: config.advisorModelString ?? null,
             advisorThinkingLevel: config.advisorThinkingLevel ?? null,
@@ -1299,6 +1301,18 @@ export const router = (authToken?: string) => {
           await context.config.editConfig((config) => ({
             ...config,
             modelFallbacks: Object.keys(sanitized).length > 0 ? sanitized : undefined,
+          }));
+        }),
+      updateModelClasses: t
+        .input(schemas.config.updateModelClasses.input)
+        .output(schemas.config.updateModelClasses.output)
+        .handler(async ({ context, input }) => {
+          // Full-map replacement. Strict-on-write: unparseable class values are
+          // dropped so skill routing never reads a class it cannot resolve.
+          const sanitized = sanitizeModelClasses(input.modelClasses);
+          await context.config.editConfig((config) => ({
+            ...config,
+            modelClasses: Object.keys(sanitized).length > 0 ? sanitized : undefined,
           }));
         }),
       updateModelPreferences: t
