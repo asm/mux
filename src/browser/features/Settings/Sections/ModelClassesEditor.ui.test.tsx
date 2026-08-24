@@ -1,6 +1,8 @@
 import { cleanup, render, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { installDom } from "../../../../../tests/ui/dom";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import type { APIClient } from "@/browser/contexts/API";
 
 let apiMock: {
   config: {
@@ -65,6 +67,7 @@ describe("ModelClassesEditor", () => {
     restoreDom = null;
     apiMock = null;
     providersConfigMock = null;
+    getAppConfigStore().setClient(null);
   });
 
   test("renders the three canonical class rows; clear button only on configured classes", async () => {
@@ -139,6 +142,9 @@ describe("ModelClassesEditor", () => {
 
   test("warns when no configured route can serve a class model", async () => {
     apiMock = createApiMock({ small: "anthropic:claude-haiku-4-5+0" });
+    // The warning gates on useRouting's `loaded`, which reads the shared
+    // AppConfigStore singleton — prime it like useRouting.test does.
+    getAppConfigStore().setClient(apiMock as unknown as APIClient);
     providersConfigMock = { anthropic: { isConfigured: false } };
     const { findByText } = render(<ModelClassesEditor />);
 

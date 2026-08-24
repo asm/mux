@@ -10,7 +10,7 @@
  */
 
 import { isCodexOauthAllowedModel, isCodexOauthRequiredModel } from "@/common/constants/codexOAuth";
-import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -82,10 +82,10 @@ export function canDirectOpenAIServeModel(
   providersConfig: ProvidersConfigMap | null | undefined
 ): boolean {
   const openAIConfig = providersConfig?.openai;
-  // A custom openai-compatible provider shadowing the built-in "openai" id is
+  // A custom provider (any wire type) shadowing the built-in "openai" id is
   // direct-only and authenticates against its own endpoint (key optional):
   // built-in OpenAI credential rules don't apply to it.
-  if (isCustomOpenAICompatibleProviderConfig(openAIConfig)) {
+  if (isCustomProviderConfig(openAIConfig)) {
     return true;
   }
   if (hasOpenAIApiKey(openAIConfig)) {

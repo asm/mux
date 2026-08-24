@@ -86,7 +86,6 @@ import { normalizeUserPreferences } from "@/common/config/schemas/userPreference
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { isValidModelFormat, normalizeSelectedModel } from "@/common/utils/ai/models";
 import { sanitizeModelFallbacks } from "@/common/utils/ai/modelFallbacks";
-import { sanitizeModelClasses } from "@/common/utils/ai/skillModelClasses";
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
 import {
   normalizeRuntimeEnablement,
