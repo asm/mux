@@ -145,6 +145,10 @@ export class TelemetryService {
   private readonly isDisabledByConfig?: () => boolean;
   private initInFlight: Promise<void> | null = null;
   private configApplyChain: Promise<void> = Promise.resolve();
+  // Latched by shutdown() so the lazy capture()-path can never resurrect a
+  // client during or after teardown; only an explicit config re-enable
+  // (setConfigEnabled(true)) clears it.
+  private shutdownRequested = false;
   /** Rate limit for capture()'s lazy cross-process re-enable initialization. */
   private static readonly LAZY_INIT_RETRY_MS = 30_000;
   private lastLazyInitAttemptMs = 0;
@@ -220,7 +224,13 @@ export class TelemetryService {
    * switch shows on, or orphan an unflushed client.
    */
   async setConfigEnabled(enabled: boolean): Promise<void> {
-    const next = this.configApplyChain.then(() => (enabled ? this.initialize() : this.shutdown()));
+    const next = this.configApplyChain.then(() => {
+      if (enabled) {
+        this.shutdownRequested = false;
+        return this.initialize();
+      }
+      return this.shutdown();
+    });
     // Keep the chain usable after a failed apply.
     this.configApplyChain = next.then(
       () => undefined,
@@ -349,7 +359,25 @@ export class TelemetryService {
       const now = Date.now();
       if (now - this.lastLazyInitAttemptMs > TelemetryService.LAZY_INIT_RETRY_MS) {
         this.lastLazyInitAttemptMs = now;
-        void this.initialize().catch(() => undefined);
+        // Serialized with toggle applies, and latched off once shutdown
+        // begins: an unserialized initialize() here could install a fresh
+        // client while shutdown() is still awaiting the PostHog flush,
+        // leaving telemetry live after teardown. The queued task re-checks
+        // every gate when it actually runs.
+        this.configApplyChain = this.configApplyChain
+          .then(async () => {
+            if (this.shutdownRequested || this.client != null) {
+              return;
+            }
+            if (isTelemetryDisabledByEnv(process.env) || this.isDisabledByConfig?.() === true) {
+              return;
+            }
+            await this.initialize();
+          })
+          .then(
+            () => undefined,
+            () => undefined
+          );
       }
       return;
     }
@@ -372,6 +400,9 @@ export class TelemetryService {
    * Should be called on app close.
    */
   async shutdown(): Promise<void> {
+    // Latch first: the lazy capture()-path must refuse to re-initialize from
+    // this point on (only an explicit setConfigEnabled(true) re-arms it).
+    this.shutdownRequested = true;
     // Null BEFORE flushing: capture() must no-op the instant a shutdown
     // begins, and a concurrent initialize() must never observe the stale
     // client and skip re-initialization.

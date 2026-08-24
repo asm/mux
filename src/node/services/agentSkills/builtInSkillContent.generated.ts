@@ -7610,7 +7610,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "## Disabling telemetry",
       "",
-      "Toggle **Usage Telemetry** off in **Settings → General**. The change applies immediately (no restart) and persists in `~/.xum/config.json` as `telemetryEnabled: false`.",
+      "Toggle **Usage Telemetry** off in **Settings → General**. The change applies immediately (no restart) and persists as `telemetryEnabled: false` in the active Xum home's `config.json` — `~/.xum` by default, or the directory `XUM_ROOT` / an existing legacy `~/.mux` install points at.",
       "",
       "Alternatively, set `XUM_DISABLE_TELEMETRY` to exactly `1` before starting the app (other values like `true` are ignored):",
       "",

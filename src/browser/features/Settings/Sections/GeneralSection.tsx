@@ -59,6 +59,7 @@ import {
   isWorktreeArchiveBehavior,
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
+import { XUM_PRODUCT_NAME } from "@/common/constants/product";
 
 function getTerminalFontAvailabilityWarning(config: TerminalFontConfig): string | undefined {
   if (typeof document === "undefined") {
@@ -1047,7 +1048,7 @@ export function GeneralSection() {
             <div className="flex-1 pr-4">
               <div className="text-foreground text-sm">Usage Telemetry</div>
               <div className="text-muted mt-0.5 text-xs">
-                Send anonymous usage events to help improve mux — no code, paths, or prompts.{" "}
+                Send anonymous usage events to help improve {XUM_PRODUCT_NAME} — no code, paths, or prompts.{" "}
                 <a
                   href="https://mux.coder.com/reference/telemetry"
                   target="_blank"
