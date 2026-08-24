@@ -1494,6 +1494,7 @@ export class Config {
           chatTranscriptFullWidth: parseOptionalBoolean(parsed.chatTranscriptFullWidth),
           muxGatewayEnabled,
           llmDebugLogs: parseOptionalBoolean(parsed.llmDebugLogs),
+          telemetryEnabled: parseOptionalBoolean(parsed.telemetryEnabled),
           heartbeatDefaultPrompt: parseOptionalNonEmptyString(parsed.heartbeatDefaultPrompt),
           heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs(
             parsed.heartbeatDefaultIntervalMs
@@ -1616,6 +1617,11 @@ export class Config {
       const llmDebugLogs = parseOptionalBoolean(config.llmDebugLogs);
       if (llmDebugLogs !== undefined) {
         data.llmDebugLogs = llmDebugLogs;
+      }
+
+      const telemetryEnabled = parseOptionalBoolean(config.telemetryEnabled);
+      if (telemetryEnabled !== undefined) {
+        data.telemetryEnabled = telemetryEnabled;
       }
 
       const heartbeatDefaultPrompt = parseOptionalNonEmptyString(config.heartbeatDefaultPrompt);
@@ -1958,6 +1964,29 @@ export class Config {
 
   getLlmDebugLogsEnabled(): boolean {
     return this.loadConfigOrDefault().llmDebugLogs === true;
+  }
+
+  /**
+   * Settings → General telemetry opt-out; absent means enabled.
+   *
+   * Fail CLOSED: when the persisted state cannot be read, report disabled —
+   * corrupted or inaccessible state must not silently override an opt-out. A
+   * genuinely missing file is not an error (fresh install ⇒ enabled), but
+   * existsSync() masks traversal failures (EACCES on ~/.xum) as "missing", so
+   * stat explicitly to tell ENOENT apart from every other failure. Callers
+   * stay non-fatal either way.
+   */
+  isTelemetryDisabledByConfig(): boolean {
+    try {
+      fs.statSync(this.configFile);
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ENOENT";
+    }
+    try {
+      return this.loadConfigOrDefault({ throwOnError: true }).telemetryEnabled === false;
+    } catch {
+      return true;
+    }
   }
 
   async setUpdateChannel(channel: UpdateChannel): Promise<void> {

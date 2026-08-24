@@ -155,6 +155,8 @@ export interface MockORPCClientOptions {
   agentDefinitions?: AgentDefinitionDescriptor[];
   /** Initial model classes for config.getConfig (Settings → Models → Model Classes) */
   modelClasses?: Record<string, string>;
+  /** Initial telemetry opt-in state for config.getConfig (Settings → General → Privacy) */
+  telemetryEnabled?: boolean;
   /** Coder lifecycle preferences for config.getConfig (e.g., Settings → Coder section) */
   coderWorkspaceArchiveBehavior?: CoderWorkspaceArchiveBehavior;
   /** What to do with xum-managed worktrees when archiving a chat. */
@@ -402,6 +404,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     taskSettings: initialTaskSettings,
     agentAiDefaults: initialAgentAiDefaults,
     modelClasses: initialModelClasses,
+    telemetryEnabled: initialTelemetryEnabled,
     coderWorkspaceArchiveBehavior: initialCoderWorkspaceArchiveBehavior = "stop",
     worktreeArchiveBehavior: initialWorktreeArchiveBehavior = "keep",
     chatTranscriptFullWidth: initialChatTranscriptFullWidth = false,
@@ -638,6 +641,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
   let layoutPresets = initialLayoutPresets ?? DEFAULT_LAYOUT_PRESETS_CONFIG;
   let modelClasses: Record<string, string> | undefined = initialModelClasses;
+  let telemetryEnabled = initialTelemetryEnabled ?? true;
 
   const mockStats: ChatStats = {
     consumers: [],
@@ -781,6 +785,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           chatTranscriptFullWidth,
           muxGovernorEnrolled,
           llmDebugLogs: false,
+          telemetryEnabled,
+          telemetryDisabledByEnv: false,
         }),
       saveConfig: (input: {
         taskSettings?: unknown;
@@ -829,6 +835,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       updateModelClasses: (input: { modelClasses: Record<string, string> }) => {
         modelClasses =
           Object.keys(input.modelClasses).length > 0 ? { ...input.modelClasses } : undefined;
+      updateTelemetryEnabled: (input: { enabled: boolean }) => {
+        telemetryEnabled = input.enabled;
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
