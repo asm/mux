@@ -835,6 +835,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       updateModelClasses: (input: { modelClasses: Record<string, string> }) => {
         modelClasses =
           Object.keys(input.modelClasses).length > 0 ? { ...input.modelClasses } : undefined;
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
       updateTelemetryEnabled: (input: { enabled: boolean }) => {
         telemetryEnabled = input.enabled;
         notifyConfigChanged();
