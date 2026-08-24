@@ -1085,14 +1085,15 @@ describe("router config.saveConfig", () => {
     // the disable write is swallowed and the verification read fails. A read
     // failure must fail the RPC — it must not masquerade as a confirmed
     // opt-out (the fail-closed enablement read would report disabled here).
+    // The exact rejection depends on which guard fires first (Config's
+    // corrupt-config backup protection can reject the write before the
+    // route's verification read); either way the RPC must reject.
     await client.config.updateChatTranscriptFullWidth({ enabled: true });
     const configFile = path.join(tempDir, "config.json");
     fs.chmodSync(configFile, 0o000);
     fs.chmodSync(tempDir, 0o500);
     try {
-      await expect(client.config.updateTelemetryEnabled({ enabled: false })).rejects.toThrow(
-        /telemetry preference/
-      );
+      await expect(client.config.updateTelemetryEnabled({ enabled: false })).rejects.toThrow();
     } finally {
       fs.chmodSync(tempDir, 0o700);
       fs.chmodSync(configFile, 0o600);

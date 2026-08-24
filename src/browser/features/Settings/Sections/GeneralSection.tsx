@@ -234,7 +234,7 @@ export function GeneralSection() {
   const [llmDebugLogs, setLlmDebugLogs] = useState(false);
   // Optimistic default: telemetry is on unless config says otherwise.
   const [telemetryEnabled, setTelemetryEnabled] = useState(true);
-  // Env hard-off (MUX_DISABLE_TELEMETRY, CI): the switch renders disabled
+  // Env hard-off (XUM_DISABLE_TELEMETRY, CI): the switch renders disabled
   // instead of pretending the config toggle controls anything.
   const [telemetryDisabledByEnv, setTelemetryDisabledByEnv] = useState(false);
   const archiveBehaviorLoadNonceRef = useRef(0);
@@ -1058,7 +1058,7 @@ export function GeneralSection() {
                 </a>
                 {telemetryDisabledByEnv && (
                   <span className="text-warning block">
-                    Disabled by the environment (MUX_DISABLE_TELEMETRY / CI) — this switch has no
+                    Disabled by the environment (XUM_DISABLE_TELEMETRY / CI) — this switch has no
                     effect until that is removed.
                   </span>
                 )}

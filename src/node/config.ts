@@ -1954,7 +1954,7 @@ export class Config {
    * Fail CLOSED: when the persisted state cannot be read, report disabled —
    * corrupted or inaccessible state must not silently override an opt-out. A
    * genuinely missing file is not an error (fresh install ⇒ enabled), but
-   * existsSync() masks traversal failures (EACCES on ~/.mux) as "missing", so
+   * existsSync() masks traversal failures (EACCES on ~/.xum) as "missing", so
    * stat explicitly to tell ENOENT apart from every other failure. Callers
    * stay non-fatal either way.
    */
