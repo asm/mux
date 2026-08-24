@@ -4569,7 +4569,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "### OpenRouter Sessions",
       "",
-      "Mux tags workspace requests sent through the OpenRouter provider with a per-workspace `session_id` (`mux-<workspace id>`). OpenRouter uses it as the [sticky-routing key](https://openrouter.ai/docs/guides/best-practices/prompt-caching), keeping a workspace's turns on the same upstream provider to maximize prompt-cache hits, and groups the workspace's requests in the Sessions view of its Logs page. Requests with no workspace context (such as naming a workspace that doesn't exist yet) are not tagged.",
+      "Xum tags workspace requests sent through the OpenRouter provider with a per-workspace `session_id` (`xum-<workspace id>`). OpenRouter uses it as the [sticky-routing key](https://openrouter.ai/docs/guides/best-practices/prompt-caching), keeping a workspace's turns on the same upstream provider to maximize prompt-cache hits, and groups the workspace's requests in the Sessions view of its Logs page. Requests with no workspace context (such as naming a workspace that doesn't exist yet) are not tagged.",
       "",
       'To override the per-workspace value with a static one, set `"session_id": "<value>"` in the provider config; to disable session tagging entirely, set `"session_id": null`. A configured `x-session-id` header also suppresses the per-workspace default.',
       "",

@@ -1836,7 +1836,7 @@ describe("ProviderModelFactory routing", () => {
           });
           expect(result.success).toBe(true);
           expect(captured).toHaveLength(1);
-          expect(captured[0]?.extraBody).toEqual({ session_id: "mux-ws1234abcd" });
+          expect(captured[0]?.extraBody).toEqual({ session_id: "xum-ws1234abcd" });
         });
       });
     });
@@ -1853,7 +1853,7 @@ describe("ProviderModelFactory routing", () => {
             { workspaceId: "ws1234abcd" }
           );
           expect(result.success).toBe(true);
-          expect(captured[0]?.extraBody).toEqual({ session_id: "mux-ws1234abcd" });
+          expect(captured[0]?.extraBody).toEqual({ session_id: "xum-ws1234abcd" });
         });
       });
     });
@@ -1946,7 +1946,7 @@ describe("ProviderModelFactory routing", () => {
               throw new Error("expected a stamped string session_id");
             }
             expect(sessionId).toHaveLength(256);
-            expect(sessionId.startsWith("mux-ppp")).toBe(true);
+            expect(sessionId.startsWith("xum-ppp")).toBe(true);
           }
           expect(sessionIds[0]).not.toBe(sessionIds[1]);
         });
@@ -1993,7 +1993,7 @@ describe("ProviderModelFactory routing", () => {
             workspaceId: "ws1234abcd",
           });
           expect(result.success).toBe(true);
-          expect(captured[0]?.extraBody).toEqual({ session_id: "mux-ws1234abcd" });
+          expect(captured[0]?.extraBody).toEqual({ session_id: "xum-ws1234abcd" });
         });
       });
     });
@@ -2054,7 +2054,7 @@ describe("ProviderModelFactory routing", () => {
             if (!result.success) return;
 
             await generateText({ model: result.data, prompt: "hi" });
-            expect(bodies[0]).toMatchObject({ session_id: "mux-ws1234abcd" });
+            expect(bodies[0]).toMatchObject({ session_id: "xum-ws1234abcd" });
           });
         },
         (options) => ({ ...options, fetch: respondingFetch })
@@ -2074,7 +2074,7 @@ describe("ProviderModelFactory routing", () => {
           expect(result.success).toBe(true);
           expect(captured[0]?.extraBody).toEqual({
             provider: { sort: "price" },
-            session_id: "mux-ws1234abcd",
+            session_id: "xum-ws1234abcd",
           });
         });
       });
