@@ -7312,13 +7312,26 @@ export class TaskService {
       preservePhysicalWorkspace?: boolean;
     }
   ): Promise<void> {
+    let removedFromConfig = false;
     try {
       await this.config.removeWorkspace(taskId);
+      removedFromConfig = true;
     } catch (error: unknown) {
       log.error("Task.create rollback: failed to remove workspace from config", {
         taskId,
         error: getErrorMessage(error),
       });
+    }
+
+    // A create that failed after sendMessage may already have scheduled
+    // extension-metadata writes (e.g. the recency update), which would
+    // recreate the entry after the deregistration above and leak a stale key
+    // until the next process start's lazy prune. Only after deregistration
+    // actually succeeded: discarding also write-tombstones the id for this
+    // process, which must not silence metadata for a workspace that is still
+    // registered because removeWorkspace failed.
+    if (removedFromConfig) {
+      await this.workspaceService.discardExtensionMetadataEntry(taskId);
     }
 
     this.workspaceService.emit("metadata", { workspaceId: taskId, metadata: null });

@@ -592,6 +592,7 @@ function createWorkspaceServiceMocks(
   emitChatEvent: ReturnType<typeof mock>;
   isWorkflowInvocationCurrent: ReturnType<typeof mock>;
   create: ReturnType<typeof mock>;
+  discardExtensionMetadataEntry: ReturnType<typeof mock>;
 } {
   const sendMessage =
     overrides?.sendMessage ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
@@ -678,10 +679,12 @@ function createWorkspaceServiceMocks(
       (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
         Promise.resolve(Err("workspaceService.create not mocked"))
     );
+  const discardExtensionMetadataEntry = mock((): Promise<void> => Promise.resolve());
 
   return {
     workspaceService: {
       create,
+      discardExtensionMetadataEntry,
       // No-op by default: task-create tests exercise launch flow, not the
       // registration-time plugin-override sanitizer (workspaceService.test.ts
       // covers it). Returning undefined means "clean".
@@ -731,6 +734,7 @@ function createWorkspaceServiceMocks(
       countQueuedAgentPeerMessages,
     } as unknown as WorkspaceService,
     create,
+    discardExtensionMetadataEntry,
     sendMessage,
     resumeStream,
     clearQueue,
@@ -23801,7 +23805,9 @@ describe("TaskService", () => {
     );
     const { aiService } = createAIServiceMocks(config);
     const failingSendMessage = mock(() => Promise.resolve(Err("send failed")));
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage: failingSendMessage });
+    const { workspaceService, discardExtensionMetadataEntry } = createWorkspaceServiceMocks({
+      sendMessage: failingSendMessage,
+    });
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
     const created = await createAgentTask(taskService, parentId, "do the thing");
@@ -23814,6 +23820,11 @@ describe("TaskService", () => {
       .some((w) => w.id === "aaaaaaaaaa");
     expect(stillExists).toBe(false);
 
+    // Rollback must also drop the extension-metadata entry: the failed send
+    // may already have scheduled metadata writes that would otherwise leak a
+    // stale key after deregistration (#3959).
+    expect(discardExtensionMetadataEntry).toHaveBeenCalledWith("aaaaaaaaaa");
+
     const workspaceName = "agent_explore_aaaaaaaaaa";
     const workspacePath = runtime.getWorkspacePath(projectPath, workspaceName);
     let workspacePathExists = true;
@@ -23823,6 +23834,63 @@ describe("TaskService", () => {
       workspacePathExists = false;
     }
     expect(workspacePathExists).toBe(false);
+  }, 20_000);
+
+  test("failed config deregistration during rollback does not tombstone the task's metadata", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["bbbbbbbbbb"], "bbbbbbbbbb");
+
+    const projectPath = await createTestProject(rootDir);
+
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const runtime = createRuntime(runtimeConfig, { projectPath });
+    const initLogger = createNullInitLogger();
+
+    const parentName = "parent-b";
+    const parentCreate = await runtime.createWorkspace({
+      projectPath,
+      branchName: parentName,
+      trunkBranch: "main",
+      directoryName: parentName,
+      initLogger,
+    });
+    expect(parentCreate.success).toBe(true);
+
+    const parentId = "2222222222";
+    const parentPath = runtime.getWorkspacePath(projectPath, parentName);
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: parentPath,
+          id: parentId,
+          name: parentName,
+          createdAt: new Date().toISOString(),
+          runtimeConfig,
+        },
+      ],
+      testTaskSettings()
+    );
+    const { aiService } = createAIServiceMocks(config);
+    const failingSendMessage = mock(() => Promise.resolve(Err("send failed")));
+    const { workspaceService, discardExtensionMetadataEntry } = createWorkspaceServiceMocks({
+      sendMessage: failingSendMessage,
+    });
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+    // Deregistration fails: the rollback must NOT discard (and thereby
+    // write-tombstone) metadata for a workspace that is still registered.
+    const removeSpy = spyOn(config, "removeWorkspace").mockImplementation(() =>
+      Promise.reject(new Error("config locked"))
+    );
+    try {
+      const created = await createAgentTask(taskService, parentId, "do the thing");
+      expect(created.success).toBe(false);
+      expect(discardExtensionMetadataEntry).not.toHaveBeenCalled();
+    } finally {
+      removeSpy.mockRestore();
+    }
   }, 20_000);
 
   test("agent_report posts report to parent, finalizes pending task tool output, and triggers cleanup", async () => {
