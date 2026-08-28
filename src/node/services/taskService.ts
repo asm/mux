@@ -18,6 +18,7 @@ import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import type { Config, ProjectsConfig, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
+import type { QueueCutCutter } from "@/node/services/messageQueue";
 import { areArchiveUntrackedPathListsEqual } from "@/node/services/workspaceService";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -667,6 +668,12 @@ export interface WorkspaceTurnCreateResult {
   kind: "workspace_turn";
   status: "queued" | "starting" | "running";
   workspaceId: string;
+  /**
+   * Active same-owner handle on the target that this tool-end follow-up may
+   * supersede at the target's next tool boundary (that handle then settles
+   * interrupted quietly). In-memory result only, never persisted.
+   */
+  maySupersedeTaskId?: string;
 }
 
 export interface WorkspaceTurnWaitResult {
@@ -915,17 +922,120 @@ const WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR =
   "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report";
 
 /**
- * Distinguishes queue-cut supersede interrupts from explicit cancellations
- * (user Esc, task_stop): supersedes still deliver a terminal continuation to a
+ * Reason prefix persisted when the owner's OWN follow-up turn (task
+ * kind="workspace", mode="existing", tool-end dispatch) cut its active
+ * delegated turn at a tool boundary. The full reason names the successor
+ * handle. Wording stays neutral third-person: the persisted error can surface
+ * to a direct parent that did NOT initiate the successor (parent ≠ owner
+ * envelope case) and to any awaiting workspace — second-person phrasing
+ * belongs only in the initiating task tool's creation note. This flavor
+ * settles quietly for the owner (no terminal-attention wake, no direct-parent
+ * envelope when the parent IS the owner): an agent should not be woken merely
+ * to learn the expected consequence of a follow-up it just initiated.
+ */
+const WORKSPACE_TURN_SUPERSEDED_BY_OWNER_FOLLOW_UP_ERROR_PREFIX =
+  "Workspace turn superseded by follow-up turn ";
+
+function buildOwnerFollowUpSupersededError(successorHandleId: string): string {
+  return (
+    `${WORKSPACE_TURN_SUPERSEDED_BY_OWNER_FOLLOW_UP_ERROR_PREFIX}${successorHandleId} from the ` +
+    "same owner workspace; the workspace continues under that turn and will report there. " +
+    "This supersede is the expected consequence of that follow-up."
+  );
+}
+
+/**
+ * The error string is the durable flavor marker (no schema field): prefix
+ * matching keeps old records parseable on downgrade while letting suppression
+ * decisions derive purely from the persisted record.
+ */
+function isOwnerFollowUpSupersededWorkspaceTurnInterrupt(
+  record: Pick<WorkspaceTurnTaskHandleRecord, "status" | "error">
+): boolean {
+  return (
+    record.status === "interrupted" &&
+    record.error?.startsWith(WORKSPACE_TURN_SUPERSEDED_BY_OWNER_FOLLOW_UP_ERROR_PREFIX) === true
+  );
+}
+
+/**
+ * Distinguishes queue-cut supersede interrupts (both flavors: generic new
+ * input and owner follow-up) from explicit cancellations (user Esc,
+ * task_stop): supersedes still deliver a terminal continuation to a
  * persistent child's direct parent, while explicit cancels stay silent because
- * the canceller already knows the outcome.
+ * the canceller already knows the outcome. Only notification decisions consult
+ * the owner-follow-up sub-flavor.
  */
 function isSupersededWorkspaceTurnInterrupt(
   record: Pick<WorkspaceTurnTaskHandleRecord, "status" | "error">
 ): boolean {
   return (
-    record.status === "interrupted" && record.error === WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR
+    (record.status === "interrupted" &&
+      record.error === WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR) ||
+    isOwnerFollowUpSupersededWorkspaceTurnInterrupt(record)
   );
+}
+
+/**
+ * Terminal settlements whose owner terminal-attention wake is suppressed. A
+ * pure function of the settled record so live settlement, startup recovery,
+ * and resettle agree — restarts must not resurrect a suppressed wake.
+ * Deliberately NOT recorded via terminalAttentionNotifiedAt (which means "a
+ * notification was delivered"): deriving from the record keeps the audit trail
+ * clean and stays downgrade-safe with no schema change.
+ */
+function workspaceTurnTerminalAttentionSuppressed(
+  record: Pick<WorkspaceTurnTaskHandleRecord, "status" | "error">
+): boolean {
+  return isOwnerFollowUpSupersededWorkspaceTurnInterrupt(record);
+}
+
+/**
+ * True when the direct parent initiated the superseding follow-up and needs no
+ * failure envelope: the outcome is the expected consequence of its own
+ * follow-up (announced in that follow-up's task tool result). When parent ≠
+ * owner (descendant-agent case: an ancestor-owned handle on a persistent
+ * child), delivery proceeds — the direct parent did not cause the cut.
+ */
+function ownerFollowUpSupersedeSkipsDirectParent(
+  record: Pick<WorkspaceTurnTaskHandleRecord, "status" | "error" | "ownerWorkspaceId">,
+  directParentWorkspaceId: string | null | undefined
+): boolean {
+  return (
+    isOwnerFollowUpSupersededWorkspaceTurnInterrupt(record) &&
+    directParentWorkspaceId === record.ownerWorkspaceId
+  );
+}
+
+/**
+ * Attribution of the queued/engaged input that cut a delegated turn at a tool
+ * boundary. Replaces a boolean so settlement can distinguish the owner's own
+ * follow-up (settles quietly) from other input (notifies as today). `null`
+ * means no live cut evidence (the tool-calls finish falls through to the
+ * truncation branch). "preserved" carries a persisted supersede classification
+ * verbatim through the repair path (never invents or downgrades a flavor).
+ */
+type QueueCutSupersedeEvidence =
+  | { kind: "same_owner_follow_up"; successorHandleId: string }
+  | { kind: "other_input" }
+  | { kind: "preserved"; error: string }
+  | null;
+
+/**
+ * In-memory cut-attribution state captured synchronously when a stream-end
+ * event is handled, BEFORE any awaits. handleStreamEnd performs async
+ * persistence and attention work ahead of settlement, during which the child
+ * session can dispatch further queued turns; classifying from live state at
+ * that later point could attribute the cut to an input that engaged only
+ * after the real cutter (e.g. a same-owner follow-up dispatched after a
+ * manual message's turn failed instantly), wrongly suppressing the
+ * notification for the real manual/cross-owner supersede. The snapshot pins
+ * attribution to the state observed at the ended stream's own event.
+ */
+interface QueueCutAttributionSnapshot {
+  activeStream: { messageId: string; muxMetadata: unknown } | undefined;
+  cutter: QueueCutCutter | undefined;
+  hasPendingQueuedOrPreparingTurn: boolean;
 }
 
 /**
@@ -944,9 +1054,10 @@ function isSelfHealEligibleSettledWorkspaceTurn(
     return true;
   }
   return (
-    record.status === "interrupted" &&
-    (record.error === WORKSPACE_TURN_STALE_RESTART_ERROR ||
-      record.error === WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR)
+    (record.status === "interrupted" && record.error === WORKSPACE_TURN_STALE_RESTART_ERROR) ||
+    // Both supersede flavors (generic new input and owner follow-up) stay
+    // self-heal eligible: late correlated evidence proves the turn continued.
+    isSupersededWorkspaceTurnInterrupt(record)
   );
 }
 
@@ -1561,6 +1672,23 @@ export class TaskService {
      */
     { handleId: string; ownerWorkspaceId: string; accepted: boolean }
   >();
+
+  /** See nextWorkspaceTurnCreatedAt. */
+  private lastWorkspaceTurnCreatedAtMs = 0;
+
+  /**
+   * Strictly increasing createdAt for workspace-turn handles issued by this
+   * process: listAllWorkspaceTurns() orders records by createdAt, and the
+   * immediate-predecessor announcement in createWorkspaceTurn (newest-first
+   * scan in findActiveWorkspaceTurnForWorkspace) must be deterministic even
+   * when two follow-ups are created within the same millisecond — an equal
+   * ISO timestamp would otherwise fall back to filesystem readdir order.
+   */
+  private nextWorkspaceTurnCreatedAt(): string {
+    const nowMs = Math.max(Date.now(), this.lastWorkspaceTurnCreatedAtMs + 1);
+    this.lastWorkspaceTurnCreatedAtMs = nowMs;
+    return new Date(nowMs).toISOString();
+  }
   private readonly taskHandleStore: TaskHandleStore;
   private readonly terminalAttentionStore: TerminalAttentionStore;
   private readonly userBackgroundedTaskIds = new Set<string>();
@@ -2123,9 +2251,16 @@ export class TaskService {
     this.aiService.on("stream-end", (payload: unknown) => {
       if (!isStreamEndEvent(payload)) return;
 
+      // Captured synchronously at event time, BEFORE the workspace event lock:
+      // another operation holding the lock would otherwise let the session
+      // drain the real (manual/cross-owner) cutter and engage a later
+      // same-owner follow-up during the wait, misattributing the cut and
+      // wrongly suppressing the real cutter's wake (see
+      // QueueCutAttributionSnapshot).
+      const queueCutSnapshot = this.captureQueueCutAttributionSnapshot(payload.workspaceId);
       void this.workspaceEventLocks
         .withLock(payload.workspaceId, async () => {
-          await this.handleStreamEnd(payload);
+          await this.handleStreamEnd(payload, queueCutSnapshot);
         })
         .catch((error: unknown) => {
           log.error("TaskService.handleStreamEnd failed", { error });
@@ -4229,7 +4364,7 @@ export class TaskService {
 
     const handleId = `${WORKSPACE_TURN_TASK_ID_PREFIX}${this.config.generateStableId()}`;
     const turnId = this.config.generateStableId();
-    const createdAt = getIsoNow();
+    const createdAt = this.nextWorkspaceTurnCreatedAt();
     // New workspace turns use exec. Follow-ups in a persistent agent-task workspace preserve that
     // child's original agent identity and task-level model settings. An explicit args.agentId
     // (validated above/below) overrides either default for this turn only.
@@ -4258,6 +4393,7 @@ export class TaskService {
     let targetIsAgentWorkspace = false;
     let createdWorkspace = false;
     let queuedForExistingWorkspace = false;
+    let maySupersedeTaskId: string | undefined;
 
     if (mode === "fork") {
       return Err('Task.createWorkspaceTurn: workspace.mode="fork" is not supported yet');
@@ -4365,13 +4501,27 @@ export class TaskService {
         ? this.resolveWorkspaceAISettings(targetEntry.workspace, workspaceTurnAgentId)
         : undefined;
       queuedForExistingWorkspace = this.workspaceService.isBusyForMessage(existingWorkspaceId);
-      const targetHasActiveWorkspaceTurn = await this.hasActiveWorkspaceTurnForWorkspace(
+      const activeWorkspaceTurn = await this.findActiveWorkspaceTurnForWorkspace(
         allWorkspaceTurns,
         existingWorkspaceId
       );
-      if (!queuedForExistingWorkspace || !targetHasActiveWorkspaceTurn) {
+      if (!queuedForExistingWorkspace || activeWorkspaceTurn == null) {
         const slot = await ensureParallelSlot();
         if (!slot.success) return Err(slot.error);
+      }
+      // Announce the probable quiet supersession in the creation result: with
+      // tool-end dispatch this follow-up cuts the caller's own immediately
+      // preceding delegated turn (the newest live handle — the queue tail, not
+      // necessarily the currently streaming one) at that turn's next tool
+      // boundary, and that handle then settles interrupted without a separate
+      // wake (see buildOwnerFollowUpSupersededError). Only the caller's own
+      // handle qualifies — a different owner's turn keeps its notify behavior.
+      if (
+        queuedForExistingWorkspace &&
+        activeWorkspaceTurn?.ownerWorkspaceId === ownerWorkspaceId &&
+        queueDispatchMode === "tool-end"
+      ) {
+        maySupersedeTaskId = activeWorkspaceTurn.handleId;
       }
     } else {
       let ownerContext: WorkspaceTurnAgentContext | undefined;
@@ -4863,6 +5013,7 @@ export class TaskService {
       kind: "workspace_turn",
       status: acceptedStatus === "queued" ? "queued" : "running",
       workspaceId: targetWorkspaceId,
+      ...(maySupersedeTaskId != null ? { maySupersedeTaskId } : {}),
     });
   }
 
@@ -7634,7 +7785,10 @@ export class TaskService {
       }
       if (
         resolveBackgroundWorkAttentionPolicy(record.attentionPolicy) !== "notify_on_terminal" ||
-        record.terminalAttentionNotifiedAt != null
+        record.terminalAttentionNotifiedAt != null ||
+        // Owner-follow-up supersedes never notified in the first place; a
+        // restart must not resurrect the suppressed wake.
+        workspaceTurnTerminalAttentionSuppressed(record)
       ) {
         continue;
       }
@@ -8195,8 +8349,10 @@ export class TaskService {
     const workspaceTurnNotifications = pending.filter(
       (notification) => notification.sourceKind === "workspace_turn"
     );
-    const deliverableWorkspaceTurnNotificationIds = new Set<string>();
-    const publicAwaitIds: string[] = [];
+    const workspaceTurnCandidates: Array<{
+      notification: (typeof pending)[number];
+      publicAwaitId: string;
+    }> = [];
     for (const notification of workspaceTurnNotifications) {
       const record = await this.taskHandleStore.getWorkspaceTurn(
         ownerWorkspaceId,
@@ -8225,20 +8381,17 @@ export class TaskService {
         }
       }
 
-      deliverableWorkspaceTurnNotificationIds.add(notification.id);
-      publicAwaitIds.push(
-        isPersistentChildContinuation ? record.workspaceId : notification.sourceId
-      );
+      workspaceTurnCandidates.push({
+        notification,
+        publicAwaitId: isPersistentChildContinuation ? record.workspaceId : notification.sourceId,
+      });
     }
     const workflowNotifications = pending.filter(
       (notification) => notification.sourceKind === "workflow_run"
     );
     const deliverableWorkflowNotificationIds = new Set<string>();
 
-    const promptSections: string[] = [];
-    if (publicAwaitIds.length > 0) {
-      promptSections.push(buildCompletedWorkspaceTurnPrompt(publicAwaitIds));
-    }
+    const workflowPromptSections: string[] = [];
     for (const notification of workflowNotifications) {
       const workflowPrompt = await this.buildWorkflowTerminalPrompt(
         ownerWorkspaceId,
@@ -8249,11 +8402,59 @@ export class TaskService {
         continue;
       }
       deliverableWorkflowNotificationIds.add(notification.id);
-      promptSections.push(workflowPrompt);
+      workflowPromptSections.push(workflowPrompt);
     }
+
+    const resumeOptions = await this.resolveParentAutoResumeOptions(
+      ownerWorkspaceId,
+      entry,
+      defaultModel
+    );
+    const workspaceTurnMuxMetadata =
+      await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(ownerWorkspaceId);
+
+    // Last-moment suppression revalidation: a quiet owner-follow-up resettle
+    // deletes its notification files, but cannot retract this drain's
+    // already-taken listPending() snapshot, so the handle records are the
+    // source of truth. All candidates are re-read in ONE parallel batch and
+    // partitioned synchronously, so no candidate's check goes stale behind a
+    // later candidate's await; suppressed handles are dropped instead of
+    // waking the owner, and their notifications are marked superseded only
+    // after the delivery decision. The residual window is the batch read →
+    // sendMessage gap below (no awaits in between besides delivery itself) —
+    // closing it would require holding settlement locks across delivery,
+    // which the drain must not do; worst case is one redundant wake (fail
+    // toward notify, never a lost wake).
+    const candidateRecords = await Promise.all(
+      workspaceTurnCandidates.map((candidate) =>
+        this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, candidate.notification.sourceId)
+      )
+    );
+    const deliverableWorkspaceTurnNotificationIds = new Set<string>();
+    const publicAwaitIds: string[] = [];
+    const suppressedNotificationIds: string[] = [];
+    workspaceTurnCandidates.forEach((candidate, index) => {
+      const record = candidateRecords[index];
+      if (record != null && workspaceTurnTerminalAttentionSuppressed(record)) {
+        suppressedNotificationIds.push(candidate.notification.id);
+        return;
+      }
+      deliverableWorkspaceTurnNotificationIds.add(candidate.notification.id);
+      publicAwaitIds.push(candidate.publicAwaitId);
+    });
+    const markSuppressedSuperseded = async () => {
+      for (const id of suppressedNotificationIds) {
+        await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, id);
+      }
+    };
 
     // Sub-agent reports and failures are already durable user-context messages. Resume from history
     // directly instead of injecting a second user turn that merely tells the model they exist.
+    const promptSections: string[] = [];
+    if (publicAwaitIds.length > 0) {
+      promptSections.push(buildCompletedWorkspaceTurnPrompt(publicAwaitIds));
+    }
+    promptSections.push(...workflowPromptSections);
     const prompt = promptSections.join("\n\n");
     const effectivePending = pending.filter((notification) => {
       if (notification.sourceKind === "agent_task") {
@@ -8264,7 +8465,10 @@ export class TaskService {
       }
       return deliverableWorkspaceTurnNotificationIds.has(notification.id);
     });
-    if (effectivePending.length === 0) return;
+    if (effectivePending.length === 0) {
+      await markSuppressedSuperseded();
+      return;
+    }
 
     const markPendingDelivered = async () => {
       for (const notification of effectivePending) {
@@ -8278,14 +8482,6 @@ export class TaskService {
       }
     };
 
-    const resumeOptions = await this.resolveParentAutoResumeOptions(
-      ownerWorkspaceId,
-      entry,
-      defaultModel
-    );
-    const workspaceTurnMuxMetadata =
-      await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(ownerWorkspaceId);
-
     const sendOptions = {
       model: resumeOptions.model,
       agentId: resumeOptions.agentId,
@@ -8295,6 +8491,9 @@ export class TaskService {
     };
     if (prompt.length === 0) {
       assert(agentNotifications.length > 0, "prompt-free terminal drain requires sub-agent work");
+      // No workspace-turn wakes are delivered on this path, so marking the
+      // suppressed ones first cannot go stale against a delivery.
+      await markSuppressedSuperseded();
       const resumeResult = await this.workspaceService.resumeStream(ownerWorkspaceId, sendOptions, {
         agentInitiated: true,
       });
@@ -8322,6 +8521,11 @@ export class TaskService {
       // Synthetic, idle-only auto-resume — same flags as the active-work auto-resume path.
       { skipAutoResumeReset: true, synthetic: true, agentInitiated: true, requireIdle: true }
     );
+    // Deferred until after the delivery attempt so no await separates the
+    // batch revalidation above from sendMessage. Best-effort: an early return
+    // above leaves these pending, and a later drain re-derives suppression
+    // from the records and drops them again.
+    await markSuppressedSuperseded();
 
     if (!sendResult.success && isWorkspaceBusyIdleOnlySend(sendResult.error)) {
       const latestCfg = this.config.loadConfigOrDefault();
@@ -8434,10 +8638,97 @@ export class TaskService {
     return requestingWorkspaceIds;
   }
 
+  /**
+   * Move disposable-workspace ownership from a quietly superseded handle to
+   * its successor. Returns false when the successor is missing, targets a
+   * different workspace, or already settled terminally (its own cleanup
+   * chance is gone) — the caller then keeps disposable ownership on the old
+   * record. Holds the successor's settlement lock so its own settlement
+   * cannot interleave with the ownership flip.
+   */
+  private async transferDisposableWorkspaceToSuccessor(
+    record: WorkspaceTurnTaskHandleRecord,
+    successorHandleId: string
+  ): Promise<boolean> {
+    return await this.workspaceTurnSettlementLocks.withLock(successorHandleId, async () => {
+      const successor = await this.taskHandleStore.getWorkspaceTurn(
+        record.ownerWorkspaceId,
+        successorHandleId
+      );
+      if (
+        successor == null ||
+        successor.workspaceId !== record.workspaceId ||
+        this.isTerminalWorkspaceTurnStatus(successor.status)
+      ) {
+        return false;
+      }
+      if (!successor.disposableWorkspace) {
+        // Metadata-only flip: updatedAt stays unchanged so terminal-attention
+        // generation ids and settlement staleness comparisons are unaffected.
+        await this.taskHandleStore.upsertWorkspaceTurn({
+          ...successor,
+          disposableWorkspace: true,
+        });
+      }
+      return true;
+    });
+  }
+
+  /**
+   * Forward disposable-workspace ownership from a terminally settled handle to
+   * the oldest live same-owner turn still targeting the same workspace, if
+   * any. Covers settlement paths with no queue-cut attribution (cancellation,
+   * accepted pre-stream failures, stale-handle recovery) and three-handle
+   * chains where the announced successor itself failed while another follow-up
+   * remains queued. Returns true when ownership moved.
+   */
+  private async forwardDisposableOwnershipToLiveSuccessor(
+    record: WorkspaceTurnTaskHandleRecord
+  ): Promise<boolean> {
+    // createdAt-ascending: prefer the next turn in line; if it settles too,
+    // its own cleanup forwards again, so the cascade always terminates at a
+    // live successor or actual removal.
+    const candidates = await this.taskHandleStore.listWorkspaceTurns(record.ownerWorkspaceId);
+    for (const candidate of candidates) {
+      if (
+        candidate.handleId === record.handleId ||
+        candidate.workspaceId !== record.workspaceId ||
+        !isActiveWorkspaceTurnTaskStatus(candidate.status)
+      ) {
+        continue;
+      }
+      if (await this.transferDisposableWorkspaceToSuccessor(record, candidate.handleId)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private async cleanupDisposableWorkspaceTurn(
     record: WorkspaceTurnTaskHandleRecord
   ): Promise<void> {
     if (!record.disposableWorkspace) return;
+    // Forward instead of deleting while another live same-owner turn still
+    // targets this workspace. Every caller invokes cleanup only after
+    // persisting this record's terminal status, which makes the candidate
+    // scan deadlock-free: a concurrently settling candidate scanning back at
+    // this record sees it terminal on disk and skips it (and transfer
+    // re-validates the successor under its settlement lock), so two
+    // settlements can never wait on each other's locks.
+    if (await this.forwardDisposableOwnershipToLiveSuccessor(record)) {
+      // Metadata-only flip off a fresh read (updatedAt unchanged), mirroring
+      // transferDisposableWorkspaceToSuccessor, so terminal-attention
+      // generation ids and staleness comparisons are unaffected.
+      const current = await this.taskHandleStore.getWorkspaceTurn(
+        record.ownerWorkspaceId,
+        record.handleId
+      );
+      await this.taskHandleStore.upsertWorkspaceTurn({
+        ...(current ?? record),
+        disposableWorkspace: false,
+      });
+      return;
+    }
     try {
       const removeResult = await this.workspaceService.remove(record.workspaceId, true);
       if (!removeResult.success) {
@@ -8531,6 +8822,9 @@ export class TaskService {
       return false;
     }
     const childEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), record.workspaceId);
+    if (ownerFollowUpSupersedeSkipsDirectParent(record, childEntry?.workspace.parentWorkspaceId)) {
+      return false;
+    }
     return (
       childEntry?.workspace.parentWorkspaceId != null && childEntry.workspace.workflowTask == null
     );
@@ -8676,6 +8970,12 @@ export class TaskService {
     if (directParentWorkspaceId == null) {
       return;
     }
+    // Consulted here as well as in workspaceTurnRequiresDirectParentDelivery so
+    // live delivery AND startup recovery agree (delivery-required markers from
+    // older settlements must not resurrect a skipped envelope).
+    if (ownerFollowUpSupersedeSkipsDirectParent(record, directParentWorkspaceId)) {
+      return;
+    }
     const markDirectParentResultDelivered = async () => {
       record.directParentResultDeliveredAt = record.directParentResultDeliveredAt ?? getIsoNow();
       await this.taskHandleStore.upsertWorkspaceTurn(record);
@@ -8778,6 +9078,15 @@ export class TaskService {
      * same turn, and the correlated stream-end proves the turn's real outcome.
      */
     allowTerminalResettle?: boolean;
+    /**
+     * Only the settlement that itself moved disposable ownership to a
+     * successor (transferDisposableWorkspaceToSuccessor) may clear
+     * disposableWorkspace. Every other settlement may hold a snapshot read
+     * before a concurrent transfer flipped the bit on disk, so the
+     * lock-reloaded record's ownership is merged back in by default — dropping
+     * it would leak the disposable checkout with no owner left to clean it up.
+     */
+    disposableOwnershipTransferred?: boolean;
   }): Promise<void> {
     assert(
       params.next.handleId === params.record.handleId,
@@ -8860,13 +9169,43 @@ export class TaskService {
 
         // Decide the terminal wake-up using persisted policy + the restart-safe dedupe marker.
         // A resettle corrects a previously reported outcome, so it re-arms the wake-up even if
-        // the stale settlement was already notified/consumed.
+        // the stale settlement was already notified/consumed. Owner-follow-up supersedes settle
+        // quietly (a pure function of the settled record, so startup recovery agrees); a later
+        // self-heal resettle to completed is non-suppressed and re-arms the corrected wake.
         const policy = resolveBackgroundWorkAttentionPolicy(current.attentionPolicy);
+        const suppressedQuietSettlement = workspaceTurnTerminalAttentionSuppressed(params.next);
         const shouldNotify =
           policy === "notify_on_terminal" &&
-          (current.terminalAttentionNotifiedAt == null || resettleStaleTerminal);
+          (current.terminalAttentionNotifiedAt == null || resettleStaleTerminal) &&
+          !suppressedQuietSettlement;
+        // A stale pending wake enqueued by the superseded settlement (error or
+        // generic supersede) must not outlive a quiet resettle: the terminal
+        // attention drain does not generation-check workspace-turn
+        // notifications, so delete the prior generation here just as the
+        // corrected-notification path does for non-suppressed resettles. Safe
+        // under this settlement lock, which direct-parent consumption shares.
+        if (resettleStaleTerminal && suppressedQuietSettlement) {
+          await this.deleteWorkspaceTurnTerminalAttention(current);
+          // When the direct parent is the owner, the quiet flavor also skips
+          // the direct-parent envelope, so the requiresDirectParentDelivery
+          // block below never runs for it — the stale direct-parent generation
+          // enqueued by the superseded settlement must be invalidated here
+          // too, or the parent retains and wakes on the corrected-away
+          // failure. (Idempotent with the non-skip resettle path's delete.)
+          await this.deletePersistentChildWorkspaceTurnAttention(current);
+        }
 
         const nextRecord = { ...params.next };
+        if (
+          current.disposableWorkspace &&
+          !nextRecord.disposableWorkspace &&
+          params.disposableOwnershipTransferred !== true
+        ) {
+          // See disposableOwnershipTransferred: a transfer that landed while
+          // this settlement's snapshot was waiting on the lock is
+          // authoritative for ownership.
+          nextRecord.disposableWorkspace = true;
+        }
         if (resettleStaleTerminal) {
           log.debug("Workspace turn resettled from stale terminal status", {
             handleId: current.handleId,
@@ -8875,6 +9214,16 @@ export class TaskService {
             nextStatus: nextRecord.status,
           });
           delete nextRecord.terminalAttentionNotifiedAt;
+        }
+        if (suppressedQuietSettlement) {
+          // Downgrade-compatible suppression marker (upgrade↔downgrade rule):
+          // older builds' startup recovery knows only terminalAttentionNotifiedAt,
+          // not the quiet error prefix, and would otherwise resurrect exactly
+          // the wake this flavor suppresses. Nothing was actually delivered —
+          // on this build the pure suppression predicate governs the
+          // settle/recovery/drain paths, and a self-heal resettle deletes the
+          // marker above to re-arm the corrected wake.
+          nextRecord.terminalAttentionNotifiedAt ??= getIsoNow();
         }
         const requiresDirectParentDelivery =
           this.workspaceTurnRequiresDirectParentDelivery(nextRecord);
@@ -9150,7 +9499,10 @@ export class TaskService {
           return;
         }
         if (record.status === "interrupted") {
-          waiterEntry.reject(new Error("Workspace turn interrupted"));
+          // Preserve the persisted reason like the live settlement path does:
+          // a handle that settled quietly before this waiter's initial read
+          // must still surface the successor handle id to the awaiting caller.
+          waiterEntry.reject(new Error(record.error ?? "Workspace turn interrupted"));
         }
       })().catch((error: unknown) => {
         waiterEntry.reject(error instanceof Error ? error : new Error(String(error)));
@@ -10613,8 +10965,14 @@ export class TaskService {
           // may not have appended its user message yet, and that absence must
           // not downgrade the supersede to a truncation error. Only a different
           // correlated final (contradictory same-turn evidence) may resettle.
-          queueCutSupersedeEvidence:
-            isSupersededWorkspaceTurnInterrupt(record) && event.messageId === record.messageId,
+          // "preserved" keeps whichever flavor (generic or owner follow-up) was
+          // persisted verbatim, so repair cannot downgrade the quiet flavor.
+          supersedeEvidence:
+            isSupersededWorkspaceTurnInterrupt(record) &&
+            event.messageId === record.messageId &&
+            record.error != null
+              ? { kind: "preserved", error: record.error }
+              : null,
         });
         if (
           !options.repairFromHistory ||
@@ -12422,12 +12780,18 @@ export class TaskService {
     return isActiveWorkspaceTurnTaskStatus(record.status);
   }
 
-  private async hasActiveWorkspaceTurnForWorkspace(
+  private async findActiveWorkspaceTurnForWorkspace(
     records: readonly WorkspaceTurnTaskHandleRecord[],
     workspaceId: string
-  ): Promise<boolean> {
-    assert(workspaceId.length > 0, "hasActiveWorkspaceTurnForWorkspace requires workspaceId");
-    for (const record of records) {
+  ): Promise<WorkspaceTurnTaskHandleRecord | undefined> {
+    assert(workspaceId.length > 0, "findActiveWorkspaceTurnForWorkspace requires workspaceId");
+    // Newest-first (records arrive createdAt-ascending): the supersede
+    // announcement in createWorkspaceTurn must name the IMMEDIATE predecessor.
+    // With A active and same-owner follow-ups B and C queued, C supersedes B
+    // (not A) at B's first boundary — and B's own settlement wake is
+    // suppressed, so naming A for both B and C would leave B's interruption
+    // unreported anywhere. Existence checks are order-independent.
+    for (const record of [...records].reverse()) {
       if (record.workspaceId !== workspaceId || !this.isActiveWorkspaceTurn(record)) {
         continue;
       }
@@ -12435,9 +12799,9 @@ export class TaskService {
         await this.settleStaleWorkspaceTurn(record);
         continue;
       }
-      return true;
+      return record;
     }
-    return false;
+    return undefined;
   }
 
   private async hasActiveWorkspaceTurnDeferredBlockers(
@@ -13676,28 +14040,36 @@ export class TaskService {
   private buildTerminalWorkspaceTurnRecordFromEvent(
     record: WorkspaceTurnTaskHandleRecord,
     event: StreamEndEvent,
-    options: { queueCutSupersedeEvidence: boolean }
+    options: { supersedeEvidence: QueueCutSupersedeEvidence }
   ): WorkspaceTurnTaskHandleRecord {
     const baseRecord = { ...record };
     delete baseRecord.error;
     delete baseRecord.deferredMessageIds;
     // A "tool-calls" finish on a delegated turn backed by queue-dispatch
     // evidence is a queue cut: some other queued input (a manual user message,
-    // /compact) dispatched at the tool boundary and superseded the turn
-    // (same-turn continuations were already deferred by the caller). The child
-    // keeps working under that new input, so this is a supersede — not a
-    // failure of the delegated work. Settle as interrupted with a
-    // human-readable reason instead of alarming the owner with an "error" and
-    // internal finishReason jargon. Without such evidence a "tool-calls"
-    // finish can come from other stop conditions (e.g. a successful
-    // required-tool result), so it falls through to the truncation branch.
-    if (event.metadata.finishReason === "tool-calls" && options.queueCutSupersedeEvidence) {
+    // /compact, the owner's own follow-up turn) dispatched at the tool boundary
+    // and superseded the turn (same-turn continuations were already deferred by
+    // the caller). The child keeps working under that new input, so this is a
+    // supersede — not a failure of the delegated work. Settle as interrupted
+    // with a human-readable reason instead of alarming the owner with an
+    // "error" and internal finishReason jargon. Without such evidence a
+    // "tool-calls" finish can come from other stop conditions (e.g. a
+    // successful required-tool result), so it falls through to the truncation
+    // branch.
+    if (event.metadata.finishReason === "tool-calls" && options.supersedeEvidence != null) {
+      const evidence = options.supersedeEvidence;
+      const error =
+        evidence.kind === "same_owner_follow_up"
+          ? buildOwnerFollowUpSupersededError(evidence.successorHandleId)
+          : evidence.kind === "preserved"
+            ? evidence.error
+            : WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR;
       return {
         ...baseRecord,
         status: "interrupted",
         updatedAt: getIsoNow(),
         messageId: event.messageId,
-        error: WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR,
+        error,
         finalMessageRef: this.buildWorkspaceTurnFinalMessageRef(event),
         finalMessage: {
           messageId: event.messageId,
@@ -13770,7 +14142,7 @@ export class TaskService {
         // classified live at stream-end; a crash-window misclassification here
         // stays self-heal eligible for later correlated evidence.
         return this.buildTerminalWorkspaceTurnRecordFromEvent(record, event, {
-          queueCutSupersedeEvidence: false,
+          supersedeEvidence: null,
         });
       }
     }
@@ -13939,20 +14311,110 @@ export class TaskService {
   }
 
   /**
-   * Whether the superseding queued input that cut this stream is still visible
-   * live: queued/preparing/auto-retrying in the child session, or already
-   * streaming as a different (uncorrelated) message. Same-turn continuations
-   * were ruled out by the caller via hasSameTurnContinuation.
+   * Attribution of the superseding queued input that cut this stream, when it
+   * is still visible live: queued/preparing/dispatching/auto-retrying in the
+   * child session, or already streaming as a different (uncorrelated) message.
+   * Same-turn continuations were ruled out by the caller via
+   * hasSameTurnContinuation.
+   *
+   * Fail toward notify: only a positively identified, causally engaged (or
+   * tool-end queue-head) same-owner follow-up classifies as
+   * "same_owner_follow_up"; every ambiguous source (no metadata, cross-owner
+   * ancestor cutter, same-handle metadata, post-restart with in-memory queue
+   * state gone) classifies as "other_input" and keeps today's notify behavior.
+   *
+   * Attribution reads come from a QueueCutAttributionSnapshot captured
+   * synchronously with the stream-end event (see
+   * captureQueueCutAttributionSnapshot) so inputs engaging during
+   * handleStreamEnd's awaits cannot steal attribution from the real cutter.
    */
-  private hasLiveQueueCutSupersedeEvidence(event: StreamEndEvent): boolean {
-    if (this.workspaceService.hasPendingQueuedOrPreparingTurn(event.workspaceId)) {
-      return true;
-    }
-    const activeStream = this.aiService.getStreamInfo(event.workspaceId);
-    return activeStream != null && activeStream.messageId !== event.messageId;
+  private captureQueueCutAttributionSnapshot(workspaceId: string): QueueCutAttributionSnapshot {
+    const activeStream = this.aiService.getStreamInfo(workspaceId);
+    return {
+      activeStream:
+        activeStream != null
+          ? { messageId: activeStream.messageId, muxMetadata: activeStream.muxMetadata }
+          : undefined,
+      cutter: this.workspaceService.getQueueCutCutter(workspaceId),
+      hasPendingQueuedOrPreparingTurn:
+        this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId),
+    };
   }
 
-  private async finalizeWorkspaceTurnFromStreamEnd(event: StreamEndEvent): Promise<boolean> {
+  private getQueueCutSupersedeEvidence(
+    event: StreamEndEvent,
+    record: WorkspaceTurnTaskHandleRecord,
+    snapshot: QueueCutAttributionSnapshot
+  ): QueueCutSupersedeEvidence {
+    const classifyMetadata = (muxMetadata: unknown): QueueCutSupersedeEvidence => {
+      const successorHandleId = this.sameOwnerFollowUpHandleIdFromMetadata(record, muxMetadata);
+      return successorHandleId != null
+        ? { kind: "same_owner_follow_up", successorHandleId }
+        : { kind: "other_input" };
+    };
+    // Already streaming at the cut: the uncorrelated active stream is the
+    // engaged cutter.
+    const { activeStream, cutter } = snapshot;
+    if (activeStream != null && activeStream.messageId !== event.messageId) {
+      return classifyMetadata(activeStream.muxMetadata);
+    }
+    if (cutter?.stage === "preparing" || cutter?.stage === "dispatching") {
+      // Engaged stages report even with undefined metadata (manual message) so
+      // a same-owner follow-up queued BEHIND the engaged cutter cannot be
+      // misattributed as the cause of this cut.
+      return classifyMetadata(cutter.muxMetadata);
+    }
+    if (cutter?.stage === "queued") {
+      // Only tool-end dispatch is the documented "cut the active turn now"
+      // choice; a turn-end head did not cause this cut, so it stays generic.
+      return cutter.dispatchMode === "tool-end"
+        ? classifyMetadata(cutter.muxMetadata)
+        : { kind: "other_input" };
+    }
+    // Residual legacy positives (e.g. hasPendingAutoRetry with an empty queue)
+    // stay generic supersede evidence.
+    return snapshot.hasPendingQueuedOrPreparingTurn ? { kind: "other_input" } : null;
+  }
+
+  /** Successor handle id when metadata correlates to a DIFFERENT handle of the same owner. */
+  private sameOwnerFollowUpHandleIdFromMetadata(
+    record: WorkspaceTurnTaskHandleRecord,
+    muxMetadata: unknown
+  ): string | undefined {
+    const correlation = parseWorkspaceTurnTaskCorrelation(muxMetadata);
+    return correlation != null &&
+      correlation.ownerWorkspaceId === record.ownerWorkspaceId &&
+      correlation.taskHandleId !== record.handleId
+      ? correlation.taskHandleId
+      : undefined;
+  }
+
+  /**
+   * Same-owner follow-up that continues on this workspace at this stream end,
+   * for disposable-ownership transfer. Unlike cut attribution
+   * (getQueueCutSupersedeEvidence), dispatch mode is irrelevant here: a
+   * turn-end follow-up never cuts, but it still dispatches once the
+   * predecessor's stream ends naturally, so a completed predecessor's cleanup
+   * would otherwise delete the workspace out from under it.
+   */
+  private findSameOwnerFollowUpForDisposableTransfer(
+    event: StreamEndEvent,
+    record: WorkspaceTurnTaskHandleRecord,
+    snapshot: QueueCutAttributionSnapshot
+  ): string | undefined {
+    const { activeStream, cutter } = snapshot;
+    if (activeStream != null && activeStream.messageId !== event.messageId) {
+      return this.sameOwnerFollowUpHandleIdFromMetadata(record, activeStream.muxMetadata);
+    }
+    return cutter != null
+      ? this.sameOwnerFollowUpHandleIdFromMetadata(record, cutter.muxMetadata)
+      : undefined;
+  }
+
+  private async finalizeWorkspaceTurnFromStreamEnd(
+    event: StreamEndEvent,
+    queueCutSnapshot: QueueCutAttributionSnapshot
+  ): Promise<boolean> {
     const metadata = this.getWorkspaceTurnMetadata(event);
     if (metadata == null) {
       if (event.metadata.muxMetadata != null) {
@@ -14005,9 +14467,37 @@ export class TaskService {
       return true;
     }
 
+    const supersedeEvidence = this.getQueueCutSupersedeEvidence(event, record, queueCutSnapshot);
     const next = this.buildTerminalWorkspaceTurnRecordFromEvent(record, event, {
-      queueCutSupersedeEvidence: this.hasLiveQueueCutSupersedeEvidence(event),
+      supersedeEvidence,
     });
+    // A same-owner follow-up continues on this workspace after this stream
+    // end: transfer disposable ownership to the successor handle, so the
+    // workspace is removed when the successor itself settles terminally. This
+    // covers the quiet supersede (evidence-classified cut) AND a natural
+    // completion with a follow-up queued in any dispatch mode — a turn-end
+    // follow-up never cuts (deliberately not supersede evidence) but still
+    // dispatches at this stream end and must not lose its workspace to this
+    // settlement's cleanup. When the transfer fails (successor missing,
+    // different workspace, or already terminal), the old record keeps
+    // disposable ownership and today's settlement cleanup runs rather than
+    // leaking the checkout.
+    let disposableOwnershipTransferred = false;
+    if (record.disposableWorkspace) {
+      const disposableSuccessorHandleId =
+        supersedeEvidence?.kind === "same_owner_follow_up"
+          ? supersedeEvidence.successorHandleId
+          : this.findSameOwnerFollowUpForDisposableTransfer(event, record, queueCutSnapshot);
+      if (disposableSuccessorHandleId != null) {
+        disposableOwnershipTransferred = await this.transferDisposableWorkspaceToSuccessor(
+          record,
+          disposableSuccessorHandleId
+        );
+      }
+      if (disposableOwnershipTransferred) {
+        next.disposableWorkspace = false;
+      }
+    }
     await this.settleWorkspaceTurn({
       record,
       next,
@@ -14020,11 +14510,23 @@ export class TaskService {
       // transient failure (provider error, restart) may have self-healed via auto-retry
       // of the same turn; let this settlement correct that stale record.
       allowTerminalResettle: true,
+      disposableOwnershipTransferred,
     });
     return true;
   }
 
-  private async handleStreamEnd(event: StreamEndEvent): Promise<void> {
+  private async handleStreamEnd(
+    event: StreamEndEvent,
+    // The production stream-end listener captures this synchronously at event
+    // time, before waiting on the workspace event lock; the entry-time capture
+    // below is a fallback for direct callers (tests) only.
+    eventTimeQueueCutSnapshot?: QueueCutAttributionSnapshot
+  ): Promise<void> {
+    // Cut attribution must reflect the state at the ended stream's own event,
+    // not whatever input engaged while the lock wait or the awaits below ran
+    // (see QueueCutAttributionSnapshot).
+    const queueCutSnapshot =
+      eventTimeQueueCutSnapshot ?? this.captureQueueCutAttributionSnapshot(event.workspaceId);
     const isCompaction = event.metadata.agentId === "compact" || event.metadata.mode === "compact";
     // AgentSession resolves true only after a durable compaction follow-up is accepted. Bare,
     // rejected, and failed-to-dispatch compactions remain on the normal child recovery path.
@@ -14084,7 +14586,7 @@ export class TaskService {
         await this.deliverDeferredBestOfReportsForParent(workspaceId);
         await this.requestReportedChildCleanupRechecks(workspaceId);
         if (activeWorkflowRunIds.length === 0 && activeWorkspaceTurnIds.length === 0) {
-          if (await this.finalizeWorkspaceTurnFromStreamEnd(event)) {
+          if (await this.finalizeWorkspaceTurnFromStreamEnd(event, queueCutSnapshot)) {
             return;
           }
           this.consecutiveAutoResumes.delete(workspaceId);
@@ -14134,7 +14636,7 @@ export class TaskService {
       );
 
       if (blockingTaskIds.length === 0 && activeWorkflowRunIds.length === 0) {
-        if (await this.finalizeWorkspaceTurnFromStreamEnd(event)) {
+        if (await this.finalizeWorkspaceTurnFromStreamEnd(event, queueCutSnapshot)) {
           return;
         }
         this.consecutiveAutoResumes.delete(workspaceId);
@@ -14181,7 +14683,7 @@ export class TaskService {
         await this.listActiveBackgroundWorkflowRunIds(workspaceId, activeWorkflowRunIds)
       );
       if (blockingTaskIds.length === 0 && activeWorkflowRunIds.length === 0) {
-        if (await this.finalizeWorkspaceTurnFromStreamEnd(event)) {
+        if (await this.finalizeWorkspaceTurnFromStreamEnd(event, queueCutSnapshot)) {
           return;
         }
         this.consecutiveAutoResumes.delete(workspaceId);
@@ -14241,7 +14743,7 @@ export class TaskService {
           await this.listActiveBackgroundWorkflowRunIds(workspaceId, activeWorkflowRunIds)
         );
         if (blockingTaskIds.length === 0 && activeWorkflowRunIds.length === 0) {
-          if (await this.finalizeWorkspaceTurnFromStreamEnd(event)) {
+          if (await this.finalizeWorkspaceTurnFromStreamEnd(event, queueCutSnapshot)) {
             return;
           }
           this.consecutiveAutoResumes.delete(workspaceId);
@@ -14295,7 +14797,7 @@ export class TaskService {
       return;
     }
 
-    if (await this.finalizeWorkspaceTurnFromStreamEnd(event)) {
+    if (await this.finalizeWorkspaceTurnFromStreamEnd(event, queueCutSnapshot)) {
       return;
     }
 
