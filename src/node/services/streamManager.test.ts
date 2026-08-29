@@ -15,7 +15,12 @@ import type { MuxMessage } from "@/common/types/message";
 import { Ok, Err } from "@/common/types/result";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { ToolSearchStreamState } from "@/common/utils/tools/toolCatalog";
-import { StreamManager, type ModelFallbackPrepareOptions } from "./streamManager";
+import {
+  StreamManager,
+  type ModelFallbackPrepareOptions,
+  type TurnEngineEvent,
+  type TurnExecutionOptions,
+} from "./streamManager";
 import type {
   ActiveTurnThinkingOverride,
   RebuildFirstStepForThinkingLevel,
@@ -45,6 +50,7 @@ import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { attachLanguageModelCleanup } from "./languageModelCleanup";
 import { shellQuote } from "@/common/utils/shell";
+import { onTurnEngineEvent } from "./streamManager.testHarness";
 
 function createTestLanguageModel(modelId = "cleanup-model"): LanguageModel {
   return {
@@ -58,7 +64,6 @@ function createTestLanguageModel(modelId = "cleanup-model"): LanguageModel {
 }
 
 // Skip integration tests if TEST_INTEGRATION is not set
-const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
 // Validate API keys before running tests
 if (shouldRunIntegrationTests()) {
@@ -105,6 +110,21 @@ function createExecStreamForTests(): ExecStream {
 const TEST_STREAM_MODEL_ID = KNOWN_MODELS.SONNET.id;
 const TEST_USAGE = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const LOCAL_TEST_RUNTIME = createRuntime({ type: "local", srcBaseDir: "/tmp" });
+
+/** Base startStream options; scenarios override only what they assert. */
+function testStartOptions(
+  overrides: Partial<TurnExecutionOptions> &
+    Pick<TurnExecutionOptions, "workspaceId" | "messageId" | "model">
+): TurnExecutionOptions {
+  return {
+    messages: [{ role: "user", content: "hello" }],
+    modelString: "openai:gpt-4.1-mini",
+    historySequence: 1,
+    system: "system",
+    runtime: LOCAL_TEST_RUNTIME,
+    ...overrides,
+  };
+}
 
 type ProcessStreamWithCleanupForTests = (
   workspaceId: string,
@@ -237,6 +257,38 @@ function createStreamInfoForTests(
   };
 }
 
+describe("StreamManager - event sink rejection containment", () => {
+  test("a rejecting async event sink does not become an unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const streamManager = new StreamManager(historyService, undefined, undefined, () =>
+        Promise.reject(new Error("sink boom"))
+      );
+      const emitTurnEvent = getPrivateMethodForTests<(event: TurnEngineEvent) => void>(
+        streamManager,
+        "emitTurnEvent"
+      );
+      emitTurnEvent.call(streamManager, {
+        type: "workflow-run-attached",
+        workspaceId: "sink-rejection-workspace",
+        messageId: "sink-rejection-message",
+        toolCallId: "sink-rejection-call",
+        runId: "wfr_sink",
+        timestamp: Date.now(),
+      });
+      // A macrotask so an uncontained rejection would surface before asserting.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(unhandled).toHaveLength(0);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+});
+
 describe("StreamManager - workflow run attachments", () => {
   test("persists attached workflow run metadata to partial immediately", async () => {
     const streamManager = new StreamManager(historyService);
@@ -317,7 +369,7 @@ describe("StreamManager - workflow run attachments", () => {
     >(streamManager, "appendPartAndEmit");
 
     const replayedAttachments: WorkflowRunAttachedEvent[] = [];
-    streamManager.on("workflow-run-attached", (event: WorkflowRunAttachedEvent) => {
+    onTurnEngineEvent(streamManager, "workflow-run-attached", (event: WorkflowRunAttachedEvent) => {
       replayedAttachments.push(event);
     });
 
@@ -379,7 +431,7 @@ describe("StreamManager - nested tool call normalization", () => {
     getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
 
     const events: unknown[] = [];
-    streamManager.on("tool-call-start", (event: unknown) => events.push(event));
+    onTurnEngineEvent(streamManager, "tool-call-start", (event: unknown) => events.push(event));
 
     streamManager.emitNestedToolEvent(workspaceId, messageId, {
       type: "tool-call-start",
@@ -429,9 +481,13 @@ describe("StreamManager - tool execution start timing", () => {
     getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
 
     const events: ToolCallExecutionStartEvent[] = [];
-    streamManager.on("tool-call-execution-start", (event: ToolCallExecutionStartEvent) => {
-      events.push(event);
-    });
+    onTurnEngineEvent(
+      streamManager,
+      "tool-call-execution-start",
+      (event: ToolCallExecutionStartEvent) => {
+        events.push(event);
+      }
+    );
 
     const handleToolExecutionStart = getPrivateMethodForTests<
       (workspaceId: string, messageId: string, toolCallId: string) => void
@@ -461,9 +517,13 @@ describe("StreamManager - tool execution start timing", () => {
     getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
 
     const events: ToolCallExecutionStartEvent[] = [];
-    streamManager.on("tool-call-execution-start", (event: ToolCallExecutionStartEvent) => {
-      events.push(event);
-    });
+    onTurnEngineEvent(
+      streamManager,
+      "tool-call-execution-start",
+      (event: ToolCallExecutionStartEvent) => {
+        events.push(event);
+      }
+    );
 
     // execute() wins the race: no part yet, so the start is parked as pending.
     const handleToolExecutionStart = getPrivateMethodForTests<
@@ -1015,7 +1075,7 @@ describe("StreamManager - Anthropic cache TTL overrides", () => {
     providerOptions?: Record<string, unknown>;
   }
 
-  type BuildStreamRequestConfig = (...args: unknown[]) => StreamRequestConfigForTests;
+  type BuildStreamRequestConfig = (input: Record<string, unknown>) => StreamRequestConfigForTests;
 
   test("applies anthropicCacheTtlOverride to manual cache markers without top-level cacheControl", () => {
     const streamManager = new StreamManager(historyService);
@@ -1029,8 +1089,8 @@ describe("StreamManager - Anthropic cache TTL overrides", () => {
     }
     // Rebind: buildStreamRequestConfig reads this.getProvidersConfig for
     // cache-marker eligibility; a detached Reflect.get reference loses `this`.
-    const buildRequestConfigBound: BuildStreamRequestConfig = (...args) =>
-      buildRequestConfig.apply(streamManager, args);
+    const buildRequestConfigBound: BuildStreamRequestConfig = (input) =>
+      buildRequestConfig.call(streamManager, input);
 
     const model = createAnthropic({ apiKey: "test" })("claude-sonnet-4-5");
     const modelString = KNOWN_MODELS.SONNET.id;
@@ -1054,21 +1114,15 @@ describe("StreamManager - Anthropic cache TTL overrides", () => {
       }),
     };
 
-    const request = buildRequestConfigBound(
+    const request = buildRequestConfigBound({
       model,
       modelString,
       messages,
-      "You are a helpful assistant",
-      undefined, // routeProvider
+      system: "You are a helpful assistant",
       tools,
       providerOptions,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      "1h"
-    );
+      anthropicCacheTtlOverride: "1h",
+    });
 
     expect(request.system).toBeUndefined();
     expect(request.providerOptions).toEqual(providerOptions);
@@ -1127,7 +1181,7 @@ describe("StreamManager - OpenAI GPT-5.6 cached system instructions", () => {
     system?: string | { role: string; content: string; providerOptions?: unknown };
   }
 
-  type BuildStreamRequestConfig = (...args: unknown[]) => StreamRequestConfigForTests;
+  type BuildStreamRequestConfig = (input: Record<string, unknown>) => StreamRequestConfigForTests;
 
   const eligibleProvidersConfig: ProvidersConfigMap = {
     openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
@@ -1150,14 +1204,13 @@ describe("StreamManager - OpenAI GPT-5.6 cached system instructions", () => {
       "buildStreamRequestConfig"
     );
     // .call: the transform reads this.getProvidersConfig for route eligibility.
-    return buildRequestConfig.call(
-      streamManager,
-      createTestLanguageModel(),
+    return buildRequestConfig.call(streamManager, {
+      model: createTestLanguageModel(),
       modelString,
-      [{ role: "user", content: "hello" }],
-      "You are a helpful assistant",
-      routeProvider
-    );
+      messages: [{ role: "user", content: "hello" }],
+      system: "You are a helpful assistant",
+      routeProvider,
+    });
   }
 
   test("direct GPT-5.6 replaces the system string with a structured cached message", () => {
@@ -1210,7 +1263,6 @@ describe("StreamManager - OpenAI GPT-5.6 cached system instructions", () => {
       undefined,
       () => eligibleProvidersConfig
     );
-    streamManager.on("error", () => undefined);
     Reflect.set(streamManager, "tokenTracker", {
       setModel: () => Promise.resolve(undefined),
       countTokens: () => Promise.resolve(0),
@@ -1355,7 +1407,7 @@ describe("StreamManager - sequential tool execution", () => {
     toolChoice?: { type: "tool"; toolName: string };
   }
 
-  type BuildStreamRequestConfig = (...args: unknown[]) => StreamRequestConfigForTests;
+  type BuildStreamRequestConfig = (input: Record<string, unknown>) => StreamRequestConfigForTests;
   type CreateStreamResult = (
     request: StreamRequestConfigForTests,
     abortController: AbortController
@@ -1397,7 +1449,7 @@ describe("StreamManager - sequential tool execution", () => {
     return {
       // .apply: buildStreamRequestConfig reads this.getProvidersConfig for
       // cache-marker eligibility; a detached Reflect.get reference loses `this`.
-      buildRequestConfig: (...args) => buildRequestConfig.apply(streamManager, args),
+      buildRequestConfig: (input) => buildRequestConfig.call(streamManager, input),
       createStreamResult: (request, abortController) =>
         createStreamResultMethod.call(streamManager, request, abortController),
     };
@@ -1453,22 +1505,14 @@ describe("StreamManager - sequential tool execution", () => {
       steps: Promise.resolve([]),
     } as unknown as ReturnType<typeof aiSdk.streamText>);
 
-    const request = buildRequestConfig(
+    const request = buildRequestConfig({
       model,
-      KNOWN_MODELS.SONNET.id,
-      [{ role: "user", content: "hello" }],
-      "system",
-      undefined, // routeProvider
+      modelString: KNOWN_MODELS.SONNET.id,
+      messages: [{ role: "user", content: "hello" }],
+      system: "system",
       tools,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      false,
-      () => false,
-      undefined,
-      undefined
-    );
+      hasQueuedMessages: () => false,
+    });
     createStreamResult(request, new AbortController());
 
     expect(streamTextSpy).toHaveBeenCalledTimes(1);
@@ -1515,7 +1559,7 @@ describe("StreamManager - call settings overrides", () => {
     onChunk?: NonNullable<Parameters<typeof aiSdk.streamText>[0]["onChunk"]>;
   }
 
-  type BuildStreamRequestConfig = (...args: unknown[]) => StreamRequestConfigForTests;
+  type BuildStreamRequestConfig = (input: Record<string, unknown>) => StreamRequestConfigForTests;
   type CreateStreamResult = (
     request: StreamRequestConfigForTests,
     abortController: AbortController
@@ -1546,7 +1590,7 @@ describe("StreamManager - call settings overrides", () => {
     return {
       // .apply: buildStreamRequestConfig reads this.getProvidersConfig for
       // cache-marker eligibility; a detached Reflect.get reference loses `this`.
-      buildRequestConfig: (...args) => buildRequestConfig.apply(streamManager, args),
+      buildRequestConfig: (input) => buildRequestConfig.call(streamManager, input),
       createStreamResult: (request, abortController) =>
         createStreamResultMethod.call(streamManager, request, abortController),
     };
@@ -1563,21 +1607,14 @@ describe("StreamManager - call settings overrides", () => {
       };
     }
   ): StreamRequestConfigForTests {
-    return buildRequestConfig(
+    return buildRequestConfig({
       model,
       modelString,
       messages,
-      "system",
-      undefined, // routeProvider
-      undefined,
-      undefined,
-      options.maxOutputTokens,
-      options.callSettingsOverrides,
-      undefined,
-      undefined,
-      undefined,
-      undefined
-    );
+      system: "system",
+      maxOutputTokens: options.maxOutputTokens,
+      callSettingsOverrides: options.callSettingsOverrides,
+    });
   }
 
   function setupStreamTextSpy() {
@@ -1665,23 +1702,7 @@ describe("StreamManager - call settings overrides", () => {
     const streamTextSpy = setupStreamTextSpy();
     const onChunk = mock(() => undefined);
 
-    const request = buildRequestConfig(
-      model,
-      modelString,
-      messages,
-      "system",
-      undefined, // routeProvider
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      onChunk,
-      undefined
-    );
+    const request = buildRequestConfig({ model, modelString, messages, system: "system", onChunk });
 
     createStreamResult(request, new AbortController());
 
@@ -1726,7 +1747,6 @@ describe("StreamManager - language model cleanup", () => {
     streamInfoOverrides?: Record<string, unknown>;
   }): Promise<void> {
     const streamManager = new StreamManager(historyService);
-    streamManager.on("error", () => undefined);
     const historySequence = 1;
 
     await appendPartialAssistantForTests(params.workspaceId, params.messageId, historySequence);
@@ -1863,15 +1883,12 @@ describe("StreamManager - language model cleanup", () => {
     abortController.abort(new Error("pre-abort"));
 
     const result = await streamManager.startStream(
-      "cleanup-preabort-workspace",
-      [{ role: "user", content: "hello" }],
-      model,
-      "openai:gpt-4.1-mini",
-      1,
-      "system",
-      runtime,
-      "cleanup-preabort-message",
-      abortController.signal
+      testStartOptions({
+        workspaceId: "cleanup-preabort-workspace",
+        messageId: "cleanup-preabort-message",
+        model,
+        abortSignal: abortController.signal,
+      })
     );
 
     expect(result.success).toBe(true);
@@ -1880,10 +1897,9 @@ describe("StreamManager - language model cleanup", () => {
 
   test("interrupt during onStreamConstructed skips processing and preserves a replacement registration", async () => {
     const streamManager = new StreamManager(historyService);
-    streamManager.on("error", () => undefined);
     const { model, getCleanupCalls } = createCleanupModel("constructed-abort-model");
     const startEvents: unknown[] = [];
-    streamManager.on("stream-start", (event) => startEvents.push(event));
+    onTurnEngineEvent(streamManager, "stream-start", (event) => startEvents.push(event));
 
     const workspaceId = "constructed-abort-workspace";
     const replacementSentinel = { replacement: true };
@@ -1898,37 +1914,12 @@ describe("StreamManager - language model cleanup", () => {
     };
 
     const result = await streamManager.startStream(
-      workspaceId,
-      [{ role: "user", content: "hello" }],
-      model,
-      "openai:gpt-4.1-mini",
-      1,
-      "system",
-      runtime,
-      "constructed-abort-message",
-      undefined, // abortSignal
-      undefined, // tools
-      undefined, // initialMetadata
-      undefined, // providerOptions
-      undefined, // maxOutputTokens
-      undefined, // toolPolicy
-      undefined, // providedStreamToken
-      undefined, // hasQueuedMessages
-      undefined, // workspaceName
-      undefined, // thinkingLevel
-      undefined, // headers
-      undefined, // anthropicCacheTtlOverride
-      undefined, // callSettingsOverrides
-      undefined, // onChunk
-      undefined, // onStepMessages
-      undefined, // providedRuntimeTempDir
-      undefined, // modelFallback
-      undefined, // toolSearchState
-      undefined, // thinkingOverrideState
-      undefined, // rebuildProviderOptionsForThinkingLevel
-      undefined, // forcedFirstStepToolNames
-      undefined, // providersConfigSnapshot
-      onStreamConstructed
+      testStartOptions({
+        workspaceId,
+        messageId: "constructed-abort-message",
+        model,
+        onStreamConstructed,
+      })
     );
 
     expect(result.success).toBe(true);
@@ -1952,20 +1943,189 @@ describe("StreamManager - language model cleanup", () => {
     expect(replaceCreateStreamResult).toBe(true);
 
     const result = await streamManager.startStream(
-      "cleanup-create-throw-workspace",
-      [{ role: "user", content: "hello" }],
-      model,
-      "openai:gpt-4.1-mini",
-      1,
-      "system",
-      runtime,
-      "cleanup-create-throw-message"
+      testStartOptions({
+        workspaceId: "cleanup-create-throw-workspace",
+        messageId: "cleanup-create-throw-message",
+        model,
+      })
     );
 
     expect(result.success).toBe(false);
     expect(getCleanupCalls()).toBe(1);
   });
 });
+
+describe("StreamManager - turn completion", () => {
+  function stubTokenTracker(streamManager: StreamManager): void {
+    Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(),
+      countTokens: () => Promise.resolve(0),
+    });
+  }
+
+  /** Stream body that stays open until its turn abort controller fires. */
+  const hangUntilAbort = (_request: unknown, abortController: AbortController) =>
+    createStreamResultForTests(
+      (async function* () {
+        await new Promise<void>((resolve) => {
+          abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        yield* [];
+      })()
+    );
+
+  async function startWithStreamResult(input: {
+    workspaceId: string;
+    messageId: string;
+    fullStream?: AsyncGenerator<unknown, void, unknown>;
+    createStreamResult?: (request: unknown, abortController: AbortController) => unknown;
+    sink?: (event: TurnEngineEvent) => void | Promise<void>;
+    events?: TurnEngineEvent[];
+  }) {
+    const streamManager = new StreamManager(
+      historyService,
+      undefined,
+      undefined,
+      input.sink ??
+        ((event) => {
+          input.events?.push(event);
+        })
+    );
+    stubTokenTracker(streamManager);
+    Reflect.set(
+      streamManager,
+      "createStreamResult",
+      input.createStreamResult ?? (() => createStreamResultForTests(input.fullStream!))
+    );
+    await appendPartialAssistantForTests(input.workspaceId, input.messageId, 1);
+
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: input.workspaceId,
+        messageId: input.messageId,
+        model: createTestLanguageModel(),
+        providedRuntimeTempDir: "",
+      })
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("Expected stream to start");
+    return { streamManager, handle: result.data };
+  }
+
+  test("pre-start failures return Err while successful startup owns an aborted completion", async () => {
+    const streamManager = new StreamManager(historyService);
+    const model = createTestLanguageModel();
+    const failed = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: "completion-prestart-failure",
+        messageId: "prestart-failure-message",
+        model,
+        messages: [],
+      })
+    );
+    expect(failed.success).toBe(false);
+
+    const abortController = new AbortController();
+    abortController.abort();
+    const aborted = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: "completion-prestart-abort",
+        messageId: "prestart-abort-message",
+        model,
+        abortSignal: abortController.signal,
+      })
+    );
+    expect(aborted.success).toBe(true);
+    if (!aborted.success) throw new Error("Expected aborted startup handle");
+    expect(await aborted.data.completion).toEqual({ status: "aborted", abortReason: "startup" });
+  });
+
+  test("completed, failed, and debug-injected turns settle once after their terminal event", async () => {
+    const completedEvents: TurnEngineEvent[] = [];
+    const completed = await startWithStreamResult({
+      workspaceId: "completion-success-workspace",
+      messageId: "completion-success-message",
+      events: completedEvents,
+      fullStream: (async function* () {
+        await Promise.resolve();
+        yield { type: "text-delta", text: "done" };
+        yield { type: "finish", finishReason: "stop" };
+      })(),
+    });
+    let completedSettlements = 0;
+    void completed.handle.completion.then(() => {
+      completedSettlements += 1;
+    });
+    expect(await completed.handle.completion).toEqual({ status: "completed" });
+    await Promise.resolve();
+    expect(completedEvents.at(-1)?.type).toBe("stream-end");
+    expect(completedSettlements).toBe(1);
+
+    const failedEvents: TurnEngineEvent[] = [];
+    const failed = await startWithStreamResult({
+      workspaceId: "completion-failure-workspace",
+      messageId: "completion-failure-message",
+      events: failedEvents,
+      fullStream: (async function* () {
+        await Promise.resolve();
+        throw new Error("provider failed");
+        yield* [];
+      })(),
+    });
+    let failedSettlements = 0;
+    void failed.handle.completion.then(() => {
+      failedSettlements += 1;
+    });
+    const failedCompletion = await failed.handle.completion;
+    expect(failedCompletion.status).toBe("failed");
+    expect(failedEvents.at(-1)?.type).toBe("error");
+    await failed.streamManager.stopStream("completion-failure-workspace");
+    await Promise.resolve();
+    expect(failedSettlements).toBe(1);
+
+    // Debug-injected failures reach the same terminal settlement path.
+    const debug = await startWithStreamResult({
+      workspaceId: "completion-debug-error-workspace",
+      messageId: "completion-debug-error-message",
+      createStreamResult: hangUntilAbort,
+    });
+    expect(
+      await debug.streamManager.debugTriggerStreamError(
+        "completion-debug-error-workspace",
+        "debug injected failure"
+      )
+    ).toBe(true);
+    expect(await debug.handle.completion).toMatchObject({
+      status: "failed",
+      streamError: { error: "debug injected failure" },
+    });
+  });
+
+  test("aborted completion waits for asynchronous abort delivery", async () => {
+    let releaseAbortDelivery!: () => void;
+    const abortDelivery = new Promise<void>((resolve) => {
+      releaseAbortDelivery = resolve;
+    });
+    const { streamManager, handle } = await startWithStreamResult({
+      workspaceId: "completion-abort-workspace",
+      messageId: "completion-abort-message",
+      createStreamResult: hangUntilAbort,
+      sink: (event) => (event.type === "stream-abort" ? abortDelivery : undefined),
+    });
+
+    let settled = false;
+    void handle.completion.then(() => {
+      settled = true;
+    });
+    await streamManager.stopStream("completion-abort-workspace", { abortReason: "user" });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    releaseAbortDelivery();
+    expect(await handle.completion).toEqual({ status: "aborted", abortReason: "user" });
+  });
+});
+
 describe("StreamManager - stripEncryptedContent", () => {
   test("strips encryptedContent from array output shape", () => {
     const output = [
@@ -2039,87 +2199,6 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
   beforeEach(() => {
     streamManager = new StreamManager(historyService);
     // Suppress error events from bubbling up as uncaught exceptions during tests
-    streamManager.on("error", () => undefined);
-  });
-
-  // Integration test - requires API key and TEST_INTEGRATION=1
-  describeIntegration("with real API", () => {
-    test("should prevent concurrent streams for the same workspace", async () => {
-      const workspaceId = "test-workspace-concurrent";
-      const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-      const model = anthropic("claude-sonnet-4-5");
-
-      // Track when streams are actively processing
-      const streamStates: Record<string, { started: boolean; finished: boolean }> = {};
-      let firstMessageId: string | undefined;
-
-      streamManager.on("stream-start", (data: { messageId: string; historySequence: number }) => {
-        streamStates[data.messageId] = { started: true, finished: false };
-        if (data.historySequence === 1) {
-          firstMessageId = data.messageId;
-        }
-      });
-
-      streamManager.on("stream-end", (data: { messageId: string }) => {
-        if (streamStates[data.messageId]) {
-          streamStates[data.messageId].finished = true;
-        }
-      });
-
-      streamManager.on("stream-abort", (data: { messageId: string }) => {
-        if (streamStates[data.messageId]) {
-          streamStates[data.messageId].finished = true;
-        }
-      });
-
-      // Start first stream
-      const result1 = await streamManager.startStream(
-        workspaceId,
-        [{ role: "user", content: "Say hello and nothing else" }],
-        model,
-        KNOWN_MODELS.SONNET.id,
-        1,
-        "You are a helpful assistant",
-        runtime,
-        "test-msg-1",
-        undefined,
-        {}
-      );
-
-      expect(result1.success).toBe(true);
-
-      // Wait for first stream to actually start
-      await new Promise((resolve) => setTimeout(resolve, 200));
-
-      // Start second stream - should cancel first
-      const result2 = await streamManager.startStream(
-        workspaceId,
-        [{ role: "user", content: "Say goodbye and nothing else" }],
-        model,
-        KNOWN_MODELS.SONNET.id,
-        2,
-        "You are a helpful assistant",
-        runtime,
-        "test-msg-2",
-        undefined,
-        {}
-      );
-
-      expect(result2.success).toBe(true);
-
-      // Wait for second stream to complete
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-
-      // Verify: first stream should have been cancelled before second stream started
-      expect(firstMessageId).toBeDefined();
-      const trackedFirstMessageId = firstMessageId!;
-      expect(streamStates[trackedFirstMessageId]).toBeDefined();
-      expect(streamStates[trackedFirstMessageId].started).toBe(true);
-      expect(streamStates[trackedFirstMessageId].finished).toBe(true);
-
-      // Verify no streams are active after completion
-      expect(streamManager.isStreaming(workspaceId)).toBe(false);
-    }, 10000);
   });
 
   // Unit test - doesn't require API key
@@ -2192,22 +2271,8 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
       streamManager,
       "createStreamAtomically",
       (
-        wsId: string,
-        streamToken: string,
-        _runtimeTempDir: string,
-        _runtime: unknown,
-        _messages: unknown,
-        _modelArg: unknown,
-        modelString: string,
-        abortController: AbortController,
-        _system: string,
-        historySequence: number,
-        _messageId: string,
-        _tools?: Record<string, unknown>,
-        initialMetadata?: Record<string, unknown>,
-        _providerOptions?: Record<string, unknown>,
-        _maxOutputTokens?: number,
-        _toolPolicy?: unknown
+        options: TurnExecutionOptions,
+        ctx: { streamToken: string; abortController: AbortController }
       ): WorkspaceStreamInfoStub => {
         operations.push("create");
 
@@ -2220,13 +2285,13 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
             usage: Promise.resolve(undefined),
             providerMetadata: Promise.resolve(undefined),
           },
-          abortController,
+          abortController: ctx.abortController,
           messageId: `test-${Math.random().toString(36).slice(2)}`,
-          token: streamToken,
+          token: ctx.streamToken,
           startTime: Date.now(),
-          model: modelString,
-          initialMetadata,
-          historySequence,
+          model: options.modelString,
+          initialMetadata: options.initialMetadata,
+          historySequence: options.historySequence,
           parts: [],
           lastPartialWriteTime: 0,
           partialWriteTimer: undefined,
@@ -2234,7 +2299,7 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
           processingPromise: Promise.resolve(),
         };
 
-        workspaceStreams.set(wsId, streamInfo);
+        workspaceStreams.set(options.workspaceId, streamInfo);
         return streamInfo;
       }
     );
@@ -2265,18 +2330,17 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
     // Without mutex, these would interleave (ensure-start, ensure-start, ensure-start, ensure-end, ensure-end, ensure-end)
     // With mutex, they should be serialized (ensure-start, ensure-end, ensure-start, ensure-end, ensure-start, ensure-end)
     const promises = [1, 2, 3].map((sequence) =>
-      streamManager.startStream(
+      streamManager.startStream({
         workspaceId,
-        [{ role: "user", content: `test ${sequence}` }],
+        messages: [{ role: "user", content: `test ${sequence}` }],
         model,
-        KNOWN_MODELS.SONNET.id,
-        sequence,
-        "system",
+        modelString: KNOWN_MODELS.SONNET.id,
+        historySequence: sequence,
+        system: "system",
         runtime,
-        `test-msg-${sequence}`,
-        undefined,
-        {}
-      )
+        messageId: `test-msg-${sequence}`,
+        tools: {},
+      })
     );
 
     // Wait for all to complete (they will fail due to dummy API key, but that's ok)
@@ -2298,7 +2362,7 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
     let processCalled = false;
     let streamStartEmitted = false;
 
-    streamManager.on("stream-start", () => {
+    onTurnEngineEvent(streamManager, "stream-start", () => {
       streamStartEmitted = true;
     });
 
@@ -2309,76 +2373,36 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
       tempDirStartedResolve = resolve;
     });
 
-    const replaceTempDirResult = Reflect.set(
-      streamManager,
-      "createTempDirForStream",
-      (_streamToken: string, _runtime: unknown): Promise<string> => {
-        tempDirStartedResolve?.();
-        return new Promise((resolve) => {
-          abortController.signal.addEventListener("abort", () => resolve("/tmp/mock-stream-temp"), {
-            once: true,
-          });
-        });
-      }
-    );
-
-    if (!replaceTempDirResult) {
-      throw new Error("Failed to mock StreamManager.createTempDirForStream");
-    }
-
     let cleanupCalled = false;
-    const replaceCleanupResult = Reflect.set(
-      streamManager,
-      "cleanupStreamTempDir",
-      (..._args: unknown[]): void => {
-        cleanupCalled = true;
-      }
-    );
-
-    if (!replaceCleanupResult) {
-      throw new Error("Failed to mock StreamManager.cleanupStreamTempDir");
-    }
-
-    const replaceCreateResult = Reflect.set(
-      streamManager,
-      "createStreamAtomically",
-      (..._args: unknown[]): never => {
-        createCalled = true;
-        throw new Error("createStreamAtomically should not be called");
-      }
-    );
-
-    if (!replaceCreateResult) {
-      throw new Error("Failed to mock StreamManager.createStreamAtomically");
-    }
-
-    const replaceProcessResult = Reflect.set(
-      streamManager,
-      "processStreamWithCleanup",
-      (..._args: unknown[]): Promise<void> => {
-        processCalled = true;
-        return Promise.resolve();
-      }
-    );
-
-    if (!replaceProcessResult) {
-      throw new Error("Failed to mock StreamManager.processStreamWithCleanup");
-    }
-
-    const anthropic = createAnthropic({ apiKey: "dummy-key" });
-    const model = anthropic("claude-sonnet-4-5");
+    Reflect.set(streamManager, "createTempDirForStream", (): Promise<string> => {
+      tempDirStartedResolve?.();
+      return new Promise((resolve) => {
+        abortController.signal.addEventListener("abort", () => resolve("/tmp/mock-stream-temp"), {
+          once: true,
+        });
+      });
+    });
+    Reflect.set(streamManager, "cleanupStreamTempDir", (): void => {
+      cleanupCalled = true;
+    });
+    Reflect.set(streamManager, "createStreamAtomically", (): never => {
+      createCalled = true;
+      throw new Error("createStreamAtomically should not be called");
+    });
+    Reflect.set(streamManager, "processStreamWithCleanup", (): Promise<void> => {
+      processCalled = true;
+      return Promise.resolve();
+    });
 
     const startPromise = streamManager.startStream(
-      workspaceId,
-      [{ role: "user", content: "test" }],
-      model,
-      KNOWN_MODELS.SONNET.id,
-      1,
-      "system",
-      runtime,
-      "test-msg-abort",
-      abortController.signal,
-      {}
+      testStartOptions({
+        workspaceId,
+        messageId: "test-msg-abort",
+        model: createTestLanguageModel(),
+        runtime,
+        abortSignal: abortController.signal,
+        tools: {},
+      })
     );
 
     await tempDirStarted;
@@ -2386,6 +2410,8 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
 
     const result = await startPromise;
     expect(result.success).toBe(true);
+    if (!result.success) throw new Error("Expected aborted startup handle");
+    expect(await result.data.completion).toEqual({ status: "aborted", abortReason: "startup" });
     expect(createCalled).toBe(false);
     expect(cleanupCalled).toBe(true);
     expect(processCalled).toBe(false);
@@ -2402,10 +2428,10 @@ describe("StreamManager - empty stream completions", () => {
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data);
     });
 
@@ -2488,10 +2514,10 @@ describe("StreamManager - empty stream completions", () => {
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data);
     });
 
@@ -2561,10 +2587,10 @@ describe("StreamManager - empty stream completions", () => {
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data);
     });
 
@@ -2627,10 +2653,10 @@ describe("StreamManager - empty stream completions", () => {
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data);
     });
 
@@ -2684,10 +2710,10 @@ describe("StreamManager - empty stream completions", () => {
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data);
     });
 
@@ -2767,7 +2793,6 @@ describe("StreamManager - empty stream completions", () => {
 
   test("zero-output refusal finishReason survives commit when usage is unavailable", async () => {
     const streamManager = new StreamManager(historyService);
-    streamManager.on("error", () => undefined);
 
     Reflect.set(streamManager, "tokenTracker", {
       setModel: () => Promise.resolve(undefined),
@@ -2839,7 +2864,6 @@ describe("StreamManager - empty stream completions", () => {
       recordHeadlessUsage,
     } as unknown as SessionUsageService;
     const streamManager = new StreamManager(historyService, sessionUsageService);
-    streamManager.on("error", () => undefined);
 
     Reflect.set(streamManager, "tokenTracker", {
       setModel: () => Promise.resolve(undefined),
@@ -2911,10 +2935,10 @@ describe("StreamManager - empty stream completions", () => {
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data);
     });
 
@@ -3010,8 +3034,8 @@ describe("StreamManager - empty stream completions", () => {
       };
     }> = [];
 
-    streamManager.on("error", (data) => errorEvents.push(data));
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => errorEvents.push(data));
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data as (typeof streamEndEvents)[number]);
     });
 
@@ -3163,8 +3187,8 @@ describe("StreamManager - empty stream completions", () => {
       parts?: Array<{ type: string; text?: string; toolName?: string }>;
     }> = [];
 
-    streamManager.on("error", (data) => errorEvents.push(data));
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => errorEvents.push(data));
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data as (typeof streamEndEvents)[number]);
     });
 
@@ -3300,8 +3324,8 @@ describe("StreamManager - empty stream completions", () => {
       };
     }> = [];
 
-    streamManager.on("error", (data) => errorEvents.push(data));
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => errorEvents.push(data));
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data as (typeof streamEndEvents)[number]);
     });
 
@@ -3393,10 +3417,10 @@ describe("StreamManager - empty stream completions", () => {
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
-    streamManager.on("stream-end", (data) => streamEndEvents.push(data));
+    onTurnEngineEvent(streamManager, "stream-end", (data) => streamEndEvents.push(data));
 
     Reflect.set(streamManager, "tokenTracker", {
       setModel: () => Promise.resolve(undefined),
@@ -3477,8 +3501,8 @@ describe("StreamManager - empty stream completions", () => {
       };
     }> = [];
 
-    streamManager.on("error", (data) => errorEvents.push(data));
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => errorEvents.push(data));
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data as (typeof streamEndEvents)[number]);
     });
 
@@ -3617,8 +3641,8 @@ describe("StreamManager - empty stream completions", () => {
       parts?: Array<{ type: string; text?: string; toolName?: string }>;
     }> = [];
 
-    streamManager.on("error", (data) => errorEvents.push(data));
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => errorEvents.push(data));
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data as (typeof streamEndEvents)[number]);
     });
 
@@ -3777,10 +3801,10 @@ describe("StreamManager - empty stream completions", () => {
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
-    streamManager.on("stream-end", (data) => streamEndEvents.push(data));
+    onTurnEngineEvent(streamManager, "stream-end", (data) => streamEndEvents.push(data));
 
     Reflect.set(streamManager, "tokenTracker", {
       setModel: () => Promise.resolve(undefined),
@@ -3894,7 +3918,7 @@ describe("StreamManager - empty stream completions", () => {
     const streamManager = new StreamManager(historyService);
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
 
@@ -3971,7 +3995,7 @@ describe("StreamManager - empty stream completions", () => {
     const streamManager = new StreamManager(historyService);
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
 
@@ -4133,13 +4157,12 @@ describe("StreamManager - TTFT metadata persistence", () => {
   }) {
     const streamManager = params.streamManager ?? new StreamManager(historyService);
     // Suppress error events from bubbling up as uncaught exceptions during tests
-    streamManager.on("error", () => undefined);
 
     if (params.onStreamStart) {
-      streamManager.on("stream-start", params.onStreamStart);
+      onTurnEngineEvent(streamManager, "stream-start", params.onStreamStart);
     }
     if (params.onStreamEnd) {
-      streamManager.on("stream-end", params.onStreamEnd);
+      onTurnEngineEvent(streamManager, "stream-end", params.onStreamEnd);
     }
 
     const replaceTokenTrackerResult = Reflect.set(streamManager, "tokenTracker", {
@@ -4853,7 +4876,6 @@ describe("StreamManager - replayStream", () => {
   function createReplayStreamManager(): StreamManager {
     const streamManager = new StreamManager(historyService);
     // Suppress error events from bubbling up as uncaught exceptions during tests.
-    streamManager.on("error", () => undefined);
     return streamManager;
   }
 
@@ -4881,17 +4903,21 @@ describe("StreamManager - replayStream", () => {
     const streamManager = createReplayStreamManager();
 
     let sawStreamStart = false;
-    streamManager.on("stream-start", (event: { replay?: boolean | undefined }) => {
+    onTurnEngineEvent(streamManager, "stream-start", (event: { replay?: boolean | undefined }) => {
       sawStreamStart = true;
       expect(event.replay).toBe(true);
     });
     const workspaceId = "ws-replay-snapshot";
 
     const deltas: string[] = [];
-    streamManager.on("stream-delta", (event: { delta: string; replay?: boolean | undefined }) => {
-      expect(event.replay).toBe(true);
-      deltas.push(event.delta);
-    });
+    onTurnEngineEvent(
+      streamManager,
+      "stream-delta",
+      (event: { delta: string; replay?: boolean | undefined }) => {
+        expect(event.replay).toBe(true);
+        deltas.push(event.delta);
+      }
+    );
 
     const streamInfo = {
       state: "streaming",
@@ -4934,7 +4960,8 @@ describe("StreamManager - replayStream", () => {
     const workspaceId = "ws-replay-tool-filter";
 
     const replayedToolEnds: string[] = [];
-    streamManager.on(
+    onTurnEngineEvent(
+      streamManager,
       "tool-call-end",
       (event: { replay?: boolean | undefined; toolCallId: string }) => {
         expect(event.replay).toBe(true);
@@ -4990,7 +5017,8 @@ describe("StreamManager - replayStream", () => {
     const workspaceId = "ws-replay-exec-start";
 
     const replayedToolStarts: Array<{ toolCallId: string; executionStartedAt?: number }> = [];
-    streamManager.on(
+    onTurnEngineEvent(
+      streamManager,
       "tool-call-start",
       (event: {
         replay?: boolean | undefined;
@@ -5051,26 +5079,11 @@ describe("StreamManager - replayStream", () => {
     const streamManager = createReplayStreamManager();
 
     const workspaceId = "ws-replay-usage";
-    const usageEvents: Array<{
-      replay?: boolean;
-      usage: { inputTokens: number; outputTokens: number; totalTokens: number };
-      providerMetadata?: Record<string, unknown>;
-      cumulativeUsage: { inputTokens: number; outputTokens: number; totalTokens: number };
-      cumulativeProviderMetadata?: Record<string, unknown>;
-    }> = [];
+    const usageEvents: Array<Extract<TurnEngineEvent, { type: "usage-delta" }>> = [];
 
-    streamManager.on(
-      "usage-delta",
-      (event: {
-        replay?: boolean;
-        usage: { inputTokens: number; outputTokens: number; totalTokens: number };
-        providerMetadata?: Record<string, unknown>;
-        cumulativeUsage: { inputTokens: number; outputTokens: number; totalTokens: number };
-        cumulativeProviderMetadata?: Record<string, unknown>;
-      }) => {
-        usageEvents.push(event);
-      }
-    );
+    onTurnEngineEvent(streamManager, "usage-delta", (event) => {
+      usageEvents.push(event);
+    });
 
     setReplayStreamInfo(streamManager, workspaceId, {
       state: "streaming",
@@ -5114,7 +5127,7 @@ describe("StreamManager - replayStream", () => {
     const workspaceId = "ws-replay-usage-incremental";
     const usageEvents: Array<{ replay?: boolean }> = [];
 
-    streamManager.on("usage-delta", (event: { replay?: boolean }) => {
+    onTurnEngineEvent(streamManager, "usage-delta", (event: { replay?: boolean }) => {
       usageEvents.push(event);
     });
 
@@ -5264,38 +5277,19 @@ describe("StreamManager - categorizeError", () => {
     });
   }
 });
-describe("StreamManager - ask_user_question Partial Persistence", () => {
-  // Note: The ask_user_question tool blocks waiting for user input.
-  // If the app restarts during that wait, the partial must be persisted.
-  // The fix (flush partial immediately for ask_user_question) is verified
-  // by the code path in processStreamWithCleanup's tool-call handler:
-  //
-  //   if (part.toolName === "ask_user_question") {
-  //     await this.flushPartialWrite(workspaceId, streamInfo);
-  //   }
-  //
-  // Full integration test would require mocking the entire streaming pipeline.
-  // Instead, we verify the StreamManager has the expected method signature.
-
-  test("flushPartialWrite is a callable method", () => {
-    const streamManager = new StreamManager(historyService);
-
-    // Verify the private method exists and is callable
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-    const flushMethod = Reflect.get(streamManager, "flushPartialWrite");
-    expect(typeof flushMethod).toBe("function");
-  });
-});
-
 describe("StreamManager - stopStream", () => {
   test("emits stream-abort when stopping non-existent stream", async () => {
     const streamManager = new StreamManager(historyService);
 
     // Track emitted events
     const abortEvents: Array<{ workspaceId: string; messageId: string }> = [];
-    streamManager.on("stream-abort", (data: { workspaceId: string; messageId: string }) => {
-      abortEvents.push(data);
-    });
+    onTurnEngineEvent(
+      streamManager,
+      "stream-abort",
+      (data: { workspaceId: string; messageId: string }) => {
+        abortEvents.push(data);
+      }
+    );
 
     // Stop a stream that doesn't exist (simulates interrupt before stream-start)
     const result = await streamManager.stopStream("test-workspace");
@@ -5329,7 +5323,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
 
   test("stamps cumulative usage on the partial so committed history rows stay billable", async () => {
     const streamManager = new StreamManager(historyService);
-    streamManager.on("stream-abort", () => undefined);
     const workspaceId = "abort-usage-workspace";
     const messageId = "abort-usage-message";
     await appendPartialAssistantForTests(workspaceId, messageId, 1);
@@ -5365,7 +5358,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
       const streamManager = new StreamManager(hs, sessionUsageService);
-      streamManager.on("stream-abort", () => undefined);
       const workspaceId = "abort-tool-only-workspace";
 
       const usage = { inputTokens: 500, outputTokens: 0, totalTokens: 500 };
@@ -5424,7 +5416,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
       const streamManager = new StreamManager(hs, sessionUsageService);
-      streamManager.on("stream-abort", () => undefined);
       const workspaceId = "abort-commit-worthy-workspace";
       await appendPartialAssistantForTests(workspaceId, "abort-commit-worthy-message", 1);
 
@@ -5457,7 +5448,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
       const streamManager = new StreamManager(hs, sessionUsageService);
-      streamManager.on("error", () => undefined);
       const workspaceId = "error-nondurable-workspace";
 
       const usage = { inputTokens: 900, outputTokens: 0, totalTokens: 900 };
@@ -5504,7 +5494,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
       const streamManager = new StreamManager(hs, sessionUsageService);
-      streamManager.on("error", () => undefined);
       const workspaceId = "error-commit-worthy-workspace";
 
       const usage = { inputTokens: 900, outputTokens: 40, totalTokens: 940 };
@@ -5554,7 +5543,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
       const streamManager = new StreamManager(hs, sessionUsageService);
-      streamManager.on("stream-abort", () => undefined);
       const workspaceId = "abort-abandon-workspace";
       const messageId = "abort-abandon-message";
 
@@ -5600,7 +5588,7 @@ describe("StreamManager - tool search activeTools scoping", () => {
     toolSearchState?: ToolSearchStreamState;
   }
 
-  type BuildStreamRequestConfig = (...args: unknown[]) => StreamRequestConfigForTests;
+  type BuildStreamRequestConfig = (input: Record<string, unknown>) => StreamRequestConfigForTests;
   type CreateStreamResult = (
     request: StreamRequestConfigForTests,
     abortController: AbortController
@@ -5636,7 +5624,7 @@ describe("StreamManager - tool search activeTools scoping", () => {
     return {
       // .apply: buildStreamRequestConfig reads this.getProvidersConfig for
       // cache-marker eligibility; a detached Reflect.get reference loses `this`.
-      buildRequestConfig: (...args) => buildRequestConfig.apply(streamManager, args),
+      buildRequestConfig: (input) => buildRequestConfig.call(streamManager, input),
       createStreamResult: (request, abortController) =>
         createStreamResultMethod.call(streamManager, request, abortController),
     };
@@ -5729,24 +5717,13 @@ describe("StreamManager - tool search activeTools scoping", () => {
       activatedToolNames: new Set(),
     };
 
-    const request = buildRequestConfig(
+    const request = buildRequestConfig({
       model,
-      KNOWN_MODELS.SONNET.id,
+      modelString: KNOWN_MODELS.SONNET.id,
       messages,
-      "system",
-      undefined, // routeProvider
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      toolSearchState
-    );
+      system: "system",
+      toolSearchState,
+    });
 
     // Same reference, not a copy. tool_catalog_search.execute mutations must be
     // visible to prepareStep.
@@ -5766,7 +5743,7 @@ describe("StreamManager - mid-turn thinking override", () => {
     onStepMessages?: (stepMessages: ModelMessage[]) => void;
   }
 
-  type BuildStreamRequestConfig = (...args: unknown[]) => OverrideRequestForTests;
+  type BuildStreamRequestConfig = (input: Record<string, unknown>) => OverrideRequestForTests;
   type CreateStreamResult = (
     request: OverrideRequestForTests,
     abortController: AbortController
@@ -5791,7 +5768,7 @@ describe("StreamManager - mid-turn thinking override", () => {
     createStreamResult: CreateStreamResult;
   } {
     const buildRequestConfig = Reflect.get(streamManager, "buildStreamRequestConfig") as
-      | ((...args: unknown[]) => OverrideRequestForTests)
+      | ((input: Record<string, unknown>) => OverrideRequestForTests)
       | undefined;
     const createStreamResultMethod = Reflect.get(streamManager, "createStreamResult") as
       | CreateStreamResult
@@ -5802,7 +5779,7 @@ describe("StreamManager - mid-turn thinking override", () => {
       throw new Error("Expected StreamManager private helpers to exist");
     }
     return {
-      buildRequestConfig: (...args) => buildRequestConfig.apply(streamManager, args),
+      buildRequestConfig: (input) => buildRequestConfig.call(streamManager, input),
       createStreamResult: (request, abortController) =>
         createStreamResultMethod.call(streamManager, request, abortController),
     };
@@ -5982,50 +5959,26 @@ describe("StreamManager - mid-turn thinking override", () => {
     const rebuild: RebuildProviderOptionsForThinkingLevel = () => null;
 
     // Without the closure, an absent providerOptions stays absent (no behavior change).
-    const plainRequest = buildRequestConfig(
+    const plainRequest = buildRequestConfig({
       model,
-      KNOWN_MODELS.SONNET.id,
+      modelString: KNOWN_MODELS.SONNET.id,
       messages,
-      "system",
-      undefined, // routeProvider
-      undefined, // tools
-      undefined, // providerOptions
-      undefined, // maxOutputTokens
-      undefined, // callSettingsOverrides
-      undefined, // toolPolicy
-      undefined, // hasQueuedMessages
-      undefined, // headers
-      undefined, // anthropicCacheTtlOverride
-      undefined, // onChunk
-      undefined, // onStepMessages
-      undefined // toolSearchState
-    );
+      system: "system",
+    });
     expect(plainRequest.providerOptions).toBeUndefined();
 
     // With the closure, undefined normalizes to a mutable object whose identity
     // is exactly what streamText() captures — otherwise in-place mutation at
     // prepareStep time would be unobservable to the SDK's per-step merge.
-    const request = buildRequestConfig(
+    const request = buildRequestConfig({
       model,
-      KNOWN_MODELS.SONNET.id,
+      modelString: KNOWN_MODELS.SONNET.id,
       messages,
-      "system",
-      undefined,
-      undefined,
-      undefined, // providerOptions intentionally absent
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined, // onToolExecutionStart
-      state,
-      rebuild
-    );
+      system: "system",
+      // providerOptions intentionally absent
+      thinkingOverrideState: state,
+      rebuildProviderOptionsForThinkingLevel: rebuild,
+    });
     expect(request.providerOptions).toEqual({});
     expect(request.thinkingOverrideState).toBe(state);
     expect(request.rebuildProviderOptionsForThinkingLevel).toBe(rebuild);
