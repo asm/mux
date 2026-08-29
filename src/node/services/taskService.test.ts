@@ -82,7 +82,7 @@ import {
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProvidersConfigMap, WorkspaceChatMessage } from "@/common/orpc/types";
 import type { AIService } from "@/node/services/aiService";
-import type { WorkspaceService } from "@/node/services/workspaceService";
+import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { InitStateManager as RealInitStateManager } from "@/node/services/initStateManager";
 import assert from "node:assert";
@@ -534,7 +534,6 @@ function createWorkspaceServiceMocks(
     getQueueCutCutter: ReturnType<typeof mock>;
     hasPendingAutoRetry: ReturnType<typeof mock>;
     waitForIdleAndNoQueuedMessages: ReturnType<typeof mock>;
-    waitForIdle: ReturnType<typeof mock>;
     waitForPendingCompactionCompletionDecision: ReturnType<typeof mock>;
     waitForPendingStreamErrorRecoveryDecision: ReturnType<typeof mock>;
     archive: ReturnType<typeof mock>;
@@ -545,57 +544,18 @@ function createWorkspaceServiceMocks(
     isSnapshotArchiveEligibilityMutationSensitive: ReturnType<typeof mock>;
     hasUntrackableExternalAppOpen: ReturnType<typeof mock>;
     acquirePreInterruptionArchiveHold: ReturnType<typeof mock>;
-    deleteWorktree: ReturnType<typeof mock>;
     remove: ReturnType<typeof mock>;
     emit: ReturnType<typeof mock>;
     getInfo: ReturnType<typeof mock>;
     replaceHistory: ReturnType<typeof mock>;
     updateTitle: ReturnType<typeof mock>;
-    updateAgentStatus: ReturnType<typeof mock>;
     isExperimentEnabled: ReturnType<typeof mock>;
     emitChatEvent: ReturnType<typeof mock>;
     isWorkflowInvocationCurrent: ReturnType<typeof mock>;
     create: ReturnType<typeof mock>;
     countQueuedAgentPeerMessages: ReturnType<typeof mock>;
   }>
-): {
-  workspaceService: WorkspaceService;
-  sendMessage: ReturnType<typeof mock>;
-  resumeStream: ReturnType<typeof mock>;
-  clearQueue: ReturnType<typeof mock>;
-  removeQueuedWorkspaceTurn: ReturnType<typeof mock>;
-  removeQueuedMessagesByDedupeKeyPrefix: ReturnType<typeof mock>;
-  hasQueuedWorkspaceTurn: ReturnType<typeof mock>;
-  hasQueuedMessages: ReturnType<typeof mock>;
-  isBusyForMessage: ReturnType<typeof mock>;
-  waitForIdleAndNoQueuedMessages: ReturnType<typeof mock>;
-  waitForIdle: ReturnType<typeof mock>;
-  hasPendingQueuedOrPreparingTurn: ReturnType<typeof mock>;
-  hasPendingWorkspaceTurnContinuation: ReturnType<typeof mock>;
-  getQueueCutCutter: ReturnType<typeof mock>;
-  hasPendingAutoRetry: ReturnType<typeof mock>;
-  waitForPendingCompactionCompletionDecision: ReturnType<typeof mock>;
-  waitForPendingStreamErrorRecoveryDecision: ReturnType<typeof mock>;
-  archive: ReturnType<typeof mock>;
-  unarchive: ReturnType<typeof mock>;
-  preflightArchive: ReturnType<typeof mock>;
-  listLiveWorkspaceActivity: ReturnType<typeof mock>;
-  hasRunningBackgroundBashProcesses: ReturnType<typeof mock>;
-  isSnapshotArchiveEligibilityMutationSensitive: ReturnType<typeof mock>;
-  hasUntrackableExternalAppOpen: ReturnType<typeof mock>;
-  deleteWorktree: ReturnType<typeof mock>;
-  remove: ReturnType<typeof mock>;
-  emit: ReturnType<typeof mock>;
-  getInfo: ReturnType<typeof mock>;
-  replaceHistory: ReturnType<typeof mock>;
-  updateTitle: ReturnType<typeof mock>;
-  updateAgentStatus: ReturnType<typeof mock>;
-  isExperimentEnabled: ReturnType<typeof mock>;
-  emitChatEvent: ReturnType<typeof mock>;
-  isWorkflowInvocationCurrent: ReturnType<typeof mock>;
-  create: ReturnType<typeof mock>;
-  discardExtensionMetadataEntry: ReturnType<typeof mock>;
-} {
+) {
   const sendMessage =
     overrides?.sendMessage ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
   const resumeStream =
@@ -604,7 +564,8 @@ function createWorkspaceServiceMocks(
   const clearQueue = overrides?.clearQueue ?? mock((): Result<void> => Ok(undefined));
   const removeQueuedWorkspaceTurn =
     overrides?.removeQueuedWorkspaceTurn ?? mock((): Result<boolean> => Ok(true));
-  const removeQueuedMessagesByDedupeKeyPrefix = mock((): Result<number> => Ok(0));
+  const removeQueuedMessagesByDedupeKeyPrefix =
+    overrides?.removeQueuedMessagesByDedupeKeyPrefix ?? mock((): Result<number> => Ok(0));
   const hasQueuedWorkspaceTurn = overrides?.hasQueuedWorkspaceTurn ?? mock(() => false);
   const hasQueuedMessages = overrides?.hasQueuedMessages ?? mock(() => false);
   const isBusyForMessage = overrides?.isBusyForMessage ?? mock(() => false);
@@ -618,7 +579,6 @@ function createWorkspaceServiceMocks(
   const hasPendingAutoRetry = overrides?.hasPendingAutoRetry ?? mock(() => false);
   const waitForIdleAndNoQueuedMessages =
     overrides?.waitForIdleAndNoQueuedMessages ?? mock((): Promise<void> => Promise.resolve());
-  const waitForIdle = overrides?.waitForIdle ?? mock((): Promise<void> => Promise.resolve());
   const waitForPendingCompactionCompletionDecision =
     overrides?.waitForPendingCompactionCompletionDecision ??
     mock((): Promise<boolean> => Promise.resolve(true));
@@ -651,8 +611,6 @@ function createWorkspaceServiceMocks(
     overrides?.isSnapshotArchiveEligibilityMutationSensitive ?? mock(() => false);
   const hasUntrackableExternalAppOpen =
     overrides?.hasUntrackableExternalAppOpen ?? mock(() => false);
-  const deleteWorktree =
-    overrides?.deleteWorktree ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
   const remove =
     overrides?.remove ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
   const emit = overrides?.emit ?? mock(() => true);
@@ -661,8 +619,6 @@ function createWorkspaceServiceMocks(
     overrides?.replaceHistory ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
   const updateTitle =
     overrides?.updateTitle ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-  const updateAgentStatus =
-    overrides?.updateAgentStatus ?? mock((): Promise<void> => Promise.resolve());
   const isExperimentEnabled = overrides?.isExperimentEnabled ?? mock(() => false);
   const emitChatEvent =
     overrides?.emitChatEvent ??
@@ -706,14 +662,12 @@ function createWorkspaceServiceMocks(
       getQueueCutCutter,
       hasPendingAutoRetry,
       waitForIdleAndNoQueuedMessages,
-      waitForIdle,
       waitForPendingCompactionCompletionDecision,
       waitForPendingStreamErrorRecoveryDecision,
       archive,
       // Same mocks: the lifecycle path holds the (real) task-tree lock and calls the
       // WhileTaskTreeLocked sinks; assertions target one archive/unarchive surface.
       archiveWhileTaskTreeLocked: archive,
-      unarchive,
       unarchiveWhileTaskTreeLocked: unarchive,
       preflightArchive,
       listLiveWorkspaceActivity,
@@ -724,62 +678,71 @@ function createWorkspaceServiceMocks(
       // Task launches register their fire-and-forget background inits for archive gating;
       // a no-op suffices since these tests archive nothing mid-init.
       registerExternalBackgroundInit: mock(() => undefined),
-      deleteWorktree,
       removeWhileTaskTreeLocked: remove,
       remove,
       emit,
       getInfo,
       replaceHistory,
       updateTitle,
-      updateAgentStatus,
       isExperimentEnabled,
       emitChatEvent,
       isWorkflowInvocationCurrent,
       countQueuedAgentPeerMessages,
-    } as unknown as WorkspaceService,
+    } satisfies WorkspaceHost,
     create,
     discardExtensionMetadataEntry,
     sendMessage,
     resumeStream,
     clearQueue,
     removeQueuedWorkspaceTurn,
-    removeQueuedMessagesByDedupeKeyPrefix,
-    hasQueuedWorkspaceTurn,
-    hasQueuedMessages,
     isBusyForMessage,
-    hasPendingQueuedOrPreparingTurn,
-    hasPendingWorkspaceTurnContinuation,
     getQueueCutCutter,
-    hasPendingAutoRetry,
-    waitForIdleAndNoQueuedMessages,
-    waitForIdle,
-    waitForPendingCompactionCompletionDecision,
-    waitForPendingStreamErrorRecoveryDecision,
+    remove,
+    updateTitle,
+    emitChatEvent,
+    emit,
     archive,
     unarchive,
-    preflightArchive,
-    listLiveWorkspaceActivity,
-    hasRunningBackgroundBashProcesses,
-    isSnapshotArchiveEligibilityMutationSensitive,
-    hasUntrackableExternalAppOpen,
-    deleteWorktree,
-    remove,
-    emit,
-    getInfo,
-    replaceHistory,
-    updateTitle,
-    updateAgentStatus,
-    isExperimentEnabled,
-    emitChatEvent,
     isWorkflowInvocationCurrent,
   };
+}
+
+// Registers the created workspace-turn checkout in config the way the real create()
+// would, so handle persistence and cleanup paths see a config entry.
+function makeWorkspaceTurnCreateMock(config: Config, projectPath: string) {
+  return mock(
+    async (
+      ...args: Parameters<WorkspaceHost["create"]>
+    ): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+      const tags = args[7];
+      await config.editConfig((cfg) => {
+        const project = cfg.projects.get(projectPath);
+        assert(project, "test project must exist");
+        project.workspaces.push({
+          path: path.join(projectPath, "workspace-turn"),
+          id: "childworkspace",
+          name: "workspace-turn",
+          title: "Workspace turn",
+          createdAt: "2026-06-19T00:00:00.000Z",
+          runtimeConfig: { type: "local" },
+          tags,
+        });
+        return cfg;
+      });
+      return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
+    }
+  );
+}
+
+function makeCreateMockReturning(result: Result<{ metadata: WorkspaceMetadata }>) {
+  return mock((): Promise<Result<{ metadata: WorkspaceMetadata }>> => Promise.resolve(result));
 }
 
 function createTaskServiceHarness(
   config: Config,
   overrides?: {
     aiService?: AIService;
-    workspaceService?: WorkspaceService;
+    workspaceService?: WorkspaceHost;
     initStateManager?: InitStateManager;
     sessionUsageService?: SessionUsageService;
     workspaceGoalService?: WorkspaceGoalService;
@@ -789,7 +752,7 @@ function createTaskServiceHarness(
   partialService: HistoryService;
   taskService: TaskService;
   aiService: AIService;
-  workspaceService: WorkspaceService;
+  workspaceService: WorkspaceHost;
   initStateManager: InitStateManager;
 } {
   const historyService = new HistoryService(config);
@@ -954,57 +917,8 @@ describe("TaskService", () => {
     stubStableIds(config, options.stableIds ?? ["handle", "turn"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
 
-    const createWorkspace = mock(
-      async (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
-        const tags = args[7] as Record<string, string> | undefined;
-        await config.editConfig((cfg) => {
-          const project = cfg.projects.get(projectPath);
-          assert(project, "test project must exist");
-          project.workspaces.push({
-            path: path.join(projectPath, "workspace-turn"),
-            id: "childworkspace",
-            name: "workspace-turn",
-            title: "Workspace turn",
-            createdAt: "2026-06-19T00:00:00.000Z",
-            runtimeConfig: { type: "local" },
-            tags,
-          });
-          return cfg;
-        });
-        return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
-      }
-    );
-    const workspaceMocks = createWorkspaceServiceMocks({
-      create: createWorkspace,
-      ...(options.sendMessage != null ? { sendMessage: options.sendMessage } : {}),
-      ...(options.remove != null ? { remove: options.remove } : {}),
-      ...(options.hasQueuedMessages != null
-        ? { hasQueuedMessages: options.hasQueuedMessages }
-        : {}),
-      ...(options.hasPendingQueuedOrPreparingTurn != null
-        ? { hasPendingQueuedOrPreparingTurn: options.hasPendingQueuedOrPreparingTurn }
-        : {}),
-      ...(options.hasPendingBashMonitorWakeContinuation != null
-        ? {
-            hasPendingBashMonitorWakeContinuation: options.hasPendingBashMonitorWakeContinuation,
-          }
-        : {}),
-      ...(options.hasPendingWorkspaceTurnContinuation != null
-        ? { hasPendingWorkspaceTurnContinuation: options.hasPendingWorkspaceTurnContinuation }
-        : {}),
-      ...(options.getQueueCutCutter != null
-        ? { getQueueCutCutter: options.getQueueCutCutter }
-        : {}),
-      ...(options.hasPendingAutoRetry != null
-        ? { hasPendingAutoRetry: options.hasPendingAutoRetry }
-        : {}),
-      ...(options.waitForPendingStreamErrorRecoveryDecision != null
-        ? {
-            waitForPendingStreamErrorRecoveryDecision:
-              options.waitForPendingStreamErrorRecoveryDecision,
-          }
-        : {}),
-    });
+    const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, ...options });
     const aiMocks = createAIServiceMocks(config, {
       ...(options.isStreaming != null ? { isStreaming: options.isStreaming } : {}),
     });
@@ -1073,27 +987,7 @@ describe("TaskService", () => {
       return cfg;
     });
 
-    const workspaceMocks = createWorkspaceServiceMocks({
-      ...(options.archive != null ? { archive: options.archive } : {}),
-      ...(options.unarchive != null ? { unarchive: options.unarchive } : {}),
-      ...(options.preflightArchive != null ? { preflightArchive: options.preflightArchive } : {}),
-      ...(options.listLiveWorkspaceActivity != null
-        ? { listLiveWorkspaceActivity: options.listLiveWorkspaceActivity }
-        : {}),
-      ...(options.hasRunningBackgroundBashProcesses != null
-        ? { hasRunningBackgroundBashProcesses: options.hasRunningBackgroundBashProcesses }
-        : {}),
-      ...(options.isSnapshotArchiveEligibilityMutationSensitive != null
-        ? {
-            isSnapshotArchiveEligibilityMutationSensitive:
-              options.isSnapshotArchiveEligibilityMutationSensitive,
-          }
-        : {}),
-      ...(options.hasUntrackableExternalAppOpen != null
-        ? { hasUntrackableExternalAppOpen: options.hasUntrackableExternalAppOpen }
-        : {}),
-      ...(options.create != null ? { create: options.create } : {}),
-    });
+    const workspaceMocks = createWorkspaceServiceMocks(options);
     const { taskService } = createTaskServiceHarness(config, {
       workspaceService: workspaceMocks.workspaceService,
     });
@@ -2602,26 +2496,7 @@ describe("TaskService", () => {
     stubStableIds(config, ["childworkspace", "turnhandle"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
 
-    const createWorkspace = mock(
-      async (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
-        const tags = args[7] as Record<string, string> | undefined;
-        await config.editConfig((cfg) => {
-          const project = cfg.projects.get(projectPath);
-          assert(project, "test project must exist");
-          project.workspaces.push({
-            path: path.join(projectPath, "workspace-turn"),
-            id: "childworkspace",
-            name: "workspace-turn",
-            title: "Workspace turn",
-            createdAt: "2026-06-19T00:00:00.000Z",
-            runtimeConfig: { type: "local" },
-            tags,
-          });
-          return cfg;
-        });
-        return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
-      }
-    );
+    const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
     const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
     const { taskService } = createTaskServiceHarness(config, {
@@ -2667,9 +2542,8 @@ describe("TaskService", () => {
     stubStableIds(config, ["childworkspace", "turnhandle"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
 
-    const createWorkspace = mock(
-      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
-        Promise.resolve(Ok({ metadata: createWorkspaceTurnMetadata(projectPath) }))
+    const createWorkspace = makeCreateMockReturning(
+      Ok({ metadata: createWorkspaceTurnMetadata(projectPath) })
     );
     const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
@@ -2730,10 +2604,7 @@ describe("TaskService", () => {
       runtimeConfig: { type: "worktree", srcBaseDir: path.join(rootDir, "wt") },
       namedWorkspacePath: cleanCheckout,
     };
-    const createWorkspace = mock(
-      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
-        Promise.resolve(Ok({ metadata: targetMetadata }))
-    );
+    const createWorkspace = makeCreateMockReturning(Ok({ metadata: targetMetadata }));
     const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
     const { taskService } = createTaskServiceHarness(config, {
@@ -2760,9 +2631,8 @@ describe("TaskService", () => {
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
     checkoutOwnerBranch(projectPath, "parent");
 
-    const createWorkspace = mock(
-      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
-        Promise.resolve(Ok({ metadata: createWorkspaceTurnMetadata(projectPath) }))
+    const createWorkspace = makeCreateMockReturning(
+      Ok({ metadata: createWorkspaceTurnMetadata(projectPath) })
     );
     const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
@@ -2795,9 +2665,8 @@ describe("TaskService", () => {
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
     checkoutOwnerBranch(projectPath, "parent");
 
-    const createWorkspace = mock(
-      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
-        Promise.resolve(Ok({ metadata: createWorkspaceTurnMetadata(projectPath) }))
+    const createWorkspace = makeCreateMockReturning(
+      Ok({ metadata: createWorkspaceTurnMetadata(projectPath) })
     );
     const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
@@ -2850,9 +2719,8 @@ describe("TaskService", () => {
     await writeCustomAgentDefinition(projectPath);
     commitOwnerAgentFiles(projectPath);
 
-    const createWorkspace = mock(
-      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
-        Promise.resolve(Ok({ metadata: createWorkspaceTurnMetadata(projectPath) }))
+    const createWorkspace = makeCreateMockReturning(
+      Ok({ metadata: createWorkspaceTurnMetadata(projectPath) })
     );
     const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
@@ -2974,9 +2842,8 @@ describe("TaskService", () => {
     );
     commitOwnerAgentFiles(projectPath);
 
-    const createWorkspace = mock(
-      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
-        Promise.resolve(Ok({ metadata: createWorkspaceTurnMetadata(projectPath) }))
+    const createWorkspace = makeCreateMockReturning(
+      Ok({ metadata: createWorkspaceTurnMetadata(projectPath) })
     );
     const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
@@ -3029,10 +2896,7 @@ describe("TaskService", () => {
       runtimeConfig: { type: "worktree", srcBaseDir: path.join(rootDir, "wt") },
       namedWorkspacePath: targetBranchCheckout,
     };
-    const createWorkspace = mock(
-      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
-        Promise.resolve(Ok({ metadata: targetMetadata }))
-    );
+    const createWorkspace = makeCreateMockReturning(Ok({ metadata: targetMetadata }));
     const sendMessage = mock(
       (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
     );
@@ -3066,10 +2930,7 @@ describe("TaskService", () => {
       runtimeConfig: { type: "worktree", srcBaseDir: path.join(rootDir, "wt") },
       namedWorkspacePath: path.join(rootDir, "not-provisioned-branch"),
     };
-    const createWorkspace = mock(
-      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
-        Promise.resolve(Ok({ metadata: unreachableMetadata }))
-    );
+    const createWorkspace = makeCreateMockReturning(Ok({ metadata: unreachableMetadata }));
     const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
     const { taskService } = createTaskServiceHarness(config, {
@@ -3166,10 +3027,7 @@ describe("TaskService", () => {
       runtimeConfig: { type: "worktree", srcBaseDir: path.join(rootDir, "wt") },
       namedWorkspacePath: path.join(rootDir, "not-provisioned-collision"),
     };
-    const createWorkspace = mock(
-      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
-        Promise.resolve(Ok({ metadata: unreachableMetadata }))
-    );
+    const createWorkspace = makeCreateMockReturning(Ok({ metadata: unreachableMetadata }));
     const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
     const { taskService } = createTaskServiceHarness(config, {
@@ -3228,10 +3086,7 @@ describe("TaskService", () => {
       runtimeConfig: { type: "worktree", srcBaseDir: path.join(rootDir, "wt") },
       namedWorkspacePath: targetOnlyCheckout,
     };
-    const createWorkspace = mock(
-      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
-        Promise.resolve(Ok({ metadata: targetMetadata }))
-    );
+    const createWorkspace = makeCreateMockReturning(Ok({ metadata: targetMetadata }));
     const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
     const { taskService } = createTaskServiceHarness(config, {
@@ -3570,26 +3425,7 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const createWorkspace = mock(
-      async (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
-        const tags = args[7] as Record<string, string> | undefined;
-        await config.editConfig((cfg) => {
-          const project = cfg.projects.get(projectPath);
-          assert(project, "test project must exist");
-          project.workspaces.push({
-            path: path.join(projectPath, "workspace-turn"),
-            id: "childworkspace",
-            name: "workspace-turn",
-            title: "Workspace turn",
-            createdAt: "2026-06-19T00:00:00.000Z",
-            runtimeConfig: { type: "local" },
-            tags,
-          });
-          return cfg;
-        });
-        return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
-      }
-    );
+    const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
     const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
     const { taskService } = createTaskServiceHarness(config, {
@@ -3626,26 +3462,7 @@ describe("TaskService", () => {
       agentAiDefaults: { exec: { modelString: "openai:gpt-5.2", thinkingLevel: "xhigh" } },
     });
 
-    const createWorkspace = mock(
-      async (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
-        const tags = args[7] as Record<string, string> | undefined;
-        await config.editConfig((cfg) => {
-          const project = cfg.projects.get(projectPath);
-          assert(project, "test project must exist");
-          project.workspaces.push({
-            path: path.join(projectPath, "workspace-turn"),
-            id: "childworkspace",
-            name: "workspace-turn",
-            title: "Workspace turn",
-            createdAt: "2026-06-19T00:00:00.000Z",
-            runtimeConfig: { type: "local" },
-            tags,
-          });
-          return cfg;
-        });
-        return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
-      }
-    );
+    const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
     const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
       const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
       await internal?.onAccepted?.();
@@ -3747,26 +3564,7 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const createWorkspace = mock(
-      async (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
-        const tags = args[7] as Record<string, string> | undefined;
-        await config.editConfig((cfg) => {
-          const project = cfg.projects.get(projectPath);
-          assert(project, "test project must exist");
-          project.workspaces.push({
-            path: path.join(projectPath, "workspace-turn"),
-            id: "childworkspace",
-            name: "workspace-turn",
-            title: "Workspace turn",
-            createdAt: "2026-06-19T00:00:00.000Z",
-            runtimeConfig: { type: "local" },
-            tags,
-          });
-          return cfg;
-        });
-        return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
-      }
-    );
+    const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
     const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
       const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
       await internal?.onAccepted?.();
@@ -3842,10 +3640,7 @@ describe("TaskService", () => {
         extraProjects: [[secondaryProjectPath, { trusted: true, workspaces: [] }]],
       }
     );
-    const createWorkspace = mock(
-      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
-        Promise.resolve(Err("should not create workspace"))
-    );
+    const createWorkspace = makeCreateMockReturning(Err("should not create workspace"));
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace });
     const { taskService } = createTaskServiceHarness(config, {
       workspaceService: workspaceMocks.workspaceService,
@@ -3868,10 +3663,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["handle", "turn"]);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
-    const createWorkspace = mock(
-      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
-        Promise.resolve(Err("should not create workspace"))
-    );
+    const createWorkspace = makeCreateMockReturning(Err("should not create workspace"));
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace });
     const { taskService } = createTaskServiceHarness(config, {
       workspaceService: workspaceMocks.workspaceService,
@@ -3918,26 +3710,7 @@ describe("TaskService", () => {
     stubStableIds(config, ["firsthandle", "firstturn", "secondhandle", "secondturn"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
 
-    const createWorkspace = mock(
-      async (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
-        const tags = args[7] as Record<string, string> | undefined;
-        await config.editConfig((cfg) => {
-          const project = cfg.projects.get(projectPath);
-          assert(project, "test project must exist");
-          project.workspaces.push({
-            path: path.join(projectPath, "workspace-turn"),
-            id: "childworkspace",
-            name: "workspace-turn",
-            title: "Workspace turn",
-            createdAt: "2026-06-19T00:00:00.000Z",
-            runtimeConfig: { type: "local" },
-            tags,
-          });
-          return cfg;
-        });
-        return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
-      }
-    );
+    const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
     const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
       const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
       await internal?.onAccepted?.();
@@ -4881,26 +4654,7 @@ describe("TaskService", () => {
       return cfg;
     });
 
-    const createWorkspace = mock(
-      async (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
-        const tags = args[7] as Record<string, string> | undefined;
-        await config.editConfig((cfg) => {
-          const project = cfg.projects.get(projectPath);
-          assert(project, "test project must exist");
-          project.workspaces.push({
-            path: path.join(projectPath, "workspace-turn"),
-            id: "childworkspace",
-            name: "workspace-turn",
-            title: "Workspace turn",
-            createdAt: "2026-06-19T00:00:00.000Z",
-            runtimeConfig: { type: "local" },
-            tags,
-          });
-          return cfg;
-        });
-        return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
-      }
-    );
+    const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
     const sendMessage = mock(
       (..._args: unknown[]): Promise<Result<void, SendMessageError>> =>
         Promise.resolve(Ok(undefined))
@@ -5104,26 +4858,7 @@ describe("TaskService", () => {
       return cfg;
     });
 
-    const createWorkspace = mock(
-      async (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
-        const tags = args[7] as Record<string, string> | undefined;
-        await config.editConfig((cfg) => {
-          const project = cfg.projects.get(projectPath);
-          assert(project, "test project must exist");
-          project.workspaces.push({
-            path: path.join(projectPath, "workspace-turn"),
-            id: "childworkspace",
-            name: "workspace-turn",
-            title: "Workspace turn",
-            createdAt: "2026-06-19T00:00:00.000Z",
-            runtimeConfig: { type: "local" },
-            tags,
-          });
-          return cfg;
-        });
-        return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
-      }
-    );
+    const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
     const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
     const { taskService } = createTaskServiceHarness(config, {
@@ -5414,26 +5149,7 @@ describe("TaskService", () => {
     stubStableIds(config, ["handle", "turn"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
 
-    const createWorkspace = mock(
-      async (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
-        const tags = args[7] as Record<string, string> | undefined;
-        await config.editConfig((cfg) => {
-          const project = cfg.projects.get(projectPath);
-          assert(project, "test project must exist");
-          project.workspaces.push({
-            path: path.join(projectPath, "workspace-turn"),
-            id: "childworkspace",
-            name: "workspace-turn",
-            title: "Workspace turn",
-            createdAt: "2026-06-19T00:00:00.000Z",
-            runtimeConfig: { type: "local" },
-            tags,
-          });
-          return cfg;
-        });
-        return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
-      }
-    );
+    const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
     const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
     const { taskService } = createTaskServiceHarness(config, {
@@ -10879,26 +10595,7 @@ describe("TaskService", () => {
     stubStableIds(config, ["handle", "turn"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
 
-    const createWorkspace = mock(
-      async (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
-        const tags = args[7] as Record<string, string> | undefined;
-        await config.editConfig((cfg) => {
-          const project = cfg.projects.get(projectPath);
-          assert(project, "test project must exist");
-          project.workspaces.push({
-            path: path.join(projectPath, "workspace-turn"),
-            id: "childworkspace",
-            name: "workspace-turn",
-            title: "Workspace turn",
-            createdAt: "2026-06-19T00:00:00.000Z",
-            runtimeConfig: { type: "local" },
-            tags,
-          });
-          return cfg;
-        });
-        return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
-      }
-    );
+    const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
     const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
     const { taskService } = createTaskServiceHarness(config, {
@@ -10943,26 +10640,7 @@ describe("TaskService", () => {
     stubStableIds(config, ["handle", "turn"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
 
-    const createWorkspace = mock(
-      async (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
-        const tags = args[7] as Record<string, string> | undefined;
-        await config.editConfig((cfg) => {
-          const project = cfg.projects.get(projectPath);
-          assert(project, "test project must exist");
-          project.workspaces.push({
-            path: path.join(projectPath, "workspace-turn"),
-            id: "childworkspace",
-            name: "workspace-turn",
-            title: "Workspace turn",
-            createdAt: "2026-06-19T00:00:00.000Z",
-            runtimeConfig: { type: "local" },
-            tags,
-          });
-          return cfg;
-        });
-        return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
-      }
-    );
+    const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
     const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
     const { taskService } = createTaskServiceHarness(config, {
@@ -27668,8 +27346,9 @@ describe("TaskService", () => {
     );
 
     const removeQueuedMessagesByDedupeKeyPrefix = mock((): Result<number> => Ok(1));
-    const { workspaceService } = createWorkspaceServiceMocks();
-    workspaceService.removeQueuedMessagesByDedupeKeyPrefix = removeQueuedMessagesByDedupeKeyPrefix;
+    const { workspaceService } = createWorkspaceServiceMocks({
+      removeQueuedMessagesByDedupeKeyPrefix,
+    });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
     await handleTaskServiceStreamEndForTest(taskService, {
@@ -30268,7 +29947,7 @@ describe("TaskService", () => {
       namedWorkspacePath: childWorkspacePath,
     }));
     const replaceHistory = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-    const { workspaceService, sendMessage, updateAgentStatus } = createWorkspaceServiceMocks({
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
       getInfo,
       replaceHistory,
       sendMessage: options?.sendMessageOverride,
@@ -30288,7 +29967,6 @@ describe("TaskService", () => {
       sendMessage,
       replaceHistory,
       createModel,
-      updateAgentStatus,
       taskService,
       internal,
     };
