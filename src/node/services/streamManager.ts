@@ -982,11 +982,9 @@ export class StreamManager extends EventEmitter {
   public async createTempDirForStream(streamToken: StreamToken, runtime: Runtime): Promise<string> {
     const tempDir = `~/.xum-tmp/${streamToken}`;
 
-    // Resolve ~ in the runtime's context.
-    //
-    // IMPORTANT: On Windows local runtime, Git Bash may use a customized $HOME,
-    // while runtime.resolvePath expands ~ via Node (USERPROFILE). To avoid drift,
-    // create the directory using the resolved absolute path.
+    // Resolve ~ in the runtime's context: callers need the canonical absolute
+    // path as a value, and reusing it for ensureDir avoids a second remote
+    // resolution round trip per stream on SSH runtimes.
     let resolvedPath = (await runtime.resolvePath(tempDir)).trim();
 
     // In the main process, PlatformPaths defaults to POSIX behavior (no navigator),
