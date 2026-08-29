@@ -8,10 +8,13 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { StreamEndEventSchema, ToolCallStartEventSchema } from "@/common/orpc/schemas/stream";
 import type {
   CompletedMessagePart,
+  ToolCallEndEvent,
   ToolCallExecutionStartEvent,
+  ToolCallStartEvent,
   WorkflowRunAttachedEvent,
 } from "@/common/types/stream";
 import type { MuxMessage } from "@/common/types/message";
+import type { WorkflowRunRecord } from "@/common/types/workflow";
 import { Ok, Err } from "@/common/types/result";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { ToolSearchStreamState } from "@/common/utils/tools/toolCatalog";
@@ -233,6 +236,7 @@ function createStreamInfoForTests(
     lastPartTimestamp: now,
     toolCompletionTimestamps: new Map<string, number>(),
     pendingWorkflowRunAttachments: new Map<string, unknown>(),
+    pendingNestedCalls: new Map<string, unknown[]>(),
     pendingToolExecutionStarts: new Map<string, number>(),
     model,
     metadataModel: overrides.metadataModel ?? model,
@@ -254,6 +258,27 @@ function createStreamInfoForTests(
     currentStepStartIndex: 0,
     stepTracker: {},
     ...overrides,
+  };
+}
+
+function createWorkflowRunRecordForTests(runId: string, workspaceId: string): WorkflowRunRecord {
+  return {
+    id: runId,
+    workspaceId,
+    workflow: {
+      name: "deep-research",
+      description: "test workflow",
+      scope: "project",
+      executable: true,
+    },
+    source: "export default function workflow() { return { reportMarkdown: 'x'.repeat(64) }; }",
+    sourceHash: "sha256:test",
+    args: {},
+    status: "running",
+    createdAt: "2026-05-29T00:00:00.000Z",
+    updatedAt: "2026-05-29T00:00:01.000Z",
+    events: [],
+    steps: [],
   };
 }
 
@@ -334,6 +359,67 @@ describe("StreamManager - workflow run attachments", () => {
     });
   });
 
+  test("persists workflow attachments onto nested kernel tool calls", async () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "workflow-nested-attachment-workspace";
+    const messageId = "workflow-nested-attachment-message";
+    const timestamp = Date.now();
+    const streamInfo = createStreamInfoForTests({
+      messageId,
+      lastPartialWriteTime: timestamp,
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "code-exec-1",
+          toolName: "code_execution",
+          input: { code: "mux.workflow_run({...})" },
+          state: "input-available",
+          timestamp,
+          nestedCalls: [
+            {
+              toolCallId: "nested-workflow-1",
+              toolName: "workflow_run",
+              // Kernel bounding replaced the launch args with a marker; the
+              // attachment is the only durable run identity for this call.
+              input: { __kernelBounded: true, bytes: 18_457, preview: "{…}" },
+              state: "input-available",
+              timestamp,
+            },
+          ],
+        },
+      ],
+    });
+
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+
+    const attached = await streamManager.attachWorkflowRunToToolCall({
+      type: "workflow-run-attached",
+      workspaceId,
+      messageId,
+      toolCallId: "nested-workflow-1",
+      runId: "wfr_nested",
+      // The live event carries the full run record (large source/args),
+      // exactly what kernel bounding keeps out of the nested record.
+      run: createWorkflowRunRecordForTests("wfr_nested", workspaceId),
+      timestamp: timestamp + 1,
+    });
+
+    expect(attached).toBe(true);
+    const partial = await historyService.readPartial(workspaceId);
+    const part = partial?.parts[0];
+    if (part?.type !== "dynamic-tool") {
+      throw new Error("Expected code_execution tool part in persisted partial");
+    }
+    // Identity only: persisting the run record (source, args) would bypass the
+    // kernel record caps via partial.json.
+    expect(part.nestedCalls?.[0]?.workflowRun).toEqual({
+      runId: "wfr_nested",
+      timestamp: timestamp + 1,
+    });
+    // The attachment landed on the nested record, not the pending map.
+    expect((streamInfo.pendingWorkflowRunAttachments as Map<string, unknown>).size).toBe(0);
+  });
+
   test("persists workflow attachments that arrive before the tool part", async () => {
     const streamManager = new StreamManager(historyService);
     const workspaceId = "workflow-attachment-race-workspace";
@@ -408,6 +494,278 @@ describe("StreamManager - workflow run attachments", () => {
       runId: "wfr_race",
       timestamp: timestamp + 1,
     });
+  });
+});
+
+describe("StreamManager - nested kernel call race and replay", () => {
+  test("buffers nested events that beat the parent part and persists them (with run identity) on merge", async () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "nested-race-workspace";
+    const messageId = "nested-race-message";
+    const timestamp = Date.now();
+    const streamInfo = createStreamInfoForTests({
+      messageId,
+      lastPartialWriteTime: timestamp,
+      parts: [],
+    });
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+
+    // execute() wins the race: nested start arrives before the parent part exists.
+    streamManager.emitNestedToolEvent(workspaceId, messageId, {
+      type: "tool-call-start",
+      callId: "nested-race-workflow",
+      toolName: "workflow_run",
+      args: { __kernelBounded: true, bytes: 18_457, preview: "{…}" },
+      parentToolCallId: "code-exec-race",
+      startTime: timestamp,
+    });
+
+    // The workflow attachment lands while the nested record is still buffered.
+    const attached = await streamManager.attachWorkflowRunToToolCall({
+      type: "workflow-run-attached",
+      workspaceId,
+      messageId,
+      toolCallId: "nested-race-workflow",
+      runId: "wfr_race_nested",
+      run: createWorkflowRunRecordForTests("wfr_race_nested", workspaceId),
+      timestamp: timestamp + 1,
+    });
+    expect(attached).toBe(true);
+    // Nothing persisted yet: the parent part has not landed.
+    expect(await historyService.readPartial(workspaceId)).toBeNull();
+
+    const appendPartAndEmit = getPrivateMethodForTests<
+      (
+        workspaceId: string,
+        streamInfo: Record<string, unknown>,
+        part: CompletedMessagePart,
+        schedulePartialWrite?: boolean
+      ) => Promise<void>
+    >(streamManager, "appendPartAndEmit");
+    // The renderer dropped the original raced events, so the merge must
+    // re-deliver them once the parent part exists.
+    const reEmittedStarts: ToolCallStartEvent[] = [];
+    const reEmittedAttachments: WorkflowRunAttachedEvent[] = [];
+    onTurnEngineEvent(streamManager, "tool-call-start", (event) => reEmittedStarts.push(event));
+    onTurnEngineEvent(streamManager, "workflow-run-attached", (event) =>
+      reEmittedAttachments.push(event)
+    );
+    await appendPartAndEmit.call(
+      streamManager,
+      workspaceId,
+      streamInfo,
+      {
+        type: "dynamic-tool",
+        toolCallId: "code-exec-race",
+        toolName: "code_execution",
+        input: { code: "mux.workflow_run({...})" },
+        state: "input-available",
+        timestamp: timestamp + 2,
+      },
+      false
+    );
+    const reEmittedStart = reEmittedStarts.find((e) => e.toolCallId === "nested-race-workflow");
+    expect(reEmittedStart?.parentToolCallId).toBe("code-exec-race");
+    expect(reEmittedAttachments.some((e) => e.toolCallId === "nested-race-workflow")).toBe(true);
+
+    const partial = await historyService.readPartial(workspaceId);
+    const part = partial?.parts[0];
+    if (part?.type !== "dynamic-tool") {
+      throw new Error("Expected code_execution tool part in persisted partial");
+    }
+    expect(part.nestedCalls).toHaveLength(1);
+    expect(part.nestedCalls?.[0]?.toolCallId).toBe("nested-race-workflow");
+    // Run identity only (no run record), same bound as the direct attach path.
+    expect(part.nestedCalls?.[0]?.workflowRun).toEqual({
+      runId: "wfr_race_nested",
+      timestamp: timestamp + 1,
+    });
+    // Both holding areas were consumed.
+    expect((streamInfo.pendingNestedCalls as Map<string, unknown>).size).toBe(0);
+    expect((streamInfo.pendingWorkflowRunAttachments as Map<string, unknown>).size).toBe(0);
+  });
+
+  test("replays persisted nested calls (start, attachment, end) with the parent part", async () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "nested-replay-workspace";
+    const messageId = "nested-replay-message";
+    const timestamp = Date.now();
+    const streamInfo = createStreamInfoForTests({
+      messageId,
+      lastPartialWriteTime: timestamp,
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "code-exec-replay",
+          toolName: "code_execution",
+          input: { code: "mux.workflow_run({...})" },
+          state: "input-available",
+          timestamp,
+          nestedCalls: [
+            {
+              toolCallId: "nested-replay-workflow",
+              toolName: "workflow_run",
+              input: { __kernelBounded: true, bytes: 18_457, preview: "{…}" },
+              state: "output-available",
+              output: { __kernelBounded: true, runId: "wfr_replay", status: "running" },
+              timestamp: timestamp + 1,
+              workflowRun: { runId: "wfr_replay", timestamp: timestamp + 2 },
+            },
+          ],
+        },
+      ],
+    });
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+
+    const starts: ToolCallStartEvent[] = [];
+    const attachments: WorkflowRunAttachedEvent[] = [];
+    const ends: ToolCallEndEvent[] = [];
+    onTurnEngineEvent(streamManager, "tool-call-start", (event) => starts.push(event));
+    onTurnEngineEvent(streamManager, "workflow-run-attached", (event) => attachments.push(event));
+    onTurnEngineEvent(streamManager, "tool-call-end", (event) => ends.push(event));
+
+    await streamManager.replayStream(workspaceId);
+
+    const nestedStart = starts.find((e) => e.toolCallId === "nested-replay-workflow");
+    expect(nestedStart?.parentToolCallId).toBe("code-exec-replay");
+    expect(nestedStart?.replay).toBe(true);
+    const nestedAttach = attachments.find((e) => e.toolCallId === "nested-replay-workflow");
+    expect(nestedAttach?.runId).toBe("wfr_replay");
+    const nestedEnd = ends.find((e) => e.toolCallId === "nested-replay-workflow");
+    expect(nestedEnd?.parentToolCallId).toBe("code-exec-replay");
+  });
+
+  test("incremental replay notices a nested call that completed while disconnected", async () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "nested-replay-completion-workspace";
+    const messageId = "nested-replay-completion-message";
+    const timestamp = Date.now();
+    const makeStreamInfo = (completedAt: number) =>
+      createStreamInfoForTests({
+        messageId,
+        lastPartialWriteTime: timestamp,
+        toolCompletionTimestamps: new Map([["nested-completed-workflow", completedAt]]),
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "code-exec-completion",
+            toolName: "code_execution",
+            input: { code: "mux.workflow_run({...})" },
+            state: "input-available",
+            timestamp,
+            nestedCalls: [
+              {
+                toolCallId: "nested-completed-workflow",
+                toolName: "workflow_run",
+                input: {},
+                state: "output-available",
+                output: { runId: "wfr_done" },
+                // Start predates the cursor; only the completion is fresh.
+                timestamp,
+              },
+            ],
+          },
+        ],
+      });
+    const cursor = timestamp + 50;
+
+    // Completed after the cursor: the parent must replay.
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, makeStreamInfo(timestamp + 100));
+    const starts: ToolCallStartEvent[] = [];
+    onTurnEngineEvent(streamManager, "tool-call-start", (event) => starts.push(event));
+    await streamManager.replayStream(workspaceId, { afterTimestamp: cursor });
+    expect(starts.some((e) => e.toolCallId === "nested-completed-workflow")).toBe(true);
+
+    // Completed before the cursor: nothing fresh, no replay.
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, makeStreamInfo(timestamp + 10));
+    starts.length = 0;
+    await streamManager.replayStream(workspaceId, { afterTimestamp: cursor });
+    expect(starts.some((e) => e.toolCallId === "nested-completed-workflow")).toBe(false);
+  });
+
+  test("emitNestedToolEvent records nested completion timestamps", () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "nested-completion-record-workspace";
+    const messageId = "nested-completion-record-message";
+    const timestamp = Date.now();
+    const streamInfo = createStreamInfoForTests({
+      messageId,
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "code-exec-ts",
+          toolName: "code_execution",
+          input: {},
+          state: "input-available",
+          timestamp,
+          nestedCalls: [
+            {
+              toolCallId: "nested-ts",
+              toolName: "bash",
+              input: {},
+              state: "input-available",
+              timestamp,
+            },
+          ],
+        },
+      ],
+    });
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+
+    streamManager.emitNestedToolEvent(workspaceId, messageId, {
+      type: "tool-call-end",
+      callId: "nested-ts",
+      toolName: "bash",
+      args: {},
+      parentToolCallId: "code-exec-ts",
+      startTime: timestamp,
+      endTime: timestamp + 5,
+      result: { ok: true },
+    });
+
+    expect((streamInfo.toolCompletionTimestamps as Map<string, number>).get("nested-ts")).toBe(
+      timestamp + 5
+    );
+  });
+
+  test("incremental replay keeps a parent whose only fresh activity is nested", async () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "nested-replay-cursor-workspace";
+    const messageId = "nested-replay-cursor-message";
+    const timestamp = Date.now();
+    const streamInfo = createStreamInfoForTests({
+      messageId,
+      lastPartialWriteTime: timestamp,
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "code-exec-cursor",
+          toolName: "code_execution",
+          input: { code: "mux.workflow_run({...})" },
+          state: "input-available",
+          // Parent part predates the reconnect cursor...
+          timestamp,
+          nestedCalls: [
+            {
+              toolCallId: "nested-cursor-workflow",
+              toolName: "workflow_run",
+              input: {},
+              state: "input-available",
+              // ...but the nested workflow started after it.
+              timestamp: timestamp + 100,
+            },
+          ],
+        },
+      ],
+    });
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+
+    const starts: ToolCallStartEvent[] = [];
+    onTurnEngineEvent(streamManager, "tool-call-start", (event) => starts.push(event));
+
+    await streamManager.replayStream(workspaceId, { afterTimestamp: timestamp + 50 });
+
+    expect(starts.some((e) => e.toolCallId === "nested-cursor-workflow")).toBe(true);
   });
 });
 

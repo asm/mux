@@ -153,6 +153,13 @@ const TOOL_SCHEMA_OVERRIDES: Record<string, ZodSchema> = {
   task_terminate: TaskTerminateToolArgsSchema,
   // Historical lifecycle transcripts include actions removed from the live input schema.
   task_workspace_lifecycle: TaskWorkspaceLifecycleToolArgsSchema,
+  // Kernel-nested workflow_run calls can arrive with a __kernelBounded args marker
+  // (oversized launch args); the card still renders from the attached durable run,
+  // so don't bounce those to the generic JSON renderer.
+  workflow_run: z.union([
+    TOOL_DEFINITIONS.workflow_run.schema,
+    z.object({ __kernelBounded: z.literal(true), script_path: z.string().nullish() }),
+  ]),
   // Provider-executed web search tools have no catalog definition.
   web_search: z.object({ query: z.string().optional() }),
   // Pending Google search arguments can arrive before queries are parsed.
