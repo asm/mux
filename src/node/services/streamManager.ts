@@ -3575,7 +3575,10 @@ export class StreamManager {
                   error: toolErrorPart.error,
                 });
 
-                // Format error output
+                // Format error output. getErrorMessage (not bare
+                // JSON.stringify) so a cyclic/BigInt tool-error payload stays
+                // a recoverable tool error instead of throwing here and
+                // failing the whole stream.
                 const errorOutput = {
                   success: false,
                   error:
@@ -3583,7 +3586,7 @@ export class StreamManager {
                       ? toolErrorPart.error
                       : toolErrorPart.error instanceof Error
                         ? toolErrorPart.error.message
-                        : JSON.stringify(toolErrorPart.error),
+                        : getErrorMessage(toolErrorPart.error),
                 };
 
                 // Use shared completion logic (await to ensure partial is flushed before event)
@@ -3629,8 +3632,11 @@ export class StreamManager {
                   errorMessage ??=
                     typeof errorObj.message === "string" ? errorObj.message : undefined;
 
-                  // Last resort: stringify the error
-                  errorMessage ??= JSON.stringify(errorObj);
+                  // Last resort: stringify the error. getErrorMessage guards
+                  // against cyclic/BigInt payloads and undefined-returning
+                  // toJSON, where a bare JSON.stringify would throw and
+                  // replace the provider error with a serialization TypeError.
+                  errorMessage ??= getErrorMessage(errorObj);
 
                   const error = new Error(errorMessage);
                   // Preserve original error as cause for debugging
