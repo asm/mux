@@ -268,6 +268,14 @@ export interface WorkspaceMetadataHost {
   ): boolean;
   emit(event: "chat", payload: { workspaceId: string; message: WorkspaceChatMessage }): boolean;
   emitChatEvent(workspaceId: string, message: WorkspaceChatMessage): void;
+  getWorkflowInvocationBoundaryMessageId(
+    workspaceId: string,
+    runId: string
+  ): Promise<string | null>;
+  getWorkflowInvocationCurrentness(
+    workspaceId: string,
+    runId: string
+  ): Promise<"current" | "not_current" | "indeterminate">;
   isExperimentEnabled(experimentId: ExperimentId): boolean;
   isWorkflowInvocationCurrent(workspaceId: string, runId: string): Promise<boolean>;
 }
@@ -294,6 +302,7 @@ export interface AgentTaskIntegration {
     workspaceId: string,
     options?: { workflowRunId?: string }
   ): Promise<string[]>;
+  noteWorkspaceUnarchived(workspaceId: string): Promise<void>;
 }
 
 export function normalizeArchiveUntrackedPaths(paths: readonly string[]): string[] {

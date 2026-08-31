@@ -51,6 +51,8 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     emitChatEvent: () => undefined,
     isExperimentEnabled: () => false,
     isWorkflowInvocationCurrent: () => Promise.resolve(true),
+    getWorkflowInvocationCurrentness: () => Promise.resolve("current" as const),
+    getWorkflowInvocationBoundaryMessageId: () => Promise.resolve(null),
     ...overrides,
   };
 }
@@ -72,6 +74,7 @@ export function makeAgentTaskIntegrationFake(
     markParentWorkspaceInterrupted: () => undefined,
     latchHardInterruptCascade: () => undefined,
     terminateAllDescendantAgentTasks: () => Promise.resolve([]),
+    noteWorkspaceUnarchived: () => Promise.resolve(),
     ...overrides,
   };
 }

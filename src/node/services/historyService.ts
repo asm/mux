@@ -2949,9 +2949,71 @@ export class HistoryService {
    * @param percentage Percentage to truncate (0.0 to 1.0). 1.0 = delete all
    * @returns Result containing array of deleted historySequence numbers
    */
-  async truncateHistory(
+  /**
+   * Token-proportional prefix length that truncateHistory removes at this percentage. Messages
+   * are stringified whole for counting; only relative weights matter.
+   */
+  private async computeTruncationRemoveCount(
+    messages: MuxMessage[],
+    percentage: number
+  ): Promise<number> {
+    const tokenizer = await getTokenizerForModel(KNOWN_MODELS.SONNET.id);
+    const messageTokens = await Promise.all(
+      messages.map((msg) => tokenizer.countTokens(safeStringifyForCounting(msg)))
+    );
+    const totalTokens = messageTokens.reduce((sum, tokens) => sum + tokens, 0);
+    const tokensToRemove = Math.floor(totalTokens * percentage);
+    let tokensRemoved = 0;
+    let removeCount = 0;
+    for (const tokens of messageTokens) {
+      if (tokensRemoved >= tokensToRemove) {
+        break;
+      }
+      tokensRemoved += tokens;
+      removeCount++;
+    }
+    return removeCount;
+  }
+
+  /**
+   * Preflight for truncateHistory: whether this percentage removes no rows, a proper prefix,
+   * or every message (the full-delete fast path). The requested percentage alone cannot
+   * distinguish these, and callers that must apply per-scope semantics before the rewrite
+   * commits (workspaceService retires kernel workflow run references only when rows will
+   * actually be removed, and applies full-clear guards when everything will) need the answer
+   * up front.
+   */
+  async classifyTruncationRemoval(
     workspaceId: string,
     percentage: number
+  ): Promise<"none" | "partial" | "all"> {
+    if (percentage >= 1.0) {
+      return "all";
+    }
+    if (percentage <= 0) {
+      return "none";
+    }
+    const archivedMessages = await this.readArchivedHistory(workspaceId);
+    const chatMessages = await this.readChatHistory(workspaceId);
+    const messages = [...archivedMessages, ...chatMessages];
+    if (messages.length === 0) {
+      return "none";
+    }
+    const removeCount = await this.computeTruncationRemoveCount(messages, percentage);
+    if (removeCount === 0) {
+      return "none";
+    }
+    return removeCount >= messages.length ? "all" : "partial";
+  }
+
+  async truncateHistory(
+    workspaceId: string,
+    percentage: number,
+    options?: {
+      refuseFullDelete?: boolean;
+      refuseRowRemoval?: boolean;
+      requireFullDelete?: boolean;
+    }
   ): Promise<Result<number[], string>> {
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
@@ -2978,31 +3040,28 @@ export class HistoryService {
             return Ok([]); // Nothing to truncate
           }
 
-          // Get tokenizer for counting (use a default model)
-          const tokenizer = await getTokenizerForModel(KNOWN_MODELS.SONNET.id);
+          const removeCount = await this.computeTruncationRemoveCount(messages, percentage);
 
-          // Count tokens for each message
-          // We stringify the entire message for simplicity - only relative weights matter
-          const messageTokens: Array<{ message: MuxMessage; tokens: number }> = await Promise.all(
-            messages.map(async (msg) => {
-              const tokens = await tokenizer.countTokens(safeStringifyForCounting(msg));
-              return { message: msg, tokens };
-            })
-          );
+          // Mirror of refuseFullDelete for the opposite drift direction: the caller
+          // classified this request as a no-op (and so skipped its row-removal guards, e.g.
+          // kernel workflow reference retirement), but history grew enough between that
+          // unserialized read and this locked rewrite for the budget to reach real rows.
+          // Refuse instead of removing them unguarded; a retry re-classifies.
+          if (options?.refuseRowRemoval === true && removeCount > 0) {
+            return Err(
+              "Truncation classified as a no-op would remove messages; retry to re-run it."
+            );
+          }
 
-          // Calculate total tokens and target to remove
-          const totalTokens = messageTokens.reduce((sum, mt) => sum + mt.tokens, 0);
-          const tokensToRemove = Math.floor(totalTokens * percentage);
-
-          // Remove messages from beginning until we've removed enough tokens
-          let tokensRemoved = 0;
-          let removeCount = 0;
-          for (const mt of messageTokens) {
-            if (tokensRemoved >= tokensToRemove) {
-              break;
-            }
-            tokensRemoved += mt.tokens;
-            removeCount++;
+          // Third drift direction: the caller classified this request as emptying (and will
+          // apply full-clear-only side effects after the rewrite: context epoch advance,
+          // goal/plan/retry discards), but history grew between that unserialized read and
+          // this locked rewrite so rows would survive. Refuse instead of leaving survivors
+          // behind a "full clear"; a retry re-classifies.
+          if (options?.requireFullDelete === true && removeCount < messages.length) {
+            return Err(
+              "Truncation classified as a full clear would leave messages; retry to re-run it."
+            );
           }
 
           // No-op truncation (percentage 0 or rounding to zero tokens) must not
@@ -3014,6 +3073,17 @@ export class HistoryService {
 
           // If we're removing all messages, use fast path
           if (removeCount >= messages.length) {
+            // Serialized revalidation of the caller's emptiness preflight: an overlapping
+            // truncation can shrink history between that unserialized read and this locked
+            // rewrite, turning a partial-classified request into a full delete that skipped
+            // the caller's full-clear guards (most critically kernel workflow reference
+            // retirement). Refuse instead of emptying; a retry re-runs the preflight against
+            // the settled history and routes through the full-clear path.
+            if (options?.refuseFullDelete === true) {
+              return Err(
+                "Truncation would remove every remaining message; retry to run it as a full clear."
+              );
+            }
             await this.rewriteHistoryFilesUnlocked(workspaceId, null, null);
             this.sequenceCounters.set(workspaceId, 0);
             return Ok(allSequences);

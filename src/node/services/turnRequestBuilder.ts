@@ -1696,9 +1696,12 @@ export class TurnRequestBuilder {
             runStore: new WorkflowRunStore({
               sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             }),
+            // This build's settled markers are keyed by the run's terminal generation, so
+            // a resumed run re-arms attention by itself; only the downgrade-compat stable
+            // marker needs clearing when the run leaves terminal state.
             onRunStatusChanged: async (event) => {
               if (!isTerminalWorkflowRunStatus(event.status)) {
-                await this.dependencies.bindings.taskService?.resetWorkflowRunTerminalAttention({
+                await this.dependencies.bindings.taskService?.clearWorkflowRunDowngradeSettlement({
                   ownerWorkspaceId: event.workspaceId,
                   runId: event.runId,
                 });
@@ -1746,7 +1749,7 @@ export class TurnRequestBuilder {
                 return;
               }
               if (this.dependencies.bindings.taskService != null) {
-                await this.dependencies.bindings.taskService.enqueueWorkflowRunTerminalAttention({
+                this.dependencies.bindings.taskService.noteWorkflowRunTerminalAttention({
                   ownerWorkspaceId: workspaceId,
                   runId,
                   status,
@@ -2012,6 +2015,8 @@ export class TurnRequestBuilder {
       planFilePath,
       ancestorPlanFilePaths,
       workspaceId,
+      agentId: effectiveAgentId,
+      strictAgentResolution,
       xumScope,
       timelineService: timelineExperimentEnabled
         ? this.dependencies.bindings.timelineService

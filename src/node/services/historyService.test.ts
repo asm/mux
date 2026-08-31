@@ -2321,6 +2321,66 @@ describe("HistoryService", () => {
       expect(await fs.readFile(archivePath(wsId), "utf-8")).toBe(archiveBefore);
     });
 
+    it("refuseFullDelete refuses a partial truncation that would remove every message", async () => {
+      await appendNumberedMessages(service, wsId, 1);
+      const chatBefore = await fs.readFile(chatPath(wsId), "utf-8");
+
+      // The caller classified this request as non-emptying; the locked recomputation says it
+      // empties (an overlapping truncation shrank history in between). Refuse instead of
+      // taking the full-delete fast path without the caller's full-clear guards.
+      const refused = await service.truncateHistory(wsId, 0.9, { refuseFullDelete: true });
+      expect(refused.success).toBe(false);
+      if (!refused.success) {
+        expect(refused.error).toContain("full clear");
+      }
+      expect(await fs.readFile(chatPath(wsId), "utf-8")).toBe(chatBefore);
+
+      // Without the guard the same request takes the fast path and empties history.
+      const emptied = await service.truncateHistory(wsId, 0.9);
+      expect(emptied.success).toBe(true);
+      expect(await service.getHistoryFromLatestBoundary(wsId)).toEqual({ success: true, data: [] });
+    });
+
+    it("refuseRowRemoval refuses a truncation whose recomputed budget removes messages", async () => {
+      await appendNumberedMessages(service, wsId, 1);
+      const chatBefore = await fs.readFile(chatPath(wsId), "utf-8");
+
+      // The caller classified this request as a no-op (and skipped its row-removal guards),
+      // but the locked recomputation reaches real rows. Refuse instead of removing them.
+      const refused = await service.truncateHistory(wsId, 0.9, { refuseRowRemoval: true });
+      expect(refused.success).toBe(false);
+      if (!refused.success) {
+        expect(refused.error).toContain("no-op");
+      }
+      expect(await fs.readFile(chatPath(wsId), "utf-8")).toBe(chatBefore);
+
+      // A genuine no-op stays a silent success under the same flag.
+      const noop = await service.truncateHistory(wsId, 0.0001, { refuseRowRemoval: true });
+      expect(noop.success).toBe(true);
+      expect(await fs.readFile(chatPath(wsId), "utf-8")).toBe(chatBefore);
+    });
+
+    it("requireFullDelete refuses a truncation whose recomputed budget leaves messages", async () => {
+      await appendNumberedMessages(service, wsId, 8);
+      const chatBefore = await fs.readFile(chatPath(wsId), "utf-8");
+
+      // The caller classified this request as emptying (and applies full-clear-only side
+      // effects after the rewrite), but history grew between that unserialized read and the
+      // locked rewrite so rows would survive. Refuse instead of leaving survivors behind a
+      // "full clear".
+      const refused = await service.truncateHistory(wsId, 0.5, { requireFullDelete: true });
+      expect(refused.success).toBe(false);
+      if (!refused.success) {
+        expect(refused.error).toContain("leave messages");
+      }
+      expect(await fs.readFile(chatPath(wsId), "utf-8")).toBe(chatBefore);
+
+      // A truncation that does empty history stays a success under the same flag.
+      const emptied = await service.truncateHistory(wsId, 0.99, { requireFullDelete: true });
+      expect(emptied.success).toBe(true);
+      expect(await service.getHistoryFromLatestBoundary(wsId)).toEqual({ success: true, data: [] });
+    });
+
     it("does not reseed usage from before a partial prefix truncation", async () => {
       await appendNumberedMessages(service, wsId, 8);
       await service.appendToHistory(

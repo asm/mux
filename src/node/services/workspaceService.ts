@@ -3,6 +3,11 @@ import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/termination
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { EventEmitter } from "events";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
+import {
+  clearAgentWorkflowRunReferences,
+  readAgentWorkflowRunReferences,
+  type AgentWorkflowRunReference,
+} from "@/node/services/agentWorkflowRunReferences";
 import * as fsPromises from "fs/promises";
 import assert from "@/common/utils/assert";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
@@ -200,6 +205,7 @@ import {
 } from "@/node/services/workflows/workflowArchiveAdmission";
 import {
   WORKFLOW_RESULT_METADATA_TYPE,
+  textContainsWorkflowResultPayload,
   WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
   WORKFLOW_TRIGGER_DISPLAY_METADATA_TYPE,
   buildWorkflowRunCardMessage,
@@ -476,6 +482,23 @@ function isWorkflowResultContinuationMessage(message: MuxMessage, runId: string)
   return (
     message.metadata?.muxMetadata?.type === WORKFLOW_RESULT_METADATA_TYPE &&
     message.metadata.muxMetadata.runId === runId
+  );
+}
+
+/**
+ * The terminal-attention drain delivers workflow results as one synthetic user prompt that may
+ * coalesce several runs, so it carries no per-run workflow-result metadata. If a crash lands
+ * between the send's durable acceptance and the settled-marker write, the next sweep re-queues
+ * the run; recognizing the accepted row as consumption is what settles it without a re-send.
+ * Only synthetic rows qualify: a manual user message is a supersession boundary and is
+ * classified before this check runs.
+ */
+function isCoalescedWorkflowResultMessage(message: MuxMessage, runId: string): boolean {
+  if (message.role !== "user" || message.metadata?.synthetic !== true) {
+    return false;
+  }
+  return message.parts.some(
+    (part) => part.type === "text" && textContainsWorkflowResultPayload(part.text, runId)
   );
 }
 
@@ -4912,7 +4935,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   private async getPersistedPostCompactionDiffPaths(workspaceId: string): Promise<string[] | null> {
     const postCompactionPath = path.join(
-      path.join(this.config.sessionsDir, workspaceId),
+      this.config.sessionsDir,
+      workspaceId,
       "post-compaction.json"
     );
 
@@ -5036,10 +5060,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * Returns empty exclusions if file doesn't exist.
    */
   public async getPostCompactionExclusions(workspaceId: string): Promise<PostCompactionExclusions> {
-    const exclusionsPath = path.join(
-      path.join(this.config.sessionsDir, workspaceId),
-      "exclusions.json"
-    );
+    const exclusionsPath = path.join(this.config.sessionsDir, workspaceId, "exclusions.json");
     try {
       const data = await fsPromises.readFile(exclusionsPath, "utf-8");
       return JSON.parse(data) as PostCompactionExclusions;
@@ -9606,6 +9627,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         subProjectPath: hookMetadata?.subProjectPath,
       });
 
+      // Archived owners park workflow terminal wakes unsettled; reconcile so an idle
+      // workspace does not stay silent until the interval sweep. Only AFTER snapshot
+      // restoration and lifecycle startup above: the drain can admit a synthetic agent turn,
+      // which must not run against a half-restored checkout or precede a failed restoration's
+      // config rollback. Contained: reconciliation failure must not fail the unarchive (the
+      // sweep retries on its own cadence).
+      try {
+        await this.agentTaskIntegration?.noteWorkspaceUnarchived(workspaceId);
+      } catch (error: unknown) {
+        log.warn("Unarchive workflow attention reconciliation failed", { workspaceId, error });
+      }
+
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);
@@ -10997,38 +11030,137 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   async isWorkflowInvocationCurrent(workspaceId: string, runId: string): Promise<boolean> {
-    assert(workspaceId.length > 0, "isWorkflowInvocationCurrent requires workspaceId");
-    assert(runId.length > 0, "isWorkflowInvocationCurrent requires runId");
+    return (await this.getWorkflowInvocationCurrentness(workspaceId, runId)) === "current";
+  }
 
-    let current = false;
-    let foundDecision = false;
+  /**
+   * Three-state currentness: "indeterminate" means history/provenance could not be read or
+   * ordered, so the answer is unknown rather than no. Callers that would permanently settle a
+   * terminal wake on a negative answer (the terminal-attention drain records a superseded
+   * settlement marker) must retain and retry on "indeterminate" instead; boolean callers treat
+   * it as not-current,
+   * the pre-existing fail-safe for non-destructive decisions.
+   */
+  async getWorkflowInvocationCurrentness(
+    workspaceId: string,
+    runId: string
+  ): Promise<"current" | "not_current" | "indeterminate"> {
+    assert(workspaceId.length > 0, "getWorkflowInvocationCurrentness requires workspaceId");
+    assert(runId.length > 0, "getWorkflowInvocationCurrentness requires runId");
+
+    const decision = await this.findWorkflowInvocationDecisionRow(workspaceId, runId);
+    if (decision.status === "error") {
+      return "indeterminate";
+    }
+    if (decision.status === "found" && decision.outcome === "invocation") {
+      return "current";
+    }
+
+    // Kernel-launched runs (mux.workflow_run / mux.workflow_resume inside code_execution) leave
+    // no recognizable invocation part in history, so the backward walk above stops at the prior
+    // real user message (or, after a delivered result, at that consumed terminal message) and
+    // would wrongly drop the run's notify_on_terminal wake. Their durable provenance is the
+    // agent-workflow-runs sidecar, which snapshots the ID of the decision row that was newest
+    // at record time: the run is current exactly when that row is still the newest decision row.
+    // Row identity, not wall-clock ordering, so a backward clock correction can neither strand
+    // a legitimate wake nor let a pre-supersession reference outrank a newer boundary. For a
+    // consumed boundary, equality means a background resume/retry was recorded after the prior
+    // result was delivered. References without a boundary snapshot (pre-upgrade entries,
+    // record-time read failures) cannot be ordered against the decision row at all and defer
+    // as indeterminate below.
+    let references: AgentWorkflowRunReference[];
+    try {
+      references = await readAgentWorkflowRunReferences(
+        path.join(this.config.sessionsDir, workspaceId)
+      );
+    } catch (error: unknown) {
+      // The sidecar is the only invocation evidence a kernel-launched run has, so an
+      // unreadable file is "cannot know right now", not "no reference": defer wake decisions
+      // exactly like an unreadable history.
+      log.warn("Could not read workflow run references for currentness", {
+        workspaceId,
+        runId,
+        error,
+      });
+      return "indeterminate";
+    }
+    const reference = references.find((candidate) => candidate.runId === runId);
+    if (decision.status === "none") {
+      // A decision-free history is current only for a reference whose snapshot verified an
+      // empty history at record time (null): kernel launches from a new or fully cleared
+      // workspace (e.g. a heartbeat turn) have no decision row before or after, and their wake
+      // must still deliver. Every other surviving reference fails safe, because a full clear
+      // (truncateHistory) removes every row WITHOUT appending a reset boundary while leaving
+      // the sidecar intact, and a reference pointing at a cleared row, or one without a
+      // verified snapshot, must not inject a workflow result into the freshly cleared
+      // conversation.
+      return reference?.afterBoundaryMessageId === null ? "current" : "not_current";
+    }
+    if (reference == null) {
+      return "not_current";
+    }
+    if (reference.afterBoundaryMessageId === undefined) {
+      // No boundary snapshot (pre-upgrade entry or record-time history read failure): row
+      // identity cannot be verified, and wall-clock ordering is the exact hole the identity
+      // path exists to close (a backward clock correction would let a pre-supersession
+      // reference outrank a newer manual turn and deliver its output under that turn's tool
+      // policy). Fail quiet rather than deliver or defer forever: this is a deliberately
+      // accepted narrow window (downgrade-stripped or snapshot-failed launches), and the
+      // run's result stays retrievable via an explicit workflow_resume, which re-records the
+      // reference with a fresh boundary.
+      return "not_current";
+    }
+    if (reference.afterBoundaryMessageId === null) {
+      // Verified-empty snapshot: a decision row now exists, so it appeared after the record.
+      return "not_current";
+    }
+    return reference.afterBoundaryMessageId === decision.messageId ? "current" : "not_current";
+  }
+
+  /**
+   * The newest invocation-decision row for this run: a manual user/reset supersession, a
+   * consumed terminal result for the run, or a direct invocation part. Shared by
+   * isWorkflowInvocationCurrent and the sidecar record path so both sides of the identity
+   * comparison classify rows identically.
+   */
+  private async findWorkflowInvocationDecisionRow(
+    workspaceId: string,
+    runId: string
+  ): Promise<
+    | {
+        status: "found";
+        outcome: "invocation" | "consumed" | "superseded";
+        messageId: string;
+      }
+    | { status: "none" }
+    | { status: "error" }
+  > {
+    const state: {
+      found: {
+        outcome: "invocation" | "consumed" | "superseded";
+        messageId: string;
+      } | null;
+    } = { found: null };
     const historyResult = await this.historyService.iterateFullHistory(
       workspaceId,
       "backward",
       (messages) => {
         for (const message of messages) {
-          if (isManualUserSupersessionMessage(message)) {
-            current = false;
-            foundDecision = true;
-            return false;
-          }
-          if (isResetBoundaryMessage(message)) {
-            current = false;
-            foundDecision = true;
+          if (isManualUserSupersessionMessage(message) || isResetBoundaryMessage(message)) {
+            state.found = { outcome: "superseded", messageId: message.id };
             return false;
           }
           if (
             isWorkflowResultContinuationMessage(message, runId) ||
+            isCoalescedWorkflowResultMessage(message, runId) ||
             isTerminalWorkflowTaskAwaitResultMessage(message, runId) ||
             isTerminalWorkflowToolResultMessage(message, runId)
           ) {
-            current = false;
-            foundDecision = true;
+            state.found = { outcome: "consumed", messageId: message.id };
             return false;
           }
           if (isWorkflowInvocationMessage(message, runId)) {
-            current = true;
-            foundDecision = true;
+            state.found = { outcome: "invocation", messageId: message.id };
             return false;
           }
         }
@@ -11041,10 +11173,38 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         runId,
         error: historyResult.error,
       });
-      return false;
+      return { status: "error" };
     }
+    return state.found != null
+      ? { status: "found", outcome: state.found.outcome, messageId: state.found.messageId }
+      : { status: "none" };
+  }
 
-    return foundDecision && current;
+  /** Testable seam for the pre-truncation retirement in truncateHistory. */
+  private async retireKernelWorkflowRunReferences(workspaceId: string): Promise<void> {
+    await clearAgentWorkflowRunReferences(path.join(this.config.sessionsDir, workspaceId));
+  }
+
+  /**
+   * Boundary snapshot for the agent-workflow-runs sidecar: the message ID of the newest
+   * invocation-decision row for this run, or null when history has none. Recorded at
+   * background launch/resume so isWorkflowInvocationCurrent can compare row identity instead
+   * of wall-clock timestamps, which clock corrections can reorder.
+   */
+  async getWorkflowInvocationBoundaryMessageId(
+    workspaceId: string,
+    runId: string
+  ): Promise<string | null> {
+    assert(workspaceId.length > 0, "getWorkflowInvocationBoundaryMessageId requires workspaceId");
+    assert(runId.length > 0, "getWorkflowInvocationBoundaryMessageId requires runId");
+    const decision = await this.findWorkflowInvocationDecisionRow(workspaceId, runId);
+    // A read failure must not masquerade as a verified-empty history: persisting null would
+    // permanently fail the run's currentness check even after storage recovers. Throw so the
+    // record path can distinguish and record a rediscovery-only reference instead.
+    if (decision.status === "error") {
+      throw new Error("workflow invocation boundary unavailable: history read failed");
+    }
+    return decision.status === "found" ? decision.messageId : null;
   }
 
   /**
@@ -12704,14 +12864,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   async truncateHistory(workspaceId: string, percentage?: number): Promise<Result<void>> {
     const effectivePercentage = percentage ?? 1.0;
-    const isFullClear = effectivePercentage >= 1.0;
-    // A full clear holds the admission guard across the refine drain/lock
-    // awaits below: without it, a send admitted during those awaits could
-    // snapshot the pre-clear transcript and stream across the truncation,
-    // repopulating the cleared context. Partial truncation keeps the plain
-    // pre-check — no awaits sit between it and the truncation.
+    // The admission guard is acquired BEFORE the scope preflight and held across every await
+    // below: a turn admitted during any of them could snapshot the pre-truncation transcript
+    // and stream across the mutation, and one admitted during the preflight itself could
+    // launch a kernel workflow whose sidecar reference the wholesale retirement below would
+    // delete while its launch turn's rows survive the prefix cut, permanently suppressing
+    // that run's wake. The preflight cannot yet prove scope "none", so every request that
+    // may remove rows (percentage > 0) pays the guard; percentage <= 0 is a deterministic
+    // no-op that retires nothing and keeps the plain busy pre-check.
     let admissionGuard: Disposable | null = null;
-    if (isFullClear) {
+    if (effectivePercentage > 0) {
       const guardResult = this.acquireContextMutationAdmissionGuard(
         workspaceId,
         "truncate history"
@@ -12729,6 +12891,36 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       );
     }
     using _admissionGuard = admissionGuard;
+    // A token-proportional truncation below 100% can remove nothing (budget rounds to zero),
+    // a proper prefix, or everything (historyService's full-delete fast path), and each scope
+    // carries different obligations: an emptied transcript needs every full-clear guard, a
+    // prefix cut still needs kernel workflow reference retirement (it can delete the launch
+    // turn's restriction rows without a supersession decision), and a no-op must retire
+    // nothing, or active runs' wakes would settle superseded under an unchanged transcript.
+    // Decide up front; historyService revalidates the dangerous drift directions under the
+    // history write lock (refuseFullDelete / refuseRowRemoval / requireFullDelete below).
+    const truncationScope =
+      effectivePercentage >= 1.0
+        ? ("all" as const)
+        : effectivePercentage <= 0
+          ? ("none" as const)
+          : await this.historyService
+              .classifyTruncationRemoval(workspaceId, effectivePercentage)
+              .catch((error: unknown) => {
+                log.warn("History truncation scope preflight failed; refusing truncation", {
+                  workspaceId,
+                  error,
+                });
+                return null;
+              });
+    if (truncationScope == null) {
+      // An unknown scope must not choose a side-effect set: labeling it a full clear would
+      // discard goal/plan/retry state and advance the context epoch while rows may remain,
+      // and labeling it smaller would skip full-clear guards. Nothing is mutated or retired
+      // yet, so refusing is lossless and the user can simply retry.
+      return Err("Failed to read history to classify the truncation scope. Try again.");
+    }
+    const isFullClear = truncationScope === "all";
     const session = this.sessions.get(workspaceId);
 
     // A full clear discards the transcript a streaming refine pass may be
@@ -12772,10 +12964,49 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         );
       }
     }
+    // Kernel workflow run references belong to the conversation this truncation mutates: a
+    // full clear leaves a verified-empty (null) boundary snapshot reading the fresh
+    // conversation as current, and even a prefix truncation can delete the launch turn's
+    // restriction-bearing rows without appending any supersession decision, letting the wake
+    // recompose from unrestricted defaults. Retire the references on every row-removing
+    // truncation, BEFORE it commits, so both fault directions fail safe: a failed retirement
+    // aborts with the conversation intact, and a failed or refused truncation leaves
+    // reference-less runs settling superseded (dropped wake, still retrievable via resume,
+    // which re-records provenance under the surviving context).
+    if (truncationScope !== "none") {
+      try {
+        await this.retireKernelWorkflowRunReferences(workspaceId);
+      } catch (error) {
+        return Err(
+          `Cannot clear history: stale workflow run references could not be retired ` +
+            `(${getErrorMessage(error)}). Retry once the session storage is writable.`
+        );
+      }
+      // In-turn compaction retries bypass admission gating across a transient idle gap (see
+      // the full-clear recheck above), and this retirement is the last await before the
+      // rewrite for BOTH row-removing scopes: revalidate here or a retry admitted during it
+      // would have its history truncated underneath the stream. Refusing after retirement is
+      // the documented fail-safe direction (dropped wake, retrievable via resume).
+      if (session?.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
+        return Err(
+          "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
+        );
+      }
+    }
     if (effectivePercentage > 0) {
       session?.clearUsageState();
     }
-    const truncate = () => this.historyService.truncateHistory(workspaceId, effectivePercentage);
+    // historyService revalidates the scope preflight under the history write lock: an
+    // overlapping mutation can shift this one across a scope boundary in any dangerous
+    // direction (a partial cut becoming a full delete skips the full-clear guards; a no-op
+    // becoming a real cut skips reference retirement; a full clear leaving survivors would
+    // apply full-clear-only discards while rows remain).
+    const truncate = () =>
+      this.historyService.truncateHistory(workspaceId, effectivePercentage, {
+        refuseFullDelete: truncationScope === "partial",
+        refuseRowRemoval: truncationScope === "none",
+        requireFullDelete: truncationScope === "all",
+      });
     const truncateResult =
       effectivePercentage > 0
         ? await this.clearHistoryWithRetiredBashMonitorWakes(workspaceId, truncate, {
@@ -13210,6 +13441,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           if (!retryDiscard.success) {
             return Err(
               `Cannot replace history: pending retry state could not be discarded (${retryDiscard.error})`
+            );
+          }
+        }
+        // A destructive non-compaction replacement discards the conversation the kernel
+        // workflow references belong to, exactly like a full clear: a verified-empty (null)
+        // boundary snapshot reads the decision-free replacement history as current and would
+        // inject a pre-replacement workflow result into it. Same ordering and failure posture
+        // as truncateHistory: retire before the clear commits, abort when retirement fails.
+        // Compaction replaces preserve conversation identity, so their references stay live.
+        if (!isCompaction) {
+          try {
+            await this.retireKernelWorkflowRunReferences(workspaceId);
+          } catch (error) {
+            return Err(
+              `Cannot replace history: stale workflow run references could not be retired ` +
+                `(${getErrorMessage(error)}). Retry once the session storage is writable.`
             );
           }
         }
