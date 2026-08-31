@@ -40,6 +40,8 @@ import { secretsToRecord } from "@/common/types/secrets";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { WorkspaceService } from "@/node/services/workspaceService";
 import { TaskService } from "@/node/services/taskService";
+import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
+import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { PolicyService } from "@/node/services/policyService";
 import type { TelemetryService } from "@/node/services/telemetryService";
@@ -91,6 +93,7 @@ export interface CoreServices {
   extensionMetadata: ExtensionMetadataService;
   workspaceService: WorkspaceService;
   taskService: TaskService;
+  workspaceTurnManager: WorkspaceTurnManager;
   memoryService: MemoryService;
   memoryMetaService: MemoryMetaService;
   memoryConsolidationService: MemoryConsolidationService;
@@ -321,6 +324,7 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     }
   });
 
+  const terminalAttentionStore = new TerminalAttentionStore(config);
   const taskService = new TaskService(
     config,
     historyService,
@@ -329,10 +333,22 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     initStateManager,
     sessionUsageService,
     workspaceGoalService,
-    streamManager,
-    secretsStore
+    secretsStore,
+    terminalAttentionStore
   );
+  const workspaceTurnManager = new WorkspaceTurnManager(
+    config,
+    historyService,
+    aiService,
+    workspaceService,
+    initStateManager,
+    taskService,
+    terminalAttentionStore,
+    streamManager
+  );
+  taskService.setWorkspaceTurnManager(workspaceTurnManager);
   turnRequestBuilderBindings.taskService = taskService;
+  turnRequestBuilderBindings.workspaceTurnManager = workspaceTurnManager;
   workspaceService.setAgentTaskIntegration(taskService);
 
   // Goal continuation bridge lives at the core scope so every codepath that
@@ -365,6 +381,7 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     extensionMetadata,
     workspaceService,
     taskService,
+    workspaceTurnManager,
     memoryService,
     memoryMetaService,
     memoryConsolidationService,

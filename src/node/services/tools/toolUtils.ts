@@ -10,6 +10,7 @@ import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRunReferences";
 import { log } from "@/node/services/log";
 import type { TaskService } from "@/node/services/taskService";
+import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 
 export function requireWorkspaceId(config: ToolConfiguration, toolName: string): string {
   assert(config.workspaceId, `${toolName} requires workspaceId`);
@@ -19,6 +20,15 @@ export function requireWorkspaceId(config: ToolConfiguration, toolName: string):
 export function requireTaskService(config: ToolConfiguration, toolName: string): TaskService {
   assert(config.taskService, `${toolName} requires taskService`);
   return config.taskService;
+}
+
+export function requireWorkspaceTurnManager(
+  config: ToolConfiguration,
+  toolName: string
+): WorkspaceTurnManager {
+  const manager = config.workspaceTurnManager ?? config.taskService;
+  assert(manager, toolName + " requires workspaceTurnManager");
+  return manager as WorkspaceTurnManager;
 }
 
 export function parseToolResult<TSchema>(
