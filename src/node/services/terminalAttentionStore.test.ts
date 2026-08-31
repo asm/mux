@@ -9,12 +9,8 @@ import {
   TerminalAttentionStore,
 } from "@/node/services/terminalAttentionStore";
 
-function makeConfig(rootDir: string): {
-  sessionsDir: string;
-  getSessionDir: (id: string) => string;
-} {
-  const sessionsDir = path.join(rootDir, "sessions");
-  return { sessionsDir, getSessionDir: (id: string) => path.join(sessionsDir, id) };
+function makeConfig(rootDir: string): { sessionsDir: string } {
+  return { sessionsDir: path.join(rootDir, "sessions") };
 }
 
 describe("TerminalAttentionStore", () => {
@@ -41,7 +37,7 @@ describe("TerminalAttentionStore", () => {
     const persisted = JSON.parse(
       await fsPromises.readFile(
         path.join(
-          makeConfig(rootDir).getSessionDir("owner-1"),
+          path.join(makeConfig(rootDir).sessionsDir, "owner-1"),
           TERMINAL_ATTENTION_DIR,
           `${encodeURIComponent("workspace_turn:wst_abc")}.json`
         ),
@@ -59,7 +55,7 @@ describe("TerminalAttentionStore", () => {
 
   test("loads pending notifications written with legacy derived fields", async () => {
     const config = makeConfig(rootDir);
-    const dir = path.join(config.getSessionDir("owner-1"), TERMINAL_ATTENTION_DIR);
+    const dir = path.join(config.sessionsDir, "owner-1", TERMINAL_ATTENTION_DIR);
     await fsPromises.mkdir(dir, { recursive: true });
     await fsPromises.writeFile(
       path.join(dir, `${encodeURIComponent("agent_task:task-1")}.json`),

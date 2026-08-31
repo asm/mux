@@ -1,3 +1,4 @@
+import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import assert from "@/common/utils/assert";
@@ -31,7 +32,7 @@ import {
   type MCPPromptRuntime,
   type ToolConfiguration,
 } from "@/common/utils/tools/tools";
-import type { Config } from "@/node/config";
+import type { Config, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
 import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
 import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
@@ -464,6 +465,8 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
 
 interface TurnRequestBuilderDependencies {
   config: Config;
+  providersConfigStore: ProvidersConfigStore;
+  secretsStore: Pick<SecretsStore, "getEffectiveSecrets">;
   historyService: HistoryService;
   initStateManager: InitStateManager;
   providerService: ProviderService;
@@ -621,7 +624,7 @@ export class TurnRequestBuilder {
     );
     const resolvedOverrides = resolveModelParameterOverrides(
       pinCoderInstanceRawProvidersConfig(
-        this.dependencies.config.loadProvidersConfig(),
+        this.dependencies.providersConfigStore.loadProvidersConfig(),
         options.rawModelString,
         options.coderSelectedInstance
       ),
@@ -1338,7 +1341,7 @@ export class TurnRequestBuilder {
     try {
       await agentPluginHookService.ensureWorkspaceHooks({
         workspaceId,
-        sessionDir: this.dependencies.config.getSessionDir(workspaceId),
+        sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
         journal: this.dependencies.durableEventJournalFor(workspaceId),
         enabled: this.dependencies.isAgentPluginsEnabled(),
         xumHome: this.dependencies.config.rootDir,
@@ -1487,8 +1490,8 @@ export class TurnRequestBuilder {
     let systemMessage = prePolicyStreamSystemContext.systemMessage;
 
     const projectSecrets = isMultiProject(metadata)
-      ? mergeMultiProjectSecrets(metadata, this.dependencies.config)
-      : this.dependencies.config.getEffectiveSecrets(metadata.projectPath);
+      ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
+      : this.dependencies.secretsStore.getEffectiveSecrets(metadata.projectPath);
 
     const streamToken = this.dependencies.streamManager.generateStreamToken();
 
@@ -1691,7 +1694,7 @@ export class TurnRequestBuilder {
       dynamicWorkflowsExperimentEnabled && this.dependencies.bindings.taskService != null
         ? new WorkflowService({
             runStore: new WorkflowRunStore({
-              sessionDir: this.dependencies.config.getSessionDir(workspaceId),
+              sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             }),
             onRunStatusChanged: async (event) => {
               if (!isTerminalWorkflowRunStatus(event.status)) {
@@ -1715,7 +1718,7 @@ export class TurnRequestBuilder {
                   cwd: workspacePath,
                   runtime,
                   runtimeTempDir,
-                  workspaceSessionDir: this.dependencies.config.getSessionDir(workspaceId),
+                  workspaceSessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
                   trusted: getWorkflowProjectTrusted(),
                 },
                 getProjectTrusted: getWorkflowProjectTrusted,
@@ -1895,7 +1898,8 @@ export class TurnRequestBuilder {
                 // pinned pricing identity: two independent reads would let
                 // a catalog refresh land between them, running the request
                 // on one wire while recording usage under another type.
-                const advisorProvidersConfig = this.dependencies.config.loadProvidersConfig() ?? {};
+                const advisorProvidersConfig =
+                  this.dependencies.providersConfigStore.loadProvidersConfig() ?? {};
                 // View snapshot captured at creation time for option
                 // building (buildProviderOptions takes the oRPC view, not
                 // the raw config shape).
@@ -2004,7 +2008,7 @@ export class TurnRequestBuilder {
       },
       workspaceProjectPath: metadata.projectPath,
       workspaceExecutionRootPath: metadata.subProjectPath ?? metadata.projectPath,
-      workspaceSessionDir: this.dependencies.config.getSessionDir(workspaceId),
+      workspaceSessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
       planFilePath,
       ancestorPlanFilePaths,
       workspaceId,
@@ -2225,7 +2229,7 @@ export class TurnRequestBuilder {
           emitNestedToolEvent: emitNestedPtcToolEvent,
           sandbox: {
             workspaceId,
-            sessionDir: this.dependencies.config.getSessionDir(workspaceId),
+            sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             kernelFileLoader,
           },
         });
