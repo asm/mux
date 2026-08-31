@@ -11,11 +11,24 @@ import * as http from "http";
 import * as path from "path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { RPCHandler } from "@orpc/server/node";
-import { RPCHandler as ORPCWebSocketServerHandler } from "@orpc/server/ws";
+import { RPCHandler as ORPCWebSocketServerHandler } from "@orpc/server/websocket";
 import { ORPCError, onError } from "@orpc/server";
 import { OpenAPIGenerator } from "@orpc/openapi";
 import { OpenAPIHandler } from "@orpc/openapi/node";
-import { ZodToJsonSchemaConverter } from "@orpc/zod/zod4";
+import { ZodToJsonSchemaConverter } from "@orpc/zod";
+import { EffectSchemaToJsonSchemaConverter } from "@orpc/experimental-effect";
+
+/**
+ * Effect-migration spike: Effect Schema inputs need their own JSON-schema
+ * converter; without it the generator silently emits operations with no
+ * requestBody, producing a lossy /api/spec.json. Exported so tests can verify
+ * the production converter set against Effect Schema procedures.
+ */
+export function createOpenAPIGenerator(): OpenAPIGenerator {
+  return new OpenAPIGenerator({
+    converters: [new ZodToJsonSchemaConverter(), new EffectSchemaToJsonSchemaConverter()],
+  });
+}
 import { router, type AppRouter } from "@/node/orpc/router";
 import type { ORPCContext } from "@/node/orpc/context";
 import { extractCookieValues, extractWsHeaders, safeEq } from "@/node/orpc/authMiddleware";
@@ -1467,9 +1480,7 @@ export async function createOrpcServer({
   const orpcRouter = existingRouter ?? router(authToken);
 
   // OpenAPI generator for spec endpoint
-  const openAPIGenerator = new OpenAPIGenerator({
-    schemaConverters: [new ZodToJsonSchemaConverter()],
-  });
+  const openAPIGenerator = createOpenAPIGenerator();
 
   // OpenAPI spec endpoint
   app.get("/api/spec.json", async (req, res) => {
@@ -1481,24 +1492,27 @@ export async function createOrpcServer({
       "/api"
     );
 
+    // oRPC >=1.14 nests document fields under `base` instead of top-level options.
     const spec = await openAPIGenerator.generate(orpcRouter, {
-      info: {
-        title: "Xum API",
-        version: gitDescribe,
-        description: "API for Xum",
-      },
-      servers: [{ url: publicApiPath }],
-      security: authToken ? [{ bearerAuth: [] }] : undefined,
-      components: authToken
-        ? {
-            securitySchemes: {
-              bearerAuth: {
-                type: "http",
-                scheme: "bearer",
+      base: {
+        info: {
+          title: "Xum API",
+          version: gitDescribe,
+          description: "API for Xum",
+        },
+        servers: [{ url: publicApiPath }],
+        security: authToken ? [{ bearerAuth: [] }] : undefined,
+        components: authToken
+          ? {
+              securitySchemes: {
+                bearerAuth: {
+                  type: "http",
+                  scheme: "bearer",
+                },
               },
-            },
-          }
-        : undefined,
+            }
+          : undefined,
+      },
     });
     varyPublicBasePathHeaders(res);
     res.json(spec);

@@ -168,7 +168,8 @@ function renderAnalyticsHook<TResult>(callback: () => TResult) {
 
 function createHttpClient(baseUrl: string): RouterClient<AppRouter> {
   const link = new HTTPRPCLink({
-    url: `${baseUrl}/orpc`,
+    origin: baseUrl,
+    url: "/orpc",
   });
 
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- typed test helper
@@ -655,7 +656,11 @@ describe("useAnalytics hooks", () => {
 
     await waitFor(() => expect(result.current.loading).toBe(false));
 
-    expect(result.current.error).toBe("Internal server error");
+    // The behavioral contract is "generic error, no infrastructure detail leak".
+    // Match case-insensitively: oRPC changed its default INTERNAL_SERVER_ERROR
+    // message casing in 1.14 ("Internal server error" -> "Internal Server Error").
+    expect(result.current.error ?? "").toMatch(/^internal server error$/i);
+    expect(result.current.error).not.toContain("Analytics worker");
     expect(result.current.data).toBeNull();
   });
 });
