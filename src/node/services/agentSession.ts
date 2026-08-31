@@ -8,8 +8,8 @@ import { PlatformPaths } from "@/common/utils/paths";
 import { log } from "@/node/services/log";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import type { Config } from "@/node/config";
-import type { AIService } from "@/node/services/aiService";
 import type { TurnStreamHandle } from "@/node/services/streamManager";
+import type { StreamMessageOptions } from "@/node/services/turnRequestBuilder";
 import type { HistoryService } from "@/node/services/historyService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -183,8 +183,10 @@ import {
   awaitPendingBranchSummary,
   isRlmModeEnabled,
   runInlineAbandonedBranchSummary,
+  type BranchSummaryAiService,
 } from "@/node/services/branchSummary";
 import type { Runtime } from "@/node/runtime/Runtime";
+import type { XumToolScope } from "@/common/types/toolScope";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
 import type { MemorySessionContext } from "@/node/services/memoryService";
@@ -525,11 +527,57 @@ export interface AgentSessionMetadataEvent {
   metadata: FrontendWorkspaceMetadata | null;
 }
 
+interface AgentSessionActiveStreamInfo {
+  messageId: string;
+  startTime?: number;
+  parts: Array<{ timestamp?: number; workflowRun?: { timestamp?: number } }>;
+  toolCompletionTimestamps: Map<string, number>;
+}
+
+export interface AgentSessionStreamManager {
+  stopStream(
+    workspaceId: string,
+    options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
+  ): Promise<Result<void>>;
+  isStreaming(workspaceId: string): boolean;
+  getStreamInfo(workspaceId: string): AgentSessionActiveStreamInfo | undefined;
+  replayStream(workspaceId: string, options?: { afterTimestamp?: number }): Promise<void>;
+}
+
+/** Keeps AgentSession coupled only to the AI operations and events it consumes. */
+export interface AgentSessionAIService extends BranchSummaryAiService {
+  on(event: string, listener: (...args: unknown[]) => void): void;
+  off(event: string, listener: (...args: unknown[]) => void): void;
+  streamMessage(options: StreamMessageOptions): Promise<Result<TurnStreamHandle, SendMessageError>>;
+  stopStream?(
+    workspaceId: string,
+    options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
+  ): Promise<Result<void>>;
+  isStreaming?(workspaceId: string): boolean;
+  getStreamInfo?(workspaceId: string): AgentSessionActiveStreamInfo | undefined;
+  replayStream?(workspaceId: string, options?: { afterTimestamp?: number }): Promise<void>;
+  getProvidersConfig(): ProvidersConfigMap | null;
+  isExperimentEnabled(experimentId: ExperimentId): boolean;
+  buildMemorySessionContext?(
+    workspaceId: string,
+    modelString: string,
+    options?: { includeHotMemories?: boolean }
+  ): Promise<MemorySessionContext | null>;
+  isClaudeSkillsCompatEnabled?(): boolean;
+  isAgentPluginsEnabled?(): boolean;
+  resolveXumToolScopeForWorkspace?(
+    metadata: WorkspaceMetadata,
+    runtime: Runtime,
+    workspacePath: string
+  ): XumToolScope;
+}
+
 interface AgentSessionOptions {
   workspaceId: string;
   config: Config;
   historyService: HistoryService;
-  aiService: AIService;
+  aiService: AgentSessionAIService;
+  streamManager?: AgentSessionStreamManager;
   mcpServerManager?: MCPServerManager;
   initStateManager: InitStateManager;
   telemetryService?: TelemetryService;
@@ -596,7 +644,8 @@ export class AgentSession {
   private readonly workspaceId: string;
   private readonly config: Config;
   private readonly historyService: HistoryService;
-  private readonly aiService: AIService;
+  private readonly aiService: AgentSessionAIService;
+  private readonly streamManager: AgentSessionStreamManager;
   private readonly mcpServerManager?: MCPServerManager;
   private readonly initStateManager: InitStateManager;
   private readonly backgroundProcessManager: BackgroundProcessManager;
@@ -832,6 +881,7 @@ export class AgentSession {
       config,
       historyService,
       aiService,
+      streamManager,
       mcpServerManager,
       initStateManager,
       telemetryService,
@@ -854,6 +904,15 @@ export class AgentSession {
     this.config = config;
     this.historyService = historyService;
     this.aiService = aiService;
+    const streamManagerCandidate = streamManager ?? aiService;
+    assert(
+      typeof streamManagerCandidate.stopStream === "function" &&
+        typeof streamManagerCandidate.isStreaming === "function" &&
+        typeof streamManagerCandidate.getStreamInfo === "function" &&
+        typeof streamManagerCandidate.replayStream === "function",
+      "AgentSession requires stream lifecycle access"
+    );
+    this.streamManager = streamManagerCandidate as AgentSessionStreamManager;
     this.mcpServerManager = mcpServerManager;
     this.initStateManager = initStateManager;
     this.backgroundProcessManager = backgroundProcessManager;
@@ -919,7 +978,7 @@ export class AgentSession {
     // flip the process exit code after the run already completed.
     // Promise.resolve guards test doubles that return non-promises.
     void Promise.resolve(
-      this.aiService.stopStream(this.workspaceId, { abandonPartial: true })
+      this.streamManager.stopStream(this.workspaceId, { abandonPartial: true })
     ).catch((error) => {
       log.debug(`dispose: stopStream failed: ${getErrorMessage(error)}`);
     });
@@ -933,7 +992,7 @@ export class AgentSession {
     }
 
     for (const { event, handler } of this.aiListeners) {
-      this.aiService.off(event, handler as never);
+      this.aiService.off(event, handler);
     }
     this.aiListeners.length = 0;
     for (const { event, handler } of this.initListeners) {
@@ -1490,11 +1549,7 @@ export class AgentSession {
   }
 
   private isAiStreaming(): boolean {
-    const aiService = this.aiService as Partial<Pick<AIService, "isStreaming">>;
-    if (typeof aiService.isStreaming !== "function") {
-      return false;
-    }
-    return aiService.isStreaming(this.workspaceId);
+    return this.streamManager.isStreaming(this.workspaceId);
   }
 
   private normalizeStartupModel(model: unknown): string | undefined {
@@ -1791,7 +1846,9 @@ export class AgentSession {
   }
 
   private async getWorkspaceMetadataForRetry(): Promise<WorkspaceMetadata | undefined> {
-    const aiService = this.aiService as Partial<Pick<AIService, "getWorkspaceMetadata">>;
+    const aiService = this.aiService as Partial<
+      Pick<AgentSessionAIService, "getWorkspaceMetadata">
+    >;
     if (typeof aiService.getWorkspaceMetadata !== "function") {
       return undefined;
     }
@@ -2283,14 +2340,14 @@ export class AgentSession {
         };
 
         const cleanup = () => {
-          this.aiService.off("stream-end", maybeResolve as never);
-          this.aiService.off("stream-abort", maybeResolve as never);
-          this.aiService.off("error", maybeResolve as never);
+          this.aiService.off("stream-end", maybeResolve);
+          this.aiService.off("stream-abort", maybeResolve);
+          this.aiService.off("error", maybeResolve);
         };
 
-        this.aiService.on("stream-end", maybeResolve as never);
-        this.aiService.on("stream-abort", maybeResolve as never);
-        this.aiService.on("error", maybeResolve as never);
+        this.aiService.on("stream-end", maybeResolve);
+        this.aiService.on("stream-abort", maybeResolve);
+        this.aiService.on("error", maybeResolve);
 
         // Defensive: stream state may have changed between waitForIdle() and listener setup.
         maybeResolve({ workspaceId: this.workspaceId });
@@ -2401,7 +2458,7 @@ export class AgentSession {
       this.startupAutoRetryCheckScheduled = false;
       if (
         this.isBusy() ||
-        this.aiService.isStreaming(this.workspaceId) ||
+        this.streamManager.isStreaming(this.workspaceId) ||
         this.retryManager.isRetryPending
       ) {
         return;
@@ -2428,7 +2485,7 @@ export class AgentSession {
   shouldRetainAfterStartupRecovery(): boolean {
     return (
       this.isBusy() ||
-      this.aiService.isStreaming(this.workspaceId) ||
+      this.streamManager.isStreaming(this.workspaceId) ||
       this.retryManager.isRetryPending
     );
   }
@@ -2546,15 +2603,15 @@ export class AgentSession {
         // Live mode still needs stream context when a response is currently active.
         // Replay only stream-start (no historical deltas/tool updates) so clients can
         // attach future live events to the correct message.
-        const liveStreamInfo = this.aiService.getStreamInfo(this.workspaceId);
+        const liveStreamInfo = this.streamManager.getStreamInfo(this.workspaceId);
         if (liveStreamInfo) {
           const streamLastTimestamp = this.getStreamLastTimestamp(liveStreamInfo);
-          await this.aiService.replayStream(this.workspaceId, {
+          await this.streamManager.replayStream(this.workspaceId, {
             afterTimestamp: streamLastTimestamp,
           });
 
           // Stream can end while replayStream runs; only expose cursor when still active.
-          const liveStreamInfoAfterReplay = this.aiService.getStreamInfo?.(this.workspaceId);
+          const liveStreamInfoAfterReplay = this.streamManager.getStreamInfo(this.workspaceId);
           if (liveStreamInfoAfterReplay) {
             serverCursor = {
               ...serverCursor,
@@ -2575,7 +2632,7 @@ export class AgentSession {
 
       // Read partial BEFORE iterating history so we can skip the corresponding
       // placeholder message (which has empty parts). The partial has the real content.
-      const streamInfo = this.aiService.getStreamInfo(this.workspaceId);
+      const streamInfo = this.streamManager.getStreamInfo(this.workspaceId);
       const partial = await this.historyService.readPartial(this.workspaceId);
       const partialHistorySequence = partial?.metadata?.historySequence;
 
@@ -2747,13 +2804,13 @@ export class AgentSession {
 
       const attemptedStreamReplay = streamInfo !== undefined;
       if (streamInfo) {
-        await this.aiService.replayStream(this.workspaceId, { afterTimestamp });
+        await this.streamManager.replayStream(this.workspaceId, { afterTimestamp });
       }
 
       // Re-read stream state after replay. The stream can end while we are
       // replaying history, and caught-up cursor metadata must reflect that
       // latest backend state to avoid phantom active streams in the client.
-      const streamInfoAfterReplay = this.aiService.getStreamInfo?.(this.workspaceId);
+      const streamInfoAfterReplay = this.streamManager.getStreamInfo(this.workspaceId);
       if (streamInfoAfterReplay) {
         serverCursor = {
           ...serverCursor,
@@ -4235,7 +4292,7 @@ export class AgentSession {
       // Prefer ProviderService's safe config view: it includes env/file API-key source
       // metadata plus the Codex OAuth presence bit, which context-limit resolution needs
       // to distinguish GPT-5.5 API-key requests from lower-cap OAuth-routed requests.
-      const maybeAIService = this.aiService as AIService & {
+      const maybeAIService = this.aiService as AgentSessionAIService & {
         getProvidersConfig?: () => ProvidersConfigMap | null;
       };
       if (typeof maybeAIService.getProvidersConfig === "function") {
@@ -4698,7 +4755,7 @@ export class AgentSession {
 
     this.midStreamCompactionPending = true;
     try {
-      const stopResult = await this.aiService.stopStream(this.workspaceId, {
+      const stopResult = await this.streamManager.stopStream(this.workspaceId, {
         abortReason: "system",
       });
       if (!stopResult.success) {
@@ -4820,7 +4877,7 @@ export class AgentSession {
       }
     }
 
-    const stopResult = await this.aiService.stopStream(this.workspaceId, {
+    const stopResult = await this.streamManager.stopStream(this.workspaceId, {
       ...options,
       abortReason: "user",
     });
@@ -5718,7 +5775,7 @@ export class AgentSession {
         void handler(payload as WorkspaceChatMessage);
       };
       this.aiListeners.push({ event, handler: wrapped });
-      this.aiService.on(event, wrapped as never);
+      this.aiService.on(event, wrapped);
     };
 
     forward("stream-start", (payload) => {
@@ -6165,7 +6222,7 @@ export class AgentSession {
     };
 
     this.aiListeners.push({ event: "error", handler: errorHandler });
-    this.aiService.on("error", errorHandler as never);
+    this.aiService.on("error", errorHandler);
   }
 
   private attachInitListeners(): void {
@@ -6717,7 +6774,7 @@ export class AgentSession {
     }
 
     this.queuedProviderToolEndAbortInFlight = true;
-    const result = await this.aiService.stopStream(this.workspaceId, {
+    const result = await this.streamManager.stopStream(this.workspaceId, {
       soft: true,
       abortReason: "system",
     });
