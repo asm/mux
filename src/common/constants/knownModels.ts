@@ -27,13 +27,13 @@ interface KnownModel extends KnownModelDefinition {
 // Model definitions. Note we avoid listing legacy models here. These represent the focal models
 // of the community.
 const MODEL_DEFINITIONS = {
-  // Claude Fable 5 - Mythos-class model (a tier above Opus) released June 9, 2026.
-  // It is the generally-available variant of the Mythos 5 model, shipped with safeguards
-  // enabled (a small fraction of flagged requests fall back to Opus 4.8 server-side, which
-  // is transparent to API clients). API id `claude-fable-5`; $10/M input, $50/M output.
+  // Claude Fable 5.1 - Mythos-class model (a tier above Opus), successor to Fable 5
+  // (released June 9, 2026) as the generally-available safeguarded variant, at unchanged
+  // pricing ($10/M input, $50/M output). API id `claude-fable-5-1`; Fable 5 stays usable
+  // as the custom model string `anthropic:claude-fable-5`.
   FABLE: {
     provider: "anthropic",
-    providerModelId: "claude-fable-5",
+    providerModelId: "claude-fable-5-1",
     aliases: ["fable"],
     warm: true,
     // Fable/Mythos use the newer Opus 4.7+ tokenizer, which isn't published upstream;
@@ -282,11 +282,23 @@ export const MODEL_ABBREVIATIONS: Record<string, string> = Object.fromEntries(
     .sort(([a], [b]) => a.localeCompare(b))
 );
 
-export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = Object.fromEntries(
-  Object.values(KNOWN_MODELS)
-    .filter((model) => Boolean(model.tokenizerOverride))
-    .map((model) => [model.id, model.tokenizerOverride!])
-);
+// Retired first-class models stay documented as custom model strings (see the
+// FABLE/OPUS comments); keep their approximate-tokenizer overrides so exact-id
+// lookup does not fall back to the generic per-provider tokenizer.
+const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
+  "anthropic:claude-fable-5": "anthropic/claude-opus-4.5",
+  "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
+};
+
+export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
+  ...LEGACY_TOKENIZER_MODEL_OVERRIDES,
+  // Spread current models last so a returning id always wins over its legacy entry.
+  ...Object.fromEntries(
+    Object.values(KNOWN_MODELS)
+      .filter((model) => Boolean(model.tokenizerOverride))
+      .map((model) => [model.id, model.tokenizerOverride!])
+  ),
+};
 
 /** Tooltip-friendly abbreviation examples: show representative shortcuts */
 export const MODEL_ABBREVIATION_EXAMPLES = (["opus", "sonnet"] as const).map((abbrev) => ({

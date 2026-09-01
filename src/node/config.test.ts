@@ -70,6 +70,7 @@ describe("Config", () => {
           taskSettings: { preserveSubagentsUntilArchive: true },
           migrations: {
             defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
             persistentSubagentsDefaulted: true,
           },
         })
@@ -1484,7 +1485,10 @@ describe("Config", () => {
         JSON.stringify({
           projects: [],
           // Keep this test focused on normalization, not default seeding.
-          migrations: { defaultModelFallbacksSeeded: true },
+          migrations: {
+            defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
+          },
           modelFallbacks: {
             // Gateway-prefixed key + non-string chain entries + unknown trigger.
             "openrouter:anthropic/claude-opus-4-6": {
@@ -1514,6 +1518,7 @@ describe("Config", () => {
 
   describe("default model fallbacks seeding", () => {
     const FABLE = KNOWN_MODELS.FABLE.id;
+    const LEGACY_FABLE = "anthropic:claude-fable-5";
     const OPUS = KNOWN_MODELS.OPUS.id;
     const configFilePath = () => path.join(tempDir, "config.json");
 
@@ -1521,7 +1526,12 @@ describe("Config", () => {
       fs.writeFileSync(configFilePath(), JSON.stringify({ projects: [] }));
 
       const loaded = config.loadConfigOrDefault();
-      expect(loaded.modelFallbacks).toEqual({ [FABLE]: { models: [OPUS] } });
+      // The original seed pass also carries the legacy Fable 5 chain so a
+      // downgraded build (whose FABLE is Fable 5) still finds its default.
+      expect(loaded.modelFallbacks).toEqual({
+        [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE]: { models: [OPUS] },
+      });
       expect(loaded.migrations?.defaultModelFallbacksSeeded).toBe(true);
 
       // Seed is written back so the flag survives restarts even without saves.
@@ -1530,7 +1540,10 @@ describe("Config", () => {
         modelFallbacks?: unknown;
         migrations?: { defaultModelFallbacksSeeded?: unknown };
       };
-      expect(raw.modelFallbacks).toEqual({ [FABLE]: { models: [OPUS] } });
+      expect(raw.modelFallbacks).toEqual({
+        [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE]: { models: [OPUS] },
+      });
       expect(raw.migrations?.defaultModelFallbacksSeeded).toBe(true);
     });
 
@@ -1539,11 +1552,68 @@ describe("Config", () => {
         configFilePath(),
         JSON.stringify({
           projects: [],
-          migrations: { defaultModelFallbacksSeeded: true },
+          migrations: {
+            defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
+          },
         })
       );
 
       expect(config.loadConfigOrDefault().modelFallbacks).toBeUndefined();
+    });
+
+    it("seeds the Fable 5.1 chain once for configs seeded before the 5.1 promotion", async () => {
+      // Pre-5.1 configs carry a chain only for the old source key
+      // (anthropic:claude-fable-5); the promoted FABLE key must get its own
+      // one-time seed without touching the legacy chain (the legacy default
+      // is only added while the original seed pass itself runs).
+      fs.writeFileSync(
+        configFilePath(),
+        JSON.stringify({
+          projects: [],
+          migrations: { defaultModelFallbacksSeeded: true },
+          modelFallbacks: {
+            "anthropic:claude-fable-5": { models: ["anthropic:claude-opus-4-8"] },
+          },
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.modelFallbacks).toEqual({
+        "anthropic:claude-fable-5": { models: ["anthropic:claude-opus-4-8"] },
+        [FABLE]: { models: [OPUS] },
+      });
+      expect(loaded.migrations?.defaultModelFallbacksSeededFable51).toBe(true);
+
+      await flushConfigEdits();
+      const raw = JSON.parse(fs.readFileSync(configFilePath(), "utf-8")) as {
+        modelFallbacks?: unknown;
+        migrations?: { defaultModelFallbacksSeededFable51?: unknown };
+      };
+      expect(raw.modelFallbacks).toEqual({
+        "anthropic:claude-fable-5": { models: ["anthropic:claude-opus-4-8"] },
+        [FABLE]: { models: [OPUS] },
+      });
+      expect(raw.migrations?.defaultModelFallbacksSeededFable51).toBe(true);
+    });
+
+    it("does not overwrite an existing Fable 5.1 chain during the 5.1 re-seed", () => {
+      fs.writeFileSync(
+        configFilePath(),
+        JSON.stringify({
+          projects: [],
+          migrations: { defaultModelFallbacksSeeded: true },
+          modelFallbacks: {
+            [FABLE]: { models: ["openai:gpt-5.5"] },
+          },
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.modelFallbacks).toEqual({
+        [FABLE]: { models: ["openai:gpt-5.5"] },
+      });
+      expect(loaded.migrations?.defaultModelFallbacksSeededFable51).toBe(true);
     });
 
     it("merges the seeded default with pre-existing chains for other source models", async () => {
@@ -1560,6 +1630,7 @@ describe("Config", () => {
       const loaded = config.loadConfigOrDefault();
       expect(loaded.modelFallbacks).toEqual({
         "anthropic:claude-opus-4-6": { models: ["openai:gpt-5.5"] },
+        [LEGACY_FABLE]: { models: [OPUS] },
         [FABLE]: { models: [OPUS] },
       });
 
@@ -1571,6 +1642,7 @@ describe("Config", () => {
       };
       expect(raw.modelFallbacks).toEqual({
         "anthropic:claude-opus-4-6": { models: ["openai:gpt-5.5"] },
+        [LEGACY_FABLE]: { models: [OPUS] },
         [FABLE]: { models: [OPUS] },
       });
       expect(raw.migrations?.defaultModelFallbacksSeeded).toBe(true);
@@ -1582,7 +1654,7 @@ describe("Config", () => {
         JSON.stringify({
           projects: [],
           modelFallbacks: {
-            "openrouter:anthropic/claude-fable-5": { models: ["openai:gpt-5.5"] },
+            "openrouter:anthropic/claude-fable-5-1": { models: ["openai:gpt-5.5"] },
           },
         })
       );
@@ -1591,6 +1663,7 @@ describe("Config", () => {
       // the seed must treat it as configured and leave the user's chain alone.
       expect(config.loadConfigOrDefault().modelFallbacks).toEqual({
         [FABLE]: { models: ["openai:gpt-5.5"] },
+        [LEGACY_FABLE]: { models: [OPUS] },
       });
     });
 
@@ -1608,10 +1681,15 @@ describe("Config", () => {
       const loaded = config.loadConfigOrDefault();
       // The entry sanitizes to nothing at runtime (no fallback fires), but it
       // is still user intent: the seed must not replace it with an enabled
-      // default chain, and the raw on-disk form must survive.
-      expect(loaded.modelFallbacks).toBeUndefined();
+      // default chain, and the raw on-disk form must survive. Only the
+      // untouched legacy key gets seeded.
+      expect(loaded.modelFallbacks).toEqual({
+        [LEGACY_FABLE]: { models: [OPUS] },
+      });
       expect(loaded.migrations?.defaultModelFallbacksSeeded).toBe(true);
 
+      // Raw file read before the async write-back flushes: the tombstone's
+      // on-disk form must survive untouched.
       const raw = JSON.parse(fs.readFileSync(configFilePath(), "utf-8")) as {
         modelFallbacks?: unknown;
       };
@@ -1652,12 +1730,14 @@ describe("Config", () => {
       const loaded = config.loadConfigOrDefault();
       expect(loaded.modelFallbacks).toEqual({
         [FABLE]: { enabled: false, models: ["openai:gpt-5.5"] },
+        [LEGACY_FABLE]: { models: [OPUS] },
       });
       expect(loaded.migrations?.defaultModelFallbacksSeeded).toBe(true);
     });
 
     it("applies the defaults to fresh installs and locks the flag on first save", async () => {
       expect(config.loadConfigOrDefault().modelFallbacks).toEqual({
+        [LEGACY_FABLE]: { models: [OPUS] },
         [FABLE]: { models: [OPUS] },
       });
 
@@ -1667,7 +1747,10 @@ describe("Config", () => {
         modelFallbacks?: unknown;
         migrations?: { defaultModelFallbacksSeeded?: unknown };
       };
-      expect(raw.modelFallbacks).toEqual({ [FABLE]: { models: [OPUS] } });
+      expect(raw.modelFallbacks).toEqual({
+        [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE]: { models: [OPUS] },
+      });
       expect(raw.migrations?.defaultModelFallbacksSeeded).toBe(true);
     });
   });
@@ -2269,9 +2352,12 @@ describe("Config", () => {
           routeOverrides: {
             "openai:gpt-4o": "direct",
           },
-          // Without this flag the one-time default-fallbacks seed would write
-          // the file, which is not the rewrite this test guards against.
-          migrations: { defaultModelFallbacksSeeded: true },
+          // Without these flags the one-time default-fallbacks seeds would
+          // write the file, which is not the rewrite this test guards against.
+          migrations: {
+            defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
+          },
         })
       );
 
