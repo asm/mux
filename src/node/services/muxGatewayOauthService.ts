@@ -18,7 +18,7 @@
 import * as crypto from "crypto";
 import { Effect, Schema } from "effect";
 import type { Result } from "@/common/types/result";
-import { Err, Ok } from "@/common/types/result";
+import { Err } from "@/common/types/result";
 import {
   buildAuthorizeUrl,
   buildExchangeBody,
@@ -31,7 +31,7 @@ import type { ProviderService } from "@/node/services/providerService";
 import { resolveProviderCredentials } from "@/node/utils/providerRequirements";
 import type { WindowService } from "@/node/services/windowService";
 import { log } from "@/node/services/log";
-import { createDeferred, renderOAuthCallbackHtml } from "@/node/utils/oauthUtils";
+import { createDeferred, renderOAuthCallbackHtml, toWireResult } from "@/node/utils/oauthUtils";
 import { startLoopbackServer } from "@/node/utils/oauthLoopbackServer";
 import { OAuthFlowManager } from "@/node/utils/oauthFlowManager";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -63,18 +63,6 @@ export class MuxGatewayOAuthError extends Schema.TaggedError<MuxGatewayOAuthErro
   "MuxGatewayOAuthError",
   { reason: Schema.String }
 ) {}
-
-/** Fold the typed failure channel back into the wire `Result` shape. */
-function toWireResult<A>(
-  effect: Effect.Effect<A, MuxGatewayOAuthError>
-): Effect.Effect<Result<A, string>> {
-  return effect.pipe(
-    Effect.map((value): Result<A, string> => Ok(value)),
-    Effect.catchTag("MuxGatewayOAuthError", (error) =>
-      Effect.succeed<Result<A, string>>(Err(error.reason))
-    )
-  );
-}
 
 export class MuxGatewayOauthService {
   private readonly desktopFlows = new OAuthFlowManager();
@@ -189,6 +177,13 @@ export class MuxGatewayOauthService {
           }),
       });
 
+      // Guard before field access: a null/non-object JSON body must fold into
+      // the invalid-payload error instead of a fiber-killing defect.
+      if (json === null || typeof json !== "object") {
+        return yield* Effect.fail(
+          new MuxGatewayOAuthError({ reason: "Xum Gateway returned an invalid balance payload" })
+        );
+      }
       const payload = json as {
         remaining_microdollars?: unknown;
         ai_gateway_concurrent_requests_per_user?: unknown;
@@ -363,13 +358,41 @@ export class MuxGatewayOauthService {
     flowId: string,
     opts?: { timeoutMs?: number }
   ): Promise<Result<void, string>> {
-    return this.desktopFlows.waitFor(flowId, opts?.timeoutMs ?? DEFAULT_DESKTOP_TIMEOUT_MS);
+    return Effect.runPromise(this.waitForDesktopFlowEffect(flowId, opts));
+  }
+
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers. Left
+   * interruptible: abandoning the wait does not affect the flow itself (the
+   * shared deferred and registered timeout keep the flow's lifecycle intact).
+   */
+  waitForDesktopFlowEffect(
+    flowId: string,
+    opts?: { timeoutMs?: number }
+  ): Effect.Effect<Result<void, string>> {
+    return this.desktopFlows.waitForEffect(flowId, opts?.timeoutMs ?? DEFAULT_DESKTOP_TIMEOUT_MS);
   }
 
   async cancelDesktopFlow(flowId: string): Promise<void> {
-    if (!this.desktopFlows.has(flowId)) return;
-    log.debug(`Xum Gateway OAuth desktop flow cancelled (flowId=${flowId})`);
-    await this.desktopFlows.cancel(flowId);
+    return Effect.runPromise(this.cancelDesktopFlowEffect(flowId));
+  }
+
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers.
+   * Uninterruptible: once the cancel begins, the teardown must complete — a
+   * client abort mid-cancel must not leave the flow registered (its callback
+   * could still persist credentials after the user asked to cancel).
+   */
+  cancelDesktopFlowEffect(flowId: string): Effect.Effect<void> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.uninterruptible(
+      Effect.gen(function* () {
+        if (!self.desktopFlows.has(flowId)) return;
+        log.debug(`Xum Gateway OAuth desktop flow cancelled (flowId=${flowId})`);
+        yield* self.desktopFlows.cancelEffect(flowId);
+      })
+    );
   }
 
   startServerFlow(input: { redirectUri: string }): { authorizeUrl: string; state: string } {
@@ -505,7 +528,15 @@ export class MuxGatewayOauthService {
       }
 
       const json = yield* Effect.tryPromise({
-        try: async () => (await response.json()) as { access_token?: unknown },
+        try: async () => {
+          const parsed = (await response.json()) as unknown;
+          // Validate inside the caught region: a null/non-object JSON body
+          // folds into the wire error instead of a defect.
+          if (parsed === null || typeof parsed !== "object") {
+            throw new TypeError("Response was not a JSON object");
+          }
+          return parsed as { access_token?: unknown };
+        },
         catch: (error) =>
           new MuxGatewayOAuthError({
             reason: `Xum Gateway exchange failed: ${getErrorMessage(error)}`,
