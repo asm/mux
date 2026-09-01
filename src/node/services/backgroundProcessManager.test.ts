@@ -1,11 +1,12 @@
 import { Buffer } from "node:buffer";
-import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import { Ok } from "@/common/types/result";
 import {
   BackgroundProcessManager,
   boundTailContent,
   computeTailStartOffset,
   parseSpawnRecordMeta,
+  type BackgroundProcess,
   type BackgroundProcessMeta,
   type MonitorArmedPayload,
   type MonitorMatchPayload,
@@ -510,6 +511,8 @@ describe("BackgroundProcessManager", () => {
     it("folds a same-poll read chunk into the failure payload when the exit probe escalates", async () => {
       const stoppedEvents: MonitorStoppedPayload[] = [];
       manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+      const matchEvents: MonitorMatchPayload[] = [];
+      manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
 
       const result = await manager.spawn(runtime, testWorkspaceId, "sleep 5", {
         cwd: process.cwd(),
@@ -553,6 +556,12 @@ describe("BackgroundProcessManager", () => {
       );
       expect(stoppedEvent?.failedOperations).toEqual(["getExitCode"]);
       expect(stoppedEvent?.failedMatch).toMatchObject({ lines: ["READY"], totalMatches: 1 });
+      expect(matchEvents).toEqual([]);
+      expect(
+        manager
+          .pullMonitorWakeSignals(testWorkspaceId)
+          .find((snapshot) => snapshot.processId === result.processId)?.match?.lines
+      ).toEqual(["READY"]);
     });
 
     it("retires a monitor after repeated output failures while exit probes stay healthy", async () => {
@@ -1042,9 +1051,13 @@ describe("BackgroundProcessManager", () => {
         expect(terminated.success).toBe(true);
         if (!terminated.success) return;
         await manager.terminate(terminated.processId, { monitorDisposition: "discard" });
-        expect(events.stopped).toContainEqual({
-          workspaceId: testWorkspaceId,
-          payload: { processId: terminated.processId, reason: "canceled" },
+        const canceled = events.stopped.find(
+          (event) => event.payload.processId === terminated.processId
+        );
+        expect(canceled?.workspaceId).toBe(testWorkspaceId);
+        expect(canceled?.payload).toMatchObject({
+          processId: terminated.processId,
+          reason: "canceled",
         });
       });
 
@@ -1531,6 +1544,104 @@ describe("BackgroundProcessManager", () => {
       expect(incompleteLineBytes).toBeLessThanOrEqual(1_000_000);
     });
 
+    it("retains matched lines until the reconciler acknowledges their offset", async () => {
+      const eventPromise = waitForMonitorMatch(manager);
+      const result = await manager.spawn(runtime, testWorkspaceId, "printf 'READY\n'; sleep 30", {
+        cwd: process.cwd(),
+        displayName: "retained-monitor-match",
+        monitor: { filter: "READY", pattern: /READY/, exclude: false, cooldownMs: 0 },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      await eventPromise;
+
+      const before = manager.pullMonitorWakeSignals(testWorkspaceId);
+      const snapshot = before.find((candidate) => candidate.processId === result.processId);
+      expect(snapshot?.match?.lines).toEqual(["READY"]);
+      expect(snapshot?.match?.throughOffset).toBeGreaterThan(0);
+
+      manager.acknowledgeMonitorWake(
+        result.processId,
+        Date.parse(snapshot?.createdAt ?? ""),
+        snapshot?.match?.throughOffset
+      );
+      const after = manager.pullMonitorWakeSignals(testWorkspaceId);
+      expect(
+        after.find((candidate) => candidate.processId === result.processId)?.match
+      ).toBeUndefined();
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
+    });
+
+    it("cancellation after max-events retirement clears retained wake state", async () => {
+      const eventPromise = waitForMonitorMatch(manager);
+      const result = await manager.spawn(runtime, testWorkspaceId, "printf 'READY\n'; sleep 30", {
+        cwd: process.cwd(),
+        displayName: "retired-then-canceled",
+        monitor: {
+          filter: "READY",
+          pattern: /READY/,
+          exclude: false,
+          cooldownMs: 0,
+          maxEvents: 1,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      await eventPromise;
+      expect(
+        manager
+          .pullMonitorWakeSignals(testWorkspaceId)
+          .find((snapshot) => snapshot.processId === result.processId)?.match?.lines
+      ).toEqual(["READY"]);
+
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
+
+      expect(
+        manager
+          .pullMonitorWakeSignals(testWorkspaceId)
+          .find((snapshot) => snapshot.processId === result.processId)?.match
+      ).toBeUndefined();
+    });
+
+    it("acknowledging one flush preserves only later retained batches", async () => {
+      const events: MonitorMatchPayload[] = [];
+      manager.on("monitor:match", (_workspaceId, payload) => events.push(payload));
+      const result = await manager.spawn(
+        runtime,
+        testWorkspaceId,
+        "printf 'BATCH_A\n'; sleep 0.5; printf 'BATCH_B\n'; sleep 30",
+        {
+          cwd: process.cwd(),
+          displayName: "retained-monitor-batches",
+          monitor: { filter: "BATCH_", pattern: /BATCH_/, exclude: false, cooldownMs: 0 },
+        }
+      );
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      for (let attempt = 0; attempt < 80 && events.length < 1; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      const first = manager
+        .pullMonitorWakeSignals(testWorkspaceId)
+        .find((snapshot) => snapshot.processId === result.processId);
+      expect(first?.match?.lines).toEqual(["BATCH_A"]);
+      for (let attempt = 0; attempt < 80 && events.length < 2; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+
+      manager.acknowledgeMonitorWake(
+        result.processId,
+        Date.parse(first?.createdAt ?? ""),
+        first?.match?.throughOffset
+      );
+
+      const remaining = manager
+        .pullMonitorWakeSignals(testWorkspaceId)
+        .find((snapshot) => snapshot.processId === result.processId);
+      expect(remaining?.match?.lines).toEqual(["BATCH_B"]);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
+    });
+
     describe("settlement wakes", () => {
       it("wakes with a terminal payload when the process exits without any match, before monitor:stopped", async () => {
         // Incident regression (workspace 31d3dfd254): a watcher script exits printing a failure
@@ -1576,19 +1687,29 @@ describe("BackgroundProcessManager", () => {
         // Terminal-only settlement: no undelivered matched output, so no offset signal that
         // could ever falsely suppress the wake (EOF == shown offset for unread output is fine).
         expect(payload.matchedThroughOffset).toBeUndefined();
-        // Synthetic settle line (downgrade fallback) in lines; the actionable failure travels in
-        // the separate tail so the store can dedupe it against persisted matches.
-        expect(
-          payload.lines.some((line) => line.includes("process settled: exited (code 1)"))
-        ).toBe(true);
+        expect(payload.lines).toEqual([]);
         expect(
           (payload.tailLines ?? []).some((line) =>
             line.includes("Unresolved review comments found")
           )
         ).toBe(true);
+        const wakeSignal = manager
+          .pullMonitorWakeSignals(testWorkspaceId)
+          .find((snapshot) => snapshot.processId === result.processId);
+        expect(wakeSignal?.match).toBeUndefined();
+        expect(
+          wakeSignal?.terminal?.tailLines?.some(
+            (entry) =>
+              entry.line.includes("Unresolved review comments found") && entry.endOffset > 0
+          )
+        ).toBe(true);
         // Durability ordering: the wake emit precedes registry deletion.
         expect(order).toEqual(["match", "stopped"]);
-        expect(stoppedEvents[0]).toEqual({ processId: result.processId, reason: "completed" });
+        expect(stoppedEvents[0]).toMatchObject({
+          processId: result.processId,
+          reason: "completed",
+          terminal: { status: "exited", exitCode: 1, wakeOnExit: true },
+        });
       });
 
       it("wakes for a zero-output process (never suppressed by the offset gate)", async () => {
@@ -1604,7 +1725,7 @@ describe("BackgroundProcessManager", () => {
         const event = await eventPromise;
         expect(event.payload.terminal).toEqual({ status: "exited", exitCode: 3 });
         expect(event.payload.matchedThroughOffset).toBeUndefined();
-        expect(event.payload.lines).toEqual(["[monitor] process settled: exited (code 3)"]);
+        expect(event.payload.lines).toEqual([]);
       });
 
       it("timeout auto-termination settles with a deterministic killed payload", async () => {
@@ -1620,9 +1741,7 @@ describe("BackgroundProcessManager", () => {
 
         const event = await eventPromise;
         expect(event.payload.terminal?.status).toBe("killed");
-        expect(event.payload.lines.some((line) => line.includes("process settled: killed"))).toBe(
-          true
-        );
+        expect(event.payload.lines).toEqual([]);
       });
 
       it("emits ONE coalesced payload for pending matched lines plus exit", async () => {
@@ -1654,9 +1773,14 @@ describe("BackgroundProcessManager", () => {
         expect(payload.lines[0]).toBe("ERR boom");
         expect(payload.matchedThroughOffset).toBeDefined();
         expect(payload.terminal).toEqual({ status: "exited", exitCode: 2 });
-        expect(
-          payload.lines.some((line) => line.includes("process settled: exited (code 2)"))
-        ).toBe(true);
+        expect(payload.lines).toEqual(["ERR boom"]);
+        const wakeSignal = manager
+          .pullMonitorWakeSignals(testWorkspaceId)
+          .find((snapshot) => snapshot.processId === result.processId);
+        expect(wakeSignal?.match?.lines).toEqual(["ERR boom"]);
+        expect(wakeSignal?.match?.lines.some((line) => line.includes("process settled:"))).toBe(
+          false
+        );
       });
 
       it("emits no settlement wake on discard-mode termination (task_stop)", async () => {
@@ -1677,7 +1801,8 @@ describe("BackgroundProcessManager", () => {
         await new Promise((resolve) => setTimeout(resolve, 400));
 
         expect(matchEvents).toHaveLength(0);
-        expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "canceled" }]);
+        expect(stoppedEvents).toHaveLength(1);
+        expect(stoppedEvents[0]).toMatchObject({ processId: result.processId, reason: "canceled" });
       });
 
       it("wake_on_exit=false suppresses the terminal wake entirely on a no-match exit", async () => {
@@ -1704,13 +1829,20 @@ describe("BackgroundProcessManager", () => {
           await new Promise((resolve) => setTimeout(resolve, 50));
         }
 
-        expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "completed" }]);
+        expect(stoppedEvents).toHaveLength(1);
+        expect(stoppedEvents[0]).toMatchObject({
+          processId: result.processId,
+          reason: "completed",
+          terminal: { status: "exited", exitCode: 1, wakeOnExit: false },
+        });
         expect(matchEvents).toHaveLength(0);
       });
 
       it("wake_on_exit=false still flushes pending matched lines without terminal metadata", async () => {
         const matchEvents: MonitorMatchPayload[] = [];
         manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
+        const stoppedEvents: MonitorStoppedPayload[] = [];
+        manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
 
         const result = await manager.spawn(
           runtime,
@@ -1739,6 +1871,10 @@ describe("BackgroundProcessManager", () => {
         expect(matchEvents[0].lines).toEqual(["ERR boom"]);
         expect(matchEvents[0].terminal).toBeUndefined();
         expect(matchEvents[0].matchedThroughOffset).toBeDefined();
+        expect(stoppedEvents).toHaveLength(1);
+        expect(stoppedEvents[0].terminal?.matchedThroughOffset).toBe(
+          matchEvents[0].matchedThroughOffset
+        );
       });
 
       it("does not settle after maxEvents retirement", async () => {
@@ -1773,7 +1909,11 @@ describe("BackgroundProcessManager", () => {
 
         expect(matchEvents).toHaveLength(1);
         expect(matchEvents[0].terminal).toBeUndefined();
-        expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "completed" }]);
+        expect(stoppedEvents).toHaveLength(1);
+        expect(stoppedEvents[0]).toMatchObject({
+          processId: result.processId,
+          reason: "completed",
+        });
       });
 
       it("maxEvents reached inside the settlement scan still yields one combined payload", async () => {
@@ -1805,10 +1945,15 @@ describe("BackgroundProcessManager", () => {
         expect(matchEvents).toHaveLength(1);
         expect(matchEvents[0].lines[0]).toBe("ERR final");
         // The matched line appears once in lines; its tail-window duplicate travels separately
-        // and is deduped by the wake store before persistence.
+        // and is deduped by BashMonitorWakeReconciler.composeLines before delivery.
         expect(matchEvents[0].lines.filter((line) => line === "ERR final")).toHaveLength(1);
         expect(matchEvents[0].terminal).toEqual({ status: "exited", exitCode: 0 });
-        expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "completed" }]);
+        expect(stoppedEvents).toHaveLength(1);
+        expect(stoppedEvents[0]).toMatchObject({
+          processId: result.processId,
+          reason: "completed",
+          terminal: { status: "exited", exitCode: 0, wakeOnExit: true },
+        });
       });
 
       it("honors max_events while accumulating settlement matches", async () => {
@@ -2067,8 +2212,7 @@ describe("BackgroundProcessManager", () => {
 
         const event = await eventPromise;
         expect(event.payload.terminal).toEqual({ status: "exited", exitCode: 1 });
-        // Tail unavailable: the synthetic settle line alone still delivers.
-        expect(event.payload.lines).toEqual(["[monitor] process settled: exited (code 1)"]);
+        expect(event.payload.lines).toEqual([]);
       });
 
       it("cancellation during the claimed settlement window wins (no terminal wake, one canceled stop)", async () => {
@@ -2113,7 +2257,8 @@ describe("BackgroundProcessManager", () => {
         await new Promise((resolve) => setTimeout(resolve, 300));
 
         expect(matchEvents).toHaveLength(0);
-        expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "canceled" }]);
+        expect(stoppedEvents).toHaveLength(1);
+        expect(stoppedEvents[0]).toMatchObject({ processId: result.processId, reason: "canceled" });
       });
 
       it("emits no settlement wakes during shutdown", async () => {
@@ -2263,6 +2408,52 @@ describe("BackgroundProcessManager", () => {
         },
       },
     ]);
+  });
+
+  describe("wake signal snapshots", () => {
+    it("reads the delivery frontier without probing process transport", async () => {
+      const processId = "non-probing-wake-frontier";
+      const startTime = Date.now();
+      const getExitCode = mock(() => Promise.reject(new Error("persistent transport failure")));
+      const processRecord = {
+        id: processId,
+        workspaceId: testWorkspaceId,
+        startTime,
+        status: "running",
+        shownThroughOffset: 0,
+        terminalStatusShownToAgent: false,
+        handle: { getExitCode } as unknown as BackgroundHandle,
+      } as unknown as BackgroundProcess;
+      const internal = manager as unknown as {
+        processes: Map<string, BackgroundProcess>;
+      };
+      internal.processes.set(processId, processRecord);
+
+      const state = await manager.getMonitorWakeDeliveryState(processId, startTime);
+
+      expect(state).toMatchObject({ status: "settled", shownThroughOffset: 0 });
+      expect(getExitCode).not.toHaveBeenCalled();
+      internal.processes.delete(processId);
+    });
+
+    it("bounds scripts exposed through live wake snapshots", async () => {
+      const script = "sleep 30\n#" + "x".repeat(10_000);
+      const result = await manager.spawn(runtime, testWorkspaceId, script, {
+        cwd: process.cwd(),
+        displayName: "bounded-live-wake-script",
+        monitor: { filter: "READY", pattern: /READY/, exclude: false, cooldownMs: 0 },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      const snapshot = manager
+        .pullMonitorWakeSignals(testWorkspaceId)
+        .find((candidate) => candidate.processId === result.processId);
+
+      expect(Buffer.byteLength(snapshot?.script ?? "", "utf8")).toBeLessThan(2_200);
+      expect(snapshot?.script.endsWith("… [truncated]")).toBe(true);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
+    });
   });
 
   describe("getSettledShownThroughOffset", () => {

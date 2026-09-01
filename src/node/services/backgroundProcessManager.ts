@@ -16,7 +16,6 @@ import {
   BG_OUTPUT_SUBDIR,
 } from "./backgroundProcessExecutor";
 import { execBuffered } from "@/node/utils/runtime/helpers";
-import { BASH_MONITOR_SETTLE_LINE_PREFIX } from "./bashMonitorWakeStore";
 import { Ok, Err, type Result } from "@/common/types/result";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -24,7 +23,13 @@ import { log } from "./log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { BASH_MAX_LINE_BYTES } from "@/common/constants/toolLimits";
 import { stripAnsiControlChars } from "@/node/utils/ansi";
+import { truncateUtf8Prefix } from "@/node/utils/utf8";
 import type { BashMonitorFailedOperation } from "@/common/types/message";
+import {
+  boundBashMonitorRegistryScript,
+  type BashMonitorTerminalSummary,
+} from "./bashMonitorRegistryStore";
+import type { BashMonitorProcessSnapshot, BashMonitorTailLine } from "./bashMonitorWakeReconciler";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 
@@ -191,6 +196,17 @@ export type MonitorWakeDeliveryState =
   | { status: "blocked"; readSettled: Promise<void> }
   | { status: "settled"; shownThroughOffset: number; terminalStatusShown: boolean };
 
+interface MonitorRetainedMatchBatch {
+  lines: string[];
+  totalMatches: number;
+  droppedLines: number;
+  matchedThroughOffset: number;
+}
+
+interface MonitorSettlementDisposition extends BashMonitorTerminalSummary {
+  tailLines: readonly BashMonitorTailLine[];
+}
+
 export interface OutputShownPayload {
   processId: string;
   processStartTime: number;
@@ -231,6 +247,7 @@ export interface MonitorStoppedPayload {
   failedOperations?: BashMonitorFailedOperation[];
   armMetadata?: MonitorArmedPayload;
   failedMatch?: MonitorFailedMatchPayload;
+  terminal?: BashMonitorTerminalSummary;
 }
 
 // One or two misses can be transient; three means that capability cannot serve the monitor.
@@ -269,6 +286,8 @@ export interface BackgroundProcessMonitorState extends BackgroundProcessMonitorC
    * agent's shown-read offset to suppress wakes for output already delivered inline.
    */
   matchedThroughOffset: number;
+  retainedMatches: MonitorRetainedMatchBatch[];
+  settlementDisposition?: MonitorSettlementDisposition;
   pollIntervalMs: number;
   incompleteLineBuffer: string;
   stopped: boolean;
@@ -448,11 +467,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   }
 
   /**
-   * Nudge background-bash subscribers after a monitor wake-state transition (pending
-   * enqueued, delivered, or superseded). Wake records live in BashMonitorWakeStore
-   * (owned by WorkspaceService), but subscribers observe them through this manager's
-   * "change" stream, so the owner needs a way to request an emit when only wake state
-   * — not process state — changed.
+   * Nudge background-bash subscribers after a monitor wake-state transition (pending,
+   * delivered, or consumed). Wake state lives in WorkspaceService's reconciler, but
+   * subscribers observe it through this manager's "change" stream, so the owner needs
+   * a way to request an emit when only wake state — not process state — changed.
    */
   notifyMonitorWakeStateChanged(workspaceId: string): void {
     assert(workspaceId.length > 0, "notifyMonitorWakeStateChanged requires a workspaceId");
@@ -477,6 +495,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       lastLines: [],
       lastReadOffset: 0,
       matchedThroughOffset: 0,
+      retainedMatches: [],
       incompleteLineBuffer: "",
       stopped: false,
       probeFailures: {},
@@ -560,6 +579,36 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     });
   }
 
+  private retainMonitorMatch(
+    monitor: BackgroundProcessMonitorState,
+    update: { lines: readonly string[]; droppedLines: number; matchedThroughOffset: number }
+  ): void {
+    monitor.retainedMatches.push({
+      lines: [...update.lines],
+      totalMatches: monitor.matchesCount,
+      droppedLines: update.droppedLines,
+      matchedThroughOffset: update.matchedThroughOffset,
+    });
+    let retainedLineCount = monitor.retainedMatches.reduce(
+      (total, batch) => total + batch.lines.length,
+      0
+    );
+    while (retainedLineCount > MONITOR_MAX_PENDING_LINES) {
+      const first = monitor.retainedMatches[0];
+      const removeCount = Math.min(
+        retainedLineCount - MONITOR_MAX_PENDING_LINES,
+        first.lines.length
+      );
+      first.lines.splice(0, removeCount);
+      first.droppedLines += removeCount;
+      retainedLineCount -= removeCount;
+      if (first.lines.length === 0 && monitor.retainedMatches.length > 1) {
+        const removed = monitor.retainedMatches.shift();
+        if (removed != null) monitor.retainedMatches[0].droppedLines += removed.droppedLines;
+      }
+    }
+  }
+
   /** Low-level "monitor:match" emitter shared by normal flushes and settlement payloads. */
   private emitMonitorUpdate(
     proc: BackgroundProcess,
@@ -572,6 +621,13 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       terminal?: MonitorTerminalStatus;
     }
   ): void {
+    if (update.matchedThroughOffset !== undefined && update.lines.length > 0) {
+      this.retainMonitorMatch(monitor, {
+        lines: update.lines,
+        droppedLines: update.droppedLines,
+        matchedThroughOffset: update.matchedThroughOffset,
+      });
+    }
     this.emit("monitor:match", proc.workspaceId, {
       processId: proc.id,
       taskId: `bash:${proc.id}`,
@@ -631,13 +687,25 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       clearTimeout(monitor.flushTimer);
       monitor.flushTimer = undefined;
     }
-    if (flushPending) {
+    if (reason === "failed") {
+      if (failedMatch?.matchedThroughOffset != null && failedMatch.lines.length > 0) {
+        this.retainMonitorMatch(monitor, {
+          lines: failedMatch.lines,
+          droppedLines: failedMatch.droppedLines,
+          matchedThroughOffset: failedMatch.matchedThroughOffset,
+        });
+      }
+      monitor.pendingLines = [];
+      monitor.droppedLines = 0;
+    } else if (flushPending) {
       this.emitMonitorMatch(proc, monitor);
     } else {
       // Explicit cancellation means the caller no longer wants this condition to produce a wake.
       // Drop coalesced matches rather than letting monitor teardown create the late wake itself.
       monitor.pendingLines = [];
       monitor.droppedLines = 0;
+      monitor.retainedMatches = [];
+      monitor.settlementDisposition = undefined;
     }
     // A monitor retiring while the app is alive means the agent no longer wants wakes for
     // this process, so its armed-registry record must go. During shutdown the record must
@@ -646,13 +714,29 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       this.emit("monitor:stopped", proc.workspaceId, {
         processId: proc.id,
         reason,
+        armMetadata: monitor.armMetadata,
+        ...(monitor.settlementDisposition != null
+          ? {
+              terminal: {
+                status: monitor.settlementDisposition.status,
+                ...(monitor.settlementDisposition.exitCode !== undefined
+                  ? { exitCode: monitor.settlementDisposition.exitCode }
+                  : {}),
+                settledAt: monitor.settlementDisposition.settledAt,
+                wakeOnExit: monitor.settlementDisposition.wakeOnExit,
+                terminalStatusShown: monitor.settlementDisposition.terminalStatusShown,
+                ...(monitor.settlementDisposition.matchedThroughOffset != null
+                  ? { matchedThroughOffset: monitor.settlementDisposition.matchedThroughOffset }
+                  : {}),
+              },
+            }
+          : {}),
         ...(failure != null
           ? {
               failureMessage: failure.message,
               ...(failure.failedOperations != null
                 ? { failedOperations: failure.failedOperations }
                 : {}),
-              armMetadata: monitor.armMetadata,
               ...(failedMatch != null ? { failedMatch } : {}),
             }
           : {}),
@@ -675,8 +759,14 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // A match may already have retired the monitor and queued a synthetic wake. Explicit process
     // cancellation must still retract that undelivered wake, so emit a cancellation notification
     // even though the in-memory monitor has no remaining timer or pending lines to clear.
+    monitor.retainedMatches = [];
+    monitor.settlementDisposition = undefined;
     if (!this.shuttingDown) {
-      this.emit("monitor:stopped", proc.workspaceId, { processId: proc.id, reason: "canceled" });
+      this.emit("monitor:stopped", proc.workspaceId, {
+        processId: proc.id,
+        reason: "canceled",
+        armMetadata: monitor.armMetadata,
+      });
     }
   }
 
@@ -710,9 +800,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * The payload coalesces (in order): pending matched lines still undelivered at settlement, a
    * synthetic settle line (the downgrade fallback: older builds strip the `terminal` field but
    * still deliver an actionable match-shaped wake), and a bounded recent-output tail. It is
-   * emitted BEFORE "monitor:stopped" so the wake record is persisted before the armed-monitor
-   * registry record is deleted (both WorkspaceService listeners enqueue their work onto the same
-   * per-workspace mutex synchronously and in FIFO emit order).
+   * emitted BEFORE "monitor:stopped" so the retained wake state is observable before the
+   * armed-monitor registry record gains its terminal summary (both WorkspaceService listeners
+   * enqueue their work onto the same per-workspace mutex synchronously and in FIFO emit order).
    *
    * Cancellation wins during the claimed window: explicit cancel (task_stop, workspace cleanup)
    * sets monitor.stopped and emits "monitor:stopped"(canceled); this helper re-checks that state
@@ -760,7 +850,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // beginShutdown can never leak a pending-match emit past this point.
     if (monitor.stopped || this.shuttingDown) return;
 
-    let tailLines: string[] = [];
+    let tailLines: BashMonitorTailLine[] = [];
     if (monitor.wakeOnExit) {
       try {
         tailLines = await this.readSettlementTailLines(proc);
@@ -784,6 +874,22 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const includeMatched =
       pendingLines.length > 0 && proc.shownThroughOffset < monitor.matchedThroughOffset;
 
+    const retainedMatch = monitor.retainedMatches[monitor.retainedMatches.length - 1];
+    const retainedMatchedThroughOffset = includeMatched
+      ? monitor.matchedThroughOffset
+      : retainedMatch?.matchedThroughOffset;
+    monitor.settlementDisposition = {
+      status: terminal.status,
+      ...(terminal.exitCode !== undefined ? { exitCode: terminal.exitCode } : {}),
+      settledAt: new Date().toISOString(),
+      wakeOnExit: monitor.wakeOnExit,
+      terminalStatusShown: proc.terminalStatusShownToAgent,
+      ...(retainedMatchedThroughOffset != null
+        ? { matchedThroughOffset: retainedMatchedThroughOffset }
+        : {}),
+      tailLines,
+    };
+
     if (!monitor.wakeOnExit) {
       // wake_on_exit=false degrades to the legacy exit flush: matched lines only, no terminal
       // metadata, no synthetic/tail lines.
@@ -795,20 +901,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         });
       }
     } else {
-      // No task_await instruction here: the durable line outlives the process registration (a
-      // recovered wake after a Xum restart would direct the agent at a not_found task ID), so
-      // awaitability guidance lives only in the prompt builder, which renders it conditionally.
-      // Downgraded builds keep actionability from their generic match-record closing guidance.
-      const settleLine =
-        `${BASH_MONITOR_SETTLE_LINE_PREFIX} ${terminal.status}` +
-        `${terminal.exitCode !== undefined ? ` (code ${terminal.exitCode})` : ""}`;
-      // The tail travels separately from the event lines: a matched line inside the final tail
-      // window would otherwise render twice, and only the wake store can also see matches that
-      // were already flushed into a persisted pending record while the owner was busy. The store
-      // dedupes the tail against both before persisting one combined line list.
       this.emitMonitorUpdate(proc, monitor, {
-        lines: [...(includeMatched ? pendingLines : []), settleLine],
-        ...(tailLines.length > 0 ? { tailLines } : {}),
+        lines: includeMatched ? pendingLines : [],
+        ...(tailLines.length > 0 ? { tailLines: tailLines.map((entry) => entry.line) } : {}),
         droppedLines: includeMatched ? droppedLines : 0,
         ...(includeMatched ? { matchedThroughOffset: monitor.matchedThroughOffset } : {}),
         terminal,
@@ -826,38 +921,36 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * ~4 KB, sanitized and middle-truncated like matched lines. Read failure propagates to the
    * caller, which treats it as an empty tail.
    */
-  private async readSettlementTailLines(proc: BackgroundProcess): Promise<string[]> {
+  private async readSettlementTailLines(proc: BackgroundProcess): Promise<BashMonitorTailLine[]> {
     const fileSizeBytes = await proc.handle.getOutputFileSize();
     const windowStart = computeTailStartOffset(fileSizeBytes, MONITOR_SETTLEMENT_TAIL_BYTES);
-    // Exclude bytes the owner was already shown: an unfiltered read can consume the final lines
-    // while the process is still running, and repeating them after the settle marker as "new
-    // output" could retrigger work the agent already handled. The frontier always sits at the
-    // end of a complete line, so a frontier start begins exactly on a line boundary and its
-    // first segment is a real line (no fragment to drop).
     const offset = Math.max(windowStart, proc.shownThroughOffset);
     const startedAtLineBoundary = offset === proc.shownThroughOffset;
     const result = await proc.handle.readOutput(offset);
-    // Re-enforce the byte bound on the returned content: a degraded size query above (see
-    // boundTailContent) would otherwise let a large remote log flow into line processing whole.
     const bounded = boundTailContent(result.content, MONITOR_SETTLEMENT_TAIL_BYTES);
     const startedMidLine = (offset > 0 && !startedAtLineBoundary) || bounded.startedMidContent;
     const segments = bounded.content.split("\n");
-    // A mid-file (or mid-content, after the byte cut) start almost certainly begins inside a
-    // line; drop that partial fragment rather than presenting it as a complete output line.
-    const rawLines = startedMidLine ? segments.slice(1) : segments;
+    let cursor = result.newOffset - Buffer.byteLength(bounded.content, "utf8");
+    const positioned = segments.map((line, index) => {
+      cursor += Buffer.byteLength(line, "utf8");
+      if (index < segments.length - 1) cursor += 1;
+      return { line, endOffset: cursor };
+    });
+    const rawLines = startedMidLine ? positioned.slice(1) : positioned;
     const lines = rawLines
-      .map((line) => this.sanitizeMonitorLine(line))
-      .filter((line) => line.length > 0)
+      .map((entry) => ({ ...entry, line: this.sanitizeMonitorLine(entry.line) }))
+      .filter((entry) => entry.line.length > 0)
       .slice(-MONITOR_SETTLEMENT_TAIL_MAX_LINES)
-      .map((line) => this.truncateMonitorLine(line));
+      .map((entry) => ({ ...entry, line: this.truncateMonitorLine(entry.line) }));
     if (lines.length > 0 || !startedMidLine) return lines;
-    // The whole window sat inside one oversized line (no line boundary in the final ~4 KB —
-    // e.g. long JSON diagnostics or a single-line compiler failure): dropping the lone fragment
-    // would deliver an empty tail exactly when that line IS the decisive output. Keep the
-    // bounded suffix, explicitly marked as a mid-line cut.
     const fragment = this.sanitizeMonitorLine(segments[0] ?? "");
     if (fragment.length === 0) return [];
-    return [this.truncateMonitorLine(`${MONITOR_TRUNCATION_MARKER}${fragment}`)];
+    return [
+      {
+        line: this.truncateMonitorLine(`${MONITOR_TRUNCATION_MARKER}${fragment}`),
+        endOffset: result.newOffset,
+      },
+    ];
   }
 
   private scheduleMonitorFlush(
@@ -875,20 +968,6 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         this.emitMonitorMatch(proc, monitor);
       }
     }, monitor.cooldownMs);
-  }
-
-  private truncateUtf8Prefix(value: string, maxBytes: number): string {
-    assert(maxBytes > 0, "truncateUtf8Prefix requires a positive byte limit");
-    let bytes = 0;
-    let endIndex = 0;
-    for (const char of value) {
-      const charBytes = Buffer.byteLength(char, "utf8");
-      if (bytes + charBytes > maxBytes) break;
-      bytes += charBytes;
-      endIndex += char.length;
-    }
-
-    return value.slice(0, endIndex);
   }
 
   private truncateUtf8Suffix(value: string, maxBytes: number): string {
@@ -915,7 +994,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const remainingBytes = Math.max(1, maxBytes - markerBytes);
     const prefixBytes = Math.floor(remainingBytes / 2);
     const suffixBytes = remainingBytes - prefixBytes;
-    return `${this.truncateUtf8Prefix(value, prefixBytes)}${MONITOR_TRUNCATION_MARKER}${this.truncateUtf8Suffix(value, suffixBytes)}`;
+    return `${truncateUtf8Prefix(value, prefixBytes)}${MONITOR_TRUNCATION_MARKER}${this.truncateUtf8Suffix(value, suffixBytes)}`;
   }
 
   private sanitizeMonitorLine(line: string): string {
@@ -1763,24 +1842,135 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * `originNotAfterMs` binds the answer to the process instance that produced the wake. Process IDs
    * are reclaimed across restarts, so a newer instance must not suppress an older instance's wake.
    */
-  async getMonitorWakeDeliveryState(
+  pullMonitorWakeSignals(ownerWorkspaceId: string): readonly BashMonitorProcessSnapshot[] {
+    const snapshots: BashMonitorProcessSnapshot[] = [];
+    for (const proc of this.processes.values()) {
+      const monitor = proc.monitor;
+      if (proc.workspaceId !== ownerWorkspaceId || monitor == null) continue;
+      const match =
+        monitor.retainedMatches.length === 0
+          ? undefined
+          : {
+              batches: monitor.retainedMatches.map((batch) => ({
+                throughOffset: batch.matchedThroughOffset,
+                lines: [...batch.lines],
+                totalMatches: batch.totalMatches,
+                droppedLines: batch.droppedLines,
+              })),
+              throughOffset:
+                monitor.retainedMatches[monitor.retainedMatches.length - 1].matchedThroughOffset,
+              lines: monitor.retainedMatches.flatMap((batch) => batch.lines),
+              totalMatches:
+                monitor.retainedMatches[monitor.retainedMatches.length - 1].totalMatches,
+              droppedLines: monitor.retainedMatches.reduce(
+                (total, batch) => total + batch.droppedLines,
+                0
+              ),
+            };
+      snapshots.push({
+        processId: proc.id,
+        taskId: monitor.armMetadata.taskId,
+        ownerWorkspaceId: proc.workspaceId,
+        ...(proc.displayName !== undefined ? { displayName: proc.displayName } : {}),
+        filter: monitor.filter,
+        filterExclude: monitor.exclude,
+        script: boundBashMonitorRegistryScript(proc.script),
+        createdAt: monitor.armMetadata.createdAt,
+        ...(match != null
+          ? {
+              match: {
+                batches: match.batches,
+                throughOffset: match.throughOffset,
+                lines: [...match.lines],
+                totalMatches: match.totalMatches,
+                ...(match.droppedLines > 0 ? { droppedLines: match.droppedLines } : {}),
+              },
+            }
+          : {}),
+        ...(monitor.settlementDisposition != null
+          ? {
+              terminal: {
+                status: monitor.settlementDisposition.status,
+                ...(monitor.settlementDisposition.exitCode !== undefined
+                  ? { exitCode: monitor.settlementDisposition.exitCode }
+                  : {}),
+                settledAt: monitor.settlementDisposition.settledAt,
+                wakeOnExit: monitor.settlementDisposition.wakeOnExit,
+                terminalStatusShown: monitor.settlementDisposition.terminalStatusShown,
+                ...(monitor.settlementDisposition.matchedThroughOffset != null
+                  ? { matchedThroughOffset: monitor.settlementDisposition.matchedThroughOffset }
+                  : {}),
+                tailLines: monitor.settlementDisposition.tailLines.map((entry) => ({ ...entry })),
+              },
+            }
+          : {}),
+        retired: monitor.stopped,
+      });
+    }
+    return snapshots;
+  }
+
+  acknowledgeMonitorWake(
+    processId: string,
+    originNotAfterMs: number,
+    matchedThroughOffset?: number,
+    terminalSettledAt?: string
+  ): void {
+    if (matchedThroughOffset != null) {
+      this.dropMonitorMatchedLineBatchesThrough(processId, originNotAfterMs, matchedThroughOffset);
+    }
+    if (terminalSettledAt != null) {
+      const proc = this.processes.get(processId);
+      if (
+        proc != null &&
+        proc.startTime <= originNotAfterMs &&
+        proc.monitor?.settlementDisposition?.settledAt === terminalSettledAt
+      ) {
+        proc.monitor.settlementDisposition = undefined;
+      }
+    }
+  }
+
+  dropRetiredMonitor(processId: string, createdAt: string): void {
+    const proc = this.processes.get(processId);
+    if (proc?.monitor?.stopped && proc.monitor.armMetadata.createdAt === createdAt) {
+      proc.monitor = undefined;
+    }
+  }
+
+  dropMonitorMatchedLineBatchesThrough(
+    processId: string,
+    originNotAfterMs: number,
+    matchedThroughOffset: number
+  ): void {
+    const proc = this.processes.get(processId);
+    if (proc == null || !(proc.startTime <= originNotAfterMs)) return;
+    const monitor = proc.monitor;
+    if (monitor == null) return;
+    monitor.retainedMatches = monitor.retainedMatches.filter(
+      (batch) => batch.matchedThroughOffset > matchedThroughOffset
+    );
+  }
+
+  getMonitorWakeDeliveryState(
     processId: string,
     originNotAfterMs?: number
   ): Promise<MonitorWakeDeliveryState | undefined> {
-    const proc = await this.getProcess(processId);
-    if (!proc) return undefined;
-    // Negated <= instead of > so a NaN bound (malformed persisted marker) also lands here:
-    // treating it as a generation mismatch fails open (the wake delivers) instead of letting an
-    // unrelated instance's read state supersede a durable wake or mark it awaitable.
-    if (originNotAfterMs != null && !(proc.startTime <= originNotAfterMs)) return undefined;
-    if (proc.monitorWakeBlockingReadSettled) {
-      return { status: "blocked", readSettled: proc.monitorWakeBlockingReadSettled };
+    const proc = this.processes.get(processId);
+    if (proc == null || (originNotAfterMs != null && !(proc.startTime <= originNotAfterMs))) {
+      return Promise.resolve(undefined);
     }
-    return {
+    if (proc.monitorWakeBlockingReadSettled) {
+      return Promise.resolve({
+        status: "blocked",
+        readSettled: proc.monitorWakeBlockingReadSettled,
+      });
+    }
+    return Promise.resolve({
       status: "settled",
       shownThroughOffset: proc.shownThroughOffset,
       terminalStatusShown: proc.terminalStatusShownToAgent,
-    };
+    });
   }
 
   /**
