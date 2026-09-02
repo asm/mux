@@ -599,6 +599,26 @@ export async function clearProviderConfigFixableAbandonMarkers(
 export const CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE =
   "Workspace history is being cleared or reset. Please wait and try again.";
 
+/**
+ * Accepted-send payload for a turn whose rows are durable but that never
+ * reached a provider (a late consent refusal, a canceled startup): the visible
+ * stream error is the record, and the renderer must not attribute send
+ * telemetry to it — no request occurred.
+ */
+const ACCEPTED_WITHOUT_STREAM: SendMessageAccepted = { acceptedWithoutStream: true };
+
+/**
+ * Late consent gate of a routed project-skill turn. `requestCarriesProjectContent`
+ * is set by the provider-boundary caller when the assembled request carries
+ * project-scope content from EARLIER turns; `midStream` marks a per-step
+ * (prepareStep) invocation, whose refusal surfaces through the stream's own
+ * error path — the gate then leaves the visible error emission to it.
+ */
+type RoutedConsentRejection = (
+  requestCarriesProjectContent?: boolean,
+  midStream?: boolean
+) => Promise<SendMessageError | null>;
+
 // ROUTED_SKILL_TRUST_REVOKED_MESSAGE moved to utils/sendMessageError.ts so
 // StreamManager's per-step consent gate can share it without an import cycle.
 
@@ -999,6 +1019,12 @@ export class AgentSession {
      * from these options when present.
      */
     compactionBaseOptions?: SendMessageOptions;
+    /**
+     * The turn's late consent gate, so AgentSession-internal recreations of
+     * this stream (the post-compaction context_exceeded retry) keep verifying
+     * trust the way StreamManager's own fallback/retry recreations do.
+     */
+    routedConsentRejection?: RoutedConsentRejection;
   };
 
   private activeCompactionRequest?: {
@@ -1478,9 +1504,11 @@ export class AgentSession {
         // Consent refusals are non-retryable: the verdict cannot change
         // without user action (re-granting trust or sending a new turn), and
         // RetryManager treats "unknown" as retryable with no attempt limit —
-        // it would recheck the same revoked trust forever. Persist the
-        // abandon so startup recovery stays stopped too.
-        await this.persistStartupAutoRetryAbandon("pre_stream_rejected");
+        // it would recheck the same revoked trust forever. resumeStream's
+        // refusal already persisted the abandon marker WITH the refused
+        // turn's row key and stamped its rows (rejectResumedRoutedTurn);
+        // re-persisting here without the key would erase what the repair
+        // needs to finish a failed stamp after a restart.
         this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "pre_stream_rejected" });
         return;
       }
@@ -4388,6 +4416,12 @@ export class AgentSession {
           });
         }
       }
+      // On-send compaction already persisted its request row (carrying this
+      // prompt as the pending follow-up) while the user row itself was held
+      // back: refusing without rolling it back would leave a hidden compaction
+      // request that startup recovery resumes — dispatching a prompt whose
+      // send was reported failed. Still pre-acceptance, so the set is exact.
+      await rollbackPersistedTurnRows();
       return Err(trustError);
     }
 
@@ -4707,12 +4741,13 @@ export class AgentSession {
     // (recovery honors this abandon reason without rerunning the gates), and
     // the failure must be VISIBLE (these gates bypass streamWithHistory's
     // own error emission).
-    const routedConsentRejection = async (
+    const routedConsentRejection: RoutedConsentRejection = async (
       // Set by the provider-boundary caller when the assembled REQUEST
       // carries project-scope snapshot rows from EARLIER turns: an untrusted
       // workspace's history can hold a project snapshot even when the
       // current routed invocation is global with no project refs.
-      requestCarriesProjectContent?: boolean
+      requestCarriesProjectContent?: boolean,
+      midStream?: boolean
     ): Promise<SendMessageError | null> => {
       if (
         skillModelOverride?.kind !== "override" ||
@@ -4765,7 +4800,12 @@ export class AgentSession {
         });
       }
       await this.persistStartupAutoRetryAbandon("pre_stream_rejected", userMessage.id);
-      if (!this.disposed) {
+      // Pre-start refusals bypass every stream error path, so this emission is
+      // the only visible record. A per-step (mid-stream) refusal is thrown
+      // through StreamManager's standard failure pipeline, whose
+      // handleStreamError emits the row — emitting here too would leave two
+      // error rows for one refusal.
+      if (!this.disposed && midStream !== true) {
         this.emitChatEvent(createStreamErrorMessage(buildStreamErrorEventData(trustError)));
       }
       return trustError;
@@ -4819,7 +4859,7 @@ export class AgentSession {
           await notifyAcceptedPreStreamFailure(
             createUnknownSendMessageError("Accepted stream startup was canceled before it began.")
           );
-          return Ok(undefined);
+          return Ok(ACCEPTED_WITHOUT_STREAM);
         }
         // Background processes are workspace-scoped, not context-scoped. Compaction must preserve
         // processes, monitors, and queued wakes so a waiting agent is not stranded.
@@ -4831,7 +4871,7 @@ export class AgentSession {
           await notifyAcceptedPreStreamFailure(
             createUnknownSendMessageError("Accepted stream startup was canceled before streaming.")
           );
-          return Ok(undefined);
+          return Ok(ACCEPTED_WITHOUT_STREAM);
         }
 
         // Consent check before streamWithHistory's startup work: every await
@@ -4845,7 +4885,7 @@ export class AgentSession {
           const consentError = await routedConsentRejection();
           if (consentError) {
             await notifyAcceptedPreStreamFailure(consentError);
-            return Ok(undefined);
+            return Ok(ACCEPTED_WITHOUT_STREAM);
           }
         }
 
@@ -4871,7 +4911,7 @@ export class AgentSession {
           streamResult.error.raw === ROUTED_SKILL_TRUST_REVOKED_MESSAGE
         ) {
           await notifyAcceptedPreStreamFailure(streamResult.error);
-          return Ok(undefined);
+          return Ok(ACCEPTED_WITHOUT_STREAM);
         }
         if (streamResult.success && preparedTurnAbortController.signal.aborted) {
           await notifyAcceptedPreStreamFailure(
@@ -4975,7 +5015,7 @@ export class AgentSession {
       internal?.routedProjectConsent === true &&
       !(await this.isRoutedProjectSkillTurnStillTrusted())
     ) {
-      return Err(createUnknownSendMessageError(ROUTED_SKILL_TRUST_REVOKED_MESSAGE));
+      return Err(await this.rejectResumedRoutedTurn());
     }
     // The same verdict rides to the provider-dispatch boundary (pricing,
     // history reconstruction, request building, and stream startup below are
@@ -4983,11 +5023,12 @@ export class AgentSession {
     // OR on the request scan — the replayed request carries the original
     // turn's persisted snapshot rows, so history-carried and
     // materialization-discovered project content is covered even when the
-    // pre-crash seed missed it. No row stamping here: the retry failure
-    // accounting owns bookkeeping for resumed attempts.
+    // pre-crash seed missed it. A refusal stamps the replayed turn's rows
+    // (rejectResumedRoutedTurn): they belong to the ORIGINAL accepted send,
+    // and nothing downstream knows their keys.
     const isRoutedResume =
       internal?.routedProjectConsent === true || internal?.compactionBaseOptions != null;
-    const resumedConsentRejection = isRoutedResume
+    const resumedConsentRejection: RoutedConsentRejection | undefined = isRoutedResume
       ? async (requestCarriesProjectContent?: boolean): Promise<SendMessageError | null> => {
           if (internal?.routedProjectConsent !== true && requestCarriesProjectContent !== true) {
             return null;
@@ -4995,7 +5036,7 @@ export class AgentSession {
           if (await this.isRoutedProjectSkillTurnStillTrusted()) {
             return null;
           }
-          return createUnknownSendMessageError(ROUTED_SKILL_TRUST_REVOKED_MESSAGE);
+          return await this.rejectResumedRoutedTurn();
         }
       : undefined;
 
@@ -5861,14 +5902,12 @@ export class AgentSession {
     compactionBaseOptions?: SendMessageOptions,
     // Late consent gate for routed project-skill turns, threaded to the
     // provider-dispatch boundary inside AIService (invoked immediately
-    // before the stream manager starts the provider operation). Receives
-    // whether the assembled request carries historical project snapshots.
-    // Performs rejection bookkeeping and returns the error to surface;
-    // absent on retry/internal paths (resumeStream re-verifies consent
-    // itself via routedProjectConsent).
-    routedConsentRejection?: (
-      requestCarriesProjectContent?: boolean
-    ) => Promise<SendMessageError | null>
+    // before the stream manager starts the provider operation, and again
+    // per step). Receives whether the assembled request carries historical
+    // project content. Performs rejection bookkeeping and returns the error
+    // to surface; absent on unrouted internal paths (resumeStream supplies
+    // its own for resumed routed turns).
+    routedConsentRejection?: RoutedConsentRejection
   ): Promise<AgentSessionResult<void>> {
     const isStartupAbortRequested = (): boolean => abortSignal?.aborted === true;
 
@@ -5892,6 +5931,7 @@ export class AgentSession {
       ...(goalId != null ? { goalId } : {}),
       providersConfig,
       ...(compactionBaseOptions != null ? { compactionBaseOptions } : {}),
+      ...(routedConsentRejection != null ? { routedConsentRejection } : {}),
     };
     this.activeStreamUserMessageId = undefined;
 
@@ -6067,7 +6107,9 @@ export class AgentSession {
     // workspace's history can carry one even when the current routed
     // invocation is global. The gate performs the rejection bookkeeping; the
     // caller converts the Err into an accepted pre-stream failure.
-    let preDispatchConsentGate: (() => Promise<SendMessageError | null>) | undefined;
+    let preDispatchConsentGate:
+      | ((context?: { midStream?: boolean }) => Promise<SendMessageError | null>)
+      | undefined;
     if (routedConsentRejection) {
       let requestCarriesProjectContent = requestMessages.some(
         (msg) => msg.metadata?.agentSkillSnapshot?.scope === "project"
@@ -6100,7 +6142,8 @@ export class AgentSession {
       // Bound once: content kept under trust arms the gate so a revocation
       // BETWEEN this assembly and any step's provider call still rejects.
       const carriesForGate = requestCarriesProjectContent || attachmentsCarryProjectSkills;
-      preDispatchConsentGate = () => routedConsentRejection(carriesForGate);
+      preDispatchConsentGate = (context) =>
+        routedConsentRejection(carriesForGate, context?.midStream === true);
     }
 
     this.activeStreamHadPostCompactionInjection =
@@ -6514,8 +6557,11 @@ export class AgentSession {
         context.goalKind,
         context.goalId,
         undefined,
-        // A routed turn's retry keeps its routed compaction policy.
-        context.compactionBaseOptions
+        // A routed turn's retry keeps its routed compaction policy AND its
+        // consent gate: the rebuilt history still carries the project-skill
+        // snapshot, and trust may have been revoked since the failed attempt.
+        context.compactionBaseOptions,
+        context.routedConsentRejection
       );
     } finally {
       if (this.turnPhase === TurnPhase.PREPARING) {
@@ -7972,7 +8018,7 @@ export class AgentSession {
             this.sendQueuedMessages();
             return;
           }
-          if (this.turnPhase === TurnPhase.IDLE) {
+          if (this.turnPhase === TurnPhase.IDLE || result.data?.acceptedWithoutStream === true) {
             // Accepted pre-stream failure (e.g. a late consent rejection):
             // sendMessage resolved success but the turn is already back at
             // IDLE with no stream-start ever fired — no stream-end drain
@@ -9430,6 +9476,36 @@ export class AgentSession {
         error: getErrorMessage(error),
       });
     }
+  }
+
+  /**
+   * A resumed routed turn refused by the consent gate. Unlike a fresh send,
+   * the refused rows are the ORIGINAL accepted turn's (its user row plus the
+   * snapshot prefix the retry replays), and the resume path holds none of
+   * their keys — so recover the key the way startup recovery does (the
+   * newest retry-eligible user row), persist the abandon marker WITH it, and
+   * run the marker-gated repair, which stamps the whole turn and removes a
+   * surviving partial. A failed stamp still leaves startup recovery a key to
+   * retry with. Returns the visible error for the caller to surface.
+   */
+  private async rejectResumedRoutedTurn(): Promise<SendMessageError> {
+    const trustError = createUnknownSendMessageError(ROUTED_SKILL_TRUST_REVOKED_MESSAGE);
+    try {
+      const historyResult = await this.historyService.getLastMessages(this.workspaceId, 20);
+      const resumedUserMessage = historyResult.success
+        ? [...historyResult.data]
+            .reverse()
+            .find((message) => this.shouldUseUserMessageForRetry(message))
+        : undefined;
+      await this.persistStartupAutoRetryAbandon("pre_stream_rejected", resumedUserMessage?.id);
+      await this.repairUnstampedRejectedTurn();
+    } catch (error) {
+      log.warn("Failed to stamp a consent-refused resumed turn", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+    return trustError;
   }
 
   private async materializeAgentSkillSnapshots(

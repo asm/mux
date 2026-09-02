@@ -2261,7 +2261,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           // (recording here would double-count, and a later cancellation or
           // rejection would make the event wholly false).
           const queuedSkillSend = result.data?.queued === true && skillInvocation != null;
-          if (!queuedSkillSend) {
+          // Accepted but never dispatched (a late consent refusal, a canceled
+          // startup): the visible stream error is the record, and no provider
+          // request happened to attribute.
+          const acceptedWithoutStream = result.data?.acceptedWithoutStream === true;
+          if (!queuedSkillSend && !acceptedWithoutStream) {
             telemetry.messageSent(
               props.workspaceId,
               result.data?.routedModel ?? effectiveModel,

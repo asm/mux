@@ -19,6 +19,11 @@ export const SendMessageAcceptedSchema = z.object({
   // resolved yet, so the absence of routedModel means "unknown", not
   // "unrouted" — telemetry must not attribute the ambient model to it.
   queued: z.boolean().optional(),
+  // True when the turn was ACCEPTED (its rows are durable) but never reached
+  // a provider — a late consent refusal or a canceled startup surfaced as a
+  // visible stream error instead. No request occurred, so send telemetry must
+  // not attribute the ambient model to it.
+  acceptedWithoutStream: z.boolean().optional(),
 });
 
 /**

@@ -244,7 +244,7 @@ interface StreamRequestOptions {
    * Returns the error to surface (null = proceed); rejection bookkeeping
    * happens inside the callback.
    */
-  preDispatchConsentGate?: () => Promise<SendMessageError | null>;
+  preDispatchConsentGate?: (context?: { midStream?: boolean }) => Promise<SendMessageError | null>;
   model: LanguageModel;
   modelString: string;
   messages: ModelMessage[];
@@ -292,7 +292,7 @@ interface StreamRequestConfig {
   model: LanguageModel;
   messages: ModelMessage[];
   /** Per-step consent verdict for routed project-skill turns (see TurnExecutionOptions). */
-  preDispatchConsentGate?: () => Promise<SendMessageError | null>;
+  preDispatchConsentGate?: (context?: { midStream?: boolean }) => Promise<SendMessageError | null>;
   /** Provider-ready system instructions from TurnContextAssembler. */
   system?: string | SystemModelMessage;
   tools?: Record<string, Tool>;
@@ -2335,9 +2335,10 @@ export class StreamManager {
         // recreations included), so mid-turn revocation stops the next
         // request instead of riding the stream. The callback already
         // performed its rejection bookkeeping; throwing surfaces through
-        // the stream's standard error path.
+        // the stream's standard error path, which also emits the visible
+        // error row — hence midStream, so the callback does not emit its own.
         if (request.preDispatchConsentGate) {
-          const consentError = await request.preDispatchConsentGate();
+          const consentError = await request.preDispatchConsentGate({ midStream: true });
           if (consentError) {
             throw new Error(formatSendMessageError(consentError).message);
           }

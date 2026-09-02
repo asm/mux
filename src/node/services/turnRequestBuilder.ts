@@ -236,9 +236,11 @@ export interface StreamMessageOptions {
    * operation starts. Invoked by AIService immediately before
    * streamManager.startStream — request building is the final revocation
    * window. Performs its own rejection bookkeeping and returns the error to
-   * surface (null = proceed). Never sourced from IPC schemas.
+   * surface (null = proceed). Per-step re-verification passes
+   * `midStream: true` (the stream's error path then owns the visible
+   * emission). Never sourced from IPC schemas.
    */
-  preDispatchConsentGate?: () => Promise<SendMessageError | null>;
+  preDispatchConsentGate?: (context?: { midStream?: boolean }) => Promise<SendMessageError | null>;
   thinkingLevel?: ThinkingLevel;
   /** OpenAI pro reasoning mode; delivered via provider options (inert for unsupported models). */
   reasoningMode?: OpenAIReasoningMode;

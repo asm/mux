@@ -92,7 +92,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       })),
     } as unknown as Config;
 
-    const { session, cleanup, historyService } = await createAgentSessionHarness({
+    const { session, cleanup, historyService, events } = await createAgentSessionHarness({
       workspaceId,
       config,
       aiServiceOverrides: {
@@ -102,10 +102,45 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
           ? { getProvidersConfig: mock(() => args.providersConfig) }
           : {}),
       } as unknown as Partial<AIService>,
+      captureEvents: true,
     });
     historyCleanup = cleanup;
     sessions.push(session);
-    return { session, streamed, historyService };
+    return { session, streamed, historyService, events };
+  }
+
+  /** Force the next send onto the on-send compaction path (mirrors the autoCompaction fixtures). */
+  function forceOnSendCompaction(session: object): void {
+    (session as { compactionMonitor: unknown }).compactionMonitor = {
+      checkBeforeSend: mock(() => ({
+        shouldShowWarning: true,
+        shouldForceCompact: true,
+        usagePercentage: 99,
+        thresholdPercentage: 85,
+      })),
+      checkMidStream: mock(() => false),
+      resetForNewStream: mock(() => undefined),
+      setThreshold: mock(() => undefined),
+      getThreshold: mock(() => 0.85),
+    };
+  }
+
+  /** Revoke Project Trust the instant routing consent is granted (before the later rechecks). */
+  function revokeTrustAfterRouting(
+    session: object,
+    harnessArgs: Parameters<typeof createRoutingHarness>[0]
+  ): void {
+    const withResolve = session as {
+      resolveSkillModelClassOverride: (...resolveArgs: unknown[]) => Promise<unknown>;
+    };
+    const originalResolve = withResolve.resolveSkillModelClassOverride.bind(session);
+    spyOn(withResolve, "resolveSkillModelClassOverride").mockImplementation(
+      async (...resolveArgs: unknown[]) => {
+        const resolved = await originalResolve(...resolveArgs);
+        harnessArgs.projectTrusted = false;
+        return resolved;
+      }
+    );
   }
 
   function skillSendOptions(overrides?: Record<string, unknown>) {
@@ -336,7 +371,9 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
 
     const result = await session.sendMessage("Use skill done", skillSendOptions());
     expect(result.success).toBe(true);
-    expect(result.success && result.data).toBeUndefined();
+    // Accepted, but no provider request happened: the renderer must not
+    // attribute send telemetry to the ambient model for this turn.
+    expect(result.success && result.data).toEqual({ acceptedWithoutStream: true });
     expect(streamed).toHaveLength(0);
 
     // The turn's own row persisted exactly once — no rejected-copy duplicate.
@@ -735,6 +772,140 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     harnessArgs.projectTrusted = false;
     const rejection = await streamed[0].preDispatchConsentGate?.();
     expect(JSON.stringify(rejection)).toMatch(/trust was revoked/i);
+    session.dispose();
+  });
+
+  it("rolls back the on-send compaction request when the pre-snapshot consent recheck refuses", async () => {
+    // On-send compaction persists its request row (carrying the prompt as the
+    // pending follow-up) BEFORE the consent recheck runs. A refusal that left
+    // that row behind would let startup recovery resume the compaction and
+    // dispatch a prompt whose send was reported failed.
+    const workspacePath = await createWorkspaceWithSkill({
+      skillName: "done",
+      metadataYaml: "metadata:\n  model-class: small\n",
+    });
+    const harnessArgs: Parameters<typeof createRoutingHarness>[0] = {
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" } },
+    };
+    const { session, streamed, historyService } = await createRoutingHarness(harnessArgs);
+    forceOnSendCompaction(session);
+    revokeTrustAfterRouting(session, harnessArgs);
+
+    const result = await session.sendMessage("Use skill done", skillSendOptions());
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(JSON.stringify(result.error)).toMatch(/trust was revoked/i);
+    }
+    expect(streamed).toHaveLength(0);
+
+    const history = await historyService.getHistoryFromLatestBoundary("ws-skill-routing");
+    if (!history.success) throw new Error(history.error);
+    expect(
+      history.data.some((message) => message.metadata?.muxMetadata?.type === "compaction-request")
+    ).toBe(false);
+    expect(history.data).toHaveLength(0);
+    session.dispose();
+  });
+
+  it("stamps a resumed routed turn's rows when the resume is refused for revoked trust", async () => {
+    // A same-session retry or startup recovery replays the ORIGINAL accepted
+    // turn; the resume path holds none of its row keys. A refusal must still
+    // leave those rows provider-ineligible (and the abandon marker keyed) —
+    // otherwise the next accepted manual send clears the marker and ships
+    // the project content after all.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const { session, historyService } = await createRoutingHarness({
+      workspacePath,
+      projectTrusted: false,
+    });
+    const workspaceId = "ws-skill-routing";
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("snap-routed", "user", "Do the thing.", {
+        timestamp: 1,
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "routed" },
+      })
+    );
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u-routed", "user", "Use skill done", { timestamp: 2 })
+    );
+
+    const result = await session.resumeStream(
+      { model: USER_MODEL, agentId: "exec" },
+      { routedProjectConsent: true }
+    );
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(JSON.stringify(result.error)).toMatch(/trust was revoked/i);
+    }
+
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    expect(history.data.find((m) => m.id === "u-routed")?.metadata?.preStreamRejected).toBe(true);
+    expect(history.data.find((m) => m.id === "snap-routed")?.metadata?.preStreamRejected).toBe(
+      true
+    );
+    const abandon = (
+      session as unknown as {
+        startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
+      }
+    ).startupAutoRetryAbandon;
+    expect(abandon).toEqual({ reason: "pre_stream_rejected", userMessageId: "u-routed" });
+    session.dispose();
+  });
+
+  it("emits a refusal once: the gate for pre-start, the stream error path for per-step", async () => {
+    const workspacePath = await createWorkspaceWithSkill({
+      skillName: "done",
+      metadataYaml: "metadata:\n  model-class: small\n",
+    });
+    const harnessArgs: Parameters<typeof createRoutingHarness>[0] = {
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" } },
+    };
+    const { session, streamed, events } = await createRoutingHarness(harnessArgs);
+    const result = await session.sendMessage("Use skill done", skillSendOptions());
+    expect(result.success).toBe(true);
+    expect(streamed).toHaveLength(1);
+    const gate = streamed[0].preDispatchConsentGate;
+    if (gate == null) throw new Error("routed turn must carry the provider-boundary gate");
+
+    harnessArgs.projectTrusted = false;
+    const streamErrorCount = () => events.filter((event) => event.type === "stream-error").length;
+    const before = streamErrorCount();
+    // Per-step: StreamManager throws the refusal through its standard failure
+    // pipeline, which emits the visible row — a second one here would leave
+    // two error rows for one refusal.
+    expect(JSON.stringify(await gate({ midStream: true }))).toMatch(/trust was revoked/i);
+    expect(streamErrorCount()).toBe(before);
+    // Pre-start: nothing else surfaces the refusal.
+    expect(JSON.stringify(await gate())).toMatch(/trust was revoked/i);
+    expect(streamErrorCount()).toBe(before + 1);
+    session.dispose();
+  });
+
+  it("keeps the routed turn's consent gate on the active stream context for internal retries", async () => {
+    // The post-compaction context_exceeded retry rebuilds the stream inside
+    // AgentSession (outside StreamManager's gate-preserving recreations); it
+    // must find the gate here or the rebuilt history reaches the class
+    // provider unverified.
+    const workspacePath = await createWorkspaceWithSkill({
+      skillName: "done",
+      metadataYaml: "metadata:\n  model-class: small\n",
+    });
+    const { session } = await createRoutingHarness({
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" } },
+    });
+    const contextOf = () =>
+      (session as unknown as { activeStreamContext?: { routedConsentRejection?: unknown } })
+        .activeStreamContext;
+
+    expect((await session.sendMessage("Use skill done", skillSendOptions())).success).toBe(true);
+    expect(typeof contextOf()?.routedConsentRejection).toBe("function");
     session.dispose();
   });
 
