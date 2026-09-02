@@ -2986,24 +2986,39 @@ export class Config {
   setTelemetryOptOutMarker(disabled: boolean): void {
     this.quarantineMalformedTelemetryOptOutMarker();
     if (disabled) {
-      fs.writeFileSync(
+      // Never write THROUGH a link planted at the marker path between the
+      // quarantine check above and this open (where the platform has
+      // O_NOFOLLOW); the marker is always a plain file of our own.
+      const fd = fs.openSync(
         this.telemetryOptOutMarkerFile,
-        "Usage telemetry is disabled while this file exists (Settings → General).\n",
-        "utf-8"
+        fs.constants.O_WRONLY |
+          fs.constants.O_CREAT |
+          fs.constants.O_TRUNC |
+          ((fs.constants.O_NOFOLLOW as number | undefined) ?? 0)
       );
+      try {
+        fs.writeSync(
+          fd,
+          "Usage telemetry is disabled while this file exists (Settings → General).\n"
+        );
+      } finally {
+        fs.closeSync(fd);
+      }
     } else {
       fs.rmSync(this.telemetryOptOutMarkerFile, { force: true });
     }
   }
 
   /**
-   * Self-heal a marker path occupied by something other than a file (a
-   * directory left by corrupted state or a stray mkdir). writeFileSync and
-   * rmSync both fail on it (EISDIR), so every toggle would roll its field
-   * back while the entry keeps reading as an opt-out — the Settings control
-   * could never re-enable telemetry without manual filesystem repair. Rename
-   * it aside (never delete unknown content) so the marker write or removal
-   * can proceed.
+   * Self-heal a marker path occupied by anything but a regular file. A
+   * directory (corrupted state, a stray mkdir) makes writeFileSync and rmSync
+   * fail with EISDIR, so every toggle would roll its field back while the
+   * entry keeps reading as an opt-out — the Settings control could never
+   * re-enable telemetry without manual filesystem repair. A symlink is worse:
+   * the marker write would follow it and truncate whatever the link points
+   * at. Rename the entry aside (never delete unknown content; renaming a link
+   * moves the link, not its target) so the marker write or removal proceeds
+   * on a path we own.
    */
   private quarantineMalformedTelemetryOptOutMarker(): void {
     let stats: fs.Stats;
@@ -3015,7 +3030,7 @@ export class Config {
       }
       throw error;
     }
-    if (stats.isFile() || stats.isSymbolicLink()) {
+    if (stats.isFile()) {
       return;
     }
     const quarantinePath = `${this.telemetryOptOutMarkerFile}.malformed-${Date.now()}`;

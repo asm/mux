@@ -138,6 +138,37 @@ describe("Config telemetryEnabled persistence", () => {
     expect(config.isTelemetryDisabledByConfig()).toBe(true);
   });
 
+  it("quarantines a symlink-shaped marker instead of writing through it", async () => {
+    const config = new Config(tempDir);
+    const markerPath = path.join(tempDir, "telemetry_opt_out");
+    const victim = path.join(tempDir, "victim.txt");
+    await fs.writeFile(victim, "precious", "utf-8");
+    await fs.symlink(victim, markerPath);
+
+    // A link reads as an opt-out (fail closed) but is never a healthy marker:
+    // recreating the marker from an explicit false field must not follow it
+    // into the target.
+    expect(config.isTelemetryDisabledByConfig()).toBe(true);
+    await fs.writeFile(path.join(tempDir, "config.json"), `{ "telemetryEnabled": false }`, "utf-8");
+    await config.reconcileTelemetryOptOutMarker();
+    expect(await fs.readFile(victim, "utf-8")).toBe("precious");
+    expect((await fs.lstat(markerPath)).isSymbolicLink()).toBe(false);
+    expect((await fs.lstat(markerPath)).isFile()).toBe(true);
+    const quarantined = (await fs.readdir(tempDir)).filter((name) =>
+      name.startsWith("telemetry_opt_out.malformed-")
+    );
+    expect(quarantined).toHaveLength(1);
+    expect((await fs.lstat(path.join(tempDir, quarantined[0]))).isSymbolicLink()).toBe(true);
+
+    // Re-enabling over a planted link removes the link, never the target.
+    await fs.rm(markerPath);
+    await fs.symlink(victim, markerPath);
+    await config.setTelemetryEnabledPersisted(true);
+    expect(await fs.readFile(victim, "utf-8")).toBe("precious");
+    expect(fsSync.existsSync(markerPath)).toBe(false);
+    expect(config.isTelemetryDisabledByConfig()).toBe(false);
+  });
+
   it("a telemetry toggle does not deadlock against an in-flight unrelated edit", async () => {
     const config = new Config(tempDir);
     // An ordinary editConfig mid-save — holding its queue permit and its own
