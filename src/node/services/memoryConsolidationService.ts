@@ -68,6 +68,7 @@ import { parseAgentDefinitionMarkdown } from "@/node/services/agentDefinitions/p
 import { log } from "@/node/services/log";
 import type { HistoryService } from "@/node/services/historyService";
 import { runMemoryHarvest } from "@/node/services/memoryHarvest";
+import { filterPreStreamRejectedRows } from "@/common/types/message";
 import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
@@ -352,6 +353,17 @@ export class MemoryConsolidationService extends EventEmitter {
   ) {
     super();
     this.sidecarPath = path.join(config.rootDir, "memory-consolidation.json");
+  }
+
+  /**
+   * Session-local quarantine of rejected rows whose durable stamp failed:
+   * the harvest boundary must exclude them like request assembly does.
+   * Late-bound — WorkspaceService is constructed after core services.
+   */
+  private getQuarantinedRowIds?: (workspaceId: string) => ReadonlySet<string>;
+
+  setQuarantinedRowIdsLookup(lookup: (workspaceId: string) => ReadonlySet<string>): void {
+    this.getQuarantinedRowIds = lookup;
   }
 
   private enabled(): boolean {
@@ -1002,6 +1014,15 @@ export class MemoryConsolidationService extends EventEmitter {
         );
       }
 
+      // Rejected turns are transcript-only: the dream model (which may use
+      // an explicit alternate provider) must not harvest their prompt or
+      // repository snapshots — filter both stamped rows and the session's
+      // in-memory quarantine, exactly like provider request assembly.
+      const quarantinedRowIds = self.getQuarantinedRowIds?.(metadata.workspaceId);
+      const harvestMessages = filterPreStreamRejectedRows(epoch.data.messages).filter(
+        (msg) => !quarantinedRowIds?.has(msg.id)
+      );
+
       const harvest = yield* Effect.tryPromise({
         try: async () =>
           runMemoryHarvest({
@@ -1011,7 +1032,7 @@ export class MemoryConsolidationService extends EventEmitter {
             memoryService: self.memoryService,
             ctx,
             completionMetadata: metadata,
-            messages: epoch.data.messages,
+            messages: harvestMessages,
             summary: epoch.data.summary,
             // Timeout + removal (r60); see the runLockedEffect signal for rationale.
             abortSignal: AbortSignal.any([

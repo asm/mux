@@ -231,6 +231,14 @@ export interface StreamMessageOptions {
   messages: MuxMessage[];
   workspaceId: string;
   modelString: string;
+  /**
+   * Routed project-skill turns: last consent check before the provider
+   * operation starts. Invoked by AIService immediately before
+   * streamManager.startStream — request building is the final revocation
+   * window. Performs its own rejection bookkeeping and returns the error to
+   * surface (null = proceed). Never sourced from IPC schemas.
+   */
+  preDispatchConsentGate?: () => Promise<SendMessageError | null>;
   thinkingLevel?: ThinkingLevel;
   /** OpenAI pro reasoning mode; delivered via provider options (inert for unsupported models). */
   reasoningMode?: OpenAIReasoningMode;
@@ -423,7 +431,9 @@ interface WorkflowResultContinuationSender {
       requireIdle?: boolean;
       startStreamInBackground?: boolean;
     }
-  ): Promise<Result<void, SendMessageError>>;
+    // The continuation sender ignores the accepted-send payload; unknown keeps
+    // this structural type compatible with WorkspaceService.sendMessage.
+  ): Promise<Result<unknown, SendMessageError>>;
 }
 
 interface TurnRequestBuildStartupState {
@@ -2831,6 +2841,11 @@ export class TurnRequestBuilder {
     emitStartupBreadcrumb("starting_stream");
     const turnExecutionOptions: TurnExecutionOptions = {
       workspaceId,
+      // Threaded to the stream-start critical section (see
+      // TurnExecutionOptions.preDispatchConsentGate).
+      ...(opts.preDispatchConsentGate != null
+        ? { preDispatchConsentGate: opts.preDispatchConsentGate }
+        : {}),
       messages: streamFinalMessages,
       model: modelResult.data.model,
       modelString,

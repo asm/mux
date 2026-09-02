@@ -58,6 +58,7 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
   coerceStreamErrorTypeForMessage,
   createErrorEvent,
+  formatSendMessageError,
   stripNoisyErrorPrefix,
   type StreamErrorPayload,
 } from "@/node/services/utils/sendMessageError";
@@ -235,6 +236,15 @@ export function createTurnCompletionController(): TurnCompletionController {
 // Request-construction options shared by the primary turn and model-fallback
 // hops (fallbacks rebuild these from the prepared fallback request).
 interface StreamRequestOptions {
+  /**
+   * Routed project-skill turns: final consent verdict for EVERY provider
+   * request of this turn. Invoked in the stream-start critical section and
+   * again in prepareStep immediately before each step's provider call
+   * (fallback and retry recreations inherit it via the request config).
+   * Returns the error to surface (null = proceed); rejection bookkeeping
+   * happens inside the callback.
+   */
+  preDispatchConsentGate?: () => Promise<SendMessageError | null>;
   model: LanguageModel;
   modelString: string;
   messages: ModelMessage[];
@@ -281,6 +291,8 @@ interface StepMessageTracker {
 interface StreamRequestConfig {
   model: LanguageModel;
   messages: ModelMessage[];
+  /** Per-step consent verdict for routed project-skill turns (see TurnExecutionOptions). */
+  preDispatchConsentGate?: () => Promise<SendMessageError | null>;
   /** Provider-ready system instructions from TurnContextAssembler. */
   system?: string | SystemModelMessage;
   tools?: Record<string, Tool>;
@@ -2079,6 +2091,7 @@ export class StreamManager {
       forcedFirstStepToolNames,
       providersConfigSnapshot,
       rebuildFirstStepForThinkingLevel,
+      preDispatchConsentGate,
     } = input;
     // The request's pinned providers-config snapshot keeps type-derived output limits
     // aligned with the config that created the SDK model.
@@ -2107,6 +2120,7 @@ export class StreamManager {
       maxOutputTokens ?? configMaxOutputTokens ?? resolvedModelStats?.max_output_tokens;
 
     return {
+      preDispatchConsentGate,
       model,
       messages,
       system,
@@ -2313,6 +2327,19 @@ export class StreamManager {
             log.warn("First-step message rebuild for thinking override failed", {
               error: getErrorMessage(error),
             });
+          }
+        }
+        // Routed project-skill turns: per-attempt consent verdict at the
+        // provider-call boundary — prepareStep is the last awaited hook
+        // before EVERY step's provider request (fallback and retry
+        // recreations included), so mid-turn revocation stops the next
+        // request instead of riding the stream. The callback already
+        // performed its rejection bookkeeping; throwing surfaces through
+        // the stream's standard error path.
+        if (request.preDispatchConsentGate) {
+          const consentError = await request.preDispatchConsentGate();
+          if (consentError) {
+            throw new Error(formatSendMessageError(consentError).message);
           }
         }
         if (
@@ -3159,6 +3186,10 @@ export class StreamManager {
       headers: prepared.data.headers,
       onChunk: streamInfo.request.onChunk,
       onStepMessages: streamInfo.request.onStepMessages,
+      // The fallback attempt ships the same routed project-skill turn: the
+      // per-step consent gate must ride along or the fallback provider gets
+      // the content with no verdict.
+      preDispatchConsentGate: streamInfo.request.preDispatchConsentGate,
       // Same state object: aiService's fallback prepare() rebuilt it in place
       // against the fallback toolset, so prepareStep keeps reading live state.
       toolSearchState: streamInfo.request.toolSearchState,
@@ -4826,6 +4857,20 @@ export class StreamManager {
 
         if (streamAbortController.signal.aborted) {
           return settleStartupAbort();
+        }
+
+        // Routed project-skill turns: final consent verdict inside the
+        // critical section — the mutex wait, ensureStreamSafety, and
+        // temp-dir creation above were the last revocation windows. Nothing
+        // awaitable remains between this check and provider dispatch.
+        if (options.preDispatchConsentGate) {
+          const consentError = await options.preDispatchConsentGate();
+          if (consentError) {
+            return Err(consentError);
+          }
+          if (streamAbortController.signal.aborted) {
+            return settleStartupAbort();
+          }
         }
 
         // Step 4: Atomic stream creation and registration
