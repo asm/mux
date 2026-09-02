@@ -6242,6 +6242,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       const fakeSession = {
         isBusy: mock(() => false),
         emitMetadata: mock(() => undefined),
+        drainQueuedMessagesIfIdle: mock(() => undefined),
         sendMessage: mock(
           (_msg: string, _opts: unknown, internal?: { admissionStale?: () => boolean }) => {
             capturedProbe = internal?.admissionStale;
@@ -8354,6 +8355,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     queueMessage: ReturnType<typeof mock>;
     sendMessage: ReturnType<typeof mock>;
     resumeStream: ReturnType<typeof mock>;
+    drainQueuedMessagesIfIdle: ReturnType<typeof mock>;
   };
 
   beforeEach(async () => {
@@ -8428,6 +8430,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
       queueMessage: mock(() => "tool-end" as const),
       sendMessage: mock(() => Promise.resolve(Ok(undefined))),
       resumeStream: mock(() => Promise.resolve(Ok({ started: true }))),
+      drainQueuedMessagesIfIdle: mock(() => undefined),
     };
 
     (
@@ -8471,6 +8474,260 @@ describe("WorkspaceService sendMessage status clearing", () => {
       expect.objectContaining({ model: "custom:unpriced-model", agentId: "exec" }),
       expect.objectContaining({ synthetic: undefined })
     );
+  });
+
+  test("a send arriving during an earlier send's preflight queues instead of starting a second turn", async () => {
+    // The session only reports busy once AgentSession.sendMessage claims PREPARING. A
+    // later send admitted against the idle snapshot would start a competing stream that
+    // StreamManager resolves by aborting the earlier turn. Both sends sit in preflight
+    // awaits here, so arrival order (not who checks first) must decide who yields.
+    fakeSession.isBusy.mockReturnValue(false);
+    const firstSend = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => firstSend.promise);
+
+    const firstResult = workspaceService.sendMessage("test-workspace", "first", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+    const secondResult = workspaceService.sendMessage("test-workspace", "second", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+    expect((await secondResult).success).toBe(true);
+    expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
+    expect(fakeSession.queueMessage.mock.calls[0]?.[0]).toBe("second");
+    expect(fakeSession.sendMessage).toHaveBeenCalledTimes(1);
+    expect(fakeSession.sendMessage.mock.calls[0]?.[0]).toBe("first");
+
+    firstSend.resolve(Ok(undefined));
+    expect((await firstResult).success).toBe(true);
+  });
+
+  test("entries queued behind a preflight send drain only once that send settles without a turn", async () => {
+    // Nothing else will drain them: the failed send never claimed PREPARING, so no stream
+    // end fires. Draining while the earlier send is still in preflight would let the queued
+    // entry jump ahead of it.
+    fakeSession.isBusy.mockReturnValue(false);
+    (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      "test-workspace",
+      fakeSession as unknown as AgentSession
+    );
+    const firstSend = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => firstSend.promise);
+
+    const firstResult = workspaceService.sendMessage("test-workspace", "first", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+    await waitForCondition(() => fakeSession.sendMessage.mock.calls.length === 1);
+    await workspaceService.sendMessage("test-workspace", "second", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+    expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
+    expect(fakeSession.drainQueuedMessagesIfIdle).not.toHaveBeenCalled();
+
+    firstSend.resolve(Err({ type: "unknown", raw: "rejected before the turn was accepted" }));
+    expect((await firstResult).success).toBe(false);
+    expect(fakeSession.drainQueuedMessagesIfIdle).toHaveBeenCalledTimes(1);
+  });
+
+  test("the oldest preflight failing drains the entries queued behind it while a younger preflight is live", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6eaerl): waiting for every preflight to settle would let the
+    // younger send pass shouldQueue with no earlier ticket left and start ahead of the entry
+    // queued behind the failed one. Draining as soon as the head of the line settles makes
+    // the younger send observe the dispatched (busy) session instead.
+    fakeSession.isBusy.mockReturnValue(false);
+    (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      "test-workspace",
+      fakeSession as unknown as AgentSession
+    );
+    const persistSettings = (
+      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
+    ).maybePersistAISettingsFromOptions;
+    const firstSend = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => firstSend.promise);
+    const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
+
+    const firstResult = workspaceService.sendMessage("test-workspace", "first", sendOptions);
+    await waitForCondition(() => fakeSession.sendMessage.mock.calls.length === 1);
+    await workspaceService.sendMessage("test-workspace", "second", sendOptions);
+    expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
+
+    const thirdPreflight = createDeferred<void>();
+    persistSettings.mockImplementationOnce(() => thirdPreflight.promise);
+    const thirdResult = workspaceService.sendMessage("test-workspace", "third", sendOptions);
+    await waitForCondition(() => persistSettings.mock.calls.length === 3);
+    expect(fakeSession.drainQueuedMessagesIfIdle).not.toHaveBeenCalled();
+
+    firstSend.resolve(Err({ type: "unknown", raw: "rejected before the turn was accepted" }));
+    expect((await firstResult).success).toBe(false);
+    expect(fakeSession.drainQueuedMessagesIfIdle).toHaveBeenCalledTimes(1);
+
+    thirdPreflight.resolve();
+    expect((await thirdResult).success).toBe(true);
+  });
+
+  test("manual input is not queued behind a requireIdle send in preflight, which yields to it", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6eaerm): a heartbeat's ticket is older, but queueing the
+    // user's message behind it would let the heartbeat take the turn first. The maintenance
+    // send is supersedable: the manual send goes direct and the heartbeat's own
+    // preflight-count skip refuses it.
+    fakeSession.isBusy.mockReturnValue(false);
+    const persistSettings = (
+      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
+    ).maybePersistAISettingsFromOptions;
+    const heartbeatPreflight = createDeferred<void>();
+    persistSettings.mockImplementationOnce(() => heartbeatPreflight.promise);
+    const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
+
+    const heartbeatResult = workspaceService.sendMessage(
+      "test-workspace",
+      "check in",
+      sendOptions,
+      {
+        synthetic: true,
+        agentInitiated: true,
+        requireIdle: true,
+      }
+    );
+    await waitForCondition(() => persistSettings.mock.calls.length === 1);
+
+    const manualSend = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => manualSend.promise);
+    const manualResult = workspaceService.sendMessage("test-workspace", "manual", sendOptions);
+    await waitForCondition(() => fakeSession.sendMessage.mock.calls.length === 1);
+    expect(fakeSession.sendMessage.mock.calls[0]?.[0]).toBe("manual");
+    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+
+    heartbeatPreflight.resolve();
+    expect((await heartbeatResult).success).toBe(false);
+    // The heartbeat never reached the session; only the manual send did.
+    expect(fakeSession.sendMessage).toHaveBeenCalledTimes(1);
+
+    manualSend.resolve(Ok(undefined));
+    expect((await manualResult).success).toBe(true);
+  });
+
+  test("a failed send drains the entries queued behind it even when a supersedable preflight is older", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6ebIHT): the requireIdle send is physically oldest but nobody
+    // queues behind it, so it must not decide who drains. Otherwise the entry queued behind
+    // the failed manual send waits until the maintenance preflight settles.
+    fakeSession.isBusy.mockReturnValue(false);
+    (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      "test-workspace",
+      fakeSession as unknown as AgentSession
+    );
+    const persistSettings = (
+      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
+    ).maybePersistAISettingsFromOptions;
+    const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
+    const maintenancePreflight = createDeferred<void>();
+    persistSettings.mockImplementationOnce(() => maintenancePreflight.promise);
+    const maintenanceResult = workspaceService.sendMessage(
+      "test-workspace",
+      "check in",
+      sendOptions,
+      { synthetic: true, agentInitiated: true, requireIdle: true }
+    );
+    await waitForCondition(() => persistSettings.mock.calls.length === 1);
+
+    const firstManual = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => firstManual.promise);
+    const firstManualResult = workspaceService.sendMessage("test-workspace", "first", sendOptions);
+    await waitForCondition(() => fakeSession.sendMessage.mock.calls.length === 1);
+    await workspaceService.sendMessage("test-workspace", "second", sendOptions);
+    expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
+    expect(fakeSession.drainQueuedMessagesIfIdle).not.toHaveBeenCalled();
+
+    // Codex P1 (PRRT_kwDOPxxmWM6ebqSE): the maintenance send settling first (it yields to the
+    // manual send in preflight) must not drain either: "second" is queued behind "first",
+    // which is still live, and dispatching it now would start it ahead of "first".
+    maintenancePreflight.resolve();
+    expect((await maintenanceResult).success).toBe(false);
+    expect(fakeSession.drainQueuedMessagesIfIdle).not.toHaveBeenCalled();
+
+    firstManual.resolve(Err({ type: "unknown", raw: "rejected before the turn was accepted" }));
+    expect((await firstManualResult).success).toBe(false);
+    expect(fakeSession.drainQueuedMessagesIfIdle).toHaveBeenCalledTimes(1);
+  });
+
+  test("sends reach the queue in arrival order even when a later one finishes preflight first", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6ebqSR): with "first" in preflight, "third" can finish its
+    // pricing/settings awaits before "second"; enqueueing on completion order would make the
+    // user's third prompt dispatch before the second.
+    fakeSession.isBusy.mockReturnValue(false);
+    const persistSettings = (
+      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
+    ).maybePersistAISettingsFromOptions;
+    const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
+    const firstSend = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => firstSend.promise);
+    const firstResult = workspaceService.sendMessage("test-workspace", "first", sendOptions);
+    await waitForCondition(() => fakeSession.sendMessage.mock.calls.length === 1);
+
+    const secondPreflight = createDeferred<void>();
+    persistSettings.mockImplementationOnce(() => secondPreflight.promise);
+    const secondResult = workspaceService.sendMessage("test-workspace", "second", sendOptions);
+    await waitForCondition(() => persistSettings.mock.calls.length === 2);
+    const thirdResult = workspaceService.sendMessage("test-workspace", "third", sendOptions);
+    await waitForCondition(() => persistSettings.mock.calls.length === 3);
+    await drainPendingDispatches();
+    // "third" finished its awaits but must wait for "second" to decide.
+    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+
+    secondPreflight.resolve();
+    expect((await secondResult).success).toBe(true);
+    expect((await thirdResult).success).toBe(true);
+    expect((fakeSession.queueMessage.mock.calls as unknown[][]).map((call) => call[0])).toEqual([
+      "second",
+      "third",
+    ]);
+
+    firstSend.resolve(Ok(undefined));
+    expect((await firstResult).success).toBe(true);
+  });
+
+  test("a queue-mode heartbeat in preflight yields quietly to manual input instead of racing it", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6ebIHa): queue-mode heartbeats set yieldToQueuedMessages, not
+    // requireIdle. The manual send must not queue behind the heartbeat, and the heartbeat
+    // must not start once that input is in preflight; its next slot fires anyway.
+    fakeSession.isBusy.mockReturnValue(false);
+    const persistSettings = (
+      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
+    ).maybePersistAISettingsFromOptions;
+    const heartbeatPreflight = createDeferred<void>();
+    persistSettings.mockImplementationOnce(() => heartbeatPreflight.promise);
+    const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
+
+    const heartbeatResult = workspaceService.sendMessage(
+      "test-workspace",
+      "check in",
+      { ...sendOptions, queueDispatchMode: "turn-end" },
+      {
+        synthetic: true,
+        agentInitiated: true,
+        skipAutoResumeReset: true,
+        queueDedupeKey: "heartbeat",
+        yieldToQueuedMessages: true,
+      }
+    );
+    await waitForCondition(() => persistSettings.mock.calls.length === 1);
+
+    const manualSend = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => manualSend.promise);
+    const manualResult = workspaceService.sendMessage("test-workspace", "manual", sendOptions);
+    await waitForCondition(() => fakeSession.sendMessage.mock.calls.length === 1);
+    expect(fakeSession.sendMessage.mock.calls[0]?.[0]).toBe("manual");
+    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+
+    heartbeatPreflight.resolve();
+    // Superseded heartbeats report success so the scheduler does not record a failure.
+    expect((await heartbeatResult).success).toBe(true);
+    expect(fakeSession.sendMessage).toHaveBeenCalledTimes(1);
+
+    manualSend.resolve(Ok(undefined));
+    expect((await manualResult).success).toBe(true);
   });
 
   test("the follow-up idle probe excludes the originating send after its session handoff", async () => {
@@ -9164,6 +9421,9 @@ describe("WorkspaceService pending auto-title", () => {
   let workspacePath: string;
   let fakeSession: {
     isBusy: ReturnType<typeof mock>;
+    hasQueuedMessages: ReturnType<typeof mock>;
+    hasQueuedOrDispatchingEntry: ReturnType<typeof mock>;
+    dropQueuedMessageWithOnlyDedupeKey: ReturnType<typeof mock>;
     queueMessage: ReturnType<typeof mock>;
     sendMessage: ReturnType<typeof mock>;
     resumeStream: ReturnType<typeof mock>;
@@ -9246,6 +9506,9 @@ describe("WorkspaceService pending auto-title", () => {
 
     fakeSession = {
       isBusy: mock(() => false),
+      hasQueuedMessages: mock(() => false),
+      hasQueuedOrDispatchingEntry: mock(() => false),
+      dropQueuedMessageWithOnlyDedupeKey: mock(() => false),
       queueMessage: mock(() => "tool-end" as const),
       sendMessage: mock(() => Promise.resolve(Ok(undefined))),
       resumeStream: mock(() => Promise.resolve(Ok({ started: true }))),
