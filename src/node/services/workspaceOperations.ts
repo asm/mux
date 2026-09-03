@@ -250,6 +250,9 @@ export async function sendWorkspaceMessage(
             ? { routedThinkingLevel: result.data.routedThinkingLevel }
             : {}),
           ...(result.data?.queued === true ? { queued: true } : {}),
+          // Accepted (rows durable) but refused before any provider request:
+          // the renderer must not attribute send telemetry to it.
+          ...(result.data?.acceptedWithoutStream === true ? { acceptedWithoutStream: true } : {}),
         },
       }
     : { success: false as const, error: result.error };

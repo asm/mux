@@ -861,6 +861,15 @@ export class AgentSession {
   private autoRetryEnabledPreference: boolean | null = null;
   private legacyAutoRetryEnabledHint: boolean | null = null;
   private startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null = null;
+  /**
+   * Durable key of a rejected turn whose provider-ineligibility stamp is still
+   * outstanding (the stamp and/or its partial delete failed, so the rows are
+   * only quarantined in memory). Kept apart from the abandon marker — which
+   * every accepted send and stream-end legitimately clears — so a crash
+   * between the failure and the next successful repair still leaves startup
+   * recovery a key to restamp with. Cleared only by a verified repair.
+   */
+  private pendingRejectedTurnRepair: { userMessageId?: string } | null = null;
 
   /** Latest context-usage snapshot used for on-send compaction checks. */
   private lastUsageState?: AutoCompactionUsageState;
@@ -1603,12 +1612,16 @@ export class AgentSession {
       const parsed = JSON.parse(raw) as {
         enabled?: unknown;
         startupAutoRetryAbandon?: unknown;
+        pendingRejectedTurnRepair?: unknown;
       };
       const enabled = parsed.enabled !== false;
       this.autoRetryEnabledPreference = enabled;
       this.legacyAutoRetryEnabledHint = null;
       this.startupAutoRetryAbandon = this.parseStartupAutoRetryAbandon(
         parsed.startupAutoRetryAbandon
+      );
+      this.pendingRejectedTurnRepair = this.parsePendingRejectedTurnRepair(
+        parsed.pendingRejectedTurnRepair
       );
       this.retryManager.setEnabled(enabled);
       return enabled;
@@ -1625,6 +1638,7 @@ export class AgentSession {
       this.autoRetryEnabledPreference = defaultEnabled;
       this.legacyAutoRetryEnabledHint = null;
       this.startupAutoRetryAbandon = null;
+      this.pendingRejectedTurnRepair = null;
       this.retryManager.setEnabled(defaultEnabled);
 
       if (errno === "ENOENT" && defaultEnabled === false) {
@@ -1645,7 +1659,8 @@ export class AgentSession {
   private async persistAutoRetryState(): Promise<void> {
     const preferencePath = this.getAutoRetryPreferencePath();
     const enabled = this.autoRetryEnabledPreference !== false;
-    const hasStartupAbandonState = this.startupAutoRetryAbandon !== null;
+    const hasStartupAbandonState =
+      this.startupAutoRetryAbandon !== null || this.pendingRejectedTurnRepair !== null;
 
     if (enabled && !hasStartupAbandonState) {
       try {
@@ -1668,6 +1683,7 @@ export class AgentSession {
     const payload: {
       enabled?: false;
       startupAutoRetryAbandon?: { reason: string; userMessageId?: string };
+      pendingRejectedTurnRepair?: { userMessageId?: string };
     } = {};
 
     if (!enabled) {
@@ -1676,6 +1692,9 @@ export class AgentSession {
 
     if (this.startupAutoRetryAbandon) {
       payload.startupAutoRetryAbandon = this.startupAutoRetryAbandon;
+    }
+    if (this.pendingRejectedTurnRepair) {
+      payload.pendingRejectedTurnRepair = this.pendingRejectedTurnRepair;
     }
 
     try {
@@ -1711,6 +1730,27 @@ export class AgentSession {
     }
 
     this.startupAutoRetryAbandon = null;
+    await this.persistAutoRetryState();
+  }
+
+  private parsePendingRejectedTurnRepair(value: unknown): { userMessageId?: string } | null {
+    if (typeof value !== "object" || value === null) {
+      return null;
+    }
+    const userMessageId = (value as { userMessageId?: unknown }).userMessageId;
+    return typeof userMessageId === "string" && userMessageId.trim().length > 0
+      ? { userMessageId }
+      : {};
+  }
+
+  /** Persist (or retire) the durable repair record; best-effort like the abandon marker. */
+  private async setPendingRejectedTurnRepair(
+    record: { userMessageId?: string } | null
+  ): Promise<void> {
+    if (JSON.stringify(record) === JSON.stringify(this.pendingRejectedTurnRepair)) {
+      return;
+    }
+    this.pendingRejectedTurnRepair = record;
     await this.persistAutoRetryState();
   }
 
@@ -4421,7 +4461,16 @@ export class AgentSession {
       // back: refusing without rolling it back would leave a hidden compaction
       // request that startup recovery resumes — dispatching a prompt whose
       // send was reported failed. Still pre-acceptance, so the set is exact.
-      await rollbackPersistedTurnRows();
+      const rolledBack = await rollbackPersistedTurnRows();
+      if (!rolledBack && autoCompactionMessage !== null) {
+        // The row could not be verifiably removed: fail CLOSED. Compaction
+        // requests are user rows, so the provider-request filter and the
+        // startup replay check both honor the rejection stamp; a failed
+        // stamp falls back to the in-memory quarantine plus the durable
+        // repair record, and the abandon marker keyed to the row stops
+        // startup recovery from replaying the compaction at all.
+        await this.quarantineUnremovedRefusedRows([autoCompactionMessage.id]);
+      }
       return Err(trustError);
     }
 
@@ -4798,6 +4847,8 @@ export class AgentSession {
           workspaceId: this.workspaceId,
           error: stampResult.error,
         });
+        // The quarantine dies with the process; the repair record does not.
+        await this.setPendingRejectedTurnRepair({ userMessageId: userMessage.id });
       }
       await this.persistStartupAutoRetryAbandon("pre_stream_rejected", userMessage.id);
       // Pre-start refusals bypass every stream error path, so this emission is
@@ -6747,6 +6798,12 @@ export class AgentSession {
         const deleteResult = await this.historyService.deletePartial(this.workspaceId);
         if (!deleteResult.success && rejectedPartial?.id != null) {
           this.unstampedRejectedRowIds.add(rejectedPartial.id);
+          // Durable record for the repair the next request build (or
+          // startup) must finish; the in-memory quarantine alone dies with
+          // the process.
+          await this.setPendingRejectedTurnRepair({
+            ...(failedUserMessageId != null ? { userMessageId: failedUserMessageId } : {}),
+          });
         }
       } catch (error) {
         log.warn("Failed to remove in-flight assistant after consent rejection", {
@@ -8528,6 +8585,17 @@ export class AgentSession {
       throw new Error(`Failed to dispatch pending follow-up: ${message}`);
     }
 
+    if (sendResult.data?.acceptedWithoutStream === true) {
+      // Accepted (row durable, visible stream error emitted) but refused
+      // before any provider request: no stream will start, so no stream-end
+      // will ever follow — callers (TaskService's compaction-completion
+      // decision) must not treat this as a running continuation, and there
+      // is no dispatch to attribute. The durable row is the copy now; retire
+      // the summary's pending marker so no later pass redispatches it.
+      await this.clearPendingFollowUpFromSummary(lastMessage);
+      return false;
+    }
+
     // Codex P2 (PRRT_kwDOPxxmWM6cRJEE): if the original wrap-up dispatcher
     // crashed between send acceptance and its tryMarkBudgetLimitInjected
     // commit, this redispatched follow-up owns the wrap-up now — install the
@@ -9402,16 +9470,25 @@ export class AgentSession {
    * whole rejected turn goes provider-ineligible together. Runs regardless
    * of the auto-retry preference: the hazard is the next MANUAL send.
    *
-   * Marker-gated and idempotent. Runs at startup recovery, at manual-send
-   * acceptance (BEFORE the accepted send clears the marker) and at the top of
-   * every request build (BEFORE partials are committed), so a send racing
-   * the recovery cannot slip the unstamped rows past it.
+   * Gated on the abandon marker OR the durable repair record, and idempotent.
+   * Runs at startup recovery, at manual-send acceptance (BEFORE the accepted
+   * send clears the marker) and at the top of every request build (BEFORE
+   * partials are committed), so a send racing the recovery cannot slip the
+   * unstamped rows past it. Returns whether the repair is durably complete;
+   * anything short of that leaves (or records) the repair key on disk, since
+   * the in-memory quarantine protecting the current request dies with the
+   * process.
    */
-  private async repairUnstampedRejectedTurn(): Promise<void> {
+  private async repairUnstampedRejectedTurn(): Promise<boolean> {
     const abandon = this.startupAutoRetryAbandon;
-    if (abandon?.reason !== "pre_stream_rejected") {
-      return;
+    const pending = this.pendingRejectedTurnRepair;
+    const abandonRejected = abandon?.reason === "pre_stream_rejected";
+    if (!abandonRejected && pending === null) {
+      return true;
     }
+    const userMessageId =
+      (abandonRejected ? abandon.userMessageId : undefined) ?? pending?.userMessageId;
+    let durable = true;
     try {
       // The rejected turn's in-flight assistant may still sit in
       // partial.json: its delete can fail at rejection time, and the
@@ -9426,56 +9503,89 @@ export class AgentSession {
         const deletePartialResult = await this.historyService.deletePartial(this.workspaceId);
         if (!deletePartialResult.success) {
           this.unstampedRejectedRowIds.add(rejectedPartial.id);
+          durable = false;
         }
       }
-      if (abandon.userMessageId == null) {
-        return;
-      }
-      // Full active epoch, not a bounded tail: a turn's synthetic snapshot
-      // prefix (one row per distinct skill/MCP/@file ref) has no count limit,
-      // and a truncated read would stamp only the newest subset.
-      const historyResult = await this.historyService.getHistoryFromLatestBoundary(
-        this.workspaceId
-      );
-      if (!historyResult.success) {
-        return;
-      }
-      const rows = historyResult.data;
-      const userIdx = rows.findIndex((msg) => msg.id === abandon.userMessageId);
-      if (userIdx === -1 || rows[userIdx].metadata?.preStreamRejected === true) {
-        return;
-      }
-      const restampIds = [rows[userIdx].id];
-      // Snapshot rows persist immediately before their user row; walk the
-      // contiguous synthetic snapshot prefix.
-      for (let i = userIdx - 1; i >= 0; i--) {
-        const metadata = rows[i].metadata;
-        if (
-          metadata?.synthetic === true &&
-          (metadata.agentSkillSnapshot != null ||
-            metadata.mcpPromptSnapshot != null ||
-            metadata.fileAtMentionSnapshot != null)
-        ) {
-          restampIds.push(rows[i].id);
-          continue;
-        }
-        break;
-      }
-      const restamp = await this.historyService.markMessagesPreStreamRejected(
-        this.workspaceId,
-        restampIds
-      );
-      if (!restamp.success) {
-        for (const id of restampIds) {
-          this.unstampedRejectedRowIds.add(id);
+      if (userMessageId != null) {
+        // Full active epoch, not a bounded tail: a turn's synthetic snapshot
+        // prefix (one row per distinct skill/MCP/@file ref) has no count
+        // limit, and a truncated read would stamp only the newest subset.
+        const historyResult = await this.historyService.getHistoryFromLatestBoundary(
+          this.workspaceId
+        );
+        if (!historyResult.success) {
+          durable = false;
+        } else {
+          const rows = historyResult.data;
+          const userIdx = rows.findIndex((msg) => msg.id === userMessageId);
+          // A row that is gone (truncated by an edit) or already stamped needs
+          // nothing more.
+          if (userIdx !== -1 && rows[userIdx].metadata?.preStreamRejected !== true) {
+            const restampIds = [rows[userIdx].id];
+            // Snapshot rows persist immediately before their user row; walk
+            // the contiguous synthetic snapshot prefix.
+            for (let i = userIdx - 1; i >= 0; i--) {
+              const metadata = rows[i].metadata;
+              if (
+                metadata?.synthetic === true &&
+                (metadata.agentSkillSnapshot != null ||
+                  metadata.mcpPromptSnapshot != null ||
+                  metadata.fileAtMentionSnapshot != null)
+              ) {
+                restampIds.push(rows[i].id);
+                continue;
+              }
+              break;
+            }
+            const restamp = await this.historyService.markMessagesPreStreamRejected(
+              this.workspaceId,
+              restampIds
+            );
+            if (!restamp.success) {
+              for (const id of restampIds) {
+                this.unstampedRejectedRowIds.add(id);
+              }
+              durable = false;
+            }
+          }
         }
       }
     } catch (error) {
+      durable = false;
       log.warn("Failed to repair unstamped rejected turn", {
         workspaceId: this.workspaceId,
         error: getErrorMessage(error),
       });
     }
+    await this.setPendingRejectedTurnRepair(
+      durable ? null : { ...(userMessageId != null ? { userMessageId } : {}) }
+    );
+    return durable;
+  }
+
+  /**
+   * Refused-turn rows a rollback could not verifiably delete: stamp them
+   * provider-ineligible, fall back to the in-memory quarantine plus the
+   * durable repair record when even the stamp fails, and key the abandon
+   * marker to the first row so startup recovery abandons instead of replaying
+   * it.
+   */
+  private async quarantineUnremovedRefusedRows(rowIds: string[]): Promise<void> {
+    if (rowIds.length === 0) {
+      return;
+    }
+    const stamp = await this.historyService.markMessagesPreStreamRejected(this.workspaceId, rowIds);
+    if (!stamp.success) {
+      for (const id of rowIds) {
+        this.unstampedRejectedRowIds.add(id);
+      }
+      log.warn("Failed to stamp refused rows left behind by a rollback failure; quarantined", {
+        workspaceId: this.workspaceId,
+        error: stamp.error,
+      });
+      await this.setPendingRejectedTurnRepair({ userMessageId: rowIds[0] });
+    }
+    await this.persistStartupAutoRetryAbandon("pre_stream_rejected", rowIds[0]);
   }
 
   /**

@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { LoadedSkillSnapshot } from "@/common/types/attachment";
 import { createMuxMessage } from "@/common/types/message";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
 import type { ResolvedAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
@@ -805,6 +805,99 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       history.data.some((message) => message.metadata?.muxMetadata?.type === "compaction-request")
     ).toBe(false);
     expect(history.data).toHaveLength(0);
+    session.dispose();
+  });
+
+  it("fails closed when the refused compaction request cannot be rolled back", async () => {
+    // deleteMessages can fail with the row still on disk. The refusal must
+    // then stamp the surviving compaction request provider-ineligible and key
+    // the abandon marker to it, so neither request assembly nor startup
+    // replay can pick up the prompt it carries.
+    const workspacePath = await createWorkspaceWithSkill({
+      skillName: "done",
+      metadataYaml: "metadata:\n  model-class: small\n",
+    });
+    const harnessArgs: Parameters<typeof createRoutingHarness>[0] = {
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" } },
+    };
+    const { session, historyService } = await createRoutingHarness(harnessArgs);
+    forceOnSendCompaction(session);
+    revokeTrustAfterRouting(session, harnessArgs);
+    const deleteSpy = spyOn(historyService, "deleteMessages").mockResolvedValue(
+      Err("history locked")
+    );
+    try {
+      const result = await session.sendMessage("Use skill done", skillSendOptions());
+      expect(result.success).toBe(false);
+    } finally {
+      deleteSpy.mockRestore();
+    }
+
+    const history = await historyService.getHistoryFromLatestBoundary("ws-skill-routing");
+    if (!history.success) throw new Error(history.error);
+    const compactionRequest = history.data.find(
+      (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+    );
+    if (compactionRequest == null) throw new Error("expected the unremovable row to survive");
+    expect(compactionRequest.metadata?.preStreamRejected).toBe(true);
+    const abandon = (
+      session as unknown as {
+        startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
+      }
+    ).startupAutoRetryAbandon;
+    expect(abandon).toEqual({ reason: "pre_stream_rejected", userMessageId: compactionRequest.id });
+    session.dispose();
+  });
+
+  it("keeps a durable repair key when the acceptance-time restamp fails", async () => {
+    // The accepted send legitimately clears the abandon marker; if the repair
+    // it ran first could only quarantine the rows in memory, a durable key
+    // must survive for the next request build (or a post-crash startup) to
+    // finish the stamp.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const { session, streamed, historyService } = await createRoutingHarness({ workspacePath });
+    const workspaceId = "ws-skill-routing";
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u-rejected", "user", "refused prompt", { timestamp: 1 })
+    );
+    const internals = session as unknown as {
+      startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
+      pendingRejectedTurnRepair: { userMessageId?: string } | null;
+      repairUnstampedRejectedTurn: () => Promise<boolean>;
+    };
+    internals.startupAutoRetryAbandon = {
+      reason: "pre_stream_rejected",
+      userMessageId: "u-rejected",
+    };
+
+    const stampSpy = spyOn(historyService, "markMessagesPreStreamRejected").mockResolvedValue(
+      Err("disk full")
+    );
+    try {
+      const result = await session.sendMessage("next prompt", {
+        model: USER_MODEL,
+        agentId: "exec",
+      });
+      expect(result.success).toBe(true);
+    } finally {
+      stampSpy.mockRestore();
+    }
+    // The in-memory quarantine protected THIS request...
+    expect(streamed).toHaveLength(1);
+    expect(streamed[0].messages.map((message) => message.id)).not.toContain("u-rejected");
+    // ...the accepted send cleared the marker as it always does...
+    expect(internals.startupAutoRetryAbandon).toBeNull();
+    // ...but the repair key survived it.
+    expect(internals.pendingRejectedTurnRepair).toEqual({ userMessageId: "u-rejected" });
+
+    // The next repair pass completes the durable stamp and retires the record.
+    expect(await internals.repairUnstampedRejectedTurn()).toBe(true);
+    expect(internals.pendingRejectedTurnRepair).toBeNull();
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    expect(history.data.find((m) => m.id === "u-rejected")?.metadata?.preStreamRejected).toBe(true);
     session.dispose();
   });
 
