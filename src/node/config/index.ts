@@ -2986,14 +2986,18 @@ export class Config {
   setTelemetryOptOutMarker(disabled: boolean): void {
     this.quarantineMalformedTelemetryOptOutMarker();
     if (disabled) {
-      // Never write THROUGH a link planted at the marker path between the
-      // quarantine check above and this open (where the platform has
-      // O_NOFOLLOW); the marker is always a plain file of our own.
+      // Create a NEW inode and rename it over the marker path. Whatever sits
+      // there is replaced, never truncated in place: a hard link to another
+      // file (which lstat reports as a plain file and O_NOFOLLOW cannot
+      // catch) or a symlink planted after the quarantine check can therefore
+      // never lead the marker text into someone else's file. O_EXCL and
+      // O_NOFOLLOW (where the platform has it) guard the temp path itself.
+      const tempPath = `${this.telemetryOptOutMarkerFile}.tmp-${process.pid}-${Date.now()}`;
       const fd = fs.openSync(
-        this.telemetryOptOutMarkerFile,
+        tempPath,
         fs.constants.O_WRONLY |
           fs.constants.O_CREAT |
-          fs.constants.O_TRUNC |
+          fs.constants.O_EXCL |
           ((fs.constants.O_NOFOLLOW as number | undefined) ?? 0)
       );
       try {
@@ -3003,6 +3007,12 @@ export class Config {
         );
       } finally {
         fs.closeSync(fd);
+      }
+      try {
+        fs.renameSync(tempPath, this.telemetryOptOutMarkerFile);
+      } catch (error) {
+        fs.rmSync(tempPath, { force: true });
+        throw error;
       }
     } else {
       fs.rmSync(this.telemetryOptOutMarkerFile, { force: true });

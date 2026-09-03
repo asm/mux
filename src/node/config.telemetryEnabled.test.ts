@@ -169,6 +169,28 @@ describe("Config telemetryEnabled persistence", () => {
     expect(config.isTelemetryDisabledByConfig()).toBe(false);
   });
 
+  it("never truncates a hard-linked marker in place", async () => {
+    // lstat reports a hard link as a plain file and O_NOFOLLOW cannot see it:
+    // writing the marker through the shared inode would overwrite the other
+    // name's content. The marker must be a fresh inode renamed over the path.
+    const config = new Config(tempDir);
+    const markerPath = path.join(tempDir, "telemetry_opt_out");
+    const victim = path.join(tempDir, "victim.txt");
+    await fs.writeFile(victim, "precious", "utf-8");
+    await fs.link(victim, markerPath);
+
+    await fs.writeFile(path.join(tempDir, "config.json"), `{ "telemetryEnabled": false }`, "utf-8");
+    await config.reconcileTelemetryOptOutMarker();
+
+    expect(await fs.readFile(victim, "utf-8")).toBe("precious");
+    const [markerStat, victimStat] = await Promise.all([fs.stat(markerPath), fs.stat(victim)]);
+    expect(markerStat.ino).not.toBe(victimStat.ino);
+    expect(victimStat.nlink).toBe(1);
+    expect(config.isTelemetryDisabledByConfig()).toBe(true);
+    // No temp file left behind.
+    expect((await fs.readdir(tempDir)).filter((name) => name.includes(".tmp-"))).toHaveLength(0);
+  });
+
   it("a telemetry toggle does not deadlock against an in-flight unrelated edit", async () => {
     const config = new Config(tempDir);
     // An ordinary editConfig mid-save — holding its queue permit and its own
