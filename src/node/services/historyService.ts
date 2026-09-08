@@ -353,6 +353,121 @@ export class HistoryService {
       : path.join(this.config.sessionsDir, workspaceId);
   }
 
+  /** Inactive sidecar seam: Stop must remain publishable when transcript recovery fails. */
+  withCompactionStorageLock<T>(
+    workspaceId: string,
+    operation: (sessionDir: string, assertStillOwned: () => Promise<void>) => Promise<T>
+  ): Promise<T> {
+    return this.fileLocks.withLock(workspaceId, () =>
+      this.withHistoryWriteFileLock(workspaceId, async (assertStillOwned) => {
+        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
+          throw new Error(`workspace ${workspaceId} was removed; refusing compaction mutation`);
+        const sessionDir = this.getSessionDir(workspaceId);
+        await assertStillOwned();
+        await ensurePrivateDir(sessionDir);
+        const result = await operation(sessionDir, assertStillOwned);
+        // The receipt tracks visible bytes; success clears debt only after directory sync.
+        // Match append provenance's platform policy: Windows cannot sync directory handles.
+        if (process.platform !== "win32") {
+          const directory = await fs.open(sessionDir, "r");
+          try {
+            await directory.sync();
+          } finally {
+            await directory.close();
+          }
+        }
+        return result;
+      })
+    );
+  }
+
+  /** Caller holds both history locks and has already fenced obsolete journal publication. */
+  async neutralizeCompactionRecoveryUnderHistoryLock(
+    workspaceId: string,
+    isCurrent: () => boolean,
+    assertStillOwned: () => Promise<void>
+  ): Promise<boolean> {
+    if (!isCurrent()) return false;
+    return this.getAppendProvenance(workspaceId).runMutation(async () => {
+      if (!isCurrent()) return false;
+      invalidateHistoryAppendProvenance();
+      await this.recoverTruncateTransactionUnlocked(workspaceId, assertStillOwned);
+      const clearFollowUp = (row: MuxMessage): MuxMessage => {
+        const metadata = row.metadata?.muxMetadata;
+        if (!isCompactionSummaryMetadata(metadata) || metadata.pendingFollowUp === undefined)
+          return row;
+        const { pendingFollowUp: _followUp, ...rest } = metadata;
+        return { ...row, metadata: { ...row.metadata, muxMetadata: rest } };
+      };
+      // A partial summary can later be committed into history. Capture it under
+      // the same locks as partial writers and preserve its other recovery fields.
+      const partialPath = this.getPartialPath(workspaceId);
+      const partialBytes = await this.readExistingFileBytes(partialPath);
+      if (partialBytes !== null) {
+        const text = partialBytes.toString("utf8");
+        let partial: MuxMessage | null;
+        try {
+          partial = this.normalizeTranscriptMessage(JSON.parse(text));
+        } catch {
+          throw new Error("Cannot safely neutralize malformed partial summary");
+        }
+        if (
+          !isReadableHistoryMessage(partial) ||
+          !Buffer.from(text).equals(partialBytes) ||
+          (hasRawResetMarker(text) && hasAmbiguousResetKeys(text))
+        )
+          throw new Error("Cannot safely neutralize malformed partial summary");
+        const cleared = clearFollowUp(partial);
+        if (
+          cleared !== partial &&
+          !(await publishCompactionFile(
+            partialPath,
+            JSON.stringify(cleared),
+            isCurrent,
+            undefined,
+            assertStillOwned
+          ))
+        )
+          return false;
+      }
+      // Repair every recoverable epoch, including summaries restored by truncate
+      // recovery. Raw rewrite helpers retain malformed/ambiguous privacy floors.
+      for (const filePath of [
+        this.getChatArchivePath(workspaceId),
+        this.getChatHistoryPath(workspaceId),
+      ]) {
+        if (!isCurrent()) return false;
+        const { rows } = await this.readHistoryForRewrite(filePath);
+        for (const row of rows) {
+          if (row.message) continue;
+          let damaged: MuxMessage | null;
+          try {
+            damaged = this.normalizeTranscriptMessage(JSON.parse(row.raw.toString("utf8")));
+          } catch {
+            continue;
+          }
+          const metadata = damaged?.metadata?.muxMetadata;
+          // Legacy recovery reads more permissively than rewrite. Keep the
+          // cancellation fence if clearing that intent could erase a raw floor.
+          if (isCompactionSummaryMetadata(metadata) && metadata.pendingFollowUp !== undefined)
+            throw new Error("Cannot safely neutralize malformed compaction summary");
+        }
+        let changed = false;
+        const contents = this.serializeHistoryRewrite(rows, workspaceId, (row) => {
+          const cleared = clearFollowUp(row);
+          changed ||= cleared !== row;
+          return cleared;
+        });
+        if (
+          changed &&
+          !(await publishCompactionFile(filePath, contents, isCurrent, undefined, assertStillOwned))
+        )
+          return false;
+      }
+      return isCurrent();
+    }, assertStillOwned);
+  }
+
   async getSubagentTranscript(
     input: { taskId: string; requestingWorkspaceId?: string | null },
     dependencies: SubagentTranscriptDependencies
@@ -697,7 +812,10 @@ export class HistoryService {
     );
   }
 
-  private async recoverTruncateTransactionUnlocked(workspaceId: string): Promise<boolean> {
+  private async recoverTruncateTransactionUnlocked(
+    workspaceId: string,
+    assertStillOwned?: () => Promise<void>
+  ): Promise<boolean> {
     const archivePath = this.getChatArchivePath(workspaceId);
     const archiveTombstonePath = `${archivePath}.truncate`;
     const tombstoneExists = await fs.stat(archiveTombstonePath).then(
@@ -716,6 +834,7 @@ export class HistoryService {
         return false;
       }
       const archiveExists = (await this.readExistingFileBytes(archivePath)) !== null;
+      if (assertStillOwned) await assertStillOwned();
       if (archiveExists) {
         await fs.rm(archiveTombstonePath);
       } else {
@@ -726,6 +845,7 @@ export class HistoryService {
 
     const marker = this.parseTruncateTransaction(markerContents);
     if (!tombstoneExists) {
+      if (assertStillOwned) await assertStillOwned();
       await fs.rm(markerPath, { force: true });
       if (marker === null) {
         return false;
@@ -761,14 +881,19 @@ export class HistoryService {
           marker.rawHashes?.finalChatHash
         );
       if (committed) {
+        if (assertStillOwned) await assertStillOwned();
         await fs.rm(archiveTombstonePath);
+        if (assertStillOwned) await assertStillOwned();
         await fs.rm(markerPath, { force: true });
         return true;
       }
     }
 
+    if (assertStillOwned) await assertStillOwned();
     await fs.rm(archivePath, { force: true });
+    if (assertStillOwned) await assertStillOwned();
     await fs.rename(archiveTombstonePath, archivePath);
+    if (assertStillOwned) await assertStillOwned();
     await fs.rm(markerPath, { force: true });
     return false;
   }
@@ -2635,14 +2760,14 @@ export class HistoryService {
   /** Bare cross-process history file lock; see withCrossProcessWriteLock. */
   private async withHistoryWriteFileLock<T>(
     workspaceId: string,
-    operation: () => Promise<T>
+    operation: (assertStillOwned: () => Promise<void>) => Promise<T>
   ): Promise<T> {
     await using _lock = await acquireProcessFileLock({
       lockPath: historyWriteLockPath(this.config.rootDir, workspaceId),
       timeoutMs: HISTORY_WRITE_LOCK_TIMEOUT_MS,
       label: "history write lock",
     });
-    return await operation();
+    return await operation(() => _lock.assertStillOwned());
   }
 
   /**
