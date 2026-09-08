@@ -83,6 +83,16 @@ import {
   type AppTags,
 } from "@/node/services/di/tags";
 import { ServiceContainer, StartupStepTimeoutError } from "./serviceContainer";
+import type {
+  BackgroundProcessMonitorState,
+  MonitorArmedPayload,
+} from "./backgroundProcessManager";
+import type {
+  BashMonitorWakeDispatch,
+  BashMonitorWakeDispatchOutcome,
+  BashMonitorWakeReconciler,
+} from "./bashMonitorWakeReconciler";
+import type { BashMonitorRegistryStore } from "./bashMonitorRegistryStore";
 import type { TurnCoordinator } from "@/node/services/turnCoordinator";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 
@@ -174,6 +184,263 @@ describe("ServiceContainer", () => {
       services = undefined;
     }
     fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  async function createRestartMonitor() {
+    services = new ServiceContainer(stores);
+    const internal = services.workspaceService as unknown as {
+      bashMonitorRecoveryPromise: Promise<void>;
+      bashMonitorRegistryStore: BashMonitorRegistryStore;
+      bashMonitorWakeReconciler: BashMonitorWakeReconciler;
+      dispatchBashMonitorWake(
+        dispatch: BashMonitorWakeDispatch
+      ): Promise<BashMonitorWakeDispatchOutcome>;
+      drainBashMonitorPersistence(workspaceId: string): Promise<void>;
+      scheduleBashMonitorWakeReconcile(workspaceId: string): void;
+    };
+    await internal.bashMonitorRecoveryPromise;
+    spyOn(internal, "scheduleBashMonitorWakeReconcile").mockImplementation(() => undefined);
+    const armed: MonitorArmedPayload = {
+      workspaceId: "restart-owner",
+      processId: "restart-monitor",
+      taskId: "bash:restart-monitor",
+      createdAt: new Date().toISOString(),
+      filter: "READY",
+      filterExclude: false,
+      script: "watch",
+    };
+    const monitor: BackgroundProcessMonitorState = {
+      armMetadata: armed,
+      filter: armed.filter,
+      pattern: new RegExp(armed.filter),
+      exclude: armed.filterExclude,
+      cooldownMs: 1000,
+      wakeOnExit: true,
+      matchesCount: 0,
+      pendingLines: [],
+      droppedLines: 0,
+      totalDroppedLines: 0,
+      lastLines: [],
+      lastReadOffset: 0,
+      matchedThroughOffset: 0,
+      retainedMatches: [],
+      pollIntervalMs: 1000,
+      incompleteLineBuffer: "",
+      stopped: false,
+      probeFailures: {},
+      settled: false,
+    };
+    const process = {
+      id: armed.processId,
+      workspaceId: armed.workspaceId,
+      script: armed.script,
+      startTime: Date.parse(armed.createdAt),
+      shownThroughOffset: 0,
+      terminalStatusShownToAgent: false,
+      status: "running",
+      isForeground: false,
+      monitor,
+      handle: { getExitCode: () => Promise.resolve(null) },
+    };
+    const manager = services.backgroundProcessManager as unknown as {
+      processes: Map<string, typeof process>;
+      emitMonitorMatch(proc: typeof process, monitor: BackgroundProcessMonitorState): void;
+    };
+    manager.processes.set(process.id, process);
+    return {
+      container: services,
+      internal,
+      process,
+      armed,
+      processes: manager.processes,
+      flush: () => manager.emitMonitorMatch(process, monitor),
+    };
+  }
+
+  it("exempts only durably registered, armed background monitor generations from restart", async () => {
+    const { container, internal, process, armed, processes } = await createRestartMonitor();
+    const registry = internal.bashMonitorRegistryStore;
+    const blocked = [{ kind: "background-processes" as const, count: 1 }];
+    try {
+      await container.refreshRestartBlockers();
+      expect(container.collectRestartBlockers()).toEqual(blocked);
+
+      await registry.upsert({ ...armed, createdAt: "older-generation" });
+      await container.refreshRestartBlockers();
+      expect(container.collectRestartBlockers()).toEqual(blocked);
+
+      container.backgroundProcessManager.emit("monitor:armed", armed.workspaceId, armed);
+      await internal.drainBashMonitorPersistence(armed.workspaceId);
+      await container.refreshRestartBlockers();
+      expect(container.collectRestartBlockers()).toEqual([]);
+
+      process.isForeground = true;
+      expect(container.collectRestartBlockers()).toEqual(blocked);
+      process.isForeground = false;
+      process.monitor.stopped = true;
+      expect(container.collectRestartBlockers()).toEqual(blocked);
+      process.monitor.stopped = false;
+      process.monitor.armMetadata = { ...armed, createdAt: "newer-generation" };
+      expect(container.collectRestartBlockers()).toEqual(blocked);
+      process.monitor.armMetadata = armed;
+
+      await registry.recordLost(armed.workspaceId, armed.processId, armed.createdAt, {
+        reason: "runtime-failure",
+        failedAt: new Date().toISOString(),
+      });
+      await container.refreshRestartBlockers();
+      expect(container.collectRestartBlockers()).toEqual(blocked);
+      await registry.upsert(armed);
+      await registry.recordTerminal(armed.workspaceId, armed.processId, armed.createdAt, {
+        status: "exited",
+        settledAt: new Date().toISOString(),
+        wakeOnExit: true,
+        terminalStatusShown: false,
+      });
+      await container.refreshRestartBlockers();
+      expect(container.collectRestartBlockers()).toEqual(blocked);
+
+      await registry.upsert(armed);
+      await container.refreshRestartBlockers();
+      expect(container.collectRestartBlockers()).toEqual([]);
+      await registry.remove(armed.workspaceId, armed.processId, armed.createdAt);
+      await container.refreshRestartBlockers();
+      expect(container.collectRestartBlockers()).toEqual(blocked);
+    } finally {
+      processes.clear();
+    }
+  });
+
+  it("blocks restart for unflushed monitor matches until already-shown output is flushed", async () => {
+    const { container, internal, process, armed, processes, flush } = await createRestartMonitor();
+    try {
+      await internal.bashMonitorRegistryStore.upsert(armed);
+      await container.refreshRestartBlockers();
+      expect(container.collectRestartBlockers()).toEqual([]);
+
+      process.monitor.pendingLines.push("READY");
+      process.monitor.matchesCount = 1;
+      process.monitor.matchedThroughOffset = 6;
+      expect(container.collectRestartBlockers()).toEqual([
+        { kind: "background-processes", count: 1 },
+      ]);
+
+      process.shownThroughOffset = 6;
+      flush();
+      expect(container.collectRestartBlockers()).toEqual([]);
+    } finally {
+      processes.clear();
+    }
+  });
+
+  it.each(["deferred", "in-flight"] as const)(
+    "blocks restart for a %s monitor wake until acceptance",
+    async (outcome) => {
+      const { container, internal, process, armed, processes, flush } =
+        await createRestartMonitor();
+      const dispatches: BashMonitorWakeDispatch[] = [];
+      const dispatch = spyOn(internal, "dispatchBashMonitorWake").mockImplementation((wake) => {
+        dispatches.push(wake);
+        return Promise.resolve(outcome);
+      });
+      try {
+        await internal.bashMonitorRegistryStore.upsert(armed);
+        await container.refreshRestartBlockers();
+        expect(container.collectRestartBlockers()).toEqual([]);
+
+        process.monitor.pendingLines.push("READY");
+        process.monitor.matchesCount = 1;
+        process.monitor.matchedThroughOffset = 6;
+        flush();
+        expect(process.monitor.pendingLines).toEqual([]);
+        const blocked = [{ kind: "background-processes" as const, count: 1 }];
+        expect(container.collectRestartBlockers()).toEqual(blocked);
+
+        await internal.bashMonitorWakeReconciler.reconcile(armed.workspaceId);
+        expect(dispatches).toHaveLength(1);
+        expect(container.collectRestartBlockers()).toEqual(blocked);
+        await container.refreshRestartBlockers();
+        expect(container.collectRestartBlockers()).toEqual(blocked);
+
+        await dispatches[0].onAccepted();
+        await internal.bashMonitorWakeReconciler.reconcile(armed.workspaceId);
+        expect(container.collectRestartBlockers()).toEqual([]);
+        expect(dispatches).toHaveLength(1);
+      } finally {
+        dispatch.mockRestore();
+        processes.clear();
+      }
+    }
+  );
+
+  it("keeps failed and stalled monitor arm writes blocking without waiting for them", async () => {
+    const { container, internal, armed, processes } = await createRestartMonitor();
+    const registry = internal.bashMonitorRegistryStore;
+    const upsert = spyOn(registry, "upsert");
+    let releaseWrite: (() => void) | undefined;
+    try {
+      upsert.mockRejectedValueOnce(new Error("registry write failed"));
+      container.backgroundProcessManager.emit("monitor:armed", armed.workspaceId, armed);
+      await internal.drainBashMonitorPersistence(armed.workspaceId);
+      await container.refreshRestartBlockers();
+      expect(container.collectRestartBlockers()).toEqual([
+        { kind: "background-processes", count: 1 },
+      ]);
+
+      const writeGate = new Promise<void>((resolve) => {
+        releaseWrite = resolve;
+      });
+      upsert.mockImplementationOnce(() => writeGate);
+      container.backgroundProcessManager.emit("monitor:armed", armed.workspaceId, armed);
+      await container.refreshRestartBlockers();
+      expect(container.collectRestartBlockers()).toEqual([
+        { kind: "background-processes", count: 1 },
+      ]);
+    } finally {
+      releaseWrite?.();
+      await internal.drainBashMonitorPersistence(armed.workspaceId);
+      upsert.mockRestore();
+      processes.clear();
+    }
+  });
+
+  it("fails closed on failed or stalled registry reads without applying late exemptions", async () => {
+    const { container, internal, armed, processes } = await createRestartMonitor();
+    const registry = internal.bashMonitorRegistryStore;
+    const listAll = spyOn(registry, "listAll");
+    let releaseRead: (() => void) | undefined;
+    try {
+      await registry.upsert(armed);
+      await container.refreshRestartBlockers();
+      expect(container.collectRestartBlockers()).toEqual([]);
+      const records = await registry.listAll(armed.workspaceId);
+      listAll.mockRejectedValueOnce(new Error("registry read failed"));
+      await container.refreshRestartBlockers();
+      expect(container.collectRestartBlockers()).toEqual([
+        { kind: "background-processes", count: 1 },
+      ]);
+
+      const readGate = new Promise<void>((resolve) => {
+        releaseRead = resolve;
+      });
+      listAll.mockImplementationOnce(async () => {
+        await readGate;
+        return records;
+      });
+      await container.refreshRestartBlockers();
+      expect(container.collectRestartBlockers()).toEqual([
+        { kind: "background-processes", count: 1 },
+      ]);
+      releaseRead?.();
+      await readGate;
+      expect(container.collectRestartBlockers()).toEqual([
+        { kind: "background-processes", count: 1 },
+      ]);
+    } finally {
+      releaseRead?.();
+      listAll.mockRestore();
+      processes.clear();
+    }
   });
 
   it("collects restart blockers from live sessions, including pre-stream work", () => {

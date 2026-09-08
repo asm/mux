@@ -2381,10 +2381,22 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     };
   }
 
-  getRunningProcessCount(): number {
+  getRestartBlockingProcessCount(durableMonitorGenerations?: ReadonlyMap<string, string>): number {
     let count = 0;
     for (const process of this.processes.values()) {
-      if (process.status === "running") count++;
+      if (process.status !== "running") continue;
+      if (
+        !process.isForeground &&
+        process.monitor != null &&
+        !process.monitor.stopped &&
+        // Registry recovery cannot restore match lines awaiting flush or wake acceptance.
+        process.monitor.pendingLines.length === 0 &&
+        process.monitor.retainedMatches.length === 0 &&
+        durableMonitorGenerations?.get(process.id) === process.monitor.armMetadata.createdAt
+      ) {
+        continue;
+      }
+      count++;
     }
     return count;
   }
