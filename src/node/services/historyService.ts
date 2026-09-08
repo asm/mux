@@ -97,6 +97,13 @@ interface HistoryTruncateTransaction extends HistoryTruncateHashes {
   rawHashes?: HistoryTruncateHashes & { version: 1 };
 }
 
+interface HistoryPublicationObserver {
+  assertStillOwned: () => Promise<void>;
+  isCurrent: () => boolean;
+  // Returning undefined excludes async callbacks: receipt capture must not yield after rename.
+  onCommitted: () => undefined;
+}
+
 interface HistoryRewriteRow {
   raw: Buffer;
   message: MuxMessage | undefined;
@@ -2797,14 +2804,14 @@ export class HistoryService {
    */
   private async withCrossProcessWriteLock<T>(
     workspaceId: string,
-    operation: () => Promise<T>
+    operation: (assertStillOwned: () => Promise<void>) => Promise<T>
   ): Promise<T> {
     const sessionDir = this.getSessionDir(workspaceId);
     // Lock BEFORE any directory creation (r63): the lockfile lives outside
     // the session dir, and removal holds this same lock while it tombstones
     // and deletes — so a mutation serializes with removal instead of racing
     // its own ensurePrivateDir against the deletion.
-    return this.withHistoryWriteFileLock(workspaceId, async () => {
+    return this.withHistoryWriteFileLock(workspaceId, async (assertStillOwned) => {
       // Removal gate (r63), checked IN-LOCK: a foreign backend's in-flight
       // stream survives the remover's process-local cancellation entirely; its
       // late append would otherwise recreate the deleted session directory via
@@ -2821,12 +2828,13 @@ export class HistoryService {
       // crashed transaction from another backend's live rewrite — rolling
       // back a live transaction mid-flight resurrects discarded history with
       // mismatched archive/chat state.
+      // Receipt finalization must also leave a successor's provenance untouched after reclamation.
       return this.getAppendProvenance(workspaceId).runMutation(async () => {
         if (await this.truncateRecoveryArtifactsPresent(workspaceId))
           invalidateHistoryAppendProvenance();
         await this.recoverTruncateTransactionUnlocked(workspaceId);
-        return operation();
-      });
+        return operation(assertStillOwned);
+      }, assertStillOwned);
     });
   }
 
@@ -2874,15 +2882,15 @@ export class HistoryService {
   private async withRecoveredHistoryWriteResultLock<T>(
     workspaceId: string,
     errorPrefix: string,
-    operation: () => Promise<Result<T>>
+    operation: (assertStillOwned: () => Promise<void>) => Promise<Result<T>>
   ): Promise<Result<T>> {
     // Not composed from withRecoveredHistoryLock: recovery for write paths
     // runs INSIDE withCrossProcessWriteLock (r64); the read-side conditional
     // recovery would redundantly acquire and release the same file lock.
     try {
       return await this.fileLocks.withLock(workspaceId, () =>
-        this.withCrossProcessWriteLock(workspaceId, async () => {
-          const result = await operation();
+        this.withCrossProcessWriteLock(workspaceId, async (assertStillOwned) => {
+          const result = await operation(assertStillOwned);
           if (!result.success) invalidateHistoryAppendProvenance();
           return result;
         })
@@ -2923,51 +2931,58 @@ export class HistoryService {
    */
   async appendManyToHistory(workspaceId: string, messages: MuxMessage[]): Promise<Result<void>> {
     assert(messages.length > 0, "appendManyToHistory requires at least one message");
-    return this.withRecoveredHistoryWriteResultLock(
-      workspaceId,
-      "Failed to append history",
-      async () => {
-        try {
-          await this.refreshSequenceCounterUnderWriteLock(workspaceId);
-          const workspaceDir = this.getSessionDir(workspaceId);
-          await ensurePrivateDir(workspaceDir);
-          for (const message of messages) {
-            assert(
-              message.metadata?.historySequence === undefined,
-              "appendManyToHistory messages must not carry pre-assigned historySequence values"
-            );
-            const nextSeqNum = await this.getNextHistorySequence(workspaceId);
-            assert(
-              isNonNegativeInteger(nextSeqNum),
-              "getNextHistorySequence must return a non-negative integer"
-            );
-            message.metadata = { ...message.metadata, historySequence: nextSeqNum };
-            this.sequenceCounters.set(workspaceId, nextSeqNum + 1);
-          }
-          // Atomic all-or-nothing commit (r48): fs.appendFile is not
-          // transactional — an ENOSPC or crash mid-write could persist the
-          // payload line without the trigger line, and the caller registers
-          // rollback IDs only after this returns, so the torn prefix would
-          // survive as an undelivered assistant row in future provider
-          // requests. Rewrite the whole file through the same
-          // temp-and-rename helper the other history mutations use, under the
-          // cross-process append lock (r50) so a foreign backend's row cannot
-          // land between this read and the replace and be silently deleted.
-          await this.fenceContextResetUnderHistoryLock(workspaceId, messages);
-          await this.getAppendProvenance(workspaceId).appendChat(
-            Buffer.from(this.serializeHistoryEntries(messages, workspaceId)),
-            true
-          );
-          // Publish the entire batch before sealing its previous epoch. Rotation
-          // is best-effort: a storage failure must not invite a duplicate batch.
-          const boundary = messages.findLast(isDurableContextBoundaryMarker);
-          if (boundary) await this.rotateAfterBoundaryWriteUnlocked(workspaceId, boundary);
-          return Ok(undefined);
-        } catch (error) {
-          return Err(`Failed to append to history: ${getErrorMessage(error)}`);
-        }
-      }
+    return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to append history", () =>
+      this.appendManyToHistoryUnderWriteLock(workspaceId, messages)
     );
+  }
+
+  // Replacement acceptance can reuse allocation and provenance under the already-held locks.
+  private async appendManyToHistoryUnderWriteLock(
+    workspaceId: string,
+    messages: MuxMessage[],
+    publication?: HistoryPublicationObserver
+  ): Promise<Result<void>> {
+    try {
+      await this.refreshSequenceCounterUnderWriteLock(workspaceId);
+      const workspaceDir = this.getSessionDir(workspaceId);
+      await ensurePrivateDir(workspaceDir);
+      for (const message of messages) {
+        assert(
+          message.metadata?.historySequence === undefined,
+          "appendManyToHistory messages must not carry pre-assigned historySequence values"
+        );
+        const nextSeqNum = await this.getNextHistorySequence(workspaceId);
+        assert(
+          isNonNegativeInteger(nextSeqNum),
+          "getNextHistorySequence must return a non-negative integer"
+        );
+        message.metadata = { ...message.metadata, historySequence: nextSeqNum };
+        this.sequenceCounters.set(workspaceId, nextSeqNum + 1);
+      }
+      // Atomic all-or-nothing commit (r48): fs.appendFile is not
+      // transactional — an ENOSPC or crash mid-write could persist the
+      // payload line without the trigger line, and the caller registers
+      // rollback IDs only after this returns, so the torn prefix would
+      // survive as an undelivered assistant row in future provider
+      // requests. Rewrite the whole file through the same
+      // temp-and-rename helper the other history mutations use, under the
+      // cross-process append lock (r50) so a foreign backend's row cannot
+      // land between this read and the replace and be silently deleted.
+      await this.fenceContextResetUnderHistoryLock(workspaceId, messages);
+      await this.getAppendProvenance(workspaceId).appendChat(
+        Buffer.from(this.serializeHistoryEntries(messages, workspaceId)),
+        true,
+        publication &&
+          ((filePath, bytes) => this.publishHistoryUnderWriteLock(filePath, bytes, publication))
+      );
+      // Publish the entire batch before sealing its previous epoch. Rotation
+      // is best-effort: a storage failure must not invite a duplicate batch.
+      const boundary = messages.findLast(isDurableContextBoundaryMarker);
+      if (boundary) await this.rotateAfterBoundaryWriteUnlocked(workspaceId, boundary);
+      return Ok(undefined);
+    } catch (error) {
+      return Err(`Failed to append to history: ${getErrorMessage(error)}`);
+    }
   }
 
   /**
@@ -3180,9 +3195,43 @@ export class HistoryService {
     );
   }
 
+  /** Caller holds both history locks. Ordinary writes retain their existing publication behavior. */
+  private async publishHistoryUnderWriteLock(
+    historyPath: string,
+    bytes: Buffer,
+    publication?: HistoryPublicationObserver
+  ): Promise<void> {
+    if (!publication) return writeFileAtomic(historyPath, bytes);
+
+    const stagedPath = `${historyPath}.publication-${randomUUID()}`;
+    let committed = false;
+    try {
+      await writeFileAtomic(stagedPath, bytes, { mode: 0o600 });
+      // Staging can outlive a filesystem lease even while the logical owner is current.
+      await publication.assertStillOwned();
+      // Replacement acceptance must capture its receipt in the same synchronous
+      // turn as ownership validation and rename, before any observer can yield.
+      if (!publication.isCurrent()) throw new Error("History publication no longer owned");
+      renameSync(stagedPath, historyPath);
+      committed = true;
+      try {
+        publication.onCommitted();
+      } catch (error) {
+        log.warn("History published but commit observer failed", { error });
+      }
+    } finally {
+      await fs.rm(stagedPath, { force: true }).catch((error: unknown) => {
+        // A durable write must not invite retry because staging cleanup failed.
+        if (!committed) throw error;
+        log.warn("History published but staging cleanup failed", { error });
+      });
+    }
+  }
+
   private async updateHistoryUnderWriteLock(
     workspaceId: string,
-    message: MuxMessage
+    message: MuxMessage,
+    publication?: HistoryPublicationObserver
   ): Promise<Result<void>> {
     invalidateHistoryAppendProvenance();
     try {
@@ -3247,7 +3296,7 @@ export class HistoryService {
       );
 
       // Atomic write prevents corruption if app crashes mid-write
-      await writeFileAtomic(historyPath, historyEntries);
+      await this.publishHistoryUnderWriteLock(historyPath, historyEntries, publication);
 
       // Compaction updates the streamed summary row in-place with boundary
       // metadata — seal the previous epoch once that lands. Check the persisted
