@@ -3,10 +3,14 @@ import {
   HISTORY_PROVENANCE_MAX_RECEIPT_BYTES,
   invalidateHistoryAppendProvenance,
 } from "./historyAppendProvenance";
-import { SESSION_HISTORY_MAX_SCAN_BYTES } from "@/common/constants/contextBudget";
+import {
+  SESSION_HISTORY_MAX_SCAN_BYTES,
+  SESSION_HISTORY_MAX_LINE_BYTES,
+} from "@/common/constants/contextBudget";
 import {
   hasRawResetMarker,
   hasAmbiguousResetKeys,
+  hasUnreadableHistoryResetEvidence,
   isReadableHistoryMessage,
   scanHistoryFilesBounded,
   readProviderHistoryFromLatestBoundary,
@@ -15,6 +19,7 @@ import {
   type BoundedHistoryScanOptions,
 } from "./historyScanner";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
+import { isManualHistoryReset } from "@/common/utils/messages/contextWindows";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import * as path from "path";
 import { createHash, randomUUID } from "node:crypto";
@@ -95,6 +100,7 @@ interface HistoryTruncateTransaction extends HistoryTruncateHashes {
 interface HistoryRewriteRow {
   raw: Buffer;
   message: MuxMessage | undefined;
+  protectedMessage?: MuxMessage;
 }
 
 function splitHistoryLines(raw: Buffer): Buffer[] {
@@ -131,6 +137,41 @@ function tailCutChangesProviderContext(removedMessages: MuxMessage[]): boolean {
       preserveReasoningOnly: true,
     })
   );
+}
+
+function deletionCreatesRawReset(
+  rows: readonly HistoryRewriteRow[],
+  deletedIds: ReadonlySet<string>,
+  activeRemoved: ReadonlySet<MuxMessage>
+): boolean {
+  let originalRun: Buffer[] = [];
+  let joinedRun: Buffer[] = [];
+  let existingReset = false;
+  let removedActive = false;
+  const createdReset = () =>
+    removedActive &&
+    !existingReset &&
+    !hasUnreadableHistoryResetEvidence(originalRun) &&
+    hasUnreadableHistoryResetEvidence(joinedRun);
+  // Readable rows break the raw reset probe, even when provider-ineligible.
+  // Removing such a separator can seal captured context without removing it.
+  for (const row of rows) {
+    if (!row.message) {
+      originalRun.push(row.raw);
+      joinedRun.push(row.raw);
+    } else if (deletedIds.has(row.message.id)) {
+      existingReset ||= hasUnreadableHistoryResetEvidence(originalRun);
+      originalRun = [];
+      removedActive ||= activeRemoved.has(row.message);
+    } else {
+      if (createdReset()) return true;
+      originalRun = [];
+      joinedRun = [];
+      existingReset = false;
+      removedActive = false;
+    }
+  }
+  return createdReset();
 }
 
 function stripContextUsage(message: MuxMessage): MuxMessage {
@@ -2621,18 +2662,37 @@ export class HistoryService {
   }> {
     const raw = (await this.readExistingFileBytes(filePath)) ?? Buffer.alloc(0);
     const rows = splitHistoryLines(raw).map((line) => {
-      const text = line.toString("utf8");
+      // Match the provider scanner's row budget without the JSONL delimiter.
+      const content = line.at(-1) === 10 ? line.subarray(0, -1) : line;
+      const text = content.toString("utf8");
+      const parsed = this.parseMessages(text, filePath, (value) =>
+        isReadableHistoryMessage(value) ? normalizeLegacyMuxMetadata(value) : null
+      )[0];
+      const protectedReset =
+        parsed !== undefined &&
+        ((hasRawResetMarker(text) && hasAmbiguousResetKeys(text)) ||
+          // Oversized rows use the provider scanner's token probe, even when
+          // intervening bytes prevent a contiguous raw reset marker match.
+          (content.length > SESSION_HISTORY_MAX_LINE_BYTES &&
+            hasUnreadableHistoryResetEvidence([line])));
       return {
         raw: line,
-        message: this.parseMessages(text, filePath, (value) =>
-          isReadableHistoryMessage(value) &&
-          !(hasRawResetMarker(text) && hasAmbiguousResetKeys(text))
-            ? normalizeLegacyMuxMetadata(value)
-            : null
-        )[0],
+        message: protectedReset ? undefined : parsed,
+        // Keep identity and sequence accounting even when the raw floor cannot be rewritten.
+        protectedMessage: protectedReset ? parsed : undefined,
       };
     });
     return { rows, messages: rows.flatMap((row) => (row.message ? [row.message] : [])) };
+  }
+
+  private getProtectedRewriteMaxSequence(rows: readonly HistoryRewriteRow[]): number {
+    // These parsed rows survive every partial rewrite as raw bytes, even beyond a cut.
+    // Their sequences remain occupied regardless of whether they are transformable.
+    return (
+      this.getNewestHistorySequence(
+        rows.flatMap((row) => (row.protectedMessage ? [row.protectedMessage] : []))
+      ) ?? -1
+    );
   }
 
   private serializeHistoryRewrite(
@@ -3381,10 +3441,11 @@ export class HistoryService {
           }
 
           const filteredMessages = messages.filter((message) => !ids.has(message.id));
-          await writeFileAtomic(
-            this.getChatHistoryPath(workspaceId),
-            this.serializeHistoryRewrite(rows, workspaceId, (row) => (ids.has(row.id) ? null : row))
+          const historyEntries = this.serializeHistoryRewrite(rows, workspaceId, (row) =>
+            ids.has(row.id) ? null : row
           );
+          await this.fenceDeletedMessagesUnderHistoryLock(workspaceId, rows, ids);
+          await writeFileAtomic(this.getChatHistoryPath(workspaceId), historyEntries);
 
           const maxSeq = filteredMessages.reduce((max, message) => {
             const sequence = message.metadata?.historySequence;
@@ -3401,7 +3462,7 @@ export class HistoryService {
               return max;
             }
             return sequence > max ? sequence : max;
-          }, -1);
+          }, this.getProtectedRewriteMaxSequence(rows));
           const archiveMaxSeq = await this.getArchiveTailMaxSequence(workspaceId);
           const nextSeq = Math.max(maxSeq, archiveMaxSeq) + 1;
           assert(
@@ -3433,6 +3494,41 @@ export class HistoryService {
     );
   }
 
+  private async fenceDeletedMessagesUnderHistoryLock(
+    workspaceId: string,
+    rows: HistoryRewriteRow[],
+    deletedIds: ReadonlySet<string>,
+    newerMessageCount = 0
+  ): Promise<void> {
+    // Cleanup must retire foreign compactors only when the actual removed
+    // occurrences affect today's provider view, including an empty boundary.
+    // Use the raw-aware suffix so retained unreadable resets still seal old rows.
+    const providerMessages = await readProviderHistoryFromLatestBoundary(
+      {
+        chat: this.getChatHistoryPath(workspaceId),
+        archive: this.getChatArchivePath(workspaceId),
+      },
+      0,
+      { includeReadableResetFloor: true }
+    );
+    // Archive fallback excludes all newer chat rows. Matching IDs across files
+    // would conflate retained duplicates with occurrences this write removes.
+    const activeCount = Math.max(0, providerMessages.length - newerMessageCount);
+    const messages = rows.flatMap((row) => (row.message ? [row.message] : []));
+    const removed = messages
+      .slice(Math.max(0, messages.length - activeCount))
+      .filter((message) => deletedIds.has(message.id));
+    if (
+      tailCutChangesProviderContext(removed) ||
+      removed.some((message) => isManualHistoryReset(message)) ||
+      deletionCreatesRawReset(rows, deletedIds, new Set(removed))
+    ) {
+      // Call only after serialization admits the rewrite, immediately before
+      // its write. A later disk failure must not restore the old generation.
+      await this.getContinuousCompactionJournal(workspaceId).advanceGenerationUnderHistoryLock();
+    }
+  }
+
   private async deleteMessageUnderWriteLock(
     workspaceId: string,
     messageId: string
@@ -3446,6 +3542,9 @@ export class HistoryService {
       const filteredMessages = messages.filter((msg) => msg.id !== messageId);
 
       if (filteredMessages.length === messages.length) {
+        if (rows.some((row) => row.protectedMessage?.id === messageId)) {
+          return Err(`Message with ID ${messageId} is protected reset evidence in active history`);
+        }
         // Not in the active epoch — the row may live in the sealed archive
         // (rare: cleanup paths almost always target recent rows).
         const { rows: archiveRows, messages: archiveMessages } = await this.readHistoryForRewrite(
@@ -3458,12 +3557,16 @@ export class HistoryService {
 
         // Archived rows are strictly older than active rows, so deleting one
         // can never affect the sequence counter.
-        await writeFileAtomic(
-          this.getChatArchivePath(workspaceId),
-          this.serializeHistoryRewrite(archiveRows, workspaceId, (row) =>
-            row.id === messageId ? null : row
-          )
+        const archiveEntries = this.serializeHistoryRewrite(archiveRows, workspaceId, (row) =>
+          row.id === messageId ? null : row
         );
+        await this.fenceDeletedMessagesUnderHistoryLock(
+          workspaceId,
+          archiveRows,
+          new Set([messageId]),
+          messages.length
+        );
+        await writeFileAtomic(this.getChatArchivePath(workspaceId), archiveEntries);
         return Ok(undefined);
       }
 
@@ -3472,6 +3575,7 @@ export class HistoryService {
         row.id === messageId ? null : row
       );
 
+      await this.fenceDeletedMessagesUnderHistoryLock(workspaceId, rows, new Set([messageId]));
       // Atomic write prevents corruption if app crashes mid-write
       await writeFileAtomic(historyPath, historyEntries);
 
@@ -3496,7 +3600,7 @@ export class HistoryService {
         }
 
         return seq > max ? seq : max;
-      }, -1);
+      }, this.getProtectedRewriteMaxSequence(rows));
       // Sealed archive rows keep their sequences across active-file deletes.
       // Without this floor, deleting the last sequenced active row in a fresh
       // process would cache a counter below archived rows and reuse their
@@ -3549,6 +3653,12 @@ export class HistoryService {
           const keepTargetMessage = options?.keepTargetMessage === true;
 
           if (messageIndex === -1) {
+            // A protected active target must not redirect an edit/fork to an older duplicate.
+            if (rows.some((row) => row.protectedMessage?.id === messageId)) {
+              return Err(
+                `Message with ID ${messageId} is protected reset evidence in active history`
+              );
+            }
             // Editing/forking from a pre-boundary message: the target lives in the
             // sealed archive. Everything after the cut (the archive tail AND the
             // entire active epoch) is discarded, so collapse the remainder back
@@ -3609,7 +3719,7 @@ export class HistoryService {
             }
 
             return seq > max ? seq : max;
-          }, -1);
+          }, this.getProtectedRewriteMaxSequence(rows));
           // Sealed archive rows keep their sequences across an active-epoch
           // truncation. When the truncation empties the active file, floor the
           // counter with the archive max so new appends can never reuse archived
@@ -3682,6 +3792,10 @@ export class HistoryService {
 
       // Update sequence counter to continue from where we truncated.
       // Self-healing read path: skip malformed persisted historySequence values.
+      const protectedMaxSeq = this.getProtectedRewriteMaxSequence([
+        ...archiveRows,
+        ...activeEpochRows,
+      ]);
       const maxTruncatedSeq = truncatedMessages.reduce((max, msg) => {
         const seq = msg.metadata?.historySequence;
         if (seq === undefined) {
@@ -3701,7 +3815,7 @@ export class HistoryService {
         }
 
         return seq > max ? seq : max;
-      }, -1);
+      }, protectedMaxSeq);
       const nextSeq = maxTruncatedSeq + 1;
       assert(
         isNonNegativeInteger(nextSeq),
@@ -3931,6 +4045,10 @@ export class HistoryService {
 
           // Update sequence counter to continue from where we are.
           // Self-healing read path: skip malformed persisted historySequence values.
+          const protectedMaxSeq = this.getProtectedRewriteMaxSequence([
+            ...archiveRows,
+            ...chatRows,
+          ]);
           const maxRemainingSeq = remainingMessages.reduce((max, msg) => {
             const seq = msg.metadata?.historySequence;
             if (seq === undefined) {
@@ -3950,7 +4068,7 @@ export class HistoryService {
             }
 
             return seq > max ? seq : max;
-          }, -1);
+          }, protectedMaxSeq);
           const nextSeq = maxRemainingSeq + 1;
           assert(
             isNonNegativeInteger(nextSeq),
@@ -4018,12 +4136,15 @@ export class HistoryService {
           const { rows, messages } = await this.readHistoryForRewrite(
             this.getChatHistoryPath(newWorkspaceId)
           );
+          const oldCounter = Math.max(
+            this.sequenceCounters.get(oldWorkspaceId) ?? 0,
+            this.getProtectedRewriteMaxSequence([...archiveRows, ...rows]) + 1
+          );
           if (messages.length === 0) {
             // No active messages to migrate, just transfer the sequence counter.
             // Floor it with the archive max: an archive-only session (active file
             // deleted/truncated) renamed in a fresh process has no cached counter,
             // and seeding 0 would reuse archived historySequence values.
-            const oldCounter = this.sequenceCounters.get(oldWorkspaceId) ?? 0;
             const archiveFloor = (await this.getArchiveTailMaxSequence(newWorkspaceId)) + 1;
             this.sequenceCounters.set(newWorkspaceId, Math.max(oldCounter, archiveFloor));
             this.sequenceCounters.delete(oldWorkspaceId);
@@ -4038,7 +4159,6 @@ export class HistoryService {
           await writeFileAtomic(newHistoryPath, historyEntries);
 
           // Transfer sequence counter to new workspace ID
-          const oldCounter = this.sequenceCounters.get(oldWorkspaceId) ?? 0;
           this.sequenceCounters.set(newWorkspaceId, oldCounter);
           this.sequenceCounters.delete(oldWorkspaceId);
 
