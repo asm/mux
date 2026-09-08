@@ -51,7 +51,6 @@ import { safeStringifyForCounting } from "@/common/utils/tokens/safeStringifyFor
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import {
-  findLatestContextBoundaryIndex,
   getContextBoundaryKind,
   hasProviderEligibleMessages,
   isDurableCompactedMarker,
@@ -122,16 +121,15 @@ function hasDurableCompactionBoundary(metadata: MuxMetadata | undefined): boolea
   return isPositiveInteger(metadata.compactionEpoch);
 }
 
-function prefixCutChangesActiveContext(messages: MuxMessage[], removeCount: number): boolean {
-  const boundaryIndex = findLatestContextBoundaryIndex(messages);
-  const activeStart =
-    boundaryIndex < 0
-      ? 0
-      : getContextBoundaryKind(messages[boundaryIndex]) === CONTEXT_BOUNDARY_KINDS.RESET
-        ? boundaryIndex + 1
-        : boundaryIndex;
-  return hasProviderEligibleMessages(
-    filterWorkflowDisplayOnlyMessages(messages.slice(activeStart, removeCount))
+function tailCutChangesProviderContext(removedMessages: MuxMessage[]): boolean {
+  // Even an empty boundary can hide older context. Removing it changes the
+  // provider view; unreadable reset evidence is preserved outside this parsed tail.
+  return (
+    removedMessages.some(isDurableContextBoundaryMarker) ||
+    // Shared history may be replayed with Anthropic thinking enabled.
+    hasProviderEligibleMessages(filterWorkflowDisplayOnlyMessages(removedMessages), {
+      preserveReasoningOnly: true,
+    })
   );
 }
 
@@ -2587,6 +2585,7 @@ export class HistoryService {
         `[HISTORY APPEND] Assigned historySequence=${message.metadata.historySequence ?? "unknown"} role=${message.role}`
       );
 
+      await this.fenceContextResetUnderHistoryLock(workspaceId, [message]);
       await this.getAppendProvenance(workspaceId).appendChat(
         Buffer.from(JSON.stringify(historyEntry) + "\n")
       );
@@ -2594,6 +2593,20 @@ export class HistoryService {
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to append to history: ${message}`);
+    }
+  }
+
+  private async fenceContextResetUnderHistoryLock(
+    workspaceId: string,
+    messages: readonly MuxMessage[]
+  ): Promise<void> {
+    if (
+      messages.some((message) => getContextBoundaryKind(message) === CONTEXT_BOUNDARY_KINDS.RESET)
+    ) {
+      // Reset/rollover discards context captured by foreign compactors too. Advance
+      // after admission but before appending under the same lock, so a failed
+      // generation write cannot leave a durable reset open to stale publication.
+      await this.getContinuousCompactionJournal(workspaceId).advanceGenerationUnderHistoryLock();
     }
   }
 
@@ -2880,6 +2893,7 @@ export class HistoryService {
           // temp-and-rename helper the other history mutations use, under the
           // cross-process append lock (r50) so a foreign backend's row cannot
           // land between this read and the replace and be silently deleted.
+          await this.fenceContextResetUnderHistoryLock(workspaceId, messages);
           await this.getAppendProvenance(workspaceId).appendChat(
             Buffer.from(this.serializeHistoryEntries(messages, workspaceId)),
             true
@@ -3075,6 +3089,7 @@ export class HistoryService {
           )
         );
         const rejected: MuxMessage[] = [];
+        let providerContextChanged = false;
         const earlier = new Set(messages.slice(0, triggerIndex));
         const updated = this.serializeHistoryRewrite(rows, workspaceId, (row) => {
           const ownedPrelude =
@@ -3084,10 +3099,21 @@ export class HistoryService {
             (isSyntheticSnapshotUserMessage(row) ||
               (row.role === "assistant" && row.metadata?.synthetic === true));
           if (row !== persisted && !ownedPrelude) return row;
+          providerContextChanged ||= hasProviderEligibleMessages(
+            filterWorkflowDisplayOnlyMessages([row]),
+            { preserveReasoningOnly: true }
+          );
           const marked = createContextBudgetRejectedMessage(row);
           rejected.push(marked);
           return marked;
         });
+        // Rejection removes provider context just like truncation. Retire foreign
+        // compactors before rewriting, but preserve publication on capsule retries.
+        if (providerContextChanged) {
+          await this.getContinuousCompactionJournal(
+            workspaceId
+          ).advanceGenerationUnderHistoryLock();
+        }
         await writeFileAtomic(historyPath, updated);
         return Ok(rejected);
       }
@@ -3552,6 +3578,13 @@ export class HistoryService {
 
           const archiveMaxSeq = await this.getArchiveTailMaxSequence(workspaceId);
 
+          // A real edit must retire captured provider context; missing targets,
+          // keep-target-at-tail no-ops and display-only cuts retain publication.
+          if (tailCutChangesProviderContext(removedMessages)) {
+            await this.getContinuousCompactionJournal(
+              workspaceId
+            ).advanceGenerationUnderHistoryLock();
+          }
           // Atomic write prevents corruption if app crashes mid-write
           await writeFileAtomic(historyPath, historyEntries);
 
@@ -3631,6 +3664,9 @@ export class HistoryService {
       const lastArchiveRow = archiveRows.at(-1);
       if (lastArchiveRow && lastArchiveRow.raw.at(-1) !== 10 && activeEpochRows.length > 0) {
         archiveRows.push({ raw: Buffer.from("\n"), message: undefined });
+      }
+      if (tailCutChangesProviderContext(removedMessages)) {
+        await this.getContinuousCompactionJournal(workspaceId).advanceGenerationUnderHistoryLock();
       }
       await this.rewriteHistoryFilesUnlocked(
         workspaceId,
@@ -3769,6 +3805,13 @@ export class HistoryService {
             .filter((s): s is number => isNonNegativeInteger(s));
 
           if (percentage >= 1.0) {
+            // Explicit full-clear intent includes display-only or malformed history.
+            // An already-empty history remains a no-op for publication ownership.
+            if (archiveRows.length > 0 || chatRows.length > 0) {
+              await this.getContinuousCompactionJournal(
+                workspaceId
+              ).advanceGenerationUnderHistoryLock();
+            }
             await this.rewriteHistoryFilesUnlocked(workspaceId, null, null);
             this.sequenceCounters.set(workspaceId, 0);
             return Ok(allSequences);
@@ -3825,12 +3868,32 @@ export class HistoryService {
                 "Truncation would remove every remaining message; retry to run it as a full clear."
               );
             }
+            await this.getContinuousCompactionJournal(
+              workspaceId
+            ).advanceGenerationUnderHistoryLock();
             await this.rewriteHistoryFilesUnlocked(workspaceId, null, null);
             this.sequenceCounters.set(workspaceId, 0);
             return Ok(allSequences);
           }
 
-          const activeContextChanged = prefixCutChangesActiveContext(messages, removeCount);
+          // The raw-aware reader returns the active suffix of these parsed rows.
+          // Reuse its privacy floor: retained unreadable reset evidence can seal
+          // rows that parsed boundary markers alone would misclassify as active.
+          const activeMessages = await readProviderHistoryFromLatestBoundary(
+            {
+              chat: this.getChatHistoryPath(workspaceId),
+              archive: this.getChatArchivePath(workspaceId),
+            },
+            0
+          );
+          const activeRemoveCount = Math.max(
+            0,
+            removeCount - (messages.length - activeMessages.length)
+          );
+          const activeContextChanged = hasProviderEligibleMessages(
+            filterWorkflowDisplayOnlyMessages(activeMessages.slice(0, activeRemoveCount)),
+            { preserveReasoningOnly: true }
+          );
           const sanitize = activeContextChanged
             ? stripContextUsage
             : (message: MuxMessage) => message;
@@ -3852,6 +3915,13 @@ export class HistoryService {
             retainedMessages,
             sanitize
           );
+          // Trimming sealed or display-only rows does not change a compactor's
+          // active provider context, so only an active-context cut retires it.
+          if (activeContextChanged) {
+            await this.getContinuousCompactionJournal(
+              workspaceId
+            ).advanceGenerationUnderHistoryLock();
+          }
           await this.rewriteHistoryFilesUnlocked(
             workspaceId,
             remainingArchive.length > 0 ? remainingArchive : null,
