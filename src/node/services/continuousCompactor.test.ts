@@ -1,5 +1,5 @@
 import type { ContinuousPrefixSwap } from "./continuousCompactionJournal";
-import { writeFile } from "node:fs/promises";
+import { stat, writeFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import * as atomicWrite from "write-file-atomic";
 import { EventEmitter } from "node:events";
@@ -17,6 +17,9 @@ import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail
 import { ContinuousCompactor, type ContinuousCompactionContext } from "./continuousCompactor";
 import { CompactionHandler } from "./compactionHandler";
 import { createTestHistoryService } from "./testHistoryService";
+import { HistoryService } from "./historyService";
+import * as fileLock from "@/node/utils/concurrency/fileLock";
+import { historyWriteLockPath } from "./workspaceRemoval";
 
 type Dependencies = ConstructorParameters<typeof ContinuousCompactor>[0];
 type LiveSnapshot = NonNullable<ReturnType<Dependencies["streamManager"]["getStreamInfo"]>> & {
@@ -677,7 +680,15 @@ describe("ContinuousCompactor", () => {
     expect(fastApply).not.toHaveBeenCalled();
     expect((await rows())[0].id).toBe("old-user");
     const journalStore = store.historyService.getContinuousCompactionJournal(workspaceId);
-    const journal = await journalStore.write(swap.journal, swap.prefix, () => true);
+    const publishedSwap = swap;
+    const journal = await journalStore.write(
+      swap.journal,
+      swap.prefix,
+      () => true,
+      (committed) => {
+        publishedSwap.journal = committed;
+      }
+    );
     assert(journal, "Expected reproducible journal");
     state = consumed ? "consumed" : "pending";
     swap.consumed = consumed;
@@ -716,6 +727,176 @@ describe("ContinuousCompactor", () => {
       expect(completed).not.toHaveBeenCalled();
     });
   }
+
+  it.each(["user-interrupt", "edit", "context-mutation"])(
+    "%s does not recover an interrupted startup journal on the next attempt",
+    async (reason) => {
+      const { dependencies, journalStore } = await activateJournaledSwap();
+      compactor.reset("shutdown");
+      streaming = false;
+      live = undefined;
+      compactor = new ContinuousCompactor(dependencies);
+      const entered = deferred();
+      const release = deferred();
+      const read = journalStore.read.bind(journalStore);
+      spyOn(journalStore, "read").mockImplementationOnce(async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return read(...args);
+      });
+      const recovering = compactor.recover();
+      try {
+        await entered.promise;
+        compactor.reset(reason);
+        release.resolve();
+        expect(await recovering).toBe(false);
+        compactor = new ContinuousCompactor(dependencies);
+        expect(await compactor.recover()).toBe(false);
+        expect((await rows())[0].id).toBe("old-user");
+      } finally {
+        release.resolve();
+        await recovering;
+      }
+    }
+  );
+
+  it("preserves a successor published after exact postcommit cleanup releases its lock", async () => {
+    const { journalStore, journal, swap } = await activateJournaledSwap();
+    streaming = false;
+    live = undefined;
+    const foreign = new HistoryService(store.config).getContinuousCompactionJournal(workspaceId);
+    const successor = {
+      ...journal,
+      boundary: { ...journal.boundary, id: "successor-boundary" },
+    };
+    const clear = journalStore.clear.bind(journalStore);
+    spyOn(journalStore, "clear").mockImplementationOnce(async (expected) => {
+      await clear(expected);
+      expect(await foreign.write(successor, swap.prefix, () => true)).not.toBeNull();
+    });
+    expect(await compactor.observe(0, context)).toBe("applied");
+    expect((await foreign.read())?.boundary.id).toBe(successor.boundary.id);
+    expect((await rows())[0].id).toBe(journal.boundary.id);
+  });
+
+  for (const phase of ["new-fold", "already-folded", "mismatched-source"] as const) {
+    it.each(["same-generation", "reset-during-cleanup"] as const)(
+      `${phase} preserves its recovery result after cleanup times out (%s)`,
+      async (race) => {
+        const resetDuringCleanup = race === "reset-during-cleanup";
+        const applied = phase !== "mismatched-source";
+        const { journalStore, journal, dependencies } = await activateJournaledSwap();
+        streaming = false;
+        live = undefined;
+        if (phase === "already-folded") {
+          expect(await compactor.recover()).toBe(true);
+          // Recreate the crash window between durable history publication and journal unlink.
+          await writeFile(journalStore.path, JSON.stringify(journal));
+        }
+        if (phase === "mismatched-source")
+          await seed(createMuxMessage("new-user", "user", "New work after the journal"));
+        const before = await rows();
+        const clearPrefix = spyOn(dependencies.streamManager, "clearPrefixSwap");
+        const clear = journalStore.clear.bind(journalStore);
+        const failure = spyOn(journalStore, "clear").mockImplementation(async (expected) => {
+          await using held = await fileLock.acquireProcessFileLock({
+            lockPath: historyWriteLockPath(store.config.rootDir, workspaceId),
+            timeoutMs: 1000,
+            label: "foreign history writer during journal cleanup",
+          });
+          if (resetDuringCleanup) compactor.reset("shutdown");
+          const acquire = fileLock.acquireProcessFileLock;
+          const timeout = spyOn(fileLock, "acquireProcessFileLock").mockImplementation((options) =>
+            acquire({ ...options, timeoutMs: 1 })
+          );
+          try {
+            await clear(expected);
+          } finally {
+            timeout.mockRestore();
+            await held.assertStillOwned();
+          }
+        });
+        expect(await compactor.recover().catch((error: unknown) => error)).toBe(applied);
+        expect(compactor.hasConsumedSwap()).toBe(false);
+        // A reset during cleanup owns stream retirement; the old apply must not clear it again.
+        expect(clearPrefix).toHaveBeenCalledTimes(
+          resetDuringCleanup || phase === "new-fold" ? 1 : 0
+        );
+        expect(await journalStore.read()).toEqual(journal);
+        const once = await rows();
+        if (applied) {
+          expect(once[0].id).toBe(journal.boundary.id);
+          expect(once.at(-1)?.id).toBe(journal.liveTailCopySpec.copyId);
+        } else expect(once).toEqual(before);
+        expect(completed).toHaveBeenCalledTimes(applied ? 1 : 0);
+        expect(await compactor.recover()).toBe(applied);
+        expect(await journalStore.read()).toEqual(journal);
+        expect(await rows()).toEqual(once);
+        failure.mockRestore();
+        expect(await compactor.recover()).toBe(applied);
+        expect(await rows()).toEqual(once);
+        expect(completed).toHaveBeenCalledTimes(applied ? 1 : 0);
+        expect(await journalStore.read()).toBeNull();
+        expect(await compactor.recover()).toBe(false);
+      }
+    );
+  }
+
+  it("clears explicit reset intent despite contention on the history lock", async () => {
+    const { dependencies, journalStore } = await activateJournaledSwap();
+    streaming = false;
+    live = undefined;
+    const held = await fileLock.acquireProcessFileLock({
+      lockPath: historyWriteLockPath(store.config.rootDir, workspaceId),
+      timeoutMs: 1000,
+      label: "foreign history writer",
+    });
+    // Exercise the actual lock timeout branch without waiting ten seconds.
+    const acquire = fileLock.acquireProcessFileLock;
+    const timeout = spyOn(fileLock, "acquireProcessFileLock").mockImplementation((options) =>
+      acquire({ ...options, timeoutMs: 0 })
+    );
+    let clearing = Promise.resolve();
+    const clear = journalStore.clearForReset.bind(journalStore);
+    const observed = spyOn(journalStore, "clearForReset").mockImplementation(() => {
+      clearing = clear();
+      return clearing;
+    });
+    try {
+      compactor.reset("user-interrupt");
+      await clearing.catch(() => undefined);
+      expect(await stat(journalStore.path).catch((error: unknown) => error)).toHaveProperty(
+        "code",
+        "ENOENT"
+      );
+    } finally {
+      await held[Symbol.asyncDispose]();
+      timeout.mockRestore();
+      observed.mockRestore();
+    }
+    compactor = new ContinuousCompactor({
+      ...dependencies,
+      historyService: new HistoryService(store.config),
+    });
+    expect(await compactor.recover()).toBe(false);
+    expect((await rows())[0].id).toBe("old-user");
+  });
+
+  it.each(["failed-fast-apply", "legacy-fallback", "delete-message", "dispose"])(
+    "%s only cleans its captured journal",
+    async (reason) => {
+      const { journalStore, journal, swap } = await activateJournaledSwap();
+      const foreign = new HistoryService(store.config).getContinuousCompactionJournal(workspaceId);
+      await foreign.clear(journal);
+      const successor = {
+        ...journal,
+        boundary: { ...journal.boundary, id: "foreign-successor" },
+      };
+      expect(await foreign.write(successor, swap.prefix, () => true)).not.toBeNull();
+      compactor.reset(reason);
+      expect((await journalStore.read())?.boundary.id).toBe(successor.boundary.id);
+    }
+  );
 
   it("uses P1 durable fallback when the first retained live step has no tool anchor", async () => {
     await seedLiveTurn(true, true);
