@@ -4,7 +4,7 @@ import assert from "@/common/utils/assert";
 import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
 import * as path from "path";
 
-import type { HistoryService } from "./historyService";
+import type { CompactionFollowUpCleanupOutcome, HistoryService } from "./historyService";
 
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { ContinuousCompactionPublication } from "./continuousCompactionJournal";
@@ -924,8 +924,9 @@ export class CompactionHandler {
   }
 
   async rollbackHeartbeatContextResetBoundary(
-    summaryMessage: MuxMessage
-  ): Promise<Result<void, string>> {
+    summaryMessage: MuxMessage,
+    isCurrent: () => boolean = () => true
+  ): Promise<Result<CompactionFollowUpCleanupOutcome, string>> {
     assert(
       summaryMessage.role === "assistant",
       "rollbackHeartbeatContextResetBoundary requires an assistant boundary message"
@@ -935,15 +936,22 @@ export class CompactionHandler {
       "rollbackHeartbeatContextResetBoundary requires a heartbeat reset boundary"
     );
 
-    const deleteResult = await this.historyService.deleteMessage(
+    const owner = this.pendingStateOwner;
+    const deleteResult = await this.historyService.cleanupCompactionFollowUp(
       this.workspaceId,
-      summaryMessage.id
+      summaryMessage,
+      "rollback-heartbeat",
+      () => this.pendingStateOwner === owner && isCurrent()
     );
     if (!deleteResult.success) {
       return Err(`Failed to delete heartbeat reset boundary: ${deleteResult.error}`);
     }
+    // A replacement retained its boundary, so its cached state and renderer row must survive too.
+    if (deleteResult.data === "skipped") return deleteResult;
 
-    await this.restoreHeartbeatResetRollbackState();
+    // Once deletion commits, a new turn cannot cancel reconciliation of this owner's snapshot.
+    // A replacement pending-state owner still takes precedence over the rollback.
+    if (this.pendingStateOwner === owner) await this.restoreHeartbeatResetRollbackState();
 
     const historySequence = summaryMessage.metadata?.historySequence;
     if (isNonNegativeInteger(historySequence)) {
@@ -953,7 +961,7 @@ export class CompactionHandler {
       });
     }
 
-    return Ok(undefined);
+    return Ok("applied");
   }
 
   /**
