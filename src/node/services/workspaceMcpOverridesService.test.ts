@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import { parse as jsoncParse } from "jsonc-parser";
 import * as os from "os";
@@ -413,6 +413,184 @@ describe("WorkspaceMcpOverridesService", () => {
     // workspace-local files).
     await fs.rm(filePath);
     await service.prunePluginOverrideKeys(workspaceId, "plugin:0123456789abcdef:");
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces sweeps many workspaces with one metadata load", async () => {
+    const service = new WorkspaceMcpOverridesService(config);
+    const pruned = await registerWorkspace("pruned");
+    const untouched = await registerWorkspace("untouched");
+    const broken = await registerWorkspace("broken");
+    const write = (workspacePath: string, content: string) =>
+      fs
+        .mkdir(path.join(workspacePath, ".xum"), { recursive: true })
+        .then(() => fs.writeFile(path.join(workspacePath, ".xum", "mcp.local.jsonc"), content));
+    await write(
+      pruned.workspacePath,
+      JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "other"] })
+    );
+    await write(broken.workspacePath, "{ not json");
+
+    // Warm-up: getAllWorkspaceMetadata persists read-time migrations
+    // (createdAt backfill) on first load, which would skew the call counts.
+    await config.getAllWorkspaceMetadata();
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata");
+    const configSpy = spyOn(config, "loadConfigOrDefault");
+
+    const published: Array<[string, unknown]> = [];
+    const failures = await service.prunePluginOverrideKeysForWorkspaces(
+      [pruned.workspaceId, untouched.workspaceId, broken.workspaceId, "ws-missing"],
+      "plugin:0123456789abcdef:",
+      {
+        publish: (workspaceId, persisted) => {
+          published.push([workspaceId, persisted]);
+          return Promise.resolve();
+        },
+      }
+    );
+
+    // One failure per broken workspace; the healthy ones still completed.
+    expect(failures.map((failure) => failure.workspaceId).sort()).toEqual([
+      broken.workspaceId,
+      "ws-missing",
+    ]);
+    expect(String(failures.find((f) => f.workspaceId === broken.workspaceId)?.error)).toMatch(
+      /parse errors/
+    );
+    expect(published).toEqual([
+      [pruned.workspaceId, { enabledServers: ["other"] }],
+      [untouched.workspaceId, {}],
+    ]);
+    // The sweep cost must not scale with a full config parse per workspace:
+    // one metadata load up front and one post-sweep re-resolution (each
+    // loading config once), plus the batch's single legacy-config snapshot.
+    expect(metadataSpy).toHaveBeenCalledTimes(2);
+    expect(configSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces prunes every checkout sharing a duplicated ID", async () => {
+    const service = new WorkspaceMcpOverridesService(config);
+    const first = await registerWorkspace("dup-a");
+    const second = await registerWorkspace("dup-b");
+    // Corrupted config: both entries carry the same workspace ID.
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        for (const workspace of project.workspaces) {
+          if (workspace.id === second.workspaceId) {
+            workspace.id = first.workspaceId;
+          }
+        }
+      }
+      return cfg;
+    });
+    for (const workspacePath of [first.workspacePath, second.workspacePath]) {
+      await fs.mkdir(path.join(workspacePath, ".xum"), { recursive: true });
+      await fs.writeFile(
+        path.join(workspacePath, ".xum", "mcp.local.jsonc"),
+        JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo"] })
+      );
+    }
+
+    const failures = await service.prunePluginOverrideKeysForWorkspaces(
+      [first.workspaceId, first.workspaceId],
+      "plugin:0123456789abcdef:"
+    );
+
+    expect(failures).toEqual([]);
+    for (const workspacePath of [first.workspacePath, second.workspacePath]) {
+      const after = jsoncParse(
+        await fs.readFile(path.join(workspacePath, ".xum", "mcp.local.jsonc"), "utf-8")
+      ) as Record<string, unknown>;
+      expect(after.enabledServers).toEqual([]);
+    }
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces skips off-host entries sharing a duplicated ID", async () => {
+    const service = new WorkspaceMcpOverridesService(config);
+    const local = await registerWorkspace("dup-local");
+    // Corrupted config: an SSH entry reuses the local workspace's ID. Plugin
+    // servers never run off-host, and reaching for it would attempt remote
+    // I/O against an unreachable host.
+    await config.editConfig((cfg) => {
+      cfg.projects.set("/fake/remote", {
+        workspaces: [
+          {
+            path: "/remote/checkout",
+            id: local.workspaceId,
+            name: "remote-branch",
+            runtimeConfig: { type: "ssh", host: "unreachable.invalid", srcBaseDir: "/remote" },
+          },
+        ],
+      });
+      return cfg;
+    });
+    await fs.mkdir(path.join(local.workspacePath, ".xum"), { recursive: true });
+    await fs.writeFile(
+      path.join(local.workspacePath, ".xum", "mcp.local.jsonc"),
+      JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo"] })
+    );
+
+    const failures = await service.prunePluginOverrideKeysForWorkspaces(
+      [local.workspaceId],
+      "plugin:0123456789abcdef:"
+    );
+
+    expect(failures).toEqual([]);
+    const after = jsoncParse(
+      await fs.readFile(path.join(local.workspacePath, ".xum", "mcp.local.jsonc"), "utf-8")
+    ) as Record<string, unknown>;
+    expect(after.enabledServers).toEqual([]);
+  });
+
+  it("acquireExclusiveLock holds the prune sweep until released", async () => {
+    const service = new WorkspaceMcpOverridesService(config);
+    const { workspaceId } = await registerWorkspace("locked");
+
+    const release = await service.acquireExclusiveLock();
+    let sweepDone = false;
+    const sweep = service
+      .prunePluginOverrideKeysForWorkspaces([workspaceId], "plugin:0123456789abcdef:")
+      .then((failures) => {
+        sweepDone = true;
+        return failures;
+      });
+    // Give the sweep every chance to run if the lock were not honored.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(sweepDone).toBe(false);
+
+    await release();
+    expect(await sweep).toEqual([]);
+    expect(sweepDone).toBe(true);
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces fails a workspace renamed during the sweep", async () => {
+    const service = new WorkspaceMcpOverridesService(config);
+    const stable = await registerWorkspace("stable");
+    const moved = await registerWorkspace("moved");
+    await config.getAllWorkspaceMetadata();
+    const realGetAll = config.getAllWorkspaceMetadata.bind(config);
+    // Second load (the post-sweep re-resolution) sees the workspace under a
+    // new name — exactly what a concurrent rename leaves behind.
+    spyOn(config, "getAllWorkspaceMetadata")
+      .mockImplementationOnce(realGetAll)
+      .mockImplementationOnce(async () =>
+        (await realGetAll()).map((metadata) =>
+          metadata.id === moved.workspaceId
+            ? {
+                ...metadata,
+                name: "renamed",
+                namedWorkspacePath: path.join(path.dirname(moved.workspacePath), "renamed"),
+              }
+            : metadata
+        )
+      );
+
+    const failures = await service.prunePluginOverrideKeysForWorkspaces(
+      [stable.workspaceId, moved.workspaceId],
+      "plugin:0123456789abcdef:"
+    );
+
+    expect(failures.map((failure) => failure.workspaceId)).toEqual([moved.workspaceId]);
+    expect(String(failures[0].error)).toMatch(/moved while/);
   });
 
   it("prunePluginOverrideKeys refuses symlinked override files", async () => {
