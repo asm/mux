@@ -2087,13 +2087,23 @@ export const router = (authToken?: string) => {
         .input(schemas.desktop.watchViewer.input)
         .output(schemas.desktop.watchViewer.output)
         .handler(({ context, input, signal }) =>
-          context.desktopSessionManager.watchViewer(input.workspaceId, signal)
+          context.desktopSessionManager.watchViewer(
+            input.workspaceId,
+            signal,
+            input.viewerId ?? undefined
+          )
         ),
       acknowledgeViewerRelease: t
         .input(schemas.desktop.acknowledgeViewerRelease.input)
         .output(schemas.desktop.acknowledgeViewerRelease.output)
         .handler(({ context, input }) =>
           context.desktopSessionManager.acknowledgeViewerRelease(input.viewerId)
+        ),
+      detachViewer: t
+        .input(schemas.desktop.detachViewer.input)
+        .output(schemas.desktop.detachViewer.output)
+        .handler(({ context, input }) =>
+          context.desktopSessionManager.detachViewer(input.viewerId)
         ),
       openWindow: t
         .input(schemas.desktop.openWindow.input)
@@ -2126,7 +2136,9 @@ export const router = (authToken?: string) => {
       getBootstrap: t
         .input(schemas.desktop.getBootstrap.input)
         .output(schemas.desktop.getBootstrap.output)
-        .handler(({ context, input }) => getDesktopBootstrap(context, input.workspaceId)),
+        .handler(({ context, input }) =>
+          getDesktopBootstrap(context, input.workspaceId, input.viewerId ?? null)
+        ),
     },
     update: {
       check: t

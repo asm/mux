@@ -1305,7 +1305,7 @@ describe("WorkspaceTurnManager", () => {
     const listLiveWorkspaceActivity = mock(() => ({
       streaming: true,
       terminalSessions: true,
-      desktopSession: false,
+      desktopViewers: false,
     }));
     const { parentId, taskService, archive } = await createWorkspaceLifecycleHarness({
       listLiveWorkspaceActivity,
@@ -1571,7 +1571,7 @@ describe("WorkspaceTurnManager", () => {
       streaming: false,
       queuedMessages: true,
       terminalSessions: false,
-      desktopSession: false,
+      desktopViewers: false,
     }));
     const harness = await createWorkspaceLifecycleHarness({ listLiveWorkspaceActivity });
 
