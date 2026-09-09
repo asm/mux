@@ -69,6 +69,7 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useAIViewKeybinds } from "@/browser/hooks/useAIViewKeybinds";
 import { QueuedMessage } from "@/browser/features/Messages/QueuedMessage";
+import { PendingSendMessage } from "@/browser/features/Messages/PendingSendMessage";
 import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
 import {
@@ -466,6 +467,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     hasOlderHistory,
     loadingOlderHistory,
     activeBashMonitorCount,
+    pendingSend,
   } = workspaceState;
   const shouldShowPinnedTodoList = workspaceState.todos.length > 0;
   const shouldShowReviewsBanner = reviews.reviews.length > 0;
@@ -1108,14 +1110,19 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       hasRenderableMessages: deferredMessages.length > 0,
       // Any mounted barrier (including waiting-on-monitor) counts: a cleared
       // transcript with an armed monitor must not flash placeholders under it.
-      shouldShowStreamingBarrier: shouldMountStreamingBarrier,
+      // A pending send is a live tail row for the same reason.
+      shouldShowStreamingBarrier: shouldMountStreamingBarrier || pendingSend !== null,
     });
   const showEmptyTranscriptPlaceholder =
     deferredMessages.length === 0 &&
     !showTranscriptHydrationPlaceholder &&
-    !shouldMountStreamingBarrier;
+    !shouldMountStreamingBarrier &&
+    pendingSend === null;
   const showRetryBarrier =
-    !isHydratingTranscript && !shouldShowStreamingBarrier && hasInterruptedStream;
+    !isHydratingTranscript &&
+    !shouldShowStreamingBarrier &&
+    hasInterruptedStream &&
+    pendingSend === null;
   const isAutoRetryActive =
     workspaceState.autoRetryStatus?.type === "auto-retry-scheduled" ||
     workspaceState.autoRetryStatus?.type === "auto-retry-starting";
@@ -1170,6 +1177,14 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     lastRetryCandidateMessage != null &&
     interruptedBarrierMessageIds.has(lastRetryCandidateMessage.id);
   const transcriptTailItems: TranscriptTailStackItem[] = [];
+  if (pendingSend) {
+    transcriptTailItems.push(
+      createTranscriptTailStackItem({
+        key: "pending-send",
+        node: <PendingSendMessage message={pendingSend} />,
+      })
+    );
+  }
   if (shouldMountRetryBarrier) {
     transcriptTailItems.push(
       createTranscriptTailStackItem({
@@ -1719,6 +1734,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       workspaceName={workspaceName}
                       revealDecorations={revealDecorations}
                       isStreamStarting={isStreamStarting}
+                      hasPendingSend={pendingSend !== null}
                       isTranscriptCaughtUp={isTranscriptCaughtUp}
                       runtimeConfig={runtimeConfig}
                       isPreStreamAgentTask={isPreStreamAgentTask}
@@ -1801,6 +1817,7 @@ interface ChatInputPaneProps {
   preStreamAgentTaskStatus: "queued" | "starting";
   isCompacting: boolean;
   isStreamStarting: boolean;
+  hasPendingSend: boolean;
   isTranscriptCaughtUp: boolean;
   shouldShowPinnedTodoList: boolean;
   shouldShowReviewsBanner: boolean;
@@ -1984,6 +2001,7 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         }
         isTranscriptCaughtUp={props.isTranscriptCaughtUp}
         isStreamStarting={props.isStreamStarting}
+        hasPendingSend={props.hasPendingSend}
         isCompacting={props.isCompacting}
         editingMessage={props.editingMessage}
         onCancelEdit={props.onCancelEdit}
