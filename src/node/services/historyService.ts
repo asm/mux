@@ -2245,18 +2245,24 @@ export class HistoryService {
 
   /**
    * Read the partial message for a workspace, if it exists.
+   * Startup admission must distinguish unreadable state from an absent partial.
    */
-  async readPartial(workspaceId: string): Promise<MuxMessage | null> {
+  async readPartial(
+    workspaceId: string,
+    options?: { throwOnError?: boolean }
+  ): Promise<MuxMessage | null> {
     try {
       const partialPath = this.getPartialPath(workspaceId);
       const data = await fs.readFile(partialPath, "utf-8");
-      const message = JSON.parse(data) as MuxMessage;
-      return normalizeLegacyMuxMetadata(message);
+      const message: unknown = JSON.parse(data);
+      return isReadableHistoryMessage(message) ? normalizeLegacyMuxMetadata(message) : null;
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
         return null;
       }
 
+      // Parse corruption cannot heal on retry; discard it instead of bricking task recovery.
+      if (options?.throwOnError && !(error instanceof SyntaxError)) throw error;
       log.error("Error reading partial:", error);
       return null;
     }

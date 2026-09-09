@@ -1,3 +1,5 @@
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { STARTUP_RECOVERY_PROBE_TIMEOUT_MS } from "@/constants/startupRecovery";
 import type { AIService } from "./aiService";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { GoalRecordV1 } from "@/common/types/goal";
@@ -40,7 +42,13 @@ import * as path from "path";
 import assert from "@/common/utils/assert";
 import { EventEmitter } from "events";
 import { Effect, Fiber } from "effect";
-import { StartupRecovery, type StartupRecoveryOutcome } from "./startupRecovery";
+import {
+  StartupRecovery,
+  retryStartupRead,
+  type StartupRecoveryOutcome,
+  type StartupRecoveryState,
+} from "./startupRecovery";
+import { hasErrorCode } from "./tools/skillFileUtils";
 import { mkdir, readdir, readFile, unlink, writeFile } from "fs/promises";
 import type { Dirent } from "fs";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
@@ -89,13 +97,15 @@ import {
 } from "@/constants/goals";
 import type { SendMessageError } from "@/common/types/errors";
 import {
-  AgentIdSchema,
   ChatMuxMessageSchema,
   SendMessageOptionsSchema,
   SkillNameSchema,
 } from "@/common/orpc/schemas";
 import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
-import { normalizeAgentId, resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
+import {
+  normalizePersistedAgentCandidate,
+  resolvePersistedAgentIdCandidates,
+} from "@/common/utils/agentIds";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
 import {
@@ -558,11 +568,7 @@ export async function clearProviderConfigFixableAbandonMarkers(
   try {
     entries = await readdir(sessionsDir, { withFileTypes: true });
   } catch (error) {
-    const errno =
-      typeof error === "object" && error !== null && "code" in error
-        ? (error as { code?: unknown }).code
-        : undefined;
-    if (errno === "ENOENT") {
+    if (hasErrorCode(error, "ENOENT")) {
       return;
     }
     throw error;
@@ -1745,10 +1751,7 @@ export class AgentSession {
   }
 
   private getAutoRetryPreferencePath(): string {
-    return path.join(
-      path.join(this.config.sessionsDir, this.workspaceId),
-      AUTO_RETRY_PREFERENCE_FILE
-    );
+    return path.join(this.config.sessionsDir, this.workspaceId, AUTO_RETRY_PREFERENCE_FILE);
   }
 
   setLegacyAutoRetryEnabledHint(enabled: boolean): void {
@@ -1779,19 +1782,21 @@ export class AgentSession {
         ? parsed.userMessageId
         : undefined;
 
-    return {
-      reason: parsed.reason,
-      ...(userMessageId ? { userMessageId } : {}),
-    };
+    return { reason: parsed.reason, userMessageId };
   }
 
   /**
-   * The preference file is read once per session, and every reader and writer of the in-memory
+   * Successful preference reads are cached per session, and every reader and writer of in-memory
    * auto-retry state waits for that read: a load that lands late cannot overwrite a newer change,
    * and a write never rebuilds the file from unloaded defaults.
    */
   private loadAutoRetryState(): Promise<void> {
-    this.autoRetryStateLoad ??= this.readAutoRetryState();
+    this.autoRetryStateLoad ??= this.runStartupRecoveryStep(() => this.readAutoRetryState()).catch(
+      (error: unknown) => {
+        this.autoRetryStateLoad = null;
+        throw error;
+      }
+    );
     return this.autoRetryStateLoad;
   }
 
@@ -1802,48 +1807,38 @@ export class AgentSession {
   }
 
   private async readAutoRetryState(): Promise<void> {
-    const preferencePath = this.getAutoRetryPreferencePath();
-    try {
-      const raw = await readFile(preferencePath, "utf-8");
-      if (this.coordinator.closing) return;
-      const parsed = JSON.parse(raw) as {
-        enabled?: unknown;
-        startupAutoRetryAbandon?: unknown;
-      };
-      const enabled = parsed.enabled !== false;
-      this.autoRetryEnabledPreference = enabled;
-      this.legacyAutoRetryEnabledHint = null;
-      this.startupAutoRetryAbandon = this.parseStartupAutoRetryAbandon(
-        parsed.startupAutoRetryAbandon
-      );
-      this.retryManager.setEnabled(enabled);
-    } catch (error) {
-      if (this.coordinator.closing) return;
-      // Missing preference file is the default path. Use any legacy frontend hint
-      // (captured at onChat subscribe time) before falling back to enabled.
-      const errno =
-        typeof error === "object" && error !== null && "code" in error
-          ? (error as { code?: unknown }).code
-          : undefined;
-      const defaultEnabled =
-        errno === "ENOENT" && this.legacyAutoRetryEnabledHint === false ? false : true;
-
-      this.autoRetryEnabledPreference = defaultEnabled;
-      this.legacyAutoRetryEnabledHint = null;
-      this.startupAutoRetryAbandon = null;
-      this.retryManager.setEnabled(defaultEnabled);
-
-      if (errno === "ENOENT" && defaultEnabled === false) {
-        // Persist migrated legacy opt-out so restart behavior no longer depends
-        // on renderer localStorage keys. This write runs inside the load, so
-        // persistAutoRetryState must not wait for loadAutoRetryState.
-        await this.persistAutoRetryState();
-      } else if (errno !== "ENOENT") {
-        log.warn("Failed to load auto-retry preference; defaulting to enabled", {
-          workspaceId: this.workspaceId,
-          error: getErrorMessage(error),
-        });
+    const raw = await readFile(this.getAutoRetryPreferencePath(), "utf-8").catch(
+      (error: unknown) => {
+        // An unreadable preference is not consent to restart; let bounded admission retry the I/O.
+        if (!hasErrorCode(error, "ENOENT")) throw error;
+        return null;
       }
+    );
+    if (this.coordinator.closing) return;
+    let parsed: { enabled?: unknown; startupAutoRetryAbandon?: unknown } = {};
+    try {
+      parsed = (JSON.parse(raw ?? "{}") as typeof parsed | null) ?? {};
+    } catch (error) {
+      log.warn("Failed to load auto-retry preference; defaulting to enabled", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+    // Missing preference file is the default path. Use any legacy frontend hint
+    // (captured at onChat subscribe time) before falling back to enabled.
+    const enabled =
+      raw == null ? this.legacyAutoRetryEnabledHint !== false : parsed.enabled !== false;
+    this.autoRetryEnabledPreference = enabled;
+    this.legacyAutoRetryEnabledHint = null;
+    this.startupAutoRetryAbandon ??= this.parseStartupAutoRetryAbandon(
+      parsed.startupAutoRetryAbandon
+    );
+    this.retryManager.setEnabled(enabled);
+    if (raw == null && !enabled) {
+      // Persist migrated legacy opt-out so restart behavior no longer depends
+      // on renderer localStorage keys. This write runs inside the load, so
+      // persistAutoRetryState must not wait for loadAutoRetryState.
+      await this.persistAutoRetryState();
     }
   }
 
@@ -1912,7 +1907,8 @@ export class AgentSession {
    * outlived a failed unlink can only disable retries or suppress a replay.
    */
   async recordPendingAutoRetryState(): Promise<boolean> {
-    await this.loadAutoRetryState();
+    await this.loadAutoRetryState().catch(() => undefined);
+    if (this.autoRetryEnabledPreference === null) return false;
     if (this.autoRetryEnabledPreference !== false && this.startupAutoRetryAbandon === null) {
       return true;
     }
@@ -1932,12 +1928,14 @@ export class AgentSession {
     isCurrent = () => true
   ): Promise<void> {
     if (!isCurrent()) return;
-    await this.loadAutoRetryState();
+    await this.loadAutoRetryState().catch(() => undefined);
     this.startupAutoRetryAbandon = {
       reason,
       ...(userMessageId ? { userMessageId } : {}),
     };
-    await this.persistAutoRetryState();
+    // Keep new Stop intent owed on a failed initial read, without overwriting an unknown opt-out.
+    if (this.autoRetryEnabledPreference === null) this.autoRetryStateUnrecorded = true;
+    else await this.persistAutoRetryState();
   }
 
   private async clearStartupAutoRetryAbandon(isCurrent = () => true): Promise<void> {
@@ -2002,48 +2000,24 @@ export class AgentSession {
       return undefined;
     }
 
-    const trimmed = model.trim();
-    if (trimmed.length === 0) {
-      return undefined;
-    }
-
     // Preserve explicit gateway identities (coder:, mux-gateway:, ...) just
     // like normal send-option normalization: normalizeToCanonical would
     // rewrite a cross-typed canonical-name instance such as
     // coder:openai/<claude> (type anthropic) to openai:<claude>, sending the
     // recovered turn through direct OpenAI instead of the selected gateway.
-    const normalized = normalizeSelectedModel(trimmed);
-    if (!isValidModelFormat(normalized)) {
-      return undefined;
-    }
-
-    return normalized;
-  }
-
-  private normalizeAgentIdForRetry(agentId: unknown): string | undefined {
-    if (typeof agentId !== "string") {
-      return undefined;
-    }
-
-    const normalized = normalizeAgentId(agentId, "");
-    if (normalized.length === 0) {
-      return undefined;
-    }
-
-    const parsed = AgentIdSchema.safeParse(normalized);
-    return parsed.success ? parsed.data : undefined;
+    const normalized = normalizeSelectedModel(model);
+    return isValidModelFormat(normalized) ? normalized : undefined;
   }
 
   private isPendingAskUserQuestion(message: MuxMessage | null | undefined): boolean {
-    if (!message || message.role !== "assistant") {
-      return false;
-    }
-
-    return message.parts.some(
-      (part) =>
-        part.type === "dynamic-tool" &&
-        part.toolName === "ask_user_question" &&
-        part.state === "input-available"
+    return (
+      message?.role === "assistant" &&
+      message.parts.some(
+        (part) =>
+          part.type === "dynamic-tool" &&
+          part.toolName === "ask_user_question" &&
+          part.state === "input-available"
+      )
     );
   }
 
@@ -2104,20 +2078,12 @@ export class AgentSession {
   }
 
   private getLastNonSystemHistoryMessage(historyTail: MuxMessage[]): MuxMessage | undefined {
-    for (let index = historyTail.length - 1; index >= 0; index -= 1) {
-      const candidate = historyTail[index];
-      if (candidate.role === "system") {
-        continue;
-      }
-      if (this.isSyntheticGoalPauseBoundaryMessage(candidate)) {
-        continue;
-      }
-      if (isSyntheticSnapshotUserMessage(candidate)) {
-        continue;
-      }
-      return candidate;
-    }
-    return undefined;
+    return historyTail.findLast(
+      (candidate) =>
+        candidate.role !== "system" &&
+        !this.isSyntheticGoalPauseBoundaryMessage(candidate) &&
+        !isSyntheticSnapshotUserMessage(candidate)
+    );
   }
 
   private async requireGoalAcknowledgmentForCrashRecoveredPartial(): Promise<void> {
@@ -2288,19 +2254,8 @@ export class AgentSession {
   }
 
   private async getWorkspaceMetadataForRetry(): Promise<WorkspaceMetadata | undefined> {
-    const aiService = this.aiService as Partial<
-      Pick<AgentSessionAIService, "getWorkspaceMetadata">
-    >;
-    if (typeof aiService.getWorkspaceMetadata !== "function") {
-      return undefined;
-    }
-
-    const metadataResult = await aiService.getWorkspaceMetadata(this.workspaceId);
-    if (!metadataResult.success) {
-      return undefined;
-    }
-
-    return metadataResult.data;
+    const metadata = await this.aiService.getWorkspaceMetadata?.(this.workspaceId);
+    return metadata?.success ? metadata.data : undefined;
   }
 
   private isVisibleCompletedSubagentReportMessage(message: MuxMessage): boolean {
@@ -2359,13 +2314,13 @@ export class AgentSession {
    * Startup crash recovery replays the ORIGINAL interrupted request from
    * persisted retry options / history metadata / workspace buckets. This is
    * request replay, not preference resolution, so it intentionally does not go
-   * through resolveAgentAiSettings: its layers (and the child-task-workspace
-   * inversion below) reconstruct a specific prior request rather than deriving
-   * a fresh choice, and nothing here is promoted into new defaults.
+   * through resolveAgentAiSettings: these layers reconstruct a specific prior
+   * request rather than deriving a fresh choice or promoting new defaults.
    */
   private async deriveStartupAutoRetryRequest(params: {
     partial: MuxMessage | null;
     historyTail: MuxMessage[];
+    workspaceMetadata?: WorkspaceMetadata;
   }): Promise<StartupRetrySendOptions | undefined> {
     const lastUserMessage = this.findLastRetryUserMessage(params.historyTail);
     if (lastUserMessage?.metadata?.contextBudgetRejected) return undefined;
@@ -2373,14 +2328,13 @@ export class AgentSession {
     const lastAssistantMessage =
       params.partial?.role === "assistant"
         ? params.partial
-        : [...params.historyTail]
-            .reverse()
-            .find(
-              (message): message is MuxMessage & { role: "assistant" } =>
-                message.role === "assistant"
-            );
+        : params.historyTail.findLast(
+            (message): message is MuxMessage & { role: "assistant" } => message.role === "assistant"
+          );
 
-    const workspaceMetadata = await this.getWorkspaceMetadataForRetry();
+    const workspaceMetadata =
+      params.workspaceMetadata ?? (await this.getWorkspaceMetadataForRetry());
+    if (!workspaceMetadata || workspaceMetadata.parentWorkspaceId != null) return undefined;
 
     const persistedRetrySendOptions = lastUserMessage?.metadata?.retrySendOptions;
     // The user row's own metadata.goalId is the durable copy (stamped next to
@@ -2403,25 +2357,13 @@ export class AgentSession {
 
     const workspaceAgentIdCandidates = resolvePersistedAgentIdCandidates(workspaceMetadata);
     const workspaceAgentId = workspaceAgentIdCandidates[0] ?? WORKSPACE_DEFAULTS.agentId;
-    const persistedAgentId = this.normalizeAgentIdForRetry(persistedRetrySendOptions?.agentId);
-    const assistantAgentId = this.normalizeAgentIdForRetry(lastAssistantMessage?.metadata?.agentId);
-    // Child task workspaces carry their creation-time identity/settings in workspace metadata.
-    // Startup retry metadata can be stale after recovery sends restamp agentId to exec, so
-    // child retries must prefer the persisted workspace candidate before history metadata.
-    const isChildTaskWorkspace = workspaceMetadata?.parentWorkspaceId != null;
-    const baseAgentId = isChildTaskWorkspace
-      ? workspaceAgentId
-      : (persistedAgentId ?? assistantAgentId ?? workspaceAgentId);
-    const agentSettingsCandidateFields = isChildTaskWorkspace
-      ? [...workspaceAgentIdCandidates, baseAgentId, persistedAgentId, assistantAgentId]
-      : [baseAgentId, ...workspaceAgentIdCandidates, workspaceAgentId];
-    const agentSettingsCandidates = agentSettingsCandidateFields.filter(
-      (agentId, index, candidates): agentId is string =>
-        typeof agentId === "string" && candidates.indexOf(agentId) === index
+    const persistedAgentId = normalizePersistedAgentCandidate(persistedRetrySendOptions?.agentId);
+    const assistantAgentId = normalizePersistedAgentCandidate(
+      lastAssistantMessage?.metadata?.agentId
     );
-
+    const baseAgentId = persistedAgentId ?? assistantAgentId ?? workspaceAgentId;
     const agentSettings =
-      agentSettingsCandidates
+      [baseAgentId, ...workspaceAgentIdCandidates]
         .map((agentId) => workspaceMetadata?.aiSettingsByAgent?.[agentId])
         .find((settings) => settings != null) ?? workspaceMetadata?.aiSettings;
     const compactSettings = workspaceMetadata?.aiSettingsByAgent?.compact;
@@ -2429,18 +2371,15 @@ export class AgentSession {
     const persistedModel = this.normalizeStartupModel(persistedRetrySendOptions?.model);
     const assistantModel = this.normalizeStartupModel(lastAssistantMessage?.metadata?.model);
     const agentSettingsModel = this.normalizeStartupModel(agentSettings?.model);
-    const baseModel = isChildTaskWorkspace
-      ? (agentSettingsModel ?? persistedModel ?? assistantModel ?? DEFAULT_MODEL)
-      : (persistedModel ?? assistantModel ?? agentSettingsModel ?? DEFAULT_MODEL);
+    const baseModel = persistedModel ?? assistantModel ?? agentSettingsModel ?? DEFAULT_MODEL;
 
     const persistedThinkingLevel = coerceThinkingLevel(persistedRetrySendOptions?.thinkingLevel);
     const assistantThinkingLevel = coerceThinkingLevel(
       lastAssistantMessage?.metadata?.thinkingLevel
     );
     const agentSettingsThinkingLevel = coerceThinkingLevel(agentSettings?.thinkingLevel);
-    const baseThinkingLevel = isChildTaskWorkspace
-      ? (agentSettingsThinkingLevel ?? persistedThinkingLevel ?? assistantThinkingLevel)
-      : (persistedThinkingLevel ?? assistantThinkingLevel ?? agentSettingsThinkingLevel);
+    const baseThinkingLevel =
+      persistedThinkingLevel ?? assistantThinkingLevel ?? agentSettingsThinkingLevel;
 
     // Pro reasoning mode threads alongside thinkingLevel from the same sources
     // (assistant message metadata does not carry it), so startup retries do not
@@ -2449,9 +2388,7 @@ export class AgentSession {
       persistedRetrySendOptions?.reasoningMode
     );
     const agentSettingsReasoningMode = coerceOpenAIReasoningMode(agentSettings?.reasoningMode);
-    const baseReasoningMode = isChildTaskWorkspace
-      ? (agentSettingsReasoningMode ?? persistedReasoningMode)
-      : (persistedReasoningMode ?? agentSettingsReasoningMode);
+    const baseReasoningMode = persistedReasoningMode ?? agentSettingsReasoningMode;
 
     const persistedToolPolicy =
       lastUserMessage?.metadata?.toolPolicy ?? persistedRetrySendOptions?.toolPolicy;
@@ -2597,14 +2534,22 @@ export class AgentSession {
     return retryRequest;
   }
 
+  private hasInterruptedStartupTail(partial: MuxMessage | null, history: MuxMessage[]): boolean {
+    if (this.isPendingAskUserQuestion(partial)) return false;
+    if (partial?.role === "assistant") return true;
+    const last = this.getLastNonSystemHistoryMessage(history);
+    return last?.role === "user"
+      ? !this.isVisibleCompletedSubagentReportMessage(last)
+      : last?.role === "assistant" &&
+          last.metadata?.partial === true &&
+          !this.isPendingAskUserQuestion(last);
+  }
+
   async getStartupAutoRetryModelHint(): Promise<string | null> {
     this.assertNotDisposed("getStartupAutoRetryModelHint");
 
-    const [partial, historyResult] = await Promise.all([
-      this.historyService.readPartial(this.workspaceId),
-      this.historyService.getLastMessages(this.workspaceId, 20),
-    ]);
-    if (!historyResult.success) {
+    const [partial, historyResult] = (await this.readStartupTail()) ?? [];
+    if (partial === undefined || !historyResult?.success) {
       return null;
     }
 
@@ -2614,21 +2559,7 @@ export class AgentSession {
     if (this.lastAutoRetryResumeRequest?.options.model) {
       return this.lastAutoRetryResumeRequest.options.model;
     }
-    if (partial && this.isPendingAskUserQuestion(partial)) {
-      return null;
-    }
-
-    const lastHistoryMessage = this.getLastNonSystemHistoryMessage(historyResult.data);
-    const interruptedByPartial = partial?.role === "assistant";
-    const interruptedByHistory =
-      lastHistoryMessage?.role === "user" ||
-      (lastHistoryMessage?.role === "assistant" &&
-        lastHistoryMessage.metadata?.partial === true &&
-        !this.isPendingAskUserQuestion(lastHistoryMessage));
-
-    if (!interruptedByPartial && !interruptedByHistory) {
-      return null;
-    }
+    if (!this.hasInterruptedStartupTail(partial, historyResult.data)) return null;
 
     const retryRequest = await this.deriveStartupAutoRetryRequest({
       partial,
@@ -2637,13 +2568,15 @@ export class AgentSession {
     return retryRequest?.model ?? null;
   }
 
-  private async runStartupRecoveryStep(step: () => unknown): Promise<void> {
+  private async runStartupRecoveryStep<T>(step: () => T | Promise<T>): Promise<T | undefined> {
     if (this.coordinator.closing) return;
     using _execution = this.coordinator.enterExecution();
-    await step();
+    return await step();
   }
 
-  private async scheduleStartupAutoRetryIfNeeded(): Promise<StartupRecoveryOutcome> {
+  private async scheduleStartupAutoRetryIfNeeded(
+    workspaceMetadata?: WorkspaceMetadata
+  ): Promise<StartupRecoveryOutcome> {
     if (this.coordinator.closing) return "completed";
     using _execution = this.coordinator.enterExecution();
     const turn = this.coordinator.turnId;
@@ -2654,58 +2587,25 @@ export class AgentSession {
       return "deferred";
     }
 
-    const autoRetryEnabled = await this.loadAutoRetryEnabledPreference(isCurrent);
-    if (!isCurrent()) return "completed";
-    if (!autoRetryEnabled) {
-      return "completed";
-    }
+    const autoRetryEnabled = await this.loadAutoRetryEnabledPreference(isCurrent).catch(
+      () => undefined
+    );
+    if (autoRetryEnabled == null) return "retryable";
+    if (!isCurrent() || !autoRetryEnabled) return "completed";
 
-    const reads = await Promise.allSettled([
-      this.historyService.readPartial(this.workspaceId),
-      this.historyService.getLastMessages(this.workspaceId, 20),
-    ]);
+    const [partial, historyResult] = (await this.readStartupTail()) ?? [];
     if (!isCurrent()) return "completed";
-    // A rejected read does not cancel its sibling's disk I/O. Join both before releasing
-    // this probe's physical lease, and retry only the reads rather than the recovery prefix.
-    const [partialRead, historyRead] = reads;
-    if (partialRead.status === "rejected" || historyRead.status === "rejected") {
-      return "retryable";
-    }
-    const partial = partialRead.value;
-    const historyResult = historyRead.value;
-
-    if (!historyResult.success) {
+    if (partial === undefined || !historyResult?.success) {
       log.warn("Failed to inspect history for startup auto-retry", {
         workspaceId: this.workspaceId,
-        error: historyResult.error,
+        error: historyResult?.success ? undefined : historyResult?.error,
       });
       return "retryable";
     }
 
     const startupRetryUserMessage = this.findLastRetryUserMessage(historyResult.data);
     if (startupRetryUserMessage?.metadata?.contextBudgetRejected) return "completed";
-    if (partial && this.isPendingAskUserQuestion(partial)) {
-      return "completed";
-    }
-
-    const lastHistoryMessage = this.getLastNonSystemHistoryMessage(historyResult.data);
-    const interruptedByPartial = partial?.role === "assistant";
-    if (
-      !interruptedByPartial &&
-      lastHistoryMessage &&
-      this.isVisibleCompletedSubagentReportMessage(lastHistoryMessage)
-    ) {
-      return "completed";
-    }
-    const interruptedByHistory =
-      lastHistoryMessage?.role === "user" ||
-      (lastHistoryMessage?.role === "assistant" &&
-        lastHistoryMessage.metadata?.partial === true &&
-        !this.isPendingAskUserQuestion(lastHistoryMessage));
-
-    if (!interruptedByPartial && !interruptedByHistory) {
-      return "completed";
-    }
+    if (!this.hasInterruptedStartupTail(partial, historyResult.data)) return "completed";
 
     if (this.startupAutoRetryAbandon) {
       const abandonReason = this.startupAutoRetryAbandon.reason;
@@ -2727,6 +2627,7 @@ export class AgentSession {
       const retryRequest = await this.deriveStartupAutoRetryRequest({
         partial,
         historyTail: historyResult.data,
+        workspaceMetadata,
       });
 
       // Derivation reads metadata. A manual successor may have installed its own retry
@@ -2762,21 +2663,24 @@ export class AgentSession {
     return "completed";
   }
 
-  private async waitForStartupAutoRetryRerunWindow(retryDelayMs = 0): Promise<void> {
+  private async waitForStartupReadRetry(
+    retryDelayMs: number,
+    signal = this.closingSignal
+  ): Promise<void> {
     const delayMs = Math.max(0, Math.trunc(retryDelayMs));
     if (delayMs > 0) {
       const runner = this.streamManager.effectRunner ?? defaultEffectRunner;
       const sleeper = runner.runFork(Effect.sleep(delayMs));
-      const cancel = () => sleeper.interruptUnsafe();
-      this.closingSignal.addEventListener("abort", cancel, { once: true });
-      if (this.closingSignal.aborted) cancel();
       try {
-        await runner.runPromise(Fiber.await(sleeper));
+        await raceWithAbortAndTimeout(runner.runPromise(Fiber.await(sleeper)), { signal });
       } finally {
-        this.closingSignal.removeEventListener("abort", cancel);
+        sleeper.interruptUnsafe();
       }
     }
+  }
 
+  private async waitForStartupAutoRetryRerunWindow(retryDelayMs = 0): Promise<void> {
+    await this.waitForStartupReadRetry(retryDelayMs);
     while (!this.coordinator.closing) {
       await this.coordinator.waitForUnbusy(this.closingSignal);
       if (this.coordinator.closing || !this.isAiStreaming()) {
@@ -2823,12 +2727,76 @@ export class AgentSession {
     }
   }
 
+  async getStartupRecoveryState(
+    timeoutMs = STARTUP_RECOVERY_PROBE_TIMEOUT_MS
+  ): Promise<StartupRecoveryState> {
+    if (this.closingSignal.aborted) return "blocked";
+    const deadline = new AbortController();
+    const signal = AbortSignal.any([this.closingSignal, deadline.signal]);
+    try {
+      // Release admission on timeout, not the original read's physical I/O lease.
+      const probe = retryStartupRead(
+        () => this.readStartupRecoveryState(signal).catch(() => "blocked" as const),
+        (state) => state === "blocked",
+        { signal, wait: (delay) => this.waitForStartupReadRetry(delay, signal) }
+      );
+      const result = await raceWithAbortAndTimeout(probe, { signal, timeoutMs });
+      return result.kind === "ok" ? (result.value ?? "blocked") : "blocked";
+    } catch {
+      return "blocked";
+    } finally {
+      deadline.abort();
+    }
+  }
+
+  private readStartupTail(strictPartial = false) {
+    // A rejected read does not cancel its sibling. Keep their lease until both physically settle.
+    return this.runStartupRecoveryStep(() =>
+      Promise.all([
+        this.historyService
+          .readPartial(this.workspaceId, { throwOnError: strictPartial })
+          .catch(() => undefined),
+        this.historyService.getLastMessages(this.workspaceId, 20).catch(() => null),
+      ])
+    );
+  }
+
+  private async readStartupRecoveryState(signal: AbortSignal): Promise<StartupRecoveryState> {
+    await this.loadAutoRetryState();
+    if (signal.aborted) return "blocked";
+    if (this.autoRetryEnabledPreference === false) return "stopped";
+    const [partial, history] = (await this.readStartupTail(true)) ?? [];
+    if (!history?.success || partial === undefined) return "blocked";
+    const abandon = this.startupAutoRetryAbandon;
+    if (abandon?.reason === "aborted") {
+      // Accepted synthetic guidance is new intent too; snapshots/notices are not.
+      const latest = history.data.findLast(
+        (message) =>
+          this.shouldUseUserMessageForRetry(message) ||
+          (message.role === "user" && message.metadata?.retrySendOptions != null)
+      );
+      if (!abandon.userMessageId || !latest || latest.id === abandon.userMessageId)
+        return "stopped";
+    }
+    // A question may regain its lost queue, but must never override an applicable Stop.
+    if (
+      this.isPendingAskUserQuestion(partial) ||
+      this.isPendingAskUserQuestion(this.getLastNonSystemHistoryMessage(history.data))
+    )
+      return "question";
+    return this.hasInterruptedStartupTail(partial, history.data) ? "interrupted" : "idle";
+  }
+
   ensureStartupAutoRetryCheck(): Promise<void> {
     return this.runStartupRecovery();
   }
 
-  runStartupRecovery(): Promise<void> {
-    return this.startupRecovery.run();
+  async runStartupRecovery(metadata?: WorkspaceMetadata): Promise<void> {
+    // TaskService owns child recovery; replaying a stopped child must never restart it.
+    metadata ??= await this.getWorkspaceMetadataForRetry();
+    if (!metadata || metadata.parentWorkspaceId != null) return;
+    // Reuse the bulk startup snapshot throughout retry derivation instead of rescanning all workspaces.
+    return this.startupRecovery.run(() => this.scheduleStartupAutoRetryIfNeeded(metadata));
   }
 
   shouldRetainAfterStartupRecovery(): boolean {
@@ -2841,8 +2809,8 @@ export class AgentSession {
     );
   }
 
-  scheduleStartupRecovery(): void {
-    this.runStartupRecovery().catch((error: unknown) => {
+  scheduleStartupRecovery(metadata?: WorkspaceMetadata): void {
+    this.runStartupRecovery(metadata).catch((error: unknown) => {
       log.warn("Failed to schedule startup recovery", {
         workspaceId: this.workspaceId,
         error: getErrorMessage(error),
@@ -9782,7 +9750,8 @@ export class AgentSession {
    */
   private async dispatchPendingFollowUp(
     summaryMessageId?: string,
-    cancelResume?: () => boolean
+    cancelResume?: () => boolean,
+    startStreamInBackground = false
   ): Promise<boolean> {
     if (this.coordinator.disposed || this.coordinator.closing) {
       return false;
@@ -10094,12 +10063,13 @@ export class AgentSession {
       persistedGoalId
     );
 
-    // Await sendMessage to ensure the follow-up is persisted before returning.
-    // This guarantees ordering: the follow-up message is written to history
+    // Startup waits for durable acceptance, not provider completion. Other callers still await fully.
+    // Either way, the follow-up message is written to history
     // before sendQueuedMessages() runs, preventing race conditions.
     // Mark as synthetic so recovery/background dispatches do not implicitly
     // re-enable auto-retry after a user explicitly opted out.
     const sendResult = await this.sendMessage(finalText, options, {
+      startStreamInBackground,
       synthetic: true,
       agentInitiated: followUp.agentInitiated,
       goalKind: persistedGoalKind,
@@ -10988,9 +10958,12 @@ export class AgentSession {
     return result;
   }
 
-  async dispatchPendingCompactionFollowUpIfNeeded(summaryMessageId?: string): Promise<boolean> {
+  async dispatchPendingCompactionFollowUpIfNeeded(
+    summaryMessageId?: string,
+    startStreamInBackground = false
+  ): Promise<boolean> {
     this.assertNotDisposed("dispatchPendingCompactionFollowUpIfNeeded");
-    return this.dispatchPendingFollowUp(summaryMessageId);
+    return this.dispatchPendingFollowUp(summaryMessageId, undefined, startStreamInBackground);
   }
 
   /**
