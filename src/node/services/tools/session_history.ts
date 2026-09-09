@@ -2,10 +2,15 @@ import { createHash } from "node:crypto";
 import { tool } from "ai";
 import type { z } from "zod";
 import assert from "@/common/utils/assert";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { MuxMessage } from "@/common/types/message";
 import { isMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
 import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
+import { HISTORY_PROVENANCE_MAX_RECEIPT_BYTES } from "@/node/services/historyAppendProvenance";
 import {
+  SESSION_HISTORY_MAX_SCAN_BYTES,
+  SESSION_HISTORY_MAX_SCAN_ROWS,
+  SESSION_HISTORY_SCAN_CHUNK_BYTES,
   SESSION_HISTORY_DEFAULT_LIMIT,
   SESSION_HISTORY_RESULT_ENVELOPE_BYTES,
   SESSION_HISTORY_READ_RESULT_ENVELOPE_BYTES,
@@ -20,7 +25,11 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { Config } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
-import { decodeHistoryCursor, encodeHistoryCursor } from "@/node/services/historyCursor";
+import {
+  decodeHistoryCursor,
+  encodeHistoryCursor,
+  type HistoryScanState,
+} from "@/node/services/historyCursor";
 
 export type SessionHistoryArgs = z.infer<typeof TOOL_DEFINITIONS.session_history.schema>;
 export type SessionHistoryResult = z.infer<typeof TOOL_DEFINITIONS.session_history.resultSchema>;
@@ -93,6 +102,66 @@ function projectHistory(message: MuxMessage): { text: string; toolNames: Set<str
   return { text, toolNames };
 }
 
+/**
+ * Whether a caller row holds a canonical `task` creation receipt for `taskId`: a top-level
+ * `task` tool result, a PTC-nested one (persisted `nestedCalls`, or the legacy
+ * `code_execution` output `toolCalls` records that displayedMessageBuilder still reconstructs),
+ * naming it in taskId / taskIds / tasks[] / reports[]. IDs that merely appear in other tools'
+ * output (task_list, task_await) or free text do not count. Persisted JSON is validated here
+ * and traversal depth is bounded so one corrupt row cannot take the feature down.
+ */
+function createsTask(message: MuxMessage, taskId: string): boolean {
+  const names = (entry: unknown): boolean => isPlainObject(entry) && entry.taskId === taskId;
+  const receiptNames = (output: unknown): boolean =>
+    isPlainObject(output) &&
+    (names(output) ||
+      (Array.isArray(output.taskIds) && output.taskIds.includes(taskId)) ||
+      (Array.isArray(output.tasks) && output.tasks.some(names)) ||
+      (Array.isArray(output.reports) && output.reports.some(names)));
+  const spawns = (record: Record<string, unknown>, depth: number): boolean => {
+    if (depth > 30) return false;
+    if (record.toolName === "task" && receiptNames(record.output ?? record.result)) return true;
+    const children = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
+    // Only the PTC kernel's own result carries the legacy representation; any other tool's
+    // output (MCP, structured results) is attacker-controlled text, not a receipt.
+    const legacy =
+      record.toolName === "code_execution" && isPlainObject(record.output)
+        ? record.output.toolCalls
+        : undefined;
+    const nested: unknown[] = [...children(record.nestedCalls), ...children(legacy)];
+    return nested.some((entry) => isPlainObject(entry) && spawns(entry, depth + 1));
+  };
+  return message.parts.some(
+    (part: unknown) => isPlainObject(part) && part.type === "dynamic-tool" && spawns(part, 0)
+  );
+}
+
+/**
+ * A proven caller scan only needs its validated snapshots (and any resumed append check) to
+ * detect later resets/rewrites; drop browse positions, probes and window IDs so a descendant
+ * cursor carrying two scan states stays well inside the cursor and result limits.
+ */
+function proofState(state: HistoryScanState): HistoryScanState {
+  return {
+    ...state,
+    phase: "done",
+    artifact: "chat",
+    byteOffset: 0,
+    skippingOversized: false,
+    oversizedRowEnd: null,
+    resetProbe: "",
+    resetStage: 0,
+    possibleReset: false,
+    anchorSequence: null,
+    windowId: "w:0",
+    windowBoundaryKind: null,
+    windowPending: false,
+    floor: null,
+    probe: null,
+    span: null,
+  };
+}
+
 const FILTERABLE_ACTIONS: ReadonlySet<SessionHistoryArgs["action"]> = new Set([
   "list_items",
   "search",
@@ -110,6 +179,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
   const workspaceId = config.workspaceId;
   assert(workspaceId && workspaceId.trim().length > 0, "session_history requires workspaceId");
   const history = config.historyService ?? new HistoryService(new Config());
+  const taskService = config.taskService;
   return tool({
     description: TOOL_DEFINITIONS.session_history.description,
     inputSchema: TOOL_DEFINITIONS.session_history.schema,
@@ -142,6 +212,34 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           exhausted: false,
           skipped_oversized_rows: 0,
         };
+      // Descendant history: only this workspace's own descendants, and only when
+      // the caller's CURRENT privacy segment created the branch (a manual reset
+      // preserves tasks, so ancestry alone would let the post-reset model read
+      // child output derived from its discarded context). The branch root is
+      // proven by a bounded scan of the caller's post-floor history below; verified
+      // ancestry extends that proof to grandchildren. Unrelated targets get one
+      // generic error so no target metadata leaks.
+      const target = args.task_id ?? workspaceId;
+      const foreign = target !== workspaceId;
+      let branchRoot: string | null = null;
+      if (foreign) {
+        // Fail closed: an ancestry lookup failure denies rather than grants.
+        const relation = taskService
+          ? await taskService
+              .resolveDescendantAgentTaskBranchRoot(workspaceId, target)
+              .catch(() => ({ status: "unrelated" as const }))
+          : { status: "unrelated" as const };
+        if (relation.status !== "live")
+          return {
+            success: false,
+            error: relation.status === "removed" ? "session_unavailable" : "task_not_found",
+            exhausted: false,
+            skipped_oversized_rows: 0,
+          };
+        branchRoot = relation.branchRootTaskId;
+      }
+      // Caller and target identities are both bound so a cursor cannot be replayed
+      // by another caller or against another target.
       const binding = {
         workspaceId,
         action: args.action,
@@ -156,6 +254,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               args.tool_name ?? null,
               args.max_chars_per_item ?? null,
               args.recent_first === true,
+              target,
             ])
           )
           .digest("hex"),
@@ -185,16 +284,105 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           ? SESSION_HISTORY_READ_RESULT_ENVELOPE_BYTES
           : SESSION_HISTORY_RESULT_ENVELOPE_BYTES);
       const byteLength = () => Buffer.byteLength(JSON.stringify(result));
-      try {
+      // Descendant reads hold the caller's history locks across BOTH scans so no backend can
+      // append a caller reset between proving the floor and disclosing target rows; a
+      // caller-side append (including its own tool-result persistence) simply waits.
+      const run = async (): Promise<SessionHistoryResult> => {
         // Match in the original string: lowercasing can expand Unicode characters
         // and shift snippet offsets. Escape the query so matching stays literal.
         const search =
           args.action === "search"
             ? new RegExp(args.query!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "iu")
             : null;
-        const scan = await history.scanHistoryBounded(workspaceId, {
-          cursor: args.cursor != null ? decodeHistoryCursor(args.cursor, binding) : undefined,
+        const cursor = args.cursor != null ? decodeHistoryCursor(args.cursor, binding) : undefined;
+        // One page budget is shared by the authorization scan and the target scan.
+        const budget = {
+          maxBytes: SESSION_HISTORY_MAX_SCAN_BYTES,
+          maxRows: SESSION_HISTORY_MAX_SCAN_ROWS,
+        };
+        let authorization = cursor?.authorization ?? null;
+        if (branchRoot !== null) {
+          assert(
+            authorization === null || authorization.branchRoot === branchRoot,
+            "descendant cursor binding must pin the branch root"
+          );
+          // A child created in the current turn is only in the caller's partial message
+          // until stream end, so it is provable (and readable) once the turn settles.
+          {
+            // Proven cursors carry the caller scan as "done": continuing it only runs the
+            // append check (an appended manual reset or rewrite throws stale_cursor) without
+            // browsing further caller rows.
+            let found = authorization?.proven === true;
+            const auth = await history.scanHistoryBoundedUnderLocks(workspaceId, {
+              cursor: authorization?.scan,
+              budget,
+              visit: ({ message }) => {
+                if (found || !createsTask(message, branchRoot)) return true;
+                found = true;
+                return false;
+              },
+            });
+            budget.maxBytes -= auth.bytesRead;
+            budget.maxRows -= auth.rowsScanned;
+            result.bytesRead = auth.bytesRead;
+            result.rowsScanned = auth.rowsScanned;
+            if (authorization?.proven) {
+              assert(auth.state, "a resumed caller scan reports its final state");
+              // Keep the advanced snapshot; an unfinished append check resumes next page.
+              authorization = { ...authorization, scan: proofState(auth.state) };
+              if (auth.cursor) {
+                result.exhausted = false;
+                result.nextCursor = encodeHistoryCursor({
+                  ...binding,
+                  scan: cursor?.scan ?? null,
+                  authorization,
+                });
+                return result;
+              }
+            } else if (found) {
+              assert(auth.cursor, "a receipt row leaves the caller scan resumable");
+              authorization = { branchRoot, scan: proofState(auth.cursor), proven: true };
+            } else if (auth.cursor) {
+              authorization = { branchRoot, scan: auth.cursor, proven: false };
+              result.exhausted = false;
+              // Keep any target progress made while the in-flight receipt still authorized.
+              result.nextCursor = encodeHistoryCursor({
+                ...binding,
+                scan: cursor?.scan ?? null,
+                authorization,
+              });
+              return result;
+            } else {
+              // The caller's whole post-floor history holds no creation receipt for this branch.
+              return {
+                success: false,
+                error: "task_not_found",
+                exhausted: false,
+                skipped_oversized_rows: 0,
+              };
+            }
+          }
+          // The target scan needs room for its provenance receipts and snapshot anchors;
+          // otherwise hand back a progress page instead of tripping the scanner's budget assert.
+          if (
+            budget.maxBytes <=
+              2 * HISTORY_PROVENANCE_MAX_RECEIPT_BYTES + SESSION_HISTORY_SCAN_CHUNK_BYTES ||
+            budget.maxRows <= 0
+          ) {
+            result.exhausted = false;
+            result.nextCursor = encodeHistoryCursor({
+              ...binding,
+              scan: cursor?.scan ?? null,
+              authorization,
+            });
+            return result;
+          }
+        }
+        const scan = await history.scanHistoryBounded(target, {
+          cursor: cursor?.scan ?? undefined,
           recentFirst: args.recent_first === true,
+          requireExistingHistory: foreign,
+          budget,
           visit: ({ message, itemId, windowId, windowBoundaryKind, startsWindow }) => {
             if (args.action === "list_windows") {
               if (!startsWindow) return true;
@@ -276,14 +464,14 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             return true;
           },
         });
-        result.bytesRead = scan.bytesRead;
-        result.rowsScanned = scan.rowsScanned;
+        result.bytesRead = (result.bytesRead ?? 0) + scan.bytesRead;
+        result.rowsScanned = (result.rowsScanned ?? 0) + scan.rowsScanned;
         result.oversizedLines = scan.oversizedLines;
         result.skipped_oversized_rows = scan.oversizedLines;
         result.exhausted = foundItem || scan.cursor == null;
         result.malformedLines = scan.malformedLines;
         if (scan.cursor && !foundItem)
-          result.nextCursor = encodeHistoryCursor({ ...binding, scan: scan.cursor });
+          result.nextCursor = encodeHistoryCursor({ ...binding, scan: scan.cursor, authorization });
         if (args.action === "read_item" && !foundItem && !scan.cursor) {
           result.success = false;
           result.error = "item_not_found";
@@ -293,13 +481,16 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           "session_history aggregate result exceeds budget"
         );
         return result;
+      };
+      try {
+        return foreign ? await history.withHistoryScanLocks(workspaceId, run) : await run();
       } catch (error) {
         const message = error instanceof Error ? error.message : "history_unavailable";
         return {
           success: false,
           exhausted: false,
           skipped_oversized_rows: 0,
-          error: ["stale_cursor", "invalid_cursor"].includes(message)
+          error: ["stale_cursor", "invalid_cursor", "session_unavailable"].includes(message)
             ? message
             : "history_unavailable",
         };

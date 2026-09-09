@@ -422,6 +422,8 @@ export interface BoundedHistoryScanOptions {
 }
 export interface BoundedHistoryScanResult {
   cursor?: HistoryScanState;
+  /** Final state even when the scan finished (no cursor): carries the validated snapshots. */
+  state?: HistoryScanState;
   bytesRead: number;
   rowsScanned: number;
   oversizedLines: number;
@@ -434,8 +436,10 @@ export async function scanHistoryFilesBounded(
   paths: Record<HistoryArtifact, string>,
   options: BoundedHistoryScanOptions,
   provenanceEpoch: string,
-  maxBytes = SESSION_HISTORY_MAX_SCAN_BYTES
+  maxBytes = SESSION_HISTORY_MAX_SCAN_BYTES,
+  maxRows = SESSION_HISTORY_MAX_SCAN_ROWS
 ): Promise<BoundedHistoryScanResult> {
+  assert(maxBytes >= 0 && maxRows >= 0, "history scan budgets must be non-negative");
   const result: BoundedHistoryScanResult = {
     bytesRead: 0,
     rowsScanned: 0,
@@ -635,7 +639,7 @@ export async function scanHistoryFilesBounded(
       while (
         (reverse ? cursor > lower : cursor < end) &&
         remaining() > 0 &&
-        result.rowsScanned < SESSION_HISTORY_MAX_SCAN_ROWS
+        result.rowsScanned < maxRows
       ) {
         const length = Math.min(
           SESSION_HISTORY_SCAN_CHUNK_BYTES,
@@ -665,7 +669,7 @@ export async function scanHistoryFilesBounded(
           const edge = start + i + 1;
           if (!deliver(edge)) return false;
           segmentEdge = reverse ? i : i + 1;
-          if (result.rowsScanned >= SESSION_HISTORY_MAX_SCAN_ROWS) return false;
+          if (result.rowsScanned >= maxRows) return false;
         }
         add(reverse ? chunk.subarray(0, segmentEdge) : chunk.subarray(segmentEdge));
         cursor = reverse ? start : start + length;
@@ -727,6 +731,7 @@ export async function scanHistoryFilesBounded(
         );
         if (!completed && !reachedValidatedRow) {
           result.cursor = state;
+          result.state = state;
           return await finish();
         }
         // Keep the retrieval snapshot fixed even when our own result is appended.
@@ -734,6 +739,7 @@ export async function scanHistoryFilesBounded(
         state.appendCheck = null;
         if (chatSize > state.validatedChatSnapshot.endOffsetSnapshot) {
           result.cursor = state;
+          result.state = state;
           return await finish();
         }
       }
@@ -884,11 +890,7 @@ export async function scanHistoryFilesBounded(
       state.phase = "probe";
       return true;
     };
-    while (
-      state.phase !== "done" &&
-      remaining() > 0 &&
-      result.rowsScanned < SESSION_HISTORY_MAX_SCAN_ROWS
-    ) {
+    while (state.phase !== "done" && remaining() > 0 && result.rowsScanned < maxRows) {
       if (state.phase === "probe") {
         if (!(await probePage())) break;
         continue;
@@ -987,6 +989,7 @@ export async function scanHistoryFilesBounded(
       } else state.phase = "done";
     }
     if (state.phase !== "done") result.cursor = state;
+    result.state = state;
     return await finish();
   } finally {
     await Promise.all([...handles.values()].map((handle) => handle.close()));
