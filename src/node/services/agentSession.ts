@@ -2774,6 +2774,17 @@ export class AgentSession {
       if (persistedGoalId != null) {
         compactionRequest.goalId = persistedGoalId;
       }
+      // A routed turn's on-send compaction request persisted the consent
+      // obligation (its retry options seed routedProjectConsent): the resumed
+      // compaction reads that turn's project snapshot, possibly on the class
+      // model, so recovery re-verifies Project Trust like the turn itself —
+      // this branch returns before the shared restoration below.
+      if (persistedRetrySendOptions?.routedProjectConsent === true) {
+        compactionRequest.routedProjectConsent = true;
+      }
+      if (persistedCompactionBaseOptions != null) {
+        compactionRequest.compactionBaseOptions = persistedCompactionBaseOptions;
+      }
 
       return compactionRequest;
     }
@@ -5765,9 +5776,15 @@ export class AgentSession {
       const deferredSkillAttribution = typedMuxMetadata?.type === "agent-skill";
       this.completePreparation(backgroundAttempt, () => startPreparedStream(backgroundAttempt))
         .then(async (result) => {
+          // Same rule as the queue-dispatch path: a compaction-DEFERRED skill
+          // ({ queued: true }) has not streamed — what started here is the
+          // compaction request, and dispatchPendingFollowUp attributes the
+          // skill when it actually streams; capturing here would double-count
+          // it against the compaction model.
           if (
             result.success &&
             deferredSkillAttribution &&
+            result.data?.queued !== true &&
             result.data?.acceptedWithoutStream !== true
           ) {
             await this.captureBackendMessageSent({
@@ -8298,13 +8315,26 @@ export class AgentSession {
 
     // Delayed retries belong to this admitted turn; do not lose its pinned chain on teardown.
     if (requestAssemblySnapshot) {
+      // Refresh, never replace: the accepted send (or resume) seeded this
+      // turn's routed consent obligation, compaction policy and refused-row
+      // key into the resume state moments ago. The setter swaps the whole
+      // object, so a retry after a transient failure would otherwise rebuild
+      // the project-skill request with no trust gate and no row to stamp.
+      // Same options object = the same turn's seed.
+      const seeded =
+        this.lastAutoRetryResumeRequest?.options === options
+          ? this.lastAutoRetryResumeRequest
+          : undefined;
       this.setAutoRetryResumeState(
         options,
         agentInitiated,
         goalKind,
         goalId,
         requestAssemblySnapshot,
-        contextBudgetRetried
+        contextBudgetRetried,
+        seeded?.compactionBaseOptions ?? compactionBaseOptions,
+        seeded?.routedProjectConsent,
+        seeded?.userMessageId
       );
     }
 

@@ -1152,6 +1152,61 @@ describe("AgentSession startup auto-retry recovery", () => {
     await session.dispose();
   });
 
+  test("restores routed consent on a resumed compaction request", async () => {
+    // A routed project-skill send that compacted on-send persisted its consent
+    // obligation on the compaction request row. Startup recovery derives the
+    // compaction retry through an early-returning branch; it must still carry
+    // the flag — the resumed compaction reads that turn's project snapshot,
+    // possibly on the class model, and re-verifies trust only from it.
+    const workspaceId = "startup-retry-routed-compaction-request";
+    const workspaceMetadata: WorkspaceMetadata = {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "project",
+      projectPath: "/tmp/project",
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const { session, historyService, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
+      },
+    });
+    cleanups.push(cleanup);
+
+    const appendResult = await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("compaction-request-1", "user", "Please compact", {
+        timestamp: Date.now(),
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        retrySendOptions: {
+          model: "anthropic:claude-opus-5",
+          agentId: "compact",
+          agentInitiated: true,
+          routedProjectConsent: true,
+        },
+      })
+    );
+    expect(appendResult.success).toBe(true);
+
+    await session.ensureStartupAutoRetryCheck();
+
+    const retryOptions = (
+      session as unknown as {
+        lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
+      }
+    ).lastAutoRetryResumeRequest;
+    expect(retryOptions).toBeDefined();
+    if (!retryOptions) {
+      throw new Error("Expected startup retry options");
+    }
+    expect(retryOptions.options.agentId).toBe("compact");
+    expect(retryOptions.routedProjectConsent).toBe(true);
+    expect(retryOptions.userMessageId).toBe("compaction-request-1");
+
+    await session.dispose();
+  });
+
   test("replays pending auto-retry schedule during reconnect catch-up", async () => {
     const workspaceId = "startup-retry-replay-snapshot";
     const { session, historyService, cleanup } = await createSessionBundle(workspaceId);

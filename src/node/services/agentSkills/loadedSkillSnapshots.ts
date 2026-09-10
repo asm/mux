@@ -261,17 +261,48 @@ export function rowCarriesProjectSkillContent(message: MuxMessage): boolean {
   if (message.metadata?.agentSkillSnapshot?.scope === "project") {
     return true;
   }
-  return extractLoadedSkillSnapshotsFromMessage(message).some(
-    (snapshot) => snapshot.scope === "project"
-  );
+  return message.parts.some((part) => {
+    if (part.type !== "dynamic-tool" || part.state !== "output-available") return false;
+    if (part.toolName === "agent_skill_read") return outputRetainsProjectSkill(part.output);
+    if (part.toolName === "code_execution") {
+      return nestedSkillReadRecords(part.output).some((record) =>
+        outputRetainsProjectSkill(record.result)
+      );
+    }
+    return false;
+  });
 }
 
 /** Replaces a withheld project skill's tool output in a REQUEST copy (history is untouched). */
 export const PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE =
   "Project skill content withheld: Project Trust is not granted for this workspace.";
 
-function isProjectSkillToolOutput(output: unknown): boolean {
-  return extractLoadedSkillSnapshotFromToolOutput(output)?.scope === "project";
+/**
+ * Confidentiality check for a persisted agent_skill_read result, deliberately
+ * looser than the snapshot extractor: any retained result whose skill is
+ * project-scoped counts, whether or not the call is recorded as successful (a
+ * contradictory nested `ok: false` record still carries the body the extractor
+ * discards) and whether or not the package validates fully. The scan is about
+ * what would leave for the provider, not about what is usable.
+ */
+function outputRetainsProjectSkill(output: unknown): boolean {
+  if (typeof output !== "object" || output === null || Array.isArray(output)) return false;
+  const skill = (output as { skill?: unknown }).skill;
+  if (typeof skill !== "object" || skill === null) return false;
+  return (skill as { scope?: unknown }).scope === "project";
+}
+
+/** Every nested agent_skill_read record of a code_execution output, regardless of its status. */
+function nestedSkillReadRecords(output: unknown): Array<{ toolName?: unknown; result?: unknown }> {
+  if (typeof output !== "object" || output === null) return [];
+  const toolCalls = (output as { toolCalls?: unknown }).toolCalls;
+  if (!Array.isArray(toolCalls)) return [];
+  return toolCalls.filter(
+    (record): record is { toolName?: unknown; result?: unknown } =>
+      typeof record === "object" &&
+      record !== null &&
+      (record as { toolName?: unknown }).toolName === "agent_skill_read"
+  );
 }
 
 function redactCodeExecutionOutput(output: unknown): { output: unknown; changed: boolean } {
@@ -282,7 +313,7 @@ function redactCodeExecutionOutput(output: unknown): { output: unknown; changed:
   const redactedCalls = toolCalls.map((record: unknown) => {
     if (typeof record !== "object" || record === null) return record;
     const call = record as { toolName?: unknown; result?: unknown };
-    if (call.toolName !== "agent_skill_read" || !isProjectSkillToolOutput(call.result)) {
+    if (call.toolName !== "agent_skill_read" || !outputRetainsProjectSkill(call.result)) {
       return record;
     }
     changed = true;
@@ -306,7 +337,7 @@ export function redactProjectSkillToolResults(messages: MuxMessage[]): MuxMessag
     let changed = false;
     const parts = message.parts.map((part) => {
       if (part.type !== "dynamic-tool" || part.state !== "output-available") return part;
-      if (part.toolName === "agent_skill_read" && isProjectSkillToolOutput(part.output)) {
+      if (part.toolName === "agent_skill_read" && outputRetainsProjectSkill(part.output)) {
         changed = true;
         return {
           ...part,

@@ -1691,8 +1691,60 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     ).preDispatchConsentGate;
     if (gate == null) throw new Error("rollover preparation must carry the routed turn's gate");
     expect(await gate()).toBeNull();
+    // The snapshot-backed retry state the request build refreshed must still
+    // carry the accepted send's consent obligation and refused-row key: a
+    // retry after a transient failure resumes through resumeStream, which
+    // re-verifies trust only from these fields.
+    const resumeState = (
+      session as unknown as {
+        lastAutoRetryResumeRequest?: {
+          requestAssemblySnapshot?: unknown;
+          routedProjectConsent?: boolean;
+          userMessageId?: string;
+        };
+      }
+    ).lastAutoRetryResumeRequest;
+    expect(resumeState?.requestAssemblySnapshot).toBeDefined();
+    expect(resumeState?.routedProjectConsent).toBe(true);
+    expect(typeof resumeState?.userMessageId).toBe("string");
     harnessArgs.projectTrusted = false;
     expect(JSON.stringify(await gate({ midStream: true }))).toMatch(/trust was revoked/i);
+    await session.dispose();
+  });
+
+  it("does not attribute a compaction-deferred background skill send when the compaction stream starts", async () => {
+    // A background-started skill send (a startup-dispatched follow-up; edits
+    // skip on-send compaction) that triggers on-send compaction is deferred
+    // ({ queued: true }): what starts in the background is the compaction
+    // request. dispatchPendingFollowUp attributes the skill when it actually
+    // streams; capturing at compaction start would double-count it against
+    // the compaction model.
+    const workspacePath = await createWorkspaceWithSkill({
+      skillName: "done",
+      metadataYaml: "metadata:\n  model-class: small\n",
+    });
+    const { session, streamed } = await createRoutingHarness({
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" } },
+    });
+    forceOnSendCompaction(session);
+    const captureSpy = spyOn(
+      session as unknown as { captureBackendMessageSent: (args: unknown) => Promise<void> },
+      "captureBackendMessageSent"
+    ).mockResolvedValue(undefined);
+
+    const accepted = await session.sendMessage("Use skill done", skillSendOptions(), {
+      startStreamInBackground: true,
+    });
+    expect(accepted.success).toBe(true);
+    expect(accepted.success && accepted.data?.queued).toBe(true);
+    await waitFor(() => streamed.length === 1, "the compaction stream's start");
+    // What streamed is the compaction request, not the skill.
+    expect(
+      streamed[0].messages.some((row) => row.metadata?.muxMetadata?.type === "compaction-request")
+    ).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(captureSpy).not.toHaveBeenCalled();
     await session.dispose();
   });
 

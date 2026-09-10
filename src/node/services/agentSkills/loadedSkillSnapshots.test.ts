@@ -3,7 +3,12 @@ import { describe, expect, it } from "bun:test";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
 
-import { extractLoadedSkillSnapshotsFromMessages } from "./loadedSkillSnapshots";
+import {
+  extractLoadedSkillSnapshotsFromMessages,
+  PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE,
+  redactProjectSkillToolResults,
+  rowCarriesProjectSkillContent,
+} from "./loadedSkillSnapshots";
 
 function createAgentSkillReadToolMessage(args: {
   id: string;
@@ -191,5 +196,91 @@ describe("extractLoadedSkillSnapshotsFromMessages", () => {
 
     expect(snapshots).toHaveLength(1);
     expect(snapshots[0]?.body).toContain("New tool body");
+  });
+});
+
+describe("project skill content in persisted tool results", () => {
+  function nestedRecordsMessage(records: unknown[]): MuxMessage {
+    return {
+      id: "nested",
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "tool-nested",
+          toolName: "code_execution",
+          state: "output-available",
+          input: { code: "..." },
+          output: { success: true, toolCalls: records },
+        },
+      ],
+    };
+  }
+  const projectResult = (name: string, body: string) => ({
+    success: true,
+    skill: {
+      scope: "project",
+      directoryName: name,
+      frontmatter: { name, description: `${name} description` },
+      body,
+    },
+  });
+
+  it("counts a retained project skill even when the nested record is marked failed", () => {
+    // The snapshot extractor drops a contradictory `ok: false` record as a
+    // failed call; the confidentiality scan must not — the retained body
+    // would still leave for the class provider.
+    const message = nestedRecordsMessage([
+      {
+        toolName: "agent_skill_read",
+        args: { name: "contradictory-skill" },
+        ok: false,
+        result: projectResult("contradictory-skill", "Contradictory body"),
+      },
+    ]);
+    expect(extractLoadedSkillSnapshotsFromMessages([message])).toHaveLength(0);
+    expect(rowCarriesProjectSkillContent(message)).toBe(true);
+
+    const [redacted] = redactProjectSkillToolResults([message]);
+    const serialized = JSON.stringify(redacted);
+    expect(serialized).not.toContain("Contradictory body");
+    expect(serialized).toContain(PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE);
+    // The redaction copies; history rows are untouched.
+    expect(JSON.stringify(message)).toContain("Contradictory body");
+  });
+
+  it("ignores global skills and non-skill tool results, and keeps them intact", () => {
+    const message: MuxMessage = {
+      ...createAgentSkillReadToolMessage({
+        id: "global-read",
+        skillName: "team-style",
+        body: "Global body",
+        scope: "global",
+      }),
+    };
+    const bashOnly = nestedRecordsMessage([
+      { toolName: "bash", args: { script: "true" }, result: { success: true } },
+    ]);
+    expect(rowCarriesProjectSkillContent(message)).toBe(false);
+    expect(rowCarriesProjectSkillContent(bashOnly)).toBe(false);
+    expect(redactProjectSkillToolResults([message, bashOnly])).toEqual([message, bashOnly]);
+  });
+
+  it("detects direct project results and synthetic snapshot rows alike", () => {
+    const direct = createAgentSkillReadToolMessage({
+      id: "direct-read",
+      skillName: "repo-conventions",
+      body: "Direct body",
+    });
+    const synthetic = createSyntheticSkillSnapshotMessage({
+      id: "synthetic",
+      skillName: "repo-conventions",
+      body: "Synthetic body",
+    });
+    expect(rowCarriesProjectSkillContent(direct)).toBe(true);
+    expect(rowCarriesProjectSkillContent(synthetic)).toBe(true);
+    const [redactedDirect] = redactProjectSkillToolResults([direct]);
+    expect(JSON.stringify(redactedDirect)).not.toContain("Direct body");
+    expect(rowCarriesProjectSkillContent(redactedDirect)).toBe(false);
   });
 });
