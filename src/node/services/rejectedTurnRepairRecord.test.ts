@@ -66,4 +66,35 @@ describe("rejected-turn repair record", () => {
     // A directory at the record's path fails the read with something other than ENOENT.
     expect((await readDurableRejectedTurnKeys(tempDir)).success).toBe(false);
   });
+
+  it("treats present-but-invalid nested fields as an unknown state, not as no keys", async () => {
+    // Only the document shape was validated before: `{ userMessageIds: 42 }`
+    // parsed to an empty key list, which a side channel took as an
+    // authoritative empty quarantine. Nested corruption must fail closed too.
+    const preferencePath = path.join(tempDir, AUTO_RETRY_PREFERENCE_FILE);
+    const malformed = [
+      { pendingRejectedTurnRepair: { userMessageIds: 42 } },
+      { pendingRejectedTurnRepair: { userMessageIds: ["u-1", 3] } },
+      { pendingRejectedTurnRepair: {} },
+      { pendingRejectedTurnRepair: "u-1" },
+      { startupAutoRetryAbandon: { reason: "pre_stream_rejected", userMessageId: 7 } },
+      { startupAutoRetryAbandon: { reason: "" } },
+      { startupAutoRetryAbandon: "pre_stream_rejected" },
+    ];
+    for (const record of malformed) {
+      await fs.writeFile(preferencePath, JSON.stringify(record));
+      expect((await readDurableRejectedTurnKeys(preferencePath)).success).toBe(false);
+    }
+    // Valid shapes still read: a key-less rejected marker (nothing to add), an
+    // empty key list, and an unrelated marker reason.
+    for (const record of [
+      { startupAutoRetryAbandon: { reason: "pre_stream_rejected" } },
+      { pendingRejectedTurnRepair: { userMessageIds: [] } },
+      { startupAutoRetryAbandon: { reason: "aborted", userMessageId: "u-aborted" } },
+    ]) {
+      await fs.writeFile(preferencePath, JSON.stringify(record));
+      const result = await readDurableRejectedTurnKeys(preferencePath);
+      expect(result.success && result.data.size).toBe(0);
+    }
+  });
 });

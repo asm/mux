@@ -249,6 +249,83 @@ export function mergeLoadedSkillSnapshots(snapshots: LoadedSkillSnapshot[]): Loa
   return deduped.slice(-MAX_POST_COMPACTION_LOADED_SKILLS);
 }
 
+/**
+ * Whether a history row carries repository-controlled PROJECT skill content by
+ * any channel: a synthetic skill snapshot row, or an `agent_skill_read` result
+ * (direct, or nested inside a code_execution part) whose scope is "project".
+ * The routed-request consent scan must see both — a project skill the model
+ * read through the tool in an earlier turn persists inside an assistant
+ * tool-result row, not in `metadata.agentSkillSnapshot`.
+ */
+export function rowCarriesProjectSkillContent(message: MuxMessage): boolean {
+  if (message.metadata?.agentSkillSnapshot?.scope === "project") {
+    return true;
+  }
+  return extractLoadedSkillSnapshotsFromMessage(message).some(
+    (snapshot) => snapshot.scope === "project"
+  );
+}
+
+/** Replaces a withheld project skill's tool output in a REQUEST copy (history is untouched). */
+export const PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE =
+  "Project skill content withheld: Project Trust is not granted for this workspace.";
+
+function isProjectSkillToolOutput(output: unknown): boolean {
+  return extractLoadedSkillSnapshotFromToolOutput(output)?.scope === "project";
+}
+
+function redactCodeExecutionOutput(output: unknown): { output: unknown; changed: boolean } {
+  if (typeof output !== "object" || output === null) return { output, changed: false };
+  const toolCalls = (output as { toolCalls?: unknown }).toolCalls;
+  if (!Array.isArray(toolCalls)) return { output, changed: false };
+  let changed = false;
+  const redactedCalls = toolCalls.map((record: unknown) => {
+    if (typeof record !== "object" || record === null) return record;
+    const call = record as { toolName?: unknown; result?: unknown };
+    if (call.toolName !== "agent_skill_read" || !isProjectSkillToolOutput(call.result)) {
+      return record;
+    }
+    changed = true;
+    return { ...call, result: { success: false, error: PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE } };
+  });
+  return changed
+    ? { output: { ...output, toolCalls: redactedCalls }, changed }
+    : { output, changed };
+}
+
+/**
+ * Request-copy redaction for an UNTRUSTED workspace's routed request: every
+ * project-scope `agent_skill_read` result (direct or nested in code_execution)
+ * is replaced with a withheld marker in the tool's failure shape, so the
+ * tool-call/result pairing the provider requires stays intact while the
+ * repository-controlled body never leaves for the class provider. Mirrors the
+ * synthetic-snapshot omission; rows are copied, never mutated.
+ */
+export function redactProjectSkillToolResults(messages: MuxMessage[]): MuxMessage[] {
+  return messages.map((message) => {
+    let changed = false;
+    const parts = message.parts.map((part) => {
+      if (part.type !== "dynamic-tool" || part.state !== "output-available") return part;
+      if (part.toolName === "agent_skill_read" && isProjectSkillToolOutput(part.output)) {
+        changed = true;
+        return {
+          ...part,
+          output: { success: false, error: PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE },
+        };
+      }
+      if (part.toolName === "code_execution") {
+        const redacted = redactCodeExecutionOutput(part.output);
+        if (redacted.changed) {
+          changed = true;
+          return { ...part, output: redacted.output };
+        }
+      }
+      return part;
+    });
+    return changed ? { ...message, parts } : message;
+  });
+}
+
 export function extractLoadedSkillSnapshotsFromMessages(
   messages: MuxMessage[]
 ): LoadedSkillSnapshot[] {

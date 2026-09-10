@@ -12,6 +12,7 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
 import type { ResolvedAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
+import { PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import type { HistoryService } from "@/node/services/historyService";
 import {
   createUnknownSendMessageError,
@@ -697,9 +698,15 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
 
   /** Route a GLOBAL skill (routable in untrusted projects) with pending post-compaction state. */
   async function sendRoutedGlobalSkillWithPendingState(
-    harnessArgs: Parameters<typeof createRoutingHarness>[0]
+    harnessArgs: Parameters<typeof createRoutingHarness>[0],
+    extras?: {
+      /** Rows persisted before the send (earlier turns of the conversation). */
+      seedHistory?: (historyService: HistoryService) => Promise<void>;
+      /** Post-compaction loaded skills to inject; defaults to the shared fixture set. */
+      loadedSkills?: LoadedSkillSnapshot[];
+    }
   ) {
-    const { session, streamed } = await createRoutingHarness(harnessArgs);
+    const { session, streamed, historyService } = await createRoutingHarness(harnessArgs);
     // The fixture skill lives in the project tree; present it as GLOBAL so
     // the invocation itself carries no project content and routes in an
     // untrusted project — only the attachment channel is under test.
@@ -717,9 +724,10 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     });
     spyOn(withReader.compactionHandler, "peekPendingState").mockResolvedValue({
       diffs: [],
-      loadedSkills: pendingLoadedSkills,
+      loadedSkills: extras?.loadedSkills ?? pendingLoadedSkills,
       readFiles: [],
     });
+    await extras?.seedHistory?.(historyService);
 
     const result = await session.sendMessage(
       "Use skill done",
@@ -871,7 +879,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     const internals = session as unknown as {
       startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
       pendingRejectedTurnRepair: { userMessageIds: string[] } | null;
-      repairUnstampedRejectedTurn: () => Promise<boolean>;
+      repairUnstampedRejectedTurn: () => Promise<{ durable: boolean; partialSecured: boolean }>;
     };
     internals.startupAutoRetryAbandon = {
       reason: "pre_stream_rejected",
@@ -899,7 +907,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     expect(internals.pendingRejectedTurnRepair).toEqual({ userMessageIds: ["u-rejected"] });
 
     // The next repair pass completes the durable stamp and retires the record.
-    expect(await internals.repairUnstampedRejectedTurn()).toBe(true);
+    expect((await internals.repairUnstampedRejectedTurn()).durable).toBe(true);
     expect(internals.pendingRejectedTurnRepair).toBeNull();
     const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
     if (!history.success) throw new Error(history.error);
@@ -1218,7 +1226,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     const internals = session as unknown as {
       startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
       pendingRejectedTurnRepair: { userMessageIds: string[] } | null;
-      repairUnstampedRejectedTurn: () => Promise<boolean>;
+      repairUnstampedRejectedTurn: () => Promise<{ durable: boolean; partialSecured: boolean }>;
     };
     internals.pendingRejectedTurnRepair = { userMessageIds: ["u-old"] };
     internals.startupAutoRetryAbandon = { reason: "pre_stream_rejected", userMessageId: "u-new" };
@@ -1229,14 +1237,14 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
         ids.includes("u-old") ? Promise.resolve(Err("disk full")) : realStamp(wsId, ids)
     );
     try {
-      expect(await internals.repairUnstampedRejectedTurn()).toBe(false);
+      expect((await internals.repairUnstampedRejectedTurn()).durable).toBe(false);
     } finally {
       stampSpy.mockRestore();
     }
     // The older key stays outstanding...
     expect(internals.pendingRejectedTurnRepair).toEqual({ userMessageIds: ["u-old"] });
     // ...until its own rows verify.
-    expect(await internals.repairUnstampedRejectedTurn()).toBe(true);
+    expect((await internals.repairUnstampedRejectedTurn()).durable).toBe(true);
     expect(internals.pendingRejectedTurnRepair).toBeNull();
     const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
     if (!history.success) throw new Error(history.error);
@@ -1271,12 +1279,12 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     const internals = session as unknown as {
       startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
       pendingRejectedTurnRepair: { userMessageIds: string[] } | null;
-      repairUnstampedRejectedTurn: () => Promise<boolean>;
+      repairUnstampedRejectedTurn: () => Promise<{ durable: boolean; partialSecured: boolean }>;
     };
     internals.startupAutoRetryAbandon = null;
     internals.pendingRejectedTurnRepair = { userMessageIds: ["u-old"] };
 
-    expect(await internals.repairUnstampedRejectedTurn()).toBe(true);
+    expect((await internals.repairUnstampedRejectedTurn()).durable).toBe(true);
     expect((await historyService.readPartial(workspaceId))?.id).toBe("a-later");
     const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
     if (!history.success) throw new Error(history.error);
@@ -1285,7 +1293,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
 
     // A surviving partial is the refused turn's only while that turn is the newest.
     internals.pendingRejectedTurnRepair = { userMessageIds: ["u-later"] };
-    expect(await internals.repairUnstampedRejectedTurn()).toBe(true);
+    expect((await internals.repairUnstampedRejectedTurn()).durable).toBe(true);
     expect(await historyService.readPartial(workspaceId)).toBeNull();
     await session.dispose();
   });
@@ -1782,6 +1790,120 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       session as unknown as { lastAutoRetryResumeRequest?: { routedProjectConsent?: boolean } }
     ).lastAutoRetryResumeRequest;
     expect(resumeState).toMatchObject({ routedProjectConsent: true });
+    await session.dispose();
+  });
+
+  /** An earlier turn's assistant row holding a project skill the model read with agent_skill_read. */
+  function projectSkillReadRow(id: string, body: string) {
+    return createMuxMessage(id, "assistant", "", { timestamp: Date.now() }, [
+      {
+        type: "dynamic-tool",
+        toolName: "agent_skill_read",
+        toolCallId: `${id}-call`,
+        state: "output-available",
+        input: { name: "repo-conventions" },
+        output: {
+          success: true,
+          skill: {
+            scope: "project",
+            directoryName: "repo-conventions",
+            frontmatter: { name: "repo-conventions", description: "Repository conventions" },
+            body,
+          },
+        },
+      },
+    ]);
+  }
+
+  async function seedProjectSkillReadTurn(historyService: HistoryService): Promise<void> {
+    const workspaceId = "ws-skill-routing";
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u-earlier", "user", "Read the repo conventions", { timestamp: Date.now() })
+    );
+    await historyService.appendToHistory(
+      workspaceId,
+      projectSkillReadRow("a-skill-read", "PROJECT SKILL BODY FROM TOOL")
+    );
+  }
+
+  it("redacts project skills read through agent_skill_read from a routed request in an untrusted project", async () => {
+    // A project skill the model loaded with the tool in an earlier turn lives
+    // inside an assistant tool-result row, not in metadata.agentSkillSnapshot:
+    // the routed request's consent scan must cover that channel too, and the
+    // redaction must keep the call/result pairing the provider requires.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const { session, streamed } = await sendRoutedGlobalSkillWithPendingState(
+      {
+        workspacePath,
+        projectTrusted: false,
+        configValues: { modelClasses: { small: "haiku+0" }, skillModelClasses: { done: "small" } },
+      },
+      { seedHistory: seedProjectSkillReadTurn, loadedSkills: [] }
+    );
+
+    const request = JSON.stringify(streamed[0].messages);
+    expect(request).not.toContain("PROJECT SKILL BODY FROM TOOL");
+    expect(request).toContain(PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE);
+    expect(
+      streamed[0].messages.some((row) =>
+        row.parts.some(
+          (part) => part.type === "dynamic-tool" && part.toolCallId === "a-skill-read-call"
+        )
+      )
+    ).toBe(true);
+    // Nothing project-scoped was kept, so the gate has nothing to guard.
+    expect(await streamed[0].preDispatchConsentGate?.()).toBeNull();
+    await session.dispose();
+  });
+
+  it("arms the provider-boundary gate on a project skill read through agent_skill_read under trust", async () => {
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const harnessArgs: Parameters<typeof createRoutingHarness>[0] = {
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" }, skillModelClasses: { done: "small" } },
+    };
+    const { session, streamed } = await sendRoutedGlobalSkillWithPendingState(harnessArgs, {
+      seedHistory: seedProjectSkillReadTurn,
+      loadedSkills: [],
+    });
+
+    // Trusted: the tool result rides along unredacted...
+    expect(JSON.stringify(streamed[0].messages)).toContain("PROJECT SKILL BODY FROM TOOL");
+    // ...and a revocation between request assembly and the provider call must
+    // still reject, with no snapshot row or attachment in the request.
+    harnessArgs.projectTrusted = false;
+    expect(JSON.stringify(await streamed[0].preDispatchConsentGate?.())).toMatch(
+      /trust was revoked/i
+    );
+    await session.dispose();
+  });
+
+  it("refuses to build a request while a refused turn's partial is not secured", async () => {
+    // The repair reports an unsecured partial when the refused turn's surviving
+    // in-flight assistant could not be deleted (or history could not be read to
+    // tell whose partial it is): committing it would promote it into an
+    // unmarked history row a later repair no longer finds. The request must not
+    // be built at all — unlike outstanding row stamps, which the in-memory
+    // quarantine covers (see the acceptance-time restamp test above).
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const { session, streamed, historyService, events } = await createRoutingHarness({
+      workspacePath,
+    });
+    const internals = session as unknown as {
+      repairUnstampedRejectedTurn: () => Promise<{ durable: boolean; partialSecured: boolean }>;
+    };
+    spyOn(internals, "repairUnstampedRejectedTurn").mockResolvedValue({
+      durable: false,
+      partialSecured: false,
+    });
+    const commit = spyOn(historyService, "commitPartial");
+
+    const result = await session.sendMessage("Hello", { model: USER_MODEL, agentId: "exec" });
+    expect(streamed).toHaveLength(0);
+    expect(commit).not.toHaveBeenCalled();
+    const surfaced = result.success ? JSON.stringify(events) : JSON.stringify(result.error);
+    expect(surfaced).toContain("could not be secured");
     await session.dispose();
   });
 });

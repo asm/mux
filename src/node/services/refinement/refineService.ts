@@ -929,49 +929,24 @@ export class RefineService {
     const workspace = this.config.findWorkspace(workspaceId);
     if (!workspace) return Err(`workspace not found: ${workspaceId}`);
 
-    // SECURITY: confine the distillation input to the ACTIVE context
-    // segment. getLastMessages crosses reset boundaries (and pages into the
-    // sealed archive), so after /clear --soft a pre-reset prompt injection
-    // could steer the staged proposal — which is durably appended AFTER the
-    // boundary, re-entering model-visible context, and on approval persists
-    // to memory/skills. Durable sandbox/carryover invalidation does not
-    // filter chat history, so the read itself must stop at the boundary.
-    // Compaction epochs stay represented inside the active segment (summary
-    // row + preserved tail copies), so nothing legitimate is lost.
-    const messagesResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
-    if (!messagesResult.success) {
-      return Err(`could not read workspace history: ${messagesResult.error}`);
-    }
-    // Rejected turns are transcript-only: the refinement model (possibly on
-    // another provider) must not read their prompt or repository snapshots.
-    // Stamped rows are filtered by their own metadata; the quarantine — the
-    // session's in-memory set, or the durable repair record when no session is
-    // live — names rows whose stamp failed, and a record key names only the
-    // user row, so keys expand to the whole turn (snapshot prefix included).
-    const quarantine =
-      (await this.options.getQuarantinedRowIds?.(workspaceId)) ?? Ok(new Set<string>());
-    // Fail CLOSED when the quarantine state is unknown (unreadable record): the
-    // pass cannot tell which rows an unstamped rejection still protects.
-    if (!quarantine.success) {
+    // SECURITY (TOCTOU): the transcript is snapshotted under the turn-admission
+    // block, released before the model call. Without it, a routed project-skill
+    // turn PREPARING during the read contributes rows its late consent gate may
+    // still refuse (and stamp) — the refinement model would receive them before
+    // the pre-publication recheck could notice, and that recheck only blocks
+    // publication. With no turn preparing or streaming, every persisted routed
+    // turn has already passed its gates.
+    const snapshotExclusion = this.acquireTurnExclusionIfWired(workspaceId);
+    if (!snapshotExclusion.success) {
       return Err(
-        `could not read the workspace's rejected-turn record (${quarantine.error}); ` +
-          "run /refine again once the workspace has been opened"
+        `a turn is active in this workspace (${snapshotExclusion.error}); the transcript cannot ` +
+          `be distilled while a turn is preparing or streaming — run /refine again once the ` +
+          `workspace is idle`
       );
     }
-    const quarantinedRowIds = quarantine.data;
-    const activeSegment = excludeRejectedTurnRows(
-      sliceMessagesForProviderFromLatestContextBoundary(messagesResult.data),
-      quarantinedRowIds
-    );
-    // r47: fingerprint the snapshot rows for the pre-publication recheck.
-    // Row IDs alone cannot detect same-ID rewrites: StreamManager finalizes
-    // a streaming assistant row through updateHistory() PRESERVING its ID
-    // and historySequence, so a pass distilled from the in-flight
-    // placeholder would pass an ID-only prefix test after the stream
-    // settles. Hash the serialized row instead — any in-place rewrite
-    // changes the bytes. Captured before any consumer touches the rows so
-    // the fingerprints reflect the disk state the transcript was built from.
-    const snapshotRowFingerprints = activeSegment.map(fingerprintHistoryRow);
+    const snapshot = await this.snapshotActiveSegment(workspaceId, snapshotExclusion.data);
+    if (!snapshot.success) return snapshot;
+    const { messages, quarantinedRowIds, activeSegment, snapshotRowFingerprints } = snapshot.data;
     // Reuse the branch-summary transcript builder: role-labeled,
     // thinking-stripped, char-bounded — exactly the evidence shape a
     // distillation pass needs. The tail cap preserves the prior bound on
@@ -988,8 +963,8 @@ export class RefineService {
     // CLOSED when the boundary cannot be correlated: a boundary row without
     // a usable timestamp must omit the timeline entirely rather than let
     // pre-reset user-controlled digests through unbounded.
-    const boundaryIndex = findLatestContextBoundaryIndex(messagesResult.data);
-    const boundaryRow = boundaryIndex >= 0 ? messagesResult.data[boundaryIndex] : undefined;
+    const boundaryIndex = findLatestContextBoundaryIndex(messages);
+    const boundaryRow = boundaryIndex >= 0 ? messages[boundaryIndex] : undefined;
     const timelineSinceTs = boundaryRow?.metadata?.timestamp;
     // Persisted rows are JSON-cast without metadata validation, so a
     // corrupted boundary timestamp can be any number: -1 would admit every
@@ -1577,6 +1552,78 @@ export class RefineService {
    * wired; Ok(null) otherwise (lightweight test fakes). `using` accepts the
    * null, so call sites stay uniform.
    */
+  /**
+   * The distillation input, read while `exclusion` (the turn-admission block,
+   * or null when unwired) is held and released on return so the model call
+   * that follows never blocks sends.
+   *
+   * SECURITY: confine the input to the ACTIVE context segment.
+   * getLastMessages crosses reset boundaries (and pages into the sealed
+   * archive), so after /clear --soft a pre-reset prompt injection could steer
+   * the staged proposal — which is durably appended AFTER the boundary,
+   * re-entering model-visible context, and on approval persists to
+   * memory/skills. Durable sandbox/carryover invalidation does not filter chat
+   * history, so the read itself must stop at the boundary. Compaction epochs
+   * stay represented inside the active segment (summary row + preserved tail
+   * copies), so nothing legitimate is lost.
+   *
+   * Rejected turns are transcript-only: the refinement model (possibly on
+   * another provider) must not read their prompt or repository snapshots.
+   * Stamped rows are filtered by their own metadata; the quarantine — the
+   * session's in-memory set, or the durable repair record when no session is
+   * live — names rows whose stamp failed, and a record key names only the user
+   * row, so keys expand to the whole turn (snapshot prefix included). Fail
+   * CLOSED when the quarantine state is unknown (unreadable record): the pass
+   * cannot tell which rows an unstamped rejection still protects.
+   *
+   * r47: the snapshot rows are fingerprinted for the pre-publication recheck.
+   * Row IDs alone cannot detect same-ID rewrites: StreamManager finalizes a
+   * streaming assistant row through updateHistory() PRESERVING its ID and
+   * historySequence, so a pass distilled from the in-flight placeholder would
+   * pass an ID-only prefix test after the stream settles. Hash the serialized
+   * row instead — any in-place rewrite changes the bytes. Captured before any
+   * consumer touches the rows so the fingerprints reflect the disk state the
+   * transcript was built from.
+   */
+  private async snapshotActiveSegment(
+    workspaceId: string,
+    exclusion: Disposable | null
+  ): Promise<
+    Result<
+      {
+        messages: MuxMessage[];
+        quarantinedRowIds: ReadonlySet<string>;
+        activeSegment: MuxMessage[];
+        snapshotRowFingerprints: string[];
+      },
+      string
+    >
+  > {
+    using _exclusion = exclusion;
+    const messagesResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!messagesResult.success) {
+      return Err(`could not read workspace history: ${messagesResult.error}`);
+    }
+    const quarantine =
+      (await this.options.getQuarantinedRowIds?.(workspaceId)) ?? Ok(new Set<string>());
+    if (!quarantine.success) {
+      return Err(
+        `could not read the workspace's rejected-turn record (${quarantine.error}); ` +
+          "run /refine again once the workspace has been opened"
+      );
+    }
+    const activeSegment = excludeRejectedTurnRows(
+      sliceMessagesForProviderFromLatestContextBoundary(messagesResult.data),
+      quarantine.data
+    );
+    return Ok({
+      messages: messagesResult.data,
+      quarantinedRowIds: quarantine.data,
+      activeSegment,
+      snapshotRowFingerprints: activeSegment.map(fingerprintHistoryRow),
+    });
+  }
+
   private acquireTurnExclusionIfWired(workspaceId: string): Result<Disposable | null, string> {
     if (!this.options.acquireTurnExclusion) {
       return Ok(null);

@@ -41,6 +41,17 @@ export const ROUTED_SKILL_TRUST_REVOKED_MESSAGE =
   "was not dispatched to its routed model. Re-send to run it on the current " +
   "model without routing.";
 
+/**
+ * Request build refused because an earlier consent-refused turn could not be
+ * made durably provider-ineligible (its row stamp or the deletion of its
+ * in-flight output failed again). The request never leaves: committing the
+ * surviving output as an ordinary history row would strand it protected only
+ * by process memory. Retrying the send re-runs the repair.
+ */
+export const REJECTED_TURN_REPAIR_PENDING_MESSAGE =
+  "A previously refused turn could not be secured (its rows or in-flight output " +
+  "could not be marked provider-ineligible); this message was not sent. Retry it.";
+
 export const createUnknownSendMessageError = (raw: string): SendMessageError => {
   assert(typeof raw === "string", "Expected raw error to be a string");
   const trimmed = stripNoisyErrorPrefix(raw.trim());

@@ -246,4 +246,69 @@ describe("ModelClassesEditor", () => {
     await waitFor(() => expect(queryByLabelText("Clear model class small")).not.toBeNull());
     expect(queryByText(/no configured route can serve this model/)).toBeNull();
   });
+
+  test("a peer change notification disables edits until its refetch lands", async () => {
+    // Between a config-changed notification and the fetch it triggers, the
+    // rendered map is stale: an edit composed from it would overwrite the
+    // peer's value for that class, and the post-write refetch could not
+    // recover it. The row's controls must be inert until the refetch publishes.
+    // Object properties (not let bindings): TS keeps a closure-assigned let
+    // narrowed to its null initializer.
+    const notification: { release: (() => void) | null } = { release: null };
+    const configGate: {
+      resolve: ((value: { modelClasses: Record<string, string> }) => void) | null;
+    } = { resolve: null };
+    let fetches = 0;
+    apiMock = {
+      config: {
+        getConfig: mock(() => {
+          fetches += 1;
+          if (fetches === 1) {
+            return Promise.resolve({ modelClasses: { small: "anthropic:claude-haiku-4-5+0" } });
+          }
+          return new Promise<{ modelClasses: Record<string, string> }>((resolve) => {
+            configGate.resolve = resolve;
+          });
+        }),
+        updateModelClass: mock(() => Promise.resolve(undefined)),
+        onConfigChanged: mock((_input: undefined, opts: { signal?: AbortSignal }) =>
+          Promise.resolve(
+            (async function* (): AsyncGenerator<void> {
+              // One peer notification, released by the test; then stay open
+              // like the real stream until cleanup aborts.
+              await new Promise<void>((resolve) => {
+                notification.release = resolve;
+              });
+              yield;
+              await new Promise<void>((resolve) => {
+                if (opts.signal?.aborted) {
+                  resolve();
+                  return;
+                }
+                opts.signal?.addEventListener("abort", () => resolve(), { once: true });
+              });
+            })()
+          )
+        ),
+      },
+    };
+    const { getByLabelText, queryByLabelText } = render(<ModelClassesEditor />);
+    await waitFor(() => expect(queryByLabelText("Clear model class small")).not.toBeNull());
+    expect((getByLabelText("Clear model class small") as HTMLButtonElement).disabled).toBe(false);
+
+    notification.release?.();
+    await waitFor(() => expect(fetches).toBe(2));
+    // Untrusted while the notification's fetch is outstanding: a click is inert.
+    const clearButton = getByLabelText("Clear model class small") as HTMLButtonElement;
+    expect(clearButton.disabled).toBe(true);
+    fireEvent.click(clearButton);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(apiMock.config.updateModelClass).not.toHaveBeenCalled();
+
+    // The refetch publishes the peer's value and re-enables editing.
+    configGate.resolve?.({ modelClasses: { small: "anthropic:claude-sonnet-5+1" } });
+    await waitFor(() =>
+      expect((getByLabelText("Clear model class small") as HTMLButtonElement).disabled).toBe(false)
+    );
+  });
 });

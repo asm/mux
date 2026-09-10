@@ -513,9 +513,10 @@ describe("RefineService", () => {
 
     const stagedResult = await fixture.service.run(WORKSPACE_ID);
     expect(stagedResult.success).toBe(true);
-    // The run held the exclusion around its write section and released it.
-    expect(holds).toBe(1);
-    expect(disposals).toBe(1);
+    // The run held the exclusion twice — around the transcript snapshot and
+    // around its write section — releasing each before moving on.
+    expect(holds).toBe(2);
+    expect(disposals).toBe(2);
 
     busy = true;
     const applyResult = await fixture.applyShown();
@@ -540,8 +541,9 @@ describe("RefineService", () => {
     expect(retryResult.success).toBe(true);
     if (!retryResult.success) return;
     expect(retryResult.data.applied).toHaveLength(1);
-    expect(holds).toBe(2);
-    expect(disposals).toBe(2);
+    // Two holds from the run plus the retry apply's own.
+    expect(holds).toBe(3);
+    expect(disposals).toBe(3);
   });
 
   it("rejects a concurrent invocation while a pass is in flight", async () => {
@@ -2960,6 +2962,45 @@ describe("RefineService", () => {
     const result = await fixture.service.run(WORKSPACE_ID);
     expect(result.success).toBe(false);
     if (!result.success) expect(result.error).toContain("rejected-turn record");
+    expect(fixture.modelCalls).toHaveLength(0);
+  });
+
+  it("snapshots the transcript under the turn exclusion and releases it before the model call", async () => {
+    // TOCTOU: a routed project-skill turn preparing during the read could
+    // contribute rows its late consent gate still refuses (and stamps); with
+    // the exclusion held across the read, no turn is preparing or streaming.
+    // The model call itself must not hold it — sends would be refused for the
+    // whole pass.
+    const events: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () =>
+        noOpModel(() => {
+          events.push("model");
+        }),
+      acquireTurnExclusion: () => {
+        events.push("acquire");
+        return Ok({
+          [Symbol.dispose]: () => {
+            events.push("release");
+          },
+        });
+      },
+    });
+    await fixture.seedTrajectory();
+
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    expect(events.slice(0, 3)).toEqual(["acquire", "release", "model"]);
+  });
+
+  it("refuses to snapshot the transcript while a turn is preparing or streaming", async () => {
+    using fixture = await createFixture({
+      acquireTurnExclusion: () => Err("a turn is preparing or streaming"),
+    });
+    await fixture.seedTrajectory();
+
+    const result = await fixture.service.run(WORKSPACE_ID);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("cannot be distilled");
     expect(fixture.modelCalls).toHaveLength(0);
   });
 });

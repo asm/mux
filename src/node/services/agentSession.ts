@@ -116,6 +116,7 @@ import {
   buildStreamErrorEventData,
   createStreamErrorMessage,
   createUnknownSendMessageError,
+  REJECTED_TURN_REPAIR_PENDING_MESSAGE,
   ROUTED_SKILL_TRUST_REVOKED_MESSAGE,
   type StreamErrorPayload,
 } from "@/node/services/utils/sendMessageError";
@@ -250,6 +251,8 @@ import {
   createLoadedSkillSnapshot,
   extractLoadedSkillSnapshotsFromMessages,
   mergeLoadedSkillSnapshots,
+  redactProjectSkillToolResults,
+  rowCarriesProjectSkillContent,
   stringifyAgentSkillFrontmatter,
 } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { substituteSkillArguments } from "@/node/services/agentSkills/skillArguments";
@@ -735,6 +738,18 @@ type RoutedConsentRejection = (
   requestCarriesProjectContent?: boolean,
   midStream?: boolean
 ) => Promise<SendMessageError | null>;
+
+/** Result of a rejected-turn repair pass (see repairUnstampedRejectedTurn). */
+interface RejectedTurnRepairOutcome {
+  /** Every key verified stamped and no surviving partial: the record is retired. */
+  durable: boolean;
+  /**
+   * The rejected turn's surviving in-flight assistant is gone (or there was
+   * none) and history could be read to vouch for it. False means a
+   * commitPartial would promote that output into an unmarked history row.
+   */
+  partialSecured: boolean;
+}
 
 // ROUTED_SKILL_TRUST_REVOKED_MESSAGE moved to utils/sendMessageError.ts so
 // StreamManager's per-step consent gate can share it without an import cycle.
@@ -6577,9 +6592,7 @@ export class AgentSession {
     rows: MuxMessage[]
   ): StreamMessageOptions["preDispatchConsentGate"] {
     if (routedConsentRejection == null) return undefined;
-    const carriesProjectContent = rows.some(
-      (row) => row.metadata?.agentSkillSnapshot?.scope === "project"
-    );
+    const carriesProjectContent = rows.some(rowCarriesProjectSkillContent);
     return (context) => routedConsentRejection(carriesProjectContent, context?.midStream === true);
   }
 
@@ -8329,9 +8342,19 @@ export class AgentSession {
       // assistant into an unmarked history row the repair no longer finds.
       // Marker-gated — a no-op in the common case.
       await this.loadAutoRetryEnabledPreference();
-      await this.repairUnstampedRejectedTurn();
+      const repair = await this.repairUnstampedRejectedTurn();
       if (isStreamStartAborted()) {
         return Ok(undefined);
+      }
+      if (!repair.partialSecured) {
+        // A rejected partial that could not be deleted (or a pass that could not
+        // read history to tell whose partial survives): committing below would
+        // promote it into an unmarked assistant row a later repair no longer
+        // finds, leaving it protected only by process memory. Refuse this
+        // request instead; the record keeps every key, and the next attempt
+        // re-runs the repair. Outstanding ROW stamps alone do not refuse: the
+        // in-memory quarantine filters those rows from this request.
+        return await fail(createUnknownSendMessageError(REJECTED_TURN_REPAIR_PENDING_MESSAGE));
       }
 
       const commitResult = await this.historyService.commitPartial(this.workspaceId);
@@ -8651,9 +8674,11 @@ export class AgentSession {
         | ((context?: { midStream?: boolean }) => Promise<SendMessageError | null>)
         | undefined;
       if (routedConsentRejection) {
-        let requestCarriesProjectContent = requestMessages.some(
-          (msg) => msg.metadata?.agentSkillSnapshot?.scope === "project"
-        );
+        // Every channel repository-controlled project skill content takes into
+        // a request: synthetic snapshot rows AND agent_skill_read results — a
+        // project skill the model read through the tool in an earlier turn
+        // persists inside an assistant tool-result row, not in row metadata.
+        let requestCarriesProjectContent = requestMessages.some(rowCarriesProjectSkillContent);
         // Post-compaction loaded-skill attachments carry the same repository-
         // controlled content by a different channel: once the original snapshot
         // row sits behind the boundary, the history scan above no longer sees
@@ -8668,9 +8693,10 @@ export class AgentSession {
           // fresh-snapshot omission) instead of rejecting the turn — global
           // and built-in skills are allowed to route in untrusted projects,
           // and rejecting on rows the rejection cannot remove would fail every
-          // later routed send deterministically.
-          requestMessages = requestMessages.filter(
-            (msg) => msg.metadata?.agentSkillSnapshot?.scope !== "project"
+          // later routed send deterministically. Snapshot rows drop out; tool
+          // results are redacted in place so the call/result pairing survives.
+          requestMessages = redactProjectSkillToolResults(
+            requestMessages.filter((msg) => msg.metadata?.agentSkillSnapshot?.scope !== "project")
           );
           postCompactionAttachments = excludeProjectLoadedSkills(postCompactionAttachments);
           log.warn("Excluding historical project skill content from routed request", {
@@ -12537,10 +12563,14 @@ export class AgentSession {
    * partials are committed), so a send racing the recovery cannot slip the
    * unstamped rows past it. Every outstanding key is repaired on its own and
    * retires only once ITS rows verified — a newer refusal's already-stamped
-   * row must never report an older key's repair complete. Returns whether the
-   * repair is durably complete; anything short of that leaves (or records)
+   * row must never report an older key's repair complete. Reports whether the
+   * repair is durably complete — anything short of that leaves (or records)
    * the outstanding keys on disk, since the in-memory quarantine protecting
-   * the current request dies with the process.
+   * the current request dies with the process — and, separately, whether the
+   * rejected turn's surviving partial is gone: outstanding ROW stamps are
+   * covered by the in-memory quarantine for the current request, but a partial
+   * that could not be deleted (or a pass that could not read history to tell
+   * whose partial it is) must stop the request build from committing it.
    *
    * `recoverKeylessMarker`: a `pre_stream_rejected` marker without a row key
    * (a refused resume that could not read the tail) names the newest
@@ -12552,12 +12582,12 @@ export class AgentSession {
    */
   private async repairUnstampedRejectedTurn(context?: {
     recoverKeylessMarker?: { excludeRowId?: string };
-  }): Promise<boolean> {
+  }): Promise<RejectedTurnRepairOutcome> {
     const abandon = this.startupAutoRetryAbandon;
     const pending = this.pendingRejectedTurnRepair;
     const abandonRejected = abandon?.reason === "pre_stream_rejected";
     if (!abandonRejected && pending === null) {
-      return true;
+      return { durable: true, partialSecured: true };
     }
     const keys = new Set<string>(pending?.userMessageIds ?? []);
     if (abandonRejected && abandon.userMessageId != null) {
@@ -12660,7 +12690,9 @@ export class AgentSession {
     await this.setPendingRejectedTurnRepair(
       recordKeys.length > 0 ? { userMessageIds: recordKeys } : null
     );
-    return durable;
+    // An unreadable history cannot vouch whose partial survives, so it counts
+    // as unsecured like a failed delete.
+    return { durable, partialSecured: !readFailed && partialDurable };
   }
 
   /**

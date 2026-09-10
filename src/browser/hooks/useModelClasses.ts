@@ -169,6 +169,13 @@ export function useModelClasses(): ModelClassesState {
             if (signal.aborted) {
               break;
             }
+            // A peer changed the config: the rendered map is stale until the
+            // refetch lands. An edit composed meanwhile (model + thinking pair
+            // read from the stale row) would overwrite the peer's value for
+            // that class, and the post-write refetch cannot recover it — so
+            // the map is untrusted (controls disabled) while the notification's
+            // fetch is outstanding; the fetch re-marks it loaded.
+            setLoaded(false);
             void fetchConfig();
           }
         } catch {
