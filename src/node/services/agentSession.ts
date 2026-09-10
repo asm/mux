@@ -116,6 +116,7 @@ import {
   buildStreamErrorEventData,
   createStreamErrorMessage,
   createUnknownSendMessageError,
+  REJECTED_TURN_RECORD_UNRECORDED_MESSAGE,
   REJECTED_TURN_REPAIR_PENDING_MESSAGE,
   ROUTED_SKILL_TRUST_REVOKED_MESSAGE,
   type StreamErrorPayload,
@@ -5139,6 +5140,27 @@ export class AgentSession {
         await this.addPendingRejectedTurnRepairKey(acceptedRowId);
       }
       await this.persistStartupAutoRetryAbandon("pre_stream_rejected", acceptedRowId);
+      if (!stampResult.success) {
+        // Neither the row stamp nor (possibly) the record reached disk:
+        // persistAutoRetryState is best-effort, so verify. Unrecorded, the
+        // refusal is protected by process memory alone — a crash would leave
+        // the rows provider-eligible. The visible error says so, and the next
+        // request build refuses until the record (or stamp) is durable.
+        const recorded = await this.recordPendingAutoRetryState();
+        if (!recorded && !this.coordinator.disposed) {
+          log.error("Refused turn's repair record could not be written; sends stay refused", {
+            workspaceId: this.workspaceId,
+            acceptedRowId,
+          });
+          this.emitChatEvent(
+            createStreamErrorMessage(
+              buildStreamErrorEventData(
+                createUnknownSendMessageError(REJECTED_TURN_RECORD_UNRECORDED_MESSAGE)
+              )
+            )
+          );
+        }
+      }
     };
     // Shared rejection for the late consent gates (pre-stream below and the
     // provider-dispatch boundary inside streamWithHistory): performs the
@@ -8384,6 +8406,16 @@ export class AgentSession {
         // request instead; the record keeps every key, and the next attempt
         // re-runs the repair. Outstanding ROW stamps alone do not refuse: the
         // in-memory quarantine filters those rows from this request.
+        return await fail(createUnknownSendMessageError(REJECTED_TURN_REPAIR_PENDING_MESSAGE));
+      }
+      if (
+        this.outstandingRejectedTurnKeys().length > 0 &&
+        this.autoRetryStateUnrecorded &&
+        !(await this.recordPendingAutoRetryState())
+      ) {
+        // Outstanding keys that exist only in memory: the repair record write
+        // failed (again). Until it lands, a crash would leave the refused rows
+        // provider-eligible, so no request leaves either.
         return await fail(createUnknownSendMessageError(REJECTED_TURN_REPAIR_PENDING_MESSAGE));
       }
 
@@ -12568,13 +12600,33 @@ export class AgentSession {
   }
 
   /**
-   * Rows a provider request must never carry: durably stamped pre-stream
-   * rejections plus the in-memory quarantine of rows whose stamp failed.
+   * Row keys of refused turns whose durable stamp is still outstanding: the
+   * repair record plus a rejected abandon marker's key. Named rows whose
+   * stamp the repair could not (yet) re-attempt — a transient history read
+   * failure leaves them out of the in-memory quarantine too.
+   */
+  private outstandingRejectedTurnKeys(): string[] {
+    const keys = [...(this.pendingRejectedTurnRepair?.userMessageIds ?? [])];
+    const abandon = this.startupAutoRetryAbandon;
+    if (abandon?.reason === "pre_stream_rejected" && abandon.userMessageId != null) {
+      keys.push(abandon.userMessageId);
+    }
+    return keys;
+  }
+
+  /**
+   * Rows a provider request (or a side-channel summarizer) must never carry:
+   * durably stamped pre-stream rejections, the in-memory quarantine of rows
+   * whose stamp failed, and the whole turn of every outstanding repair key —
+   * the last so a repair pass that could not read history still protects the
+   * rows it was meant to stamp.
    */
   private excludeRejectedRows(messages: MuxMessage[]): MuxMessage[] {
-    return filterPreStreamRejectedRows(messages).filter(
-      (msg) => !this.unstampedRejectedRowIds.has(msg.id)
-    );
+    const quarantined = collectRejectedTurnRowIds(messages, [
+      ...this.unstampedRejectedRowIds,
+      ...this.outstandingRejectedTurnKeys(),
+    ]);
+    return filterPreStreamRejectedRows(messages).filter((msg) => !quarantined.has(msg.id));
   }
 
   /**

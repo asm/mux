@@ -64,6 +64,7 @@ import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import type { BashToolResult } from "@/common/types/tools";
 import type { SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
+import { AUTO_RETRY_PREFERENCE_FILE } from "./rejectedTurnRepairRecord";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import {
   WORKFLOW_RESULT_METADATA_TYPE,
@@ -19859,6 +19860,165 @@ describe("WorkspaceService fork", () => {
       createRuntimeSpy.mockRestore();
       getOrCreateSessionSpy.mockRestore();
       generateStableIdSpy.mockRestore();
+    }
+  });
+
+  /**
+   * A trusted source workspace plus the fork orchestration mocked out, so fork()
+   * exercises only its session-directory work (history copy and follow-ups).
+   */
+  async function createQuarantineForkFixture(sourceWorkspaceId: string, newWorkspaceId: string) {
+    const sourceProjectPath = path.join(tempDir, "project");
+    const forkedWorkspacePath = path.join(sourceProjectPath, "fork-child");
+    const sourceMetadata: FrontendWorkspaceMetadata = {
+      id: sourceWorkspaceId,
+      name: "source-branch",
+      projectPath: sourceProjectPath,
+      projectName: "project",
+      runtimeConfig: { type: "local" },
+      namedWorkspacePath: path.join(sourceProjectPath, "source-branch"),
+    };
+    await fsPromises.mkdir(sourceProjectPath, { recursive: true });
+    await config.addWorkspace(sourceProjectPath, sourceMetadata);
+    await config.editConfig((current) => {
+      const project = current.projects.get(sourceProjectPath);
+      if (!project) {
+        throw new Error("Expected test project config to exist");
+      }
+      project.trusted = true;
+      return current;
+    });
+    const mockAIService = {
+      ...createStreamLifecycleMocks(),
+      isStreaming: mock(() => false),
+      getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
+      on: mock(() => undefined),
+      off: mock(() => undefined),
+    } as unknown as AIService;
+    const mockInitStateManager: Partial<InitStateManager> = {
+      on: mock(() => undefined as unknown as InitStateManager),
+      getInitState: mock(() => ({ status: "running" }) as unknown as InitStatus),
+      startInit: mock(() => undefined),
+      endInit: mock(() => Promise.resolve()),
+      appendOutput: mock(() => undefined),
+      enterHookPhase: mock(() => undefined),
+    };
+    const workspaceService = new WorkspaceService(
+      config,
+      historyService,
+      mockAIService,
+      mockInitStateManager as InitStateManager,
+      mockExtensionMetadataService as ExtensionMetadataService,
+      mockBackgroundProcessManager as BackgroundProcessManager
+    );
+    const targetRuntime = {
+      getWorkspacePath: mock(() => forkedWorkspacePath),
+      deleteWorkspace: mock(() => Promise.resolve()),
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
+    const spies = [
+      spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId),
+      spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
+        emitMetadata: mock(() => undefined),
+      } as unknown as AgentSession),
+      spyOn(runtimeFactory, "createRuntime").mockReturnValue(
+        {} as ReturnType<typeof runtimeFactory.createRuntime>
+      ),
+      spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+        Promise.resolve(undefined)
+      ),
+      spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(undefined),
+      spyOn(forkOrchestratorModule, "orchestrateFork").mockResolvedValue(
+        Ok({
+          workspacePath: forkedWorkspacePath,
+          trunkBranch: "main",
+          forkedRuntimeConfig: { type: "local" },
+          targetRuntime,
+          forkedFromSource: true,
+          sourceRuntimeConfigUpdated: false,
+        })
+      ),
+    ];
+    return {
+      workspaceService,
+      sourceRecordPath: path.join(
+        config.sessionsDir,
+        sourceWorkspaceId,
+        AUTO_RETRY_PREFERENCE_FILE
+      ),
+      restore: () => {
+        for (const spy of spies.reverse()) spy.mockRestore();
+      },
+    };
+  }
+
+  test("fork stamps the source's quarantined rejected rows in the copied history", async () => {
+    // A late consent refusal whose row stamp failed leaves the rows unstamped in
+    // the source, protected only by that workspace's repair record; the copied
+    // chat must not launder them into a fork with an empty quarantine.
+    const sourceWorkspaceId = "quarantine-source";
+    const newWorkspaceId = "quarantine-fork";
+    const fixture = await createQuarantineForkFixture(sourceWorkspaceId, newWorkspaceId);
+    for (const row of [
+      createMuxMessage("snap-refused", "user", "project skill body", {
+        timestamp: 1,
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
+      }),
+      createMuxMessage("u-refused", "user", "refused prompt", { timestamp: 2 }),
+      createMuxMessage("u-later", "user", "later prompt", { timestamp: 3 }),
+    ]) {
+      expect((await historyService.appendToHistory(sourceWorkspaceId, row)).success).toBe(true);
+    }
+    await fsPromises.writeFile(
+      fixture.sourceRecordPath,
+      JSON.stringify({ pendingRejectedTurnRepair: { userMessageIds: ["u-refused"] } })
+    );
+    try {
+      const result = await fixture.workspaceService.fork(sourceWorkspaceId, "fork-child");
+      expect(result.success).toBe(true);
+      const forked = await historyService.getHistoryFromLatestBoundary(newWorkspaceId);
+      if (!forked.success) throw new Error(forked.error);
+      const stamped = forked.data
+        .filter((row) => row.metadata?.preStreamRejected === true)
+        .map((row) => row.id)
+        .sort();
+      // The keyed user row AND its snapshot prefix; unrelated rows untouched.
+      expect(stamped).toEqual(["snap-refused", "u-refused"]);
+      // The source's own repair still owns its rows: nothing was stamped there.
+      const source = await historyService.getHistoryFromLatestBoundary(sourceWorkspaceId);
+      if (!source.success) throw new Error(source.error);
+      expect(source.data.some((row) => row.metadata?.preStreamRejected === true)).toBe(false);
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  test("fork refuses when the source's rejected-turn record is unreadable", async () => {
+    // Unknown quarantine state: copying the history could carry refused
+    // content nobody can identify afterwards, so the fork fails closed.
+    const sourceWorkspaceId = "quarantine-source-unreadable";
+    const newWorkspaceId = "quarantine-fork-unreadable";
+    const fixture = await createQuarantineForkFixture(sourceWorkspaceId, newWorkspaceId);
+    expect(
+      (
+        await historyService.appendToHistory(
+          sourceWorkspaceId,
+          createMuxMessage("u-only", "user", "prompt", { timestamp: 1 })
+        )
+      ).success
+    ).toBe(true);
+    await fsPromises.writeFile(fixture.sourceRecordPath, "{ not json");
+    try {
+      const result = await fixture.workspaceService.fork(sourceWorkspaceId, "fork-child");
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("rejected-turn record");
+      // The half-built fork's session directory was rolled back.
+      const leftover = await fsPromises
+        .stat(path.join(config.sessionsDir, newWorkspaceId))
+        .catch(() => null);
+      expect(leftover).toBeNull();
+    } finally {
+      fixture.restore();
     }
   });
 

@@ -17,6 +17,7 @@ import {
   type AgentWorkflowRunReference,
 } from "@/node/services/agentWorkflowRunReferences";
 import * as fsPromises from "fs/promises";
+import writeFileAtomic from "write-file-atomic";
 import assert from "@/common/utils/assert";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
@@ -195,6 +196,7 @@ import {
 import { UIModeSchema, type UIMode } from "@/common/types/mode";
 import {
   createMuxMessage,
+  collectRejectedTurnRowIds,
   getCompactionFollowUpContent,
   isSameWorkspaceTurnTaskCorrelation,
   parseWorkspaceTurnTaskCorrelation,
@@ -4439,6 +4441,68 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     if (!durable.success) return durable;
     const live = this.sessions.get(workspaceId)?.getQuarantinedRejectedRowIds();
     return Ok(live == null ? durable.data : new Set([...live, ...durable.data]));
+  }
+
+  /**
+   * Carries the source workspace's rejected-turn quarantine into a fork's
+   * copied history: every quarantined row (or turn, for record keys) still
+   * present in the fork is stamped provider-ineligible there; if the stamp
+   * fails, the fork gets its own durable repair record naming those rows, so
+   * its session repairs them at startup and side channels fail closed until
+   * then. An unreadable source record refuses the fork — copying history whose
+   * quarantine state is unknown would launder the refused content.
+   */
+  private async propagateRejectedTurnQuarantineToFork(
+    sourceWorkspaceId: string,
+    targetWorkspaceId: string,
+    targetSessionDir: string
+  ): Promise<Result<void>> {
+    const quarantine = await this.getQuarantinedRejectedRowIds(sourceWorkspaceId);
+    if (!quarantine.success) {
+      return Err(
+        `the source workspace's rejected-turn record is unreadable (${quarantine.error}); ` +
+          "refusing to fork its history"
+      );
+    }
+    if (quarantine.data.size === 0) return Ok(undefined);
+    const rows: MuxMessage[] = [];
+    const read = await this.historyService.iterateFullHistory(
+      targetWorkspaceId,
+      "forward",
+      (chunk) => {
+        rows.push(...chunk);
+      }
+    );
+    if (!read.success) return Err(read.error);
+    const present = new Set(rows.map((row) => row.id));
+    // Rows behind the branch point were truncated away; only what the fork kept matters.
+    const rowIds = [...collectRejectedTurnRowIds(rows, quarantine.data)].filter((id) =>
+      present.has(id)
+    );
+    if (rowIds.length === 0) return Ok(undefined);
+    const stamped = await this.historyService.markMessagesPreStreamRejected(
+      targetWorkspaceId,
+      rowIds
+    );
+    if (stamped.success) return Ok(undefined);
+    log.warn(
+      "Failed to stamp quarantined rows in forked history; seeding the fork's repair record",
+      {
+        sourceWorkspaceId,
+        targetWorkspaceId,
+        error: stamped.error,
+      }
+    );
+    try {
+      await fsPromises.mkdir(targetSessionDir, { recursive: true });
+      await writeFileAtomic(
+        path.join(targetSessionDir, AUTO_RETRY_PREFERENCE_FILE),
+        JSON.stringify({ pendingRejectedTurnRepair: { userMessageIds: rowIds } }) + "\n"
+      );
+    } catch (error) {
+      return Err(`could not record the fork's rejected-turn quarantine: ${getErrorMessage(error)}`);
+    }
+    return Ok(undefined);
   }
 
   /** Queued agent peer messages behind a busy workspace; sessions are lazy, so no session ⇒ 0. */
@@ -10378,6 +10442,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           sourceWorkspaceId,
           targetWorkspaceId: newWorkspaceId,
         });
+
+        // A late consent refusal whose row stamp failed leaves its rows
+        // unstamped in the source, protected by that workspace's in-memory
+        // quarantine and durable repair record — neither of which the copied
+        // chat inherits. Stamp those rows in the fork (after the partial
+        // snapshot above, which may be the refused turn's own) before it can
+        // build a request or run a side channel; when even that fails, seed the
+        // fork's repair record so its session and side channels fail closed.
+        const quarantinePropagated = await this.propagateRejectedTurnQuarantineToFork(
+          sourceWorkspaceId,
+          newWorkspaceId,
+          newSessionDir
+        );
+        if (!quarantinePropagated.success) {
+          throw new Error(quarantinePropagated.error);
+        }
 
         const referencedStagedAttachmentPaths =
           await collectReferencedStagedAttachmentPaths(newSessionDir);

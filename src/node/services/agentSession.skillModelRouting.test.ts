@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { LoadedSkillSnapshot } from "@/common/types/attachment";
-import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
@@ -1956,6 +1956,106 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     expect(commit).not.toHaveBeenCalled();
     const surfaced = result.success ? JSON.stringify(events) : JSON.stringify(result.error);
     expect(surfaced).toContain("could not be secured");
+    await session.dispose();
+  });
+
+  it("keeps refusing sends until a refused turn's record reaches disk", async () => {
+    // Both durable records fail: the row stamp (twice) and the preference-file
+    // write. The refusal still completes — the rows are quarantined in memory —
+    // but until a record lands, a crash would leave them provider-eligible, so
+    // the visible error says so and no request may leave.
+    const workspacePath = await createWorkspaceWithSkill({
+      skillName: "done",
+      metadataYaml: "metadata:\n  model-class: small\n",
+    });
+    const harnessArgs: Parameters<typeof createRoutingHarness>[0] = {
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" } },
+    };
+    const { session, streamed, historyService, events } = await createRoutingHarness(harnessArgs);
+    const internals = session as unknown as {
+      persistAutoRetryState: () => Promise<void>;
+      autoRetryStateUnrecorded: boolean;
+      unstampedRejectedRowIds: Set<string>;
+    };
+    const stampSpy = spyOn(historyService, "markMessagesPreStreamRejected").mockResolvedValue(
+      Err("disk full")
+    );
+    const persistSpy = spyOn(internals, "persistAutoRetryState").mockImplementation(() => {
+      internals.autoRetryStateUnrecorded = true;
+      return Promise.resolve();
+    });
+    try {
+      // Revoke trust once the turn is accepted (rows durable) so the LATE gate
+      // refuses and has rows to stamp; a pre-acceptance refusal rolls back.
+      const refused = await session.sendMessage("Use skill done", skillSendOptions(), {
+        onAccepted: () => {
+          harnessArgs.projectTrusted = false;
+        },
+      });
+      expect(refused.success).toBe(true);
+      expect(refused.success && refused.data?.acceptedWithoutStream).toBe(true);
+      expect(streamed).toHaveLength(0);
+      expect(internals.unstampedRejectedRowIds.size).toBeGreaterThan(0);
+      expect(
+        events.some(
+          (event) =>
+            event.type === "stream-error" &&
+            /could not be recorded on disk/i.test(JSON.stringify(event))
+        )
+      ).toBe(true);
+
+      // Only process memory protects the refused rows: the next request is refused.
+      const blocked = await session.sendMessage("plain follow-up", {
+        model: USER_MODEL,
+        agentId: "exec",
+      });
+      const surfaced = blocked.success ? JSON.stringify(events) : JSON.stringify(blocked.error);
+      expect(surfaced).toContain("could not be secured");
+      expect(streamed).toHaveLength(0);
+    } finally {
+      stampSpy.mockRestore();
+      persistSpy.mockRestore();
+    }
+
+    // The disk recovered: the repair stamps the rows for real and sends resume.
+    const resumed = await session.sendMessage("plain follow-up", {
+      model: USER_MODEL,
+      agentId: "exec",
+    });
+    expect(resumed.success).toBe(true);
+    expect(streamed).toHaveLength(1);
+    await session.dispose();
+  });
+
+  it("excludes the whole turn of an outstanding repair key even when its rows never reached the quarantine", async () => {
+    // A repair pass that could not read history leaves the key on record but
+    // cannot quarantine the rows in memory; request assembly and the
+    // abandoned-branch summarizer must still drop that turn — prompt and
+    // snapshot prefix — by the key alone.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const { session } = await createRoutingHarness({ workspacePath });
+    const internals = session as unknown as {
+      pendingRejectedTurnRepair: { userMessageIds: string[] } | null;
+      loadAutoRetryEnabledPreference: () => Promise<boolean>;
+      excludeRejectedRows: (rows: MuxMessage[]) => MuxMessage[];
+    };
+    await internals.loadAutoRetryEnabledPreference();
+    internals.pendingRejectedTurnRepair = { userMessageIds: ["u-routed"] };
+    const rows = [
+      createMuxMessage("u-first", "user", "first prompt", { timestamp: 1 }),
+      createMuxMessage("snap-routed", "user", "project skill body", {
+        timestamp: 2,
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
+      }),
+      createMuxMessage("u-routed", "user", "refused prompt", { timestamp: 3 }),
+      createMuxMessage("u-later", "user", "later prompt", { timestamp: 4 }),
+    ];
+    expect(internals.excludeRejectedRows(rows).map((row) => row.id)).toEqual([
+      "u-first",
+      "u-later",
+    ]);
     await session.dispose();
   });
 });

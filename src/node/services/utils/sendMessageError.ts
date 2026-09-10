@@ -52,6 +52,15 @@ export const REJECTED_TURN_REPAIR_PENDING_MESSAGE =
   "A previously refused turn could not be secured (its rows or in-flight output " +
   "could not be marked provider-ineligible); this message was not sent. Retry it.";
 
+/**
+ * A consent refusal whose row stamp AND repair-record write both failed: the
+ * refused content is quarantined for this process only. Sends stay refused
+ * until one of the two durable records lands.
+ */
+export const REJECTED_TURN_RECORD_UNRECORDED_MESSAGE =
+  "The refused turn could not be recorded on disk; its content is withheld for this " +
+  "session only, and new messages are refused until the record can be written.";
+
 export const createUnknownSendMessageError = (raw: string): SendMessageError => {
   assert(typeof raw === "string", "Expected raw error to be a string");
   const trimmed = stripNoisyErrorPrefix(raw.trim());

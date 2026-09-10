@@ -37,6 +37,10 @@ interface AutoRetryResumeRequest {
   goalKind?: typeof GOAL_CONTINUATION_KIND;
   /** Routed-turn compaction context; must stay absent for malformed rows. */
   compactionBaseOptions?: SendMessageOptions;
+  /** Routed project-skill turn: the resume re-verifies Project Trust. */
+  routedProjectConsent?: boolean;
+  /** The row a refused resume stamps. */
+  userMessageId?: string;
 }
 
 interface RetryableSessionForTests {
