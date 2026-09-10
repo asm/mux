@@ -5,7 +5,7 @@ import assert from "@/common/utils/assert";
 import { MAX_POST_COMPACTION_LOADED_SKILLS } from "@/common/constants/attachments";
 import type { LoadedSkillSnapshot } from "@/common/types/attachment";
 import type { AgentSkillFrontmatter, AgentSkillScope } from "@/common/types/agentSkill";
-import type { MuxMessage } from "@/common/types/message";
+import type { ModelMessage, MuxMessage } from "@/common/types/message";
 import { AgentSkillPackageSchema, AgentSkillScopeSchema } from "@/common/orpc/schemas/agentSkill";
 import {
   extractAgentSkillBodyFromSnapshotText,
@@ -354,6 +354,36 @@ export function redactProjectSkillToolResults(messages: MuxMessage[]): MuxMessag
       return part;
     });
     return changed ? { ...message, parts } : message;
+  });
+}
+
+/**
+ * Project skill content inside a step's provider-facing messages: tool results
+ * appended by EARLIER STEPS OF THE SAME STREAM (a routed global skill reading a
+ * project skill through agent_skill_read, directly or nested in a
+ * code_execution call). The request scan ran before those steps existed, so
+ * the per-step consent gate re-scans with this before every provider call.
+ */
+export function stepMessagesCarryProjectSkillContent(messages: readonly ModelMessage[]): boolean {
+  return messages.some((message) => {
+    if (message.role !== "tool" || !Array.isArray(message.content)) return false;
+    return message.content.some((part) => {
+      if (part.type !== "tool-result") return false;
+      const output: unknown = part.output;
+      // AI SDK tool outputs are typed envelopes ({ type: "json", value }); older
+      // rows carry the bare value.
+      const value =
+        typeof output === "object" && output !== null && "value" in output
+          ? (output as { value: unknown }).value
+          : output;
+      if (part.toolName === "agent_skill_read") return outputRetainsProjectSkill(value);
+      if (part.toolName === "code_execution") {
+        return nestedSkillReadRecords(value).some((record) =>
+          outputRetainsProjectSkill(record.result)
+        );
+      }
+      return false;
+    });
   });
 }
 

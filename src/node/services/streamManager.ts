@@ -272,6 +272,21 @@ export type OnStepSettled = (
   step: SettledStepBudget
 ) => Promise<"continue" | "warn" | "rollover" | "block">;
 
+/**
+ * Context handed to a routed project-skill turn's consent gate. `midStream`
+ * marks a per-step (prepareStep) invocation, whose refusal surfaces through
+ * the stream's own error path; `stepMessages` are that step's provider-facing
+ * messages — tool results appended by EARLIER steps of the same stream can
+ * carry project skill content the request scan at assembly never saw.
+ */
+export interface PreDispatchConsentGateContext {
+  midStream?: boolean;
+  stepMessages?: readonly ModelMessage[];
+}
+export type PreDispatchConsentGate = (
+  context?: PreDispatchConsentGateContext
+) => Promise<SendMessageError | null>;
+
 interface StreamRequestOptions {
   /**
    * Routed project-skill turns: final consent verdict for EVERY provider
@@ -281,7 +296,7 @@ interface StreamRequestOptions {
    * Returns the error to surface (null = proceed); rejection bookkeeping
    * happens inside the callback.
    */
-  preDispatchConsentGate?: (context?: { midStream?: boolean }) => Promise<SendMessageError | null>;
+  preDispatchConsentGate?: PreDispatchConsentGate;
   model: LanguageModel;
   modelString: string;
   messages: ModelMessage[];
@@ -340,7 +355,7 @@ interface StreamRequestConfig {
   modelString: string;
   messages: ModelMessage[];
   /** Per-step consent verdict for routed project-skill turns (see TurnExecutionOptions). */
-  preDispatchConsentGate?: (context?: { midStream?: boolean }) => Promise<SendMessageError | null>;
+  preDispatchConsentGate?: PreDispatchConsentGate;
   /** Provider-ready system instructions from TurnContextAssembler. */
   system?: string | SystemModelMessage;
   tools?: Record<string, Tool>;
@@ -2748,7 +2763,12 @@ export class StreamManager {
         // error row — hence midStream, so the callback does not emit its own.
         // Consent before budget: a refused request is not worth measuring.
         if (request.preDispatchConsentGate) {
-          const consentError = await request.preDispatchConsentGate({ midStream: true });
+          const consentError = await request.preDispatchConsentGate({
+            midStream: true,
+            // This step's messages: a project skill read by an earlier step of
+            // this stream rides in them and must arm the gate now.
+            stepMessages: rebuiltFirstStepMessages ?? effectiveMessages,
+          });
           if (consentError) {
             throw new Error(formatSendMessageError(consentError).message);
           }

@@ -63,7 +63,7 @@ import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import type { BashToolResult } from "@/common/types/tools";
 import type { SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
-import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import { AUTO_RETRY_PREFERENCE_FILE } from "./rejectedTurnRepairRecord";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import {
@@ -81,6 +81,7 @@ import * as forkOrchestratorModule from "@/node/services/utils/forkOrchestrator"
 import * as runtimeExecHelpers from "@/node/utils/runtime/helpers";
 import * as removeManagedGitWorktreeModule from "@/node/worktree/removeManagedGitWorktree";
 import * as workspaceTitleGenerator from "./workspaceTitleGenerator";
+import * as branchSummaryModule from "./branchSummary";
 import { WorkflowRunStore } from "./workflows/WorkflowRunStore";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 import { IdleDispatcher } from "./idleDispatcher";
@@ -20018,6 +20019,53 @@ describe("WorkspaceService fork", () => {
         .catch(() => null);
       expect(leftover).toBeNull();
     } finally {
+      fixture.restore();
+    }
+  });
+
+  test("fork keeps the source's quarantined turn out of the abandoned tail's summary", async () => {
+    // Forking from BEFORE the refused turn moves its rows into the removed
+    // tail the background summarizer reads (possibly on another provider):
+    // the source's quarantine must filter that tail as well as the kept rows.
+    const sourceWorkspaceId = "quarantine-source-tail";
+    const newWorkspaceId = "quarantine-fork-tail";
+    const fixture = await createQuarantineForkFixture(sourceWorkspaceId, newWorkspaceId);
+    for (const row of [
+      createMuxMessage("u-before", "user", "before the refusal", { timestamp: 1 }),
+      createMuxMessage("a-before", "assistant", "answer before", { timestamp: 2 }),
+      createMuxMessage("snap-refused", "user", "project skill body", {
+        timestamp: 3,
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
+      }),
+      createMuxMessage("u-refused", "user", "refused prompt", { timestamp: 4 }),
+      createMuxMessage("u-after", "user", "after the refusal", { timestamp: 5 }),
+    ]) {
+      expect((await historyService.appendToHistory(sourceWorkspaceId, row)).success).toBe(true);
+    }
+    await fsPromises.writeFile(
+      fixture.sourceRecordPath,
+      JSON.stringify({ pendingRejectedTurnRepair: { userMessageIds: ["u-refused"] } })
+    );
+    const summarySpy = spyOn(
+      branchSummaryModule,
+      "startAbandonedBranchSummaryInBackground"
+    ).mockResolvedValue(undefined);
+    try {
+      const result = await fixture.workspaceService.fork(
+        sourceWorkspaceId,
+        "fork-child",
+        "a-before"
+      );
+      expect(result.success).toBe(true);
+      expect(summarySpy).toHaveBeenCalledTimes(1);
+      const abandoned = (
+        summarySpy.mock.calls[0][0] as { abandonedMessages: MuxMessage[] }
+      ).abandonedMessages.map((row) => row.id);
+      // The refused turn (prompt and snapshot prefix) is gone; the rest remains.
+      expect(abandoned).toEqual(["u-after"]);
+    } finally {
+      summarySpy.mockRestore();
       fixture.restore();
     }
   });

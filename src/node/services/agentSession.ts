@@ -254,6 +254,7 @@ import {
   mergeLoadedSkillSnapshots,
   redactProjectSkillToolResults,
   rowCarriesProjectSkillContent,
+  stepMessagesCarryProjectSkillContent,
   stringifyAgentSkillFrontmatter,
 } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { substituteSkillArguments } from "@/node/services/agentSkills/skillArguments";
@@ -2584,6 +2585,30 @@ export class AgentSession {
   }
 
   /** Rejected rows terminate retry lookup, including empty assistant capsules from newer builds. */
+  /**
+   * Consent context for a resume that arrived without internal arguments (the
+   * renderer's manual Retry): the persisted retry options of the row being
+   * replayed — routedProjectConsent seeded at acceptance, the routed compaction
+   * policy — and that row's key for the refusal stamp. Mirrors what startup
+   * recovery derives. An unreadable tail yields nothing; the request build's
+   * own history read then fails the resume.
+   */
+  private async deriveResumeConsentFromTail(): Promise<{
+    routedProjectConsent?: boolean;
+    compactionBaseOptions?: SendMessageOptions;
+    userMessageId?: string;
+  }> {
+    const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    if (!history.success) return {};
+    const row = this.findLastRetryUserMessage(history.data);
+    const retry = row?.metadata?.retrySendOptions;
+    return {
+      routedProjectConsent: retry?.routedProjectConsent === true ? true : undefined,
+      compactionBaseOptions: sanitizePersistedCompactionBaseOptions(retry?.compactionBaseOptions),
+      userMessageId: row?.id,
+    };
+  }
+
   private findLastRetryUserMessage(messages: MuxMessage[]): MuxMessage | undefined {
     return messages.findLast(
       (message) =>
@@ -5875,16 +5900,34 @@ export class AgentSession {
       return Ok({ started: false });
     }
 
+    // The public (manual Retry) resume carries no internal consent arguments,
+    // yet replays the persisted row — possibly a routed turn's compaction
+    // request on the class model. Derive the obligation, the routed compaction
+    // policy and the row key from the durable tail then, as startup recovery
+    // does; internal callers (auto-retry, recovery) pass their own.
+    const routedResume =
+      internal?.routedProjectConsent != null ||
+      internal?.compactionBaseOptions != null ||
+      internal?.userMessageId != null
+        ? {
+            routedProjectConsent: internal?.routedProjectConsent,
+            compactionBaseOptions: internal?.compactionBaseOptions,
+            userMessageId: internal?.userMessageId,
+          }
+        : await this.deriveResumeConsentFromTail();
+    if (this.coordinator.closing || startupController?.signal.aborted) {
+      return Ok({ started: false });
+    }
     // Routing consent is re-verified on EVERY resumed dispatch: trust can be
     // revoked between the original acceptance and a same-session retry or a
     // startup recovery, and this path bypasses the send gates. The Err is
     // bounded by the retry machinery's attempt caps — and re-granting trust
     // lets a later attempt proceed legitimately.
     if (
-      internal?.routedProjectConsent === true &&
+      routedResume.routedProjectConsent === true &&
       !(await this.isRoutedProjectSkillTurnStillTrusted())
     ) {
-      return Err(await this.rejectResumedRoutedTurn(internal?.userMessageId));
+      return Err(await this.rejectResumedRoutedTurn(routedResume.userMessageId));
     }
     // The same verdict rides to the provider-dispatch boundary (pricing,
     // history reconstruction, request building, and stream startup below are
@@ -5897,16 +5940,16 @@ export class AgentSession {
     // they belong to the ORIGINAL accepted send, and nothing downstream
     // knows them otherwise.
     const isRoutedResume =
-      internal?.routedProjectConsent === true || internal?.compactionBaseOptions != null;
+      routedResume.routedProjectConsent === true || routedResume.compactionBaseOptions != null;
     const resumedConsentRejection: RoutedConsentRejection | undefined = isRoutedResume
       ? async (requestCarriesProjectContent?: boolean): Promise<SendMessageError | null> => {
-          if (internal?.routedProjectConsent !== true && requestCarriesProjectContent !== true) {
+          if (routedResume.routedProjectConsent !== true && requestCarriesProjectContent !== true) {
             return null;
           }
           if (await this.isRoutedProjectSkillTurnStillTrusted()) {
             return null;
           }
-          return await this.rejectResumedRoutedTurn(internal?.userMessageId);
+          return await this.rejectResumedRoutedTurn(routedResume.userMessageId);
         }
       : undefined;
 
@@ -5964,9 +6007,9 @@ export class AgentSession {
         internal?.goalId,
         internal?.requestAssemblySnapshot,
         internal?.contextBudgetRetried,
-        internal?.compactionBaseOptions,
-        internal?.routedProjectConsent,
-        internal?.userMessageId
+        routedResume.compactionBaseOptions,
+        routedResume.routedProjectConsent,
+        routedResume.userMessageId
       );
       // Open the mid-turn thinking override window for the resumed turn (after
       // preparation publication; the coordinator expires the holder when the turn becomes idle).
@@ -5989,7 +6032,7 @@ export class AgentSession {
         internal?.contextBudgetRetried === true,
         internal?.requestAssemblySnapshot,
         undefined,
-        internal?.compactionBaseOptions,
+        routedResume.compactionBaseOptions,
         resumedConsentRejection
       );
       if (!result.success) {
@@ -6632,7 +6675,13 @@ export class AgentSession {
   ): StreamMessageOptions["preDispatchConsentGate"] {
     if (routedConsentRejection == null) return undefined;
     const carriesProjectContent = rows.some(rowCarriesProjectSkillContent);
-    return (context) => routedConsentRejection(carriesProjectContent, context?.midStream === true);
+    return (context) =>
+      routedConsentRejection(
+        carriesProjectContent ||
+          (context?.stepMessages != null &&
+            stepMessagesCarryProjectSkillContent(context.stepMessages)),
+        context?.midStream === true
+      );
   }
 
   private async prepareRolloverRequest(
@@ -8732,9 +8781,7 @@ export class AgentSession {
       // workspace's history can carry one even when the current routed
       // invocation is global. The gate performs the rejection bookkeeping; the
       // caller converts the Err into an accepted pre-stream failure.
-      let preDispatchConsentGate:
-        | ((context?: { midStream?: boolean }) => Promise<SendMessageError | null>)
-        | undefined;
+      let preDispatchConsentGate: StreamMessageOptions["preDispatchConsentGate"];
       if (routedConsentRejection) {
         // Every channel repository-controlled project skill content takes into
         // a request: synthetic snapshot rows AND agent_skill_read results — a
@@ -8767,11 +8814,19 @@ export class AgentSession {
           requestCarriesProjectContent = false;
           attachmentsCarryProjectSkills = false;
         }
-        // Bound once: content kept under trust arms the gate so a revocation
-        // BETWEEN this assembly and any step's provider call still rejects.
+        // Bound at assembly: content kept under trust arms the gate so a
+        // revocation BETWEEN this assembly and any step's provider call still
+        // rejects. Re-scanned per step: a project skill the model reads
+        // through agent_skill_read DURING this stream enters the next step's
+        // messages without ever passing the scan above.
         const carriesForGate = requestCarriesProjectContent || attachmentsCarryProjectSkills;
         preDispatchConsentGate = (context) =>
-          routedConsentRejection(carriesForGate, context?.midStream === true);
+          routedConsentRejection(
+            carriesForGate ||
+              (context?.stepMessages != null &&
+                stepMessagesCarryProjectSkillContent(context.stepMessages)),
+            context?.midStream === true
+          );
       }
 
       this.activeStreamHadPostCompactionInjection =

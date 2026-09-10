@@ -197,6 +197,7 @@ import { UIModeSchema, type UIMode } from "@/common/types/mode";
 import {
   createMuxMessage,
   collectRejectedTurnRowIds,
+  excludeRejectedTurnRows,
   getCompactionFollowUpContent,
   isSameWorkspaceTurnTaskCorrelation,
   parseWorkspaceTurnTaskCorrelation,
@@ -4456,7 +4457,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     sourceWorkspaceId: string,
     targetWorkspaceId: string,
     targetSessionDir: string
-  ): Promise<Result<void>> {
+  ): Promise<Result<ReadonlySet<string>>> {
     const quarantine = await this.getQuarantinedRejectedRowIds(sourceWorkspaceId);
     if (!quarantine.success) {
       return Err(
@@ -4464,7 +4465,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           "refusing to fork its history"
       );
     }
-    if (quarantine.data.size === 0) return Ok(undefined);
+    if (quarantine.data.size === 0) return Ok(quarantine.data);
     const rows: MuxMessage[] = [];
     const read = await this.historyService.iterateFullHistory(
       targetWorkspaceId,
@@ -4479,12 +4480,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const rowIds = [...collectRejectedTurnRowIds(rows, quarantine.data)].filter((id) =>
       present.has(id)
     );
-    if (rowIds.length === 0) return Ok(undefined);
+    if (rowIds.length === 0) return Ok(quarantine.data);
     const stamped = await this.historyService.markMessagesPreStreamRejected(
       targetWorkspaceId,
       rowIds
     );
-    if (stamped.success) return Ok(undefined);
+    if (stamped.success) return Ok(quarantine.data);
     log.warn(
       "Failed to stamp quarantined rows in forked history; seeding the fork's repair record",
       {
@@ -4502,7 +4503,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     } catch (error) {
       return Err(`could not record the fork's rejected-turn quarantine: ${getErrorMessage(error)}`);
     }
-    return Ok(undefined);
+    return Ok(quarantine.data);
   }
 
   /** Queued agent peer messages behind a busy workspace; sessions are lazy, so no session ⇒ 0. */
@@ -10381,6 +10382,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // Removed tail captured inside the try, summarized only after setup
       // survives the rollback window (see the comment at the capture site).
       let abandonedBranchMessages: MuxMessage[] | null = null;
+      // The source's rejected-turn quarantine (live set ∪ durable record),
+      // applied to the copied rows below and to the abandoned tail's summary.
+      let sourceRejectedQuarantine: ReadonlySet<string> = new Set();
       try {
         const historyCopyResult = await this.historyService.copyHistorySnapshotToNewWorkspace(
           sourceWorkspaceId,
@@ -10458,6 +10462,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         if (!quarantinePropagated.success) {
           throw new Error(quarantinePropagated.error);
         }
+        sourceRejectedQuarantine = quarantinePropagated.data;
 
         const referencedStagedAttachmentPaths =
           await collectReferencedStagedAttachmentPaths(newSessionDir);
@@ -10669,7 +10674,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           // Cross-process pending marker home (r48): lets a first send served
           // by another backend wait for the in-flight summary.
           sessionDir: path.join(this.config.sessionsDir, newWorkspaceId),
-          abandonedMessages: abandonedBranchMessages,
+          // The removed tail can hold the source's refused turn (rows still
+          // unstamped there): the summarizer, possibly on another provider,
+          // must not read it any more than the fork's request may.
+          abandonedMessages: excludeRejectedTurnRows(
+            abandonedBranchMessages,
+            sourceRejectedQuarantine
+          ),
           isExperimentEnabled: (experimentId) => this.isExperimentEnabled(experimentId),
           guardTailMessageId: sourceMessageId,
           // The fork target's metadata carries no model settings yet (its

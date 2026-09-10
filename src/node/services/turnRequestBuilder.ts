@@ -36,6 +36,7 @@ import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 import type { SendMessageError } from "@/common/types/errors";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
+import type { PreDispatchConsentGate } from "@/node/services/streamManager";
 import { createMuxMessage } from "@/common/types/message";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { secretsToRecord } from "@/common/types/secrets";
@@ -277,7 +278,7 @@ export interface StreamMessageOptions {
    * `midStream: true` (the stream's error path then owns the visible
    * emission). Never sourced from IPC schemas.
    */
-  preDispatchConsentGate?: (context?: { midStream?: boolean }) => Promise<SendMessageError | null>;
+  preDispatchConsentGate?: PreDispatchConsentGate;
   thinkingLevel?: ThinkingLevel;
   /** OpenAI pro reasoning mode; delivered via provider options (inert for unsupported models). */
   reasoningMode?: OpenAIReasoningMode;

@@ -6,7 +6,12 @@ import * as path from "node:path";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { LoadedSkillSnapshot } from "@/common/types/attachment";
-import { createMuxMessage, type MuxMessage, type MuxMessageMetadata } from "@/common/types/message";
+import {
+  createMuxMessage,
+  type ModelMessage,
+  type MuxMessage,
+  type MuxMessageMetadata,
+} from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
@@ -2056,6 +2061,110 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       "u-first",
       "u-later",
     ]);
+    await session.dispose();
+  });
+
+  it("arms the per-step gate when a project skill is read through the tool mid-stream", async () => {
+    // A routed global skill starts with no project content, so the gate is
+    // bound unarmed at assembly. Its first step then reads a project skill
+    // through agent_skill_read while trusted: the next step's messages carry
+    // that body, so a revocation after the tool ran must stop the next
+    // provider call — the gate re-scans the step's messages.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const harnessArgs: Parameters<typeof createRoutingHarness>[0] = {
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" }, skillModelClasses: { done: "small" } },
+    };
+    const { session, streamed } = await sendRoutedGlobalSkillWithPendingState(harnessArgs, {
+      loadedSkills: [],
+    });
+    const gate = streamed[0].preDispatchConsentGate;
+    if (gate == null) throw new Error("a routed send must carry the gate");
+    harnessArgs.projectTrusted = false;
+    // Nothing project-scoped in the request itself: still allowed.
+    expect(await gate({ midStream: true })).toBeNull();
+    const stepMessages: ModelMessage[] = [
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "read-1",
+            toolName: "agent_skill_read",
+            output: {
+              type: "json",
+              value: {
+                success: true,
+                skill: {
+                  scope: "project",
+                  directoryName: "repo-conventions",
+                  frontmatter: { name: "repo-conventions", description: "Repository conventions" },
+                  body: "PROJECT SKILL BODY FROM TOOL",
+                },
+              },
+            },
+          },
+        ],
+      },
+    ];
+    expect(JSON.stringify(await gate({ midStream: true, stepMessages }))).toMatch(
+      /trust was revoked/i
+    );
+    await session.dispose();
+  });
+
+  it("arms a manual resume from the persisted row's routed consent", async () => {
+    // The renderer's Retry resumes through the public path with no internal
+    // consent arguments; the replayed row's persisted retry options (seeded at
+    // acceptance) must arm the same checks startup recovery applies.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const { session, streamed, historyService } = await createRoutingHarness({ workspacePath });
+    await historyService.appendToHistory(
+      "ws-skill-routing",
+      createMuxMessage("u-routed", "user", "Use skill done", {
+        timestamp: 1,
+        retrySendOptions: { model: USER_MODEL, agentId: "exec", routedProjectConsent: true },
+      })
+    );
+
+    const resumed = await session.resumeStream({ model: USER_MODEL, agentId: "exec" });
+    expect(resumed.success).toBe(true);
+    expect(streamed).toHaveLength(1);
+    // The gate rides to the provider boundary and the retry state carries the
+    // obligation plus the row to stamp.
+    expect(streamed[0].preDispatchConsentGate).toBeDefined();
+    const resumeState = (
+      session as unknown as {
+        lastAutoRetryResumeRequest?: { routedProjectConsent?: boolean; userMessageId?: string };
+      }
+    ).lastAutoRetryResumeRequest;
+    expect(resumeState).toMatchObject({ routedProjectConsent: true, userMessageId: "u-routed" });
+    await session.dispose();
+  });
+
+  it("refuses a manual resume of a routed row once trust is revoked and stamps it", async () => {
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const harnessArgs: Parameters<typeof createRoutingHarness>[0] = { workspacePath };
+    const { session, streamed, historyService } = await createRoutingHarness(harnessArgs);
+    const workspaceId = "ws-skill-routing";
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u-routed", "user", "Use skill done", {
+        timestamp: 1,
+        retrySendOptions: { model: USER_MODEL, agentId: "exec", routedProjectConsent: true },
+      })
+    );
+    harnessArgs.projectTrusted = false;
+
+    const refused = await session.resumeStream({ model: USER_MODEL, agentId: "exec" });
+    expect(refused.success).toBe(false);
+    if (!refused.success) expect(JSON.stringify(refused.error)).toMatch(/trust was revoked/i);
+    expect(streamed).toHaveLength(0);
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    expect(history.data.find((row) => row.id === "u-routed")?.metadata?.preStreamRejected).toBe(
+      true
+    );
     await session.dispose();
   });
 });
