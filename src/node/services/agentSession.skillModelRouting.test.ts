@@ -2167,4 +2167,96 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     );
     await session.dispose();
   });
+
+  it("repairs a refused turn before a heartbeat reset seals it behind a boundary", async () => {
+    // A restart can run the heartbeat reset before startup recovery repaired a
+    // refused turn whose stamp failed. The rows must be stamped BEFORE the
+    // boundary lands (the repair cannot reach them afterwards), and the pending
+    // state carried over for the heartbeat follow-up must not cache the turn's
+    // project snapshot.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const { session, historyService } = await createRoutingHarness({ workspacePath });
+    const workspaceId = "ws-skill-routing";
+    await appendRoutedTurnRows(historyService, workspaceId);
+    const internals = session as unknown as {
+      pendingRejectedTurnRepair: { userMessageIds: string[] } | null;
+      loadAutoRetryEnabledPreference: () => Promise<boolean>;
+      compactionHandler: {
+        peekPendingState: () => Promise<{ loadedSkills: Array<{ name: string }> } | null>;
+      };
+    };
+    await internals.loadAutoRetryEnabledPreference();
+    internals.pendingRejectedTurnRepair = { userMessageIds: ["u-routed"] };
+
+    const result = await session.appendHeartbeatContextResetBoundary({
+      boundaryText: "Heartbeat context reset",
+      pendingFollowUp: { text: "Continue", model: USER_MODEL, agentId: "exec" },
+    });
+    expect(result.success).toBe(true);
+    // Stamped before the boundary sealed them (the repair record retired)...
+    const rows: MuxMessage[] = [];
+    const read = await historyService.iterateFullHistory(workspaceId, "forward", (chunk) => {
+      rows.push(...chunk);
+    });
+    expect(read.success).toBe(true);
+    for (const id of ["snap-routed", "u-routed"]) {
+      expect(rows.find((row) => row.id === id)?.metadata?.preStreamRejected).toBe(true);
+    }
+    expect(internals.pendingRejectedTurnRepair).toBeNull();
+    // ...and nothing project-scoped rode into the carried-over pending state.
+    const pending = await internals.compactionHandler.peekPendingState();
+    expect(pending?.loadedSkills.some((skill) => skill.name === "done") ?? false).toBe(false);
+    await session.dispose();
+  });
+
+  it("attributes a background-started skill follow-up once, on its delivery", async () => {
+    // Startup recovery dispatches pending follow-ups in the background: the
+    // send answers { queued: true } and its background completion attributes
+    // the skill when delivery succeeds. The dispatch path must not record a
+    // second event on that deferred answer.
+    const workspacePath = await createWorkspaceWithSkill({
+      skillName: "done",
+      metadataYaml: "metadata:\n  model-class: small\n",
+    });
+    const { session, streamed, historyService } = await createRoutingHarness({
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" } },
+    });
+    await historyService.appendToHistory(
+      "ws-skill-routing",
+      createMuxMessage("summary-skill", "assistant", "Summary of the work", {
+        timestamp: Date.now(),
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: 1,
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: "Use skill done",
+            model: USER_MODEL,
+            agentId: "exec",
+            muxMetadata: {
+              type: "agent-skill",
+              rawCommand: "/done",
+              skillName: "done",
+              scope: "project",
+            },
+          },
+        },
+      })
+    );
+    const captureSpy = spyOn(
+      session as unknown as { captureBackendMessageSent: (args: unknown) => Promise<void> },
+      "captureBackendMessageSent"
+    ).mockResolvedValue(undefined);
+
+    expect(await session.dispatchPendingCompactionFollowUpIfNeeded("summary-skill", true)).toBe(
+      true
+    );
+    await waitFor(() => streamed.length === 1, "the follow-up's stream");
+    await waitFor(() => captureSpy.mock.calls.length >= 1, "the delivery attribution");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(captureSpy).toHaveBeenCalledTimes(1);
+    await session.dispose();
+  });
 });

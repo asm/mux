@@ -283,4 +283,60 @@ describe("project skill content in persisted tool results", () => {
     expect(JSON.stringify(redactedDirect)).not.toContain("Direct body");
     expect(rowCarriesProjectSkillContent(redactedDirect)).toBe(false);
   });
+
+  function skillFileReadMessage(id: string, result: Record<string, unknown>): MuxMessage {
+    return {
+      id,
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: `tool-${id}`,
+          toolName: "agent_skill_read_file",
+          state: "output-available",
+          input: { name: "repo-conventions", filePath: "references/style.md" },
+          output: result,
+        },
+      ],
+    };
+  }
+
+  it("treats a project skill's referenced file (and an untagged legacy read) as project content", () => {
+    // agent_skill_read_file persists arbitrary referenced-file content; the
+    // skill's scope rides on the result so the scan can tell it apart.
+    // Results written before the tag existed carry no provenance and fail closed.
+    const projectFile = skillFileReadMessage("project-file", {
+      success: true,
+      file_size: 12,
+      modifiedTime: "2026-01-01T00:00:00.000Z",
+      lines_read: 1,
+      content: "1\tPROJECT FILE BODY",
+      skillScope: "project",
+    });
+    const legacyFile = skillFileReadMessage("legacy-file", {
+      success: true,
+      file_size: 11,
+      modifiedTime: "2026-01-01T00:00:00.000Z",
+      lines_read: 1,
+      content: "1\tLEGACY BODY",
+    });
+    const globalFile = skillFileReadMessage("global-file", {
+      success: true,
+      file_size: 11,
+      modifiedTime: "2026-01-01T00:00:00.000Z",
+      lines_read: 1,
+      content: "1\tGLOBAL BODY",
+      skillScope: "global",
+    });
+    expect(rowCarriesProjectSkillContent(projectFile)).toBe(true);
+    expect(rowCarriesProjectSkillContent(legacyFile)).toBe(true);
+    expect(rowCarriesProjectSkillContent(globalFile)).toBe(false);
+
+    const redacted = JSON.stringify(
+      redactProjectSkillToolResults([projectFile, legacyFile, globalFile])
+    );
+    expect(redacted).not.toContain("PROJECT FILE BODY");
+    expect(redacted).not.toContain("LEGACY BODY");
+    expect(redacted).toContain("GLOBAL BODY");
+  });
 });

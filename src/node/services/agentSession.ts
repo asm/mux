@@ -1432,7 +1432,11 @@ export class AgentSession {
       sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
       telemetryService,
       emitter: this.emitter,
-      getQuarantinedRowIds: () => this.unstampedRejectedRowIds,
+      // The in-memory quarantine plus every outstanding repair key: a heartbeat
+      // reset or compaction that runs before startup recovery stamped the keyed
+      // rows must still keep them out of the carried-over pending state.
+      getQuarantinedRowIds: () =>
+        new Set([...this.unstampedRejectedRowIds, ...this.outstandingRejectedTurnKeys()]),
       onCompactionComplete: (metadata) => {
         // RLM keep-recent floor: tail copies after the boundary mean the
         // summary is no longer the last row; stash its ID so the stream-end
@@ -11790,8 +11794,16 @@ export class AgentSession {
     // deliberately skipped), so the turn is attributed here, when it actually
     // streams — routed or unbound. Routing is re-resolved after compaction
     // and can disappear (class binding removed, trust revoked); the skill
-    // then streams on the ambient model and the event must still fire.
-    if ((options.muxMetadata as MuxMessageMetadata | undefined)?.type === "agent-skill") {
+    // then streams on the ambient model and the event must still fire. Not
+    // when this dispatch itself deferred again ({ queued: true }: a
+    // background-started startup dispatch attributes on its own completion,
+    // or another on-send compaction defers the skill once more) — that would
+    // record a request that has not happened (yet); the accepted-without-
+    // stream case returned above.
+    if (
+      sendResult.data?.queued !== true &&
+      (options.muxMetadata as MuxMessageMetadata | undefined)?.type === "agent-skill"
+    ) {
       const dispatchModel = sendResult.data?.routedModel ?? options.model;
       if (dispatchModel != null) {
         await this.captureBackendMessageSent({
@@ -13319,6 +13331,18 @@ export class AgentSession {
     }
     if (this.hasQueuedMessages()) {
       return Err("Cannot reset heartbeat context while queued user input is pending.");
+    }
+
+    // A restart can run this before asynchronous startup recovery repaired a
+    // refused turn whose row stamp failed: the boundary would seal those rows
+    // where the repair no longer finds them, after the pending state had
+    // already cached their project snapshot for the follow-up. Load the durable
+    // record and repair first; whatever stays unstamped is excluded from the
+    // carried-over state by key (see the compaction handler's quarantine).
+    await this.loadAutoRetryEnabledPreference();
+    await this.repairUnstampedRejectedTurn();
+    if (this.coordinator.disposed || this.coordinator.closing) {
+      return Err("Cannot reset heartbeat context while the session is closing.");
     }
 
     const result = await this.compactionHandler.appendHeartbeatContextResetBoundary({

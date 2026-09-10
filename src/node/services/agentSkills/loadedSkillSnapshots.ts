@@ -251,10 +251,11 @@ export function mergeLoadedSkillSnapshots(snapshots: LoadedSkillSnapshot[]): Loa
 
 /**
  * Whether a history row carries repository-controlled PROJECT skill content by
- * any channel: a synthetic skill snapshot row, or an `agent_skill_read` result
- * (direct, or nested inside a code_execution part) whose scope is "project".
- * The routed-request consent scan must see both — a project skill the model
- * read through the tool in an earlier turn persists inside an assistant
+ * any channel: a synthetic skill snapshot row, an `agent_skill_read` result or
+ * an `agent_skill_read_file` result (direct, or nested inside a code_execution
+ * part) whose skill is project-scoped. The routed-request consent scan must
+ * see them all — a project skill (or one of its referenced files) the model
+ * read through a tool in an earlier turn persists inside an assistant
  * tool-result row, not in `metadata.agentSkillSnapshot`.
  */
 export function rowCarriesProjectSkillContent(message: MuxMessage): boolean {
@@ -263,14 +264,27 @@ export function rowCarriesProjectSkillContent(message: MuxMessage): boolean {
   }
   return message.parts.some((part) => {
     if (part.type !== "dynamic-tool" || part.state !== "output-available") return false;
-    if (part.toolName === "agent_skill_read") return outputRetainsProjectSkill(part.output);
-    if (part.toolName === "code_execution") {
-      return nestedSkillReadRecords(part.output).some((record) =>
-        outputRetainsProjectSkill(record.result)
-      );
-    }
-    return false;
+    return toolOutputCarriesProjectSkillContent(part.toolName, part.output);
   });
+}
+
+/** The tools whose results can carry a project skill's body or referenced files. */
+const SKILL_CONTENT_TOOLS = new Set(["agent_skill_read", "agent_skill_read_file"]);
+
+/**
+ * Whether one tool's output (direct part output, nested code_execution record
+ * result, or a step message's tool-result value) carries project skill content.
+ * code_execution outputs are inspected record by record.
+ */
+function toolOutputCarriesProjectSkillContent(toolName: unknown, output: unknown): boolean {
+  if (toolName === "agent_skill_read") return outputRetainsProjectSkill(output);
+  if (toolName === "agent_skill_read_file") return outputIsProjectSkillFile(output);
+  if (toolName === "code_execution") {
+    return nestedSkillContentRecords(output).some((record) =>
+      toolOutputCarriesProjectSkillContent(record.toolName, record.result)
+    );
+  }
+  return false;
 }
 
 /** Replaces a withheld project skill's tool output in a REQUEST copy (history is untouched). */
@@ -292,8 +306,23 @@ function outputRetainsProjectSkill(output: unknown): boolean {
   return (skill as { scope?: unknown }).scope === "project";
 }
 
-/** Every nested agent_skill_read record of a code_execution output, regardless of its status. */
-function nestedSkillReadRecords(output: unknown): Array<{ toolName?: unknown; result?: unknown }> {
+/**
+ * A persisted agent_skill_read_file success result: the referenced file of a
+ * skill, tagged with the skill's scope (`skillScope`). Results written before
+ * the tag existed carry no provenance and count as project content — fail
+ * closed rather than let a repository file through unlabeled.
+ */
+function outputIsProjectSkillFile(output: unknown): boolean {
+  if (typeof output !== "object" || output === null || Array.isArray(output)) return false;
+  const result = output as { success?: unknown; skillScope?: unknown };
+  if (result.success !== true) return false;
+  return result.skillScope === "project" || result.skillScope === undefined;
+}
+
+/** Every nested skill-content record of a code_execution output, regardless of its status. */
+function nestedSkillContentRecords(
+  output: unknown
+): Array<{ toolName?: unknown; result?: unknown }> {
   if (typeof output !== "object" || output === null) return [];
   const toolCalls = (output as { toolCalls?: unknown }).toolCalls;
   if (!Array.isArray(toolCalls)) return [];
@@ -301,7 +330,8 @@ function nestedSkillReadRecords(output: unknown): Array<{ toolName?: unknown; re
     (record): record is { toolName?: unknown; result?: unknown } =>
       typeof record === "object" &&
       record !== null &&
-      (record as { toolName?: unknown }).toolName === "agent_skill_read"
+      typeof (record as { toolName?: unknown }).toolName === "string" &&
+      SKILL_CONTENT_TOOLS.has((record as { toolName: string }).toolName)
   );
 }
 
@@ -313,7 +343,7 @@ function redactCodeExecutionOutput(output: unknown): { output: unknown; changed:
   const redactedCalls = toolCalls.map((record: unknown) => {
     if (typeof record !== "object" || record === null) return record;
     const call = record as { toolName?: unknown; result?: unknown };
-    if (call.toolName !== "agent_skill_read" || !outputRetainsProjectSkill(call.result)) {
+    if (!toolOutputCarriesProjectSkillContent(call.toolName, call.result)) {
       return record;
     }
     changed = true;
@@ -337,7 +367,10 @@ export function redactProjectSkillToolResults(messages: MuxMessage[]): MuxMessag
     let changed = false;
     const parts = message.parts.map((part) => {
       if (part.type !== "dynamic-tool" || part.state !== "output-available") return part;
-      if (part.toolName === "agent_skill_read" && outputRetainsProjectSkill(part.output)) {
+      if (
+        SKILL_CONTENT_TOOLS.has(part.toolName) &&
+        toolOutputCarriesProjectSkillContent(part.toolName, part.output)
+      ) {
         changed = true;
         return {
           ...part,
@@ -376,13 +409,7 @@ export function stepMessagesCarryProjectSkillContent(messages: readonly ModelMes
         typeof output === "object" && output !== null && "value" in output
           ? (output as { value: unknown }).value
           : output;
-      if (part.toolName === "agent_skill_read") return outputRetainsProjectSkill(value);
-      if (part.toolName === "code_execution") {
-        return nestedSkillReadRecords(value).some((record) =>
-          outputRetainsProjectSkill(record.result)
-        );
-      }
-      return false;
+      return toolOutputCarriesProjectSkillContent(part.toolName, value);
     });
   });
 }

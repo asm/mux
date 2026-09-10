@@ -17,7 +17,7 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 import {
   createMuxMessage,
-  filterPreStreamRejectedRows,
+  excludeRejectedTurnRows,
   getCompactionFollowUpContent,
   type CompactionFollowUpRequest,
   type CompactionSummaryMetadata,
@@ -724,13 +724,14 @@ export class CompactionHandler {
 
   /**
    * Rows a provider request never carries (pre-stream rejected: durably
-   * stamped, or quarantined in memory after a failed stamp) must not re-enter
-   * one through compaction either — not as loaded-skill / diff / read
-   * carryover in the pending state, and not as keep-recent tail copies.
+   * stamped, quarantined in memory after a failed stamp, or named by an
+   * outstanding repair key whose rows the session has not stamped yet) must
+   * not re-enter one through compaction either — not as loaded-skill / diff /
+   * read carryover in the pending state, and not as keep-recent tail copies.
+   * Keys expand to the whole turn (snapshot prefix included).
    */
   private excludeRejectedRows(messages: MuxMessage[]): MuxMessage[] {
-    const quarantined = this.getQuarantinedRowIds?.();
-    return filterPreStreamRejectedRows(messages).filter((msg) => !quarantined?.has(msg.id));
+    return excludeRejectedTurnRows(messages, this.getQuarantinedRowIds?.() ?? []);
   }
 
   async preparePendingStateFromMessages(
