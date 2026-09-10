@@ -27,7 +27,7 @@ import type { LanguageModel, Tool } from "ai";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import type { RefineAppliedEditPayload, RefineRecordPayload } from "@/common/orpc/schemas/api";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { excludeRejectedTurnRows, createMuxMessage, type MuxMessage } from "@/common/types/message";
 import {
   MemoryRefinementActionSchema,
   RefinementEvidenceSchema,
@@ -128,6 +128,14 @@ interface RefineServiceOptions {
   sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   /** Live-session emission hook so the appended summary row renders immediately. */
   emitChatMessage?: (workspaceId: string, message: MuxMessage) => void;
+  /**
+   * Session-local quarantine of rejected rows whose durable preStreamRejected
+   * stamp failed: refine's side-channel model call must exclude them exactly
+   * like provider request assembly does.
+   */
+  getQuarantinedRowIds?: (
+    workspaceId: string
+  ) => Result<ReadonlySet<string>, string> | Promise<Result<ReadonlySet<string>, string>>;
   /**
    * Serialize refine row publication (and apply mutations) with the
    * workspace's turn lifecycle (r40): returns a disposable holding the
@@ -934,7 +942,27 @@ export class RefineService {
     if (!messagesResult.success) {
       return Err(`could not read workspace history: ${messagesResult.error}`);
     }
-    const activeSegment = sliceMessagesForProviderFromLatestContextBoundary(messagesResult.data);
+    // Rejected turns are transcript-only: the refinement model (possibly on
+    // another provider) must not read their prompt or repository snapshots.
+    // Stamped rows are filtered by their own metadata; the quarantine — the
+    // session's in-memory set, or the durable repair record when no session is
+    // live — names rows whose stamp failed, and a record key names only the
+    // user row, so keys expand to the whole turn (snapshot prefix included).
+    const quarantine =
+      (await this.options.getQuarantinedRowIds?.(workspaceId)) ?? Ok(new Set<string>());
+    // Fail CLOSED when the quarantine state is unknown (unreadable record): the
+    // pass cannot tell which rows an unstamped rejection still protects.
+    if (!quarantine.success) {
+      return Err(
+        `could not read the workspace's rejected-turn record (${quarantine.error}); ` +
+          "run /refine again once the workspace has been opened"
+      );
+    }
+    const quarantinedRowIds = quarantine.data;
+    const activeSegment = excludeRejectedTurnRows(
+      sliceMessagesForProviderFromLatestContextBoundary(messagesResult.data),
+      quarantinedRowIds
+    );
     // r47: fingerprint the snapshot rows for the pre-publication recheck.
     // Row IDs alone cannot detect same-ID rewrites: StreamManager finalizes
     // a streaming assistant row through updateHistory() PRESERVING its ID
@@ -1170,7 +1198,15 @@ export class RefineService {
       const recheckBoundaryIndex = findLatestContextBoundaryIndex(recheckResult.data);
       const recheckBoundaryId =
         recheckBoundaryIndex >= 0 ? recheckResult.data[recheckBoundaryIndex].id : null;
-      const recheckSegment = sliceMessagesForProviderFromLatestContextBoundary(recheckResult.data);
+      const recheckSegment = excludeRejectedTurnRows(
+        sliceMessagesForProviderFromLatestContextBoundary(recheckResult.data),
+        // Same rejected-row filter as the segment above: an unfiltered recheck
+        // mismatches at the quarantined row and deterministically refuses to
+        // publish after the model call was already spent. A row stamped
+        // between the two reads drops out here and fails the prefix check —
+        // the pass distilled content that is now provider-ineligible.
+        quarantinedRowIds
+      );
       const snapshotIsUnchangedPrefix =
         activeSegment.length <= recheckSegment.length &&
         snapshotRowFingerprints.every(

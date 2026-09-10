@@ -22,6 +22,7 @@ import {
   createMuxMessage,
   pickStartupRetrySendOptions,
   type MuxMessage,
+  type StartupRetrySendOptions,
 } from "@/common/types/message";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
@@ -34,6 +35,8 @@ interface AutoRetryResumeRequest {
   options: SendMessageOptions;
   agentInitiated?: boolean;
   goalKind?: typeof GOAL_CONTINUATION_KIND;
+  /** Routed-turn compaction context; must stay absent for malformed rows. */
+  compactionBaseOptions?: SendMessageOptions;
 }
 
 interface RetryableSessionForTests {
@@ -1035,6 +1038,118 @@ describe("AgentSession startup auto-retry recovery", () => {
     } finally {
       await session.dispose();
     }
+  });
+
+  test("malformed persisted compactionBaseOptions neither marks the row routed nor is forwarded", async () => {
+    const workspaceId = "startup-retry-malformed-routed-context";
+    const workspaceMetadata: WorkspaceMetadata = {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "project",
+      projectPath: "/tmp/project",
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+      agentId: "explore",
+      agentType: "explore",
+      aiSettingsByAgent: {
+        explore: { model: "openai:gpt-5.5-low", thinkingLevel: "low" },
+      },
+    };
+    const { session, historyService, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
+      },
+    });
+    cleanups.push(cleanup);
+
+    // chat.jsonl is unchecked JSON: a corrupted non-null compactionBaseOptions
+    // (boolean here) must not count as routed compaction context and must not
+    // ride into the resume request as a compaction base.
+    const appendResult = await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-1", "user", "Interrupted routed child turn", {
+        timestamp: Date.now(),
+        retrySendOptions: {
+          model: "anthropic:claude-opus-5",
+          agentId: "explore",
+          compactionBaseOptions: true,
+        } as unknown as StartupRetrySendOptions,
+      })
+    );
+    expect(appendResult.success).toBe(true);
+
+    await session.ensureStartupAutoRetryCheck();
+
+    const retryOptions = (
+      session as unknown as {
+        lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
+      }
+    ).lastAutoRetryResumeRequest;
+    expect(retryOptions).toBeDefined();
+    if (!retryOptions) {
+      throw new Error("Expected startup retry options");
+    }
+
+    // The persisted model still resumes; the corrupted context is dropped.
+    expect(retryOptions.options.model).toBe("anthropic:claude-opus-5");
+    expect(retryOptions.compactionBaseOptions).toBeUndefined();
+
+    await session.dispose();
+  });
+
+  test("routed-retry context with an invalid model id is rejected like the startup model path", async () => {
+    const workspaceId = "startup-retry-garbage-routed-model";
+    const workspaceMetadata: WorkspaceMetadata = {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "project",
+      projectPath: "/tmp/project",
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+      agentId: "explore",
+      agentType: "explore",
+      aiSettingsByAgent: {
+        explore: { model: "openai:gpt-5.5-low", thinkingLevel: "low" },
+      },
+    };
+    const { session, historyService, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
+      },
+    });
+    cleanups.push(cleanup);
+
+    // An object shape with a model that fails provider:model validation must
+    // not count as routed either — same bar as normalizeStartupModel.
+    const appendResult = await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-1", "user", "Interrupted routed child turn", {
+        timestamp: Date.now(),
+        retrySendOptions: {
+          model: "anthropic:claude-opus-5",
+          agentId: "explore",
+          compactionBaseOptions: { model: "garbage" },
+        } as unknown as StartupRetrySendOptions,
+      })
+    );
+    expect(appendResult.success).toBe(true);
+
+    await session.ensureStartupAutoRetryCheck();
+
+    const retryOptions = (
+      session as unknown as {
+        lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
+      }
+    ).lastAutoRetryResumeRequest;
+    expect(retryOptions).toBeDefined();
+    if (!retryOptions) {
+      throw new Error("Expected startup retry options");
+    }
+
+    expect(retryOptions.options.model).toBe("anthropic:claude-opus-5");
+    expect(retryOptions.compactionBaseOptions).toBeUndefined();
+
+    await session.dispose();
   });
 
   test("replays pending auto-retry schedule during reconnect catch-up", async () => {

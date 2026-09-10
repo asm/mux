@@ -9887,7 +9887,9 @@ test.each([
           ...internal,
           restoreQueued: !live,
         })
-      ).toEqual(Ok(undefined));
+        // A busy session queues the guidance: the accepted payload says so, and the
+        // renderer relies on that flag to skip its own send attribution.
+      ).toEqual(Ok(live ? { queued: true } : undefined));
       if (!live) expect(drain).not.toHaveBeenCalled();
       busy.mockReturnValue(false);
       const drainsBeforeRestore = drain.mock.calls.length;
@@ -10479,6 +10481,55 @@ describe("WorkspaceService sendMessage status clearing", () => {
 
     manualSend.resolve(Ok(undefined));
     expect((await manualResult).success).toBe(true);
+  });
+
+  test("skill sends defer the service pricing preflight to the routing-aware session gate", async () => {
+    fakeSession.isBusy.mockReturnValue(false);
+    const pricingError: SendMessageError = { type: "unknown", raw: "unpriced model" };
+    const assertPriced = mock(() => Promise.resolve(Err(pricingError)));
+    workspaceService.setWorkspaceGoalService({
+      assertPricedModelForBudgetedGoal: assertPriced,
+    } as unknown as WorkspaceGoalService);
+    const persistMock = (
+      workspaceService as unknown as {
+        maybePersistAISettingsFromOptions: ReturnType<typeof mock>;
+      }
+    ).maybePersistAISettingsFromOptions;
+    fakeSession.sendMessage.mockImplementation(
+      async (
+        _message: unknown,
+        _options: unknown,
+        internalArg?: { onAccepted?: () => unknown }
+      ) => {
+        // AI settings must not persist before the session's dispatch-time
+        // gates — an unbound skill would reject the ambient model AFTER a
+        // premature persist had already stored it.
+        expect(persistMock).not.toHaveBeenCalled();
+        await internalArg?.onAccepted?.();
+        return Ok(undefined);
+      }
+    );
+
+    const result = await workspaceService.sendMessage("test-workspace", "/lint", {
+      model: "custom:unpriced-model",
+      agentId: "exec",
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: "/lint",
+        skillName: "lint",
+        scope: "project",
+      },
+    });
+
+    // Class routing resolves inside AgentSession (it needs the workspace's
+    // skill definitions), so the service must not reject on the ambient model
+    // before the route is known — the session's dispatch-time gate re-asserts
+    // pricing against the model that actually streams.
+    expect(result.success).toBe(true);
+    expect(assertPriced).not.toHaveBeenCalled();
+    expect(fakeSession.sendMessage).toHaveBeenCalledTimes(1);
+    // Acceptance (all gates passed) is what triggers the deferred persist.
+    expect(persistMock).toHaveBeenCalledTimes(1);
   });
 
   test("the follow-up idle probe excludes the originating send after its session handoff", async () => {

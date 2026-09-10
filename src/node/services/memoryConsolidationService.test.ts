@@ -14,7 +14,7 @@ import {
   MEMORY_CONSOLIDATION_DEBOUNCE_MS,
   MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP,
 } from "@/common/constants/memory";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import { Config } from "@/node/config";
 import {
   MemoryConsolidationService,
@@ -608,6 +608,23 @@ describe("MemoryConsolidationService", () => {
     const status = await fixture.service.getStatus("ws-dream");
     expect(status.workspaceRecord?.trigger).toBe("compaction");
     expect(status.latestHarvestRecord?.status).toBe("completed");
+  });
+
+  it("fails the harvest closed when the rejected-turn quarantine cannot be read", async () => {
+    // After a failed rejection stamp the durable record is the only key
+    // protecting the turn, so an unreadable record must not read as "nothing
+    // quarantined": no harvest model call, a retryable failed record. The
+    // sweep (memory files, not the transcript) still runs.
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    fixture.service.setQuarantinedRowIdsLookup(() => Err("record unreadable"));
+    const metadata = await seedCompactionEpoch(fixture);
+
+    const result = await fixture.service.maybeHarvestThenSweep(metadata);
+
+    expect(result.success).toBe(true);
+    expect(fixture.modelCalls).toHaveLength(1);
+    const status = await fixture.service.getStatus("ws-dream");
+    expect(status.latestHarvestRecord?.status).toBe("failed");
   });
 
   it("prunes old harvest sidecar records while preserving the newest status", async () => {

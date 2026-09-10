@@ -156,6 +156,8 @@ async function createFixture(options?: {
   applyLockTimeoutMs?: number;
   /** r40 turn-exclusion hook (busy-workspace refusal tests). */
   acquireTurnExclusion?: (workspaceId: string) => Result<Disposable, string>;
+  /** Rejected-row quarantine lookup (consent tests); Err = record unreadable. */
+  getQuarantinedRowIds?: (workspaceId: string) => Result<ReadonlySet<string>, string>;
 }): Promise<Fixture> {
   const tempDir = new TestTempDir("test-refine-service");
   const muxHome = path.join(tempDir.path, "mux-home");
@@ -218,6 +220,9 @@ async function createFixture(options?: {
         : {}),
       ...(options?.acquireTurnExclusion !== undefined
         ? { acquireTurnExclusion: options.acquireTurnExclusion }
+        : {}),
+      ...(options?.getQuarantinedRowIds !== undefined
+        ? { getQuarantinedRowIds: options.getQuarantinedRowIds }
         : {}),
       ...(options?.onStagedEditAttempted !== undefined
         ? { onStagedEditAttempted: options.onStagedEditAttempted }
@@ -2902,5 +2907,59 @@ describe("RefineService", () => {
     // Only the block's own terminator remains; the injected closers are gone.
     expect(prompt.split("</workspace_timeline>")).toHaveLength(2);
     expect(prompt).not.toMatch(/<\s*\/\s*workspace_timeline\s+>/);
+  });
+
+  it("keeps stamped rejected turns out of the distillation transcript", async () => {
+    // A late consent refusal stamps its turn transcript-only. Refine may run on
+    // another provider, so neither the refused prompt nor the project-skill
+    // snapshot persisted with it (stamp or no stamp on that row) may reach the
+    // model — the same rule the memory harvest applies.
+    const prompts: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
+    });
+    await fixture.seedTrajectory(["Please run the tests for this repo."]);
+    await fixture.historyService.appendToHistory(
+      WORKSPACE_ID,
+      createMuxMessage("snap-project-skill", "user", "PROJECT SKILL BODY", {
+        timestamp: Date.now(),
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      WORKSPACE_ID,
+      createMuxMessage("user-refused", "user", "REFUSED ROUTED PROMPT", {
+        timestamp: Date.now(),
+        preStreamRejected: true,
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      WORKSPACE_ID,
+      createMuxMessage("user-later", "user", "Lesson learned: run bun install first.", {
+        timestamp: Date.now(),
+      })
+    );
+
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    const prompt = prompts.at(-1) ?? "";
+    expect(prompt).toContain("Please run the tests for this repo.");
+    expect(prompt).toContain("Lesson learned: run bun install first.");
+    expect(prompt).not.toContain("REFUSED ROUTED PROMPT");
+    expect(prompt).not.toContain("PROJECT SKILL BODY");
+  });
+
+  it("fails closed when the rejected-turn quarantine record cannot be read", async () => {
+    // Without the record's keys the pass cannot tell which unstamped rows a
+    // refusal still protects: no model call, an explicit error to retry.
+    using fixture = await createFixture({
+      getQuarantinedRowIds: () => Err("record unreadable"),
+    });
+    await fixture.seedTrajectory();
+
+    const result = await fixture.service.run(WORKSPACE_ID);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("rejected-turn record");
+    expect(fixture.modelCalls).toHaveLength(0);
   });
 });

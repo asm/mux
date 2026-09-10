@@ -67,6 +67,7 @@ import type { AgentDefinitionPackage } from "@/common/types/agentDefinition";
 import { log } from "@/node/services/log";
 import type { HistoryService } from "@/node/services/historyService";
 import { runMemoryHarvest } from "@/node/services/memoryHarvest";
+import { excludeRejectedTurnRows } from "@/common/types/message";
 import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
@@ -349,6 +350,25 @@ export class MemoryConsolidationService extends EventEmitter {
   ) {
     super();
     this.sidecarPath = path.join(config.rootDir, "memory-consolidation.json");
+  }
+
+  /**
+   * Quarantine of rejected rows whose durable stamp failed (the live session's
+   * set plus the durable repair record): the harvest boundary must exclude
+   * them like request assembly does. Err means the record could not be read —
+   * the harvest fails closed. Late-bound — WorkspaceService is constructed
+   * after core services.
+   */
+  private getQuarantinedRowIds?: (
+    workspaceId: string
+  ) => Result<ReadonlySet<string>, string> | Promise<Result<ReadonlySet<string>, string>>;
+
+  setQuarantinedRowIdsLookup(
+    lookup: (
+      workspaceId: string
+    ) => Result<ReadonlySet<string>, string> | Promise<Result<ReadonlySet<string>, string>>
+  ): void {
+    this.getQuarantinedRowIds = lookup;
   }
 
   private enabled(): boolean {
@@ -983,6 +1003,27 @@ export class MemoryConsolidationService extends EventEmitter {
       });
       if (!epoch.success) return yield* Effect.fail(new Error(epoch.error));
 
+      // Rejected turns are transcript-only: the dream model (which may use
+      // an explicit alternate provider) must not harvest their prompt or
+      // repository snapshots — filter stamped rows plus the quarantine
+      // (the session's in-memory set, or the durable repair record when the
+      // post-restart launch sweep runs before any session exists), expanded
+      // from turn keys to the whole turn exactly like the repair stamps it.
+      // Resolved before the model is built: a fail-closed skip costs no client.
+      const quarantine = yield* Effect.promise(
+        async () =>
+          (await self.getQuarantinedRowIds?.(metadata.workspaceId)) ?? Ok(new Set<string>())
+      );
+      // Fail CLOSED when the record is unreadable: an empty set would let an
+      // unstamped rejected turn reach the dream provider. The journaled failure
+      // keeps the harvest retryable once a session repairs the record.
+      if (!quarantine.success) {
+        return yield* Effect.fail(
+          new Error(`rejected-turn quarantine unavailable: ${quarantine.error}`)
+        );
+      }
+      const harvestMessages = excludeRejectedTurnRows(epoch.data.messages, quarantine.data);
+
       const modelString = resolveDreamModelString(self.config, metadata.workspaceId);
       const modelResult = yield* Effect.tryPromise({
         try: async () =>
@@ -1007,7 +1048,7 @@ export class MemoryConsolidationService extends EventEmitter {
             memoryService: self.memoryService,
             ctx,
             completionMetadata: metadata,
-            messages: epoch.data.messages,
+            messages: harvestMessages,
             summary: epoch.data.summary,
             // Timeout + removal (r60); see the runLockedEffect signal for rationale.
             abortSignal: AbortSignal.any([
