@@ -614,6 +614,11 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         type: "context-window-rollover";
         rolloverId: string;
         reason: "on-send" | "mid-stream" | "context-exceeded";
+        /**
+         * Set when the model asked for this window with new_context. Kept out of `reason` so a
+         * downgraded release still parses the row as an ordinary rollover (not a privacy reset).
+         */
+        requestedBy?: "model";
         previousWindowId: string;
         flushOpportunity: boolean;
         contextTokens: number;

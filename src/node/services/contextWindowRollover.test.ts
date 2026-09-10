@@ -6,6 +6,7 @@ import {
   currentContextWindowId,
   estimateLastStepToolResults,
   hasRolloverEligibleMessages,
+  hasUnconsumedNewContextRequest,
   type ContextWindowRollover,
 } from "./contextWindowRollover";
 
@@ -204,5 +205,37 @@ describe("context window rollover recovery", () => {
       finalStep.toolResultChars
     );
     expect(estimateLastStepToolResults(undefined)).toEqual({ toolResultChars: 0, imageParts: 0 });
+  });
+});
+
+describe("model-requested rollover receipts", () => {
+  const request = (output: unknown, metadata?: Record<string, unknown>) =>
+    createMuxMessage("assistant", "assistant", "", metadata, [
+      {
+        type: "dynamic-tool",
+        toolCallId: "nc",
+        toolName: "new_context",
+        state: "output-available",
+        input: {},
+        output,
+      },
+    ]);
+  const user = createMuxMessage("user", "user", "Continue");
+
+  test("only a completed assistant row with a successful new_context result is a receipt", () => {
+    expect(hasUnconsumedNewContextRequest([user, request({ success: true })])).toBe(true);
+    // Interrupted (partial) rows cancel the request durably.
+    expect(
+      hasUnconsumedNewContextRequest([user, request({ success: true }, { partial: true })])
+    ).toBe(false);
+    expect(hasUnconsumedNewContextRequest([user, request({ success: false })])).toBe(false);
+    // Only the LAST assistant row counts: a later completed answer without the tool supersedes.
+    expect(
+      hasUnconsumedNewContextRequest([
+        request({ success: true }),
+        createMuxMessage("later", "assistant", "kept working"),
+      ])
+    ).toBe(false);
+    expect(hasUnconsumedNewContextRequest([user])).toBe(false);
   });
 });
