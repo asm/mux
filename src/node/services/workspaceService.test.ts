@@ -20051,6 +20051,19 @@ describe("WorkspaceService fork", () => {
       expect(routedStreaming.success).toBe(false);
       if (!routedStreaming.success) expect(routedStreaming.error).toContain("routed skill turn");
 
+      // The empty assistant placeholder a starting stream appends is not a
+      // reply: the turn is still in flight and the fork still waits.
+      expect(
+        (
+          await historyService.appendToHistory(
+            sourceWorkspaceId,
+            createMuxMessage("a-placeholder", "assistant", "", { timestamp: 2 })
+          )
+        ).success
+      ).toBe(true);
+      const placeholderOnly = await fixture.workspaceService.fork(sourceWorkspaceId, "fork-child");
+      expect(placeholderOnly.success).toBe(false);
+
       // Reply committed: the turn is settled. The fork proceeds and holds the
       // source's turn admission across the copy (probe + copy), releasing it.
       expect(

@@ -615,10 +615,24 @@ export function findUnansweredRoutedTurnRow(
   }
   const retry = messages[index].metadata?.retrySendOptions;
   const routed = retry?.routedProjectConsent === true || retry?.compactionBaseOptions != null;
-  if (!routed || messages.slice(index + 1).some((message) => message.role === "assistant")) {
+  if (!routed || messages.slice(index + 1).some(isCommittedAssistantReply)) {
     return undefined;
   }
   return messages[index];
+}
+
+/**
+ * An assistant row that carries a committed reply. TurnRequestBuilder appends
+ * an EMPTY assistant placeholder when a stream starts and finalizes it in
+ * place at stream end, so while the turn streams (and its per-step consent
+ * gate can still refuse it) the row exists with no parts: only content —
+ * text, reasoning, a tool call, a file — marks the turn answered.
+ */
+export function isCommittedAssistantReply(message: MuxMessage): boolean {
+  return (
+    message.role === "assistant" &&
+    message.parts.some((part) => part.type !== "text" || part.text.trim().length > 0)
+  );
 }
 
 /**

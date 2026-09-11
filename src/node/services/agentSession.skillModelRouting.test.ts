@@ -121,6 +121,31 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     return { session, streamed, historyService, events };
   }
 
+  /**
+   * Relabel the routed invocation's resolved package as GLOBAL: the turn is
+   * routed (a table binding), but its durable consent seed is false because
+   * the invoked package carries no project content of its own.
+   */
+  function relabelInvokedPackageAsGlobal(session: object): void {
+    const withResolve = session as unknown as {
+      resolveSkillModelClassOverride: (...resolveArgs: unknown[]) => Promise<unknown>;
+    };
+    const originalResolve = withResolve.resolveSkillModelClassOverride.bind(session);
+    spyOn(withResolve, "resolveSkillModelClassOverride").mockImplementation(
+      async (...resolveArgs: unknown[]) => {
+        const resolved = await originalResolve(...resolveArgs);
+        const override = resolved as {
+          kind?: string;
+          resolvedPackage?: { package: { scope: string } };
+        };
+        if (override.kind === "override" && override.resolvedPackage != null) {
+          override.resolvedPackage.package.scope = "global";
+        }
+        return resolved;
+      }
+    );
+  }
+
   /** Force the next send onto the on-send compaction path (mirrors the autoCompaction fixtures). */
   function forceOnSendCompaction(session: object): void {
     (session as { compactionMonitor: unknown }).compactionMonitor = {
@@ -1241,6 +1266,54 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     await session.dispose();
   });
 
+  it("marks a routed global skill's compaction request as routed-origin for its resume", async () => {
+    // A routed GLOBAL skill carries no project content of its own, but the
+    // history its on-send compaction summarizes can hold earlier project-skill
+    // content that only the request scan detects. The live send scans; a
+    // startup or manual Retry reconstructs the compaction from the persisted
+    // row alone and arms its gate only for rows marked routed — so the row
+    // must carry the routed compaction context even without the consent flag.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const { session, historyService } = await createRoutingHarness({
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" }, skillModelClasses: { done: "small" } },
+    });
+    relabelInvokedPackageAsGlobal(session);
+    await historyService.appendToHistory(
+      "ws-skill-routing",
+      createMuxMessage("snap-earlier", "user", "EARLIER PROJECT SKILL BODY", {
+        timestamp: 1,
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "repo-conventions", scope: "project", sha256: "x" },
+      })
+    );
+    forceOnSendCompaction(session);
+    expect((await session.sendMessage("Use skill done", skillSendOptions())).success).toBe(true);
+
+    const history = await historyService.getHistoryFromLatestBoundary("ws-skill-routing");
+    if (!history.success) throw new Error(history.error);
+    const compactionRequest = history.data.find(
+      (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+    );
+    if (compactionRequest == null) throw new Error("expected the compaction request row");
+    // No obligation from the invocation itself...
+    expect(compactionRequest.metadata?.retrySendOptions?.routedProjectConsent).toBeUndefined();
+    // ...but the routed compaction context marks the row's origin, and the
+    // tail derivation a manual Retry runs picks it up for this very row.
+    expect(compactionRequest.metadata?.retrySendOptions?.compactionBaseOptions).toBeDefined();
+    const derived = await (
+      session as unknown as {
+        deriveResumeConsentFromTail(): Promise<{
+          success: boolean;
+          data?: { compactionBaseOptions?: unknown; userMessageId?: string };
+        }>;
+      }
+    ).deriveResumeConsentFromTail();
+    expect(derived.success && derived.data?.userMessageId).toBe(compactionRequest.id);
+    expect(derived.success && derived.data?.compactionBaseOptions).toBeDefined();
+    await session.dispose();
+  });
+
   it("repairs each outstanding key on its own and retires only verified ones", async () => {
     // An older unstampable refusal must not be retired by a newer refusal
     // whose row is already stamped: the marker names the newer row, the record
@@ -2183,26 +2256,6 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     const harnessArgs: Parameters<typeof createRoutingHarness>[0] = {
       workspacePath,
       configValues: { modelClasses: { small: "haiku+0" }, skillModelClasses: { done: "small" } },
-    };
-    const relabelInvokedPackageAsGlobal = (session: object) => {
-      const withResolve = session as unknown as {
-        resolveSkillModelClassOverride: (...resolveArgs: unknown[]) => Promise<unknown>;
-      };
-      const originalResolve = withResolve.resolveSkillModelClassOverride.bind(session);
-      spyOn(withResolve, "resolveSkillModelClassOverride").mockImplementation(
-        async (...resolveArgs: unknown[]) => {
-          const resolved = await originalResolve(...resolveArgs);
-          // The invoked package itself is global, so the seed is false.
-          const override = resolved as {
-            kind?: string;
-            resolvedPackage?: { package: { scope: string } };
-          };
-          if (override.kind === "override" && override.resolvedPackage != null) {
-            override.resolvedPackage.package.scope = "global";
-          }
-          return resolved;
-        }
-      );
     };
     const persistedConsent = async (
       historyService: Awaited<ReturnType<typeof createRoutingHarness>>["historyService"]

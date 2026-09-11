@@ -390,6 +390,12 @@ describe("AgentStatusService", () => {
       expect(inFlight).not.toContain(withheld);
     }
 
+    // The empty assistant placeholder a starting stream appends (finalized in
+    // place at stream end) is not a reply: the turn is still in flight.
+    await history.appendToHistory(workspaceId, createMuxMessage("a-placeholder", "assistant", ""));
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+
     // Settled: with the reply committed the turn can no longer be refused.
     await history.deletePartial(workspaceId);
     await history.appendToHistory(

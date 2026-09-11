@@ -4996,7 +4996,17 @@ export class AgentSession {
               autoCompactionRequest.sendOptions,
               autoCompactionRequest.agentInitiated,
               undefined,
-              undefined,
+              // Routed-origin marker: a resume of this row (startup, manual
+              // Retry) reconstructs the compaction from the row alone, and
+              // arms its consent gate only for rows marked routed — the flag
+              // below, OR this compaction context. A routed GLOBAL skill's
+              // compaction has no obligation of its own, yet the history it
+              // summarizes can carry earlier project-skill content that only
+              // the request scan detects, so every routed compaction row
+              // carries the context.
+              skillModelOverride?.kind === "override"
+                ? compactionBaseOptionsForRoutedTurn
+                : undefined,
               // A routed turn's compaction may run on the class model (routed
               // UP) with the project snapshot in its history: startup recovery
               // of this row re-verifies Project Trust like the turn itself.
