@@ -1328,6 +1328,11 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     // invocation fails with a context error instead of compacting.
     for (const [body, expectCompaction] of [
       ["x".repeat(MAX_AGENT_SKILL_SNAPSHOT_CHARS), true],
+      // Small bodies that can EXPAND at materialization ($ARGUMENTS
+      // substitution, a whole-line dynamic-context directive) are priced at
+      // the snapshot cap.
+      ["Repeat this: $ARGUMENTS", true],
+      ["Context:\n!`git status`\nDo the thing.", true],
       ["Do the thing.", false],
     ] as const) {
       const workspacePath = await createWorkspaceWithSkill({

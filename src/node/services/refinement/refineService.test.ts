@@ -2983,6 +2983,64 @@ describe("RefineService", () => {
     expect(prompt).not.toContain("PROJECT SKILL BODY");
   });
 
+  it("keeps an unsettled routed turn out of the snapshot", async () => {
+    // An interrupted routed project-skill stream leaves the workspace idle
+    // with a retryable turn; a Retry after a trust revocation refuses and
+    // stamps it, and by then the transcript would already be streaming to the
+    // refinement provider. The whole turn stays out; a settled one is read.
+    const prompts: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
+    });
+    await fixture.seedTrajectory(["Please run the tests for this repo."]);
+    const routedRetry = {
+      model: "anthropic:claude-haiku-4-5",
+      agentId: "exec",
+      routedProjectConsent: true,
+    };
+    for (const row of [
+      createMuxMessage("snap-settled", "user", "SETTLED SKILL BODY", {
+        timestamp: Date.now(),
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "s" },
+      }),
+      createMuxMessage("user-settled", "user", "SETTLED ROUTED PROMPT", {
+        timestamp: Date.now(),
+        retrySendOptions: routedRetry,
+      }),
+      createMuxMessage("assistant-settled", "assistant", "Applied the settled skill", {
+        timestamp: Date.now(),
+      }),
+      createMuxMessage("snap-unsettled", "user", "UNSETTLED SKILL BODY", {
+        timestamp: Date.now(),
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "u" },
+      }),
+      createMuxMessage("user-unsettled", "user", "UNSETTLED ROUTED PROMPT", {
+        timestamp: Date.now(),
+        retrySendOptions: routedRetry,
+      }),
+      createMuxMessage("assistant-interrupted", "assistant", "INTERRUPTED PARTIAL OUTPUT", {
+        timestamp: Date.now(),
+        partial: true,
+      }),
+    ]) {
+      await fixture.historyService.appendToHistory(WORKSPACE_ID, row);
+    }
+
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    const prompt = prompts.at(-1) ?? "";
+    expect(prompt).toContain("SETTLED ROUTED PROMPT");
+    expect(prompt).toContain("Applied the settled skill");
+    for (const withheld of [
+      "UNSETTLED SKILL BODY",
+      "UNSETTLED ROUTED PROMPT",
+      "INTERRUPTED PARTIAL OUTPUT",
+    ]) {
+      expect(prompt).not.toContain(withheld);
+    }
+  });
+
   it("omits the timeline while the segment holds a rejected turn", async () => {
     // A `turn.user` timeline event carries the prompt's digest, recorded
     // before the row was refused; the timeline is selected by time alone, so

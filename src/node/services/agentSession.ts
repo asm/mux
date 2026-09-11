@@ -263,11 +263,15 @@ import {
   stepMessagesCarryProjectSkillContent,
   stringifyAgentSkillFrontmatter,
 } from "@/node/services/agentSkills/loadedSkillSnapshots";
-import { substituteSkillArguments } from "@/node/services/agentSkills/skillArguments";
+import {
+  skillBodyHasArgumentPlaceholders,
+  substituteSkillArguments,
+} from "@/node/services/agentSkills/skillArguments";
 import {
   injectSkillDynamicContext,
   SKILL_DYNAMIC_COMMAND_TIMEOUT_MS,
   SKILL_DYNAMIC_OUTPUT_CAP_BYTES,
+  extractSkillDynamicCommands,
 } from "@/node/services/agentSkills/skillDynamicContext";
 import {
   aliasLegacyPtcExclusive,
@@ -6417,9 +6421,20 @@ export class AgentSession {
       // The recorded usage already includes the system prompt.
       systemFloorTokens: 0,
     });
+    // Materialization substitutes $ARGUMENTS/$N and expands whole-line
+    // dynamic-context directives, either of which can grow the body up to the
+    // snapshot cap; a raw body that can expand is priced at the cap.
+    const skillBody = args.skillBody;
+    const skillChars =
+      skillBody == null
+        ? 0
+        : skillBodyHasArgumentPlaceholders(skillBody) ||
+            extractSkillDynamicCommands(skillBody).length > 0
+          ? MAX_AGENT_SKILL_SNAPSHOT_CHARS
+          : Math.min(skillBody.length, MAX_AGENT_SKILL_SNAPSHOT_CHARS);
     const chars =
       args.message.length +
-      Math.min(args.skillBody?.length ?? 0, MAX_AGENT_SKILL_SNAPSHOT_CHARS) +
+      skillChars +
       args.inlineSkillRefCount * MAX_AGENT_SKILL_SNAPSHOT_CHARS +
       textLikeChars;
     return ((Math.ceil(chars / APPROX_CHARS_PER_TOKEN) + mediaTokens) / limit) * 100;

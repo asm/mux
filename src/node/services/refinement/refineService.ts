@@ -27,7 +27,13 @@ import type { LanguageModel, Tool } from "ai";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import type { RefineAppliedEditPayload, RefineRecordPayload } from "@/common/orpc/schemas/api";
-import { excludeRejectedTurnRows, createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  collectRejectedTurnRowIds,
+  createMuxMessage,
+  excludeRejectedTurnRows,
+  findUnansweredRoutedTurnRow,
+  type MuxMessage,
+} from "@/common/types/message";
 import {
   MemoryRefinementActionSchema,
   RefinementEvidenceSchema,
@@ -1623,13 +1629,26 @@ export class RefineService {
     // every timeline event a later turn emits is stamped after this instant.
     const takenAt = Date.now();
     const segment = sliceMessagesForProviderFromLatestContextBoundary(messagesResult.data);
-    const activeSegment = excludeRejectedTurnRows(segment, quarantine.data);
+    let activeSegment = excludeRejectedTurnRows(segment, quarantine.data);
+    // A routed turn without a terminal reply (interrupted stream, failed
+    // stream) is idle yet still retryable, and a Retry after a trust
+    // revocation refuses and stamps it. The pre-dispatch re-verification
+    // cannot undo a transcript already streaming to the refinement provider,
+    // so the whole unsettled turn — snapshot prefix, user row, and every row
+    // after it — stays out of the snapshot, as the status transcript does.
+    const unsettledRouted = findUnansweredRoutedTurnRow(activeSegment);
+    if (unsettledRouted !== undefined) {
+      const turnRowIds = collectRejectedTurnRowIds(activeSegment, [unsettledRouted.id]);
+      const turnStart = activeSegment.findIndex((row) => turnRowIds.has(row.id));
+      activeSegment = activeSegment.slice(0, turnStart);
+    }
     return Ok({
       messages: messagesResult.data,
       activeSegment,
       takenAt,
       // The timeline input is selected by time alone, so the caller omits it
-      // while the segment holds a rejected turn (see runLocked).
+      // while the segment holds a withheld turn — rejected, quarantined or
+      // unsettled routed (see runLocked).
       rejectedRowsPresent: activeSegment.length !== segment.length,
       snapshotRowFingerprints: activeSegment.map(fingerprintHistoryRow),
     });
