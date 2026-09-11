@@ -20240,6 +20240,55 @@ describe("WorkspaceService fork", () => {
     }
   });
 
+  test("fork summary re-verification sees abandoned rows from a sealed archive", async () => {
+    // Forking from a message inside an older epoch abandons the rest of that
+    // archive plus the active epoch. The pre-dispatch re-verification must
+    // read the FULL history, or every pre-boundary fork would silently skip
+    // its abandoned-branch summary.
+    const sourceWorkspaceId = "archive-source-tail";
+    const newWorkspaceId = "archive-fork-tail";
+    const fixture = await createQuarantineForkFixture(sourceWorkspaceId, newWorkspaceId);
+    for (const row of [
+      createMuxMessage("u1", "user", "first prompt", { timestamp: 1 }),
+      createMuxMessage("a1", "assistant", "first answer", { timestamp: 2 }),
+      createMuxMessage("u1b", "user", "archived follow-up", { timestamp: 3 }),
+      createMuxMessage("a1b", "assistant", "archived answer", { timestamp: 4 }),
+      createMuxMessage("summary", "assistant", "Summary so far", {
+        timestamp: 5,
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: 1,
+        muxMetadata: { type: "compaction-summary" },
+      }),
+      createMuxMessage("u2", "user", "after the boundary", { timestamp: 6 }),
+      createMuxMessage("a2", "assistant", "answer after", { timestamp: 7 }),
+    ]) {
+      expect((await historyService.appendToHistory(sourceWorkspaceId, row)).success).toBe(true);
+    }
+    const summarySpy = spyOn(
+      branchSummaryModule,
+      "startAbandonedBranchSummaryInBackground"
+    ).mockResolvedValue(undefined);
+    try {
+      const result = await fixture.workspaceService.fork(sourceWorkspaceId, "fork-child", "a1");
+      expect(result.success).toBe(true);
+      expect(summarySpy).toHaveBeenCalledTimes(1);
+      const call = summarySpy.mock.calls[0][0] as {
+        abandonedMessages: MuxMessage[];
+        beforeDispatch?: () => Promise<boolean>;
+      };
+      expect(call.abandonedMessages.map((row) => row.id)).toContain("u1b");
+      expect(await call.beforeDispatch?.()).toBe(true);
+      expect(
+        (await historyService.markMessagesPreStreamRejected(sourceWorkspaceId, ["u2"])).success
+      ).toBe(true);
+      expect(await call.beforeDispatch?.()).toBe(false);
+    } finally {
+      summarySpy.mockRestore();
+      fixture.restore();
+    }
+  });
+
   test("auto-generated fork names normalize legacy fork families before the validation fallback", async () => {
     const sourceWorkspaceId = "source-workspace";
     const newWorkspaceId = "forked-workspace";

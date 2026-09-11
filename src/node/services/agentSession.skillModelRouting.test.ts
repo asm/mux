@@ -2185,6 +2185,56 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     await session.dispose();
   });
 
+  it("treats a refused turn's unreadable partial as unsecured", async () => {
+    // The lenient partial read swallows non-ENOENT failures as "no partial":
+    // the repair would report the partial secured, the acceptance path would
+    // clear the marker, and a later commitPartial could promote the refused
+    // turn's output once the file is readable again. Only a MISSING partial
+    // counts as gone.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const { session, historyService } = await createRoutingHarness({ workspacePath });
+    const workspaceId = "ws-skill-routing";
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u-rejected", "user", "refused prompt", { timestamp: 1 })
+    );
+    const internals = session as unknown as {
+      startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
+      loadAutoRetryEnabledPreference: () => Promise<boolean>;
+      repairUnstampedRejectedTurn: () => Promise<{ durable: boolean; partialSecured: boolean }>;
+    };
+    await internals.loadAutoRetryEnabledPreference();
+    internals.startupAutoRetryAbandon = {
+      reason: "pre_stream_rejected",
+      userMessageId: "u-rejected",
+    };
+    const readSpy = spyOn(historyService, "readPartial").mockImplementation(
+      (_workspaceId: string, options?: { throwOnError?: boolean }) => {
+        if (options?.throwOnError) return Promise.reject(new Error("EIO: partial.json unreadable"));
+        return Promise.resolve(null);
+      }
+    );
+    try {
+      const outcome = await internals.repairUnstampedRejectedTurn();
+      expect(outcome.partialSecured).toBe(false);
+      // The pass is not durable while the partial is unsecured (the record
+      // keeps the key), even though the row stamp itself landed.
+      expect(outcome.durable).toBe(false);
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      expect(history.data.find((row) => row.id === "u-rejected")?.metadata?.preStreamRejected).toBe(
+        true
+      );
+      expect(
+        (session as unknown as { pendingRejectedTurnRepair: { userMessageIds: string[] } | null })
+          .pendingRejectedTurnRepair
+      ).toEqual({ userMessageIds: ["u-rejected"] });
+    } finally {
+      readSpy.mockRestore();
+    }
+    await session.dispose();
+  });
+
   it("keeps refusing sends until a refused turn's record reaches disk", async () => {
     // Both durable records fail: the row stamp (twice) and the preference-file
     // write. The refusal still completes — the rows are quarantined in memory —

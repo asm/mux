@@ -13067,7 +13067,23 @@ export class AgentSession {
       const partialBelongsToRejectedTurn =
         abandonRejected || (newestRetryEligibleRow != null && keys.has(newestRetryEligibleRow.id));
       if (partialBelongsToRejectedTurn) {
-        const rejectedPartial = await this.historyService.readPartial(this.workspaceId);
+        // STRICT read: the lenient default swallows every non-ENOENT failure
+        // as "no partial", which would let this pass report the partial as
+        // secured while a transiently unreadable file still holds the refused
+        // turn's output for a later commitPartial to promote. An unreadable
+        // partial is unsecured; only a missing one is gone.
+        let rejectedPartial: MuxMessage | null = null;
+        try {
+          rejectedPartial = await this.historyService.readPartial(this.workspaceId, {
+            throwOnError: true,
+          });
+        } catch (error) {
+          partialDurable = false;
+          log.warn("Refused turn's partial could not be read; treating it as unsecured", {
+            workspaceId: this.workspaceId,
+            error: getErrorMessage(error),
+          });
+        }
         if (rejectedPartial != null) {
           const deletePartialResult = await this.historyService.deletePartial(this.workspaceId);
           if (!deletePartialResult.success) {

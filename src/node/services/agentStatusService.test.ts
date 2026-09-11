@@ -494,6 +494,62 @@ describe("AgentStatusService", () => {
     expect(generateSpy.mock.calls[1][0]).toContain("User: Try again");
   });
 
+  test("keeps withholding a routed turn past a synthetic file-update notification", async () => {
+    // A stream appends a <system-file-update> notification (synthetic user
+    // row) after the routed user row; it must not read as a newer, unrouted
+    // turn that settles the routed one.
+    const history = historyHandle.historyService;
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please run the test suite")
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("a1", "assistant", "Running tests now")
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("snap-routed", "user", "ROUTED SKILL BODY", {
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "z" },
+      })
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u-routed", "user", "ROUTED PROMPT", {
+        retrySendOptions: {
+          model: "anthropic:claude-haiku-4-5",
+          agentId: "exec",
+          routedProjectConsent: true,
+        },
+      })
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage(
+        "sys-file-update",
+        "user",
+        "<system-file-update>x.ts changed</system-file-update>",
+        {
+          synthetic: true,
+        }
+      )
+    );
+    await history.writePartial(
+      workspaceId,
+      createMuxMessage("a-partial", "assistant", "ROUTED PARTIAL OUTPUT")
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const prompt = generateSpy.mock.calls[0][0];
+    expect(prompt).toContain("User: Please run the test suite");
+    for (const withheld of ["ROUTED SKILL BODY", "ROUTED PROMPT", "ROUTED PARTIAL OUTPUT"]) {
+      expect(prompt).not.toContain(withheld);
+    }
+  });
+
   test("drops a trailing snapshot prefix whose user row has not landed yet", async () => {
     // PREPARING persists the snapshot prefix before the user row; a tick in
     // between must not read the prefix as settled history.

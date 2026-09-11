@@ -4,6 +4,7 @@ import {
   createMuxMessage,
   excludeRejectedTurnRows,
   filterPreStreamRejectedRows,
+  findUnansweredRoutedTurnRow,
 } from "./message";
 
 describe("collectRejectedTurnRowIds", () => {
@@ -96,5 +97,63 @@ describe("filterPreStreamRejectedRows", () => {
     ];
     expect(filterPreStreamRejectedRows(rows).map((row) => row.id)).toEqual(["u-kept", "a-kept"]);
     expect(excludeRejectedTurnRows(rows, []).map((row) => row.id)).toEqual(["u-kept", "a-kept"]);
+  });
+});
+
+describe("findUnansweredRoutedTurnRow", () => {
+  const routedRetry = {
+    model: "anthropic:claude-haiku-4-5",
+    agentId: "exec",
+    routedProjectConsent: true,
+  };
+
+  it("looks past synthetic notification rows appended after the routed user row", () => {
+    // A stream appends a <system-file-update> notification (synthetic user row)
+    // after the turn's own user row; it must not read as a newer, unrouted turn.
+    const rows = [
+      createMuxMessage("u-routed", "user", "Use skill done", {
+        timestamp: 1,
+        retrySendOptions: routedRetry,
+      }),
+      createMuxMessage(
+        "sys-file-update",
+        "user",
+        "<system-file-update>x changed</system-file-update>",
+        {
+          timestamp: 2,
+          synthetic: true,
+        }
+      ),
+    ];
+    expect(findUnansweredRoutedTurnRow(rows)?.id).toBe("u-routed");
+    // A committed reply settles it.
+    expect(
+      findUnansweredRoutedTurnRow([
+        ...rows,
+        createMuxMessage("a-routed", "assistant", "done", { timestamp: 3 }),
+      ])
+    ).toBeUndefined();
+  });
+
+  it("treats a synthetic compaction request as the turn it is", () => {
+    // Synthetic rows that START a turn carry retry options like any resumable
+    // turn and are found; an unrouted latest turn yields nothing.
+    const rows = [
+      createMuxMessage("u-plain", "user", "plain prompt", { timestamp: 1 }),
+      createMuxMessage("compact-request", "user", "Summarize", {
+        timestamp: 2,
+        synthetic: true,
+        retrySendOptions: routedRetry,
+      }),
+    ];
+    expect(findUnansweredRoutedTurnRow(rows)?.id).toBe("compact-request");
+    expect(
+      findUnansweredRoutedTurnRow([
+        createMuxMessage("u-unrouted", "user", "plain", {
+          timestamp: 3,
+          retrySendOptions: { model: "anthropic:claude-haiku-4-5", agentId: "exec" },
+        }),
+      ])
+    ).toBeUndefined();
   });
 });

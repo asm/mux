@@ -3263,21 +3263,28 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   /**
    * Whether every abandoned-tail row a fork's background summary was built
    * from is still present and provider-eligible in the SOURCE — re-read from
-   * current history with a fresh quarantine. False (also on an unreadable
-   * quarantine) means a row was stamped, quarantined or truncated since the
-   * copy: the summary is abandoned rather than sent from stale rows.
+   * the FULL history (a fork from an archived message abandons the rest of
+   * that archive too, which a latest-boundary read never returns) with a
+   * fresh quarantine. False (also on an unreadable history or quarantine)
+   * means a row was stamped, quarantined or truncated since the copy: the
+   * summary is abandoned rather than sent from stale rows.
    */
   private async abandonedRowsStillEligible(
     sourceWorkspaceId: string,
     rowIds: readonly string[]
   ): Promise<boolean> {
-    const history = await this.historyService.getHistoryFromLatestBoundary(sourceWorkspaceId);
-    if (!history.success) return false;
+    const rows: MuxMessage[] = [];
+    const read = await this.historyService.iterateFullHistory(
+      sourceWorkspaceId,
+      "forward",
+      (chunk) => {
+        rows.push(...chunk);
+      }
+    );
+    if (!read.success) return false;
     const quarantine = await this.getQuarantinedRejectedRowIds(sourceWorkspaceId);
     if (!quarantine.success) return false;
-    const eligible = new Set(
-      excludeRejectedTurnRows(history.data, quarantine.data).map((row) => row.id)
-    );
+    const eligible = new Set(excludeRejectedTurnRows(rows, quarantine.data).map((row) => row.id));
     return rowIds.every((id) => eligible.has(id));
   }
 

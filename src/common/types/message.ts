@@ -610,7 +610,16 @@ export function isTurnSnapshotPrefixRow(message: MuxMessage): boolean {
 export function findUnansweredRoutedTurnRow(
   messages: readonly MuxMessage[]
 ): MuxMessage | undefined {
-  const index = messages.findLastIndex((message) => message.role === "user");
+  // The latest TURN-STARTING user row: a stream appends synthetic user rows
+  // after the turn's own (a <system-file-update> notification, a snapshot
+  // prefix of the next turn), which must not read as a newer, unrouted turn.
+  // Synthetic rows that start a turn (compaction requests) carry retry
+  // options like any resumable turn and still count.
+  const index = messages.findLastIndex(
+    (message) =>
+      message.role === "user" &&
+      (message.metadata?.synthetic !== true || message.metadata.retrySendOptions != null)
+  );
   if (index === -1) {
     return undefined;
   }
