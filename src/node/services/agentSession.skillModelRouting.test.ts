@@ -1397,6 +1397,86 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     await session.dispose();
   });
 
+  for (const channel of ["file", "mcp"] as const) {
+    it(`counts the ${channel === "file" ? "@file snapshots" : "MCP prompt references"} toward the routed pending payload`, async () => {
+      // The @file mention snapshot is built before the compaction decision
+      // (exact size: two files at the per-file cap fill the 64 KiB total);
+      // MCP prompt snapshots materialize after it, so each reference is priced
+      // at the prompt text cap. A one-line skill body at 86% recorded must
+      // still take the compaction path with either channel present.
+      const workspacePath = await createWorkspaceWithSkill({
+        skillName: "done",
+        metadataYaml: "metadata:\n  model-class: small\n",
+      });
+      if (channel === "file") {
+        const content = Array.from({ length: 490 }, () => "x".repeat(65)).join("\n");
+        await fs.writeFile(path.join(workspacePath, "big1.txt"), content);
+        await fs.writeFile(path.join(workspacePath, "big2.txt"), content);
+      }
+      const { session, historyService } = await createRoutingHarness({
+        workspacePath,
+        configValues: { modelClasses: { small: "haiku+0" } },
+      });
+      stubCompactionMonitor(session, 86);
+      const result = await session.sendMessage(
+        channel === "file" ? "Use skill done @big1.txt @big2.txt" : "Use skill done",
+        skillSendOptions(
+          channel === "mcp"
+            ? {
+                muxMetadata: {
+                  type: "agent-skill",
+                  rawCommand: "/done",
+                  skillName: "done",
+                  scope: "project",
+                  mcpPromptRefs: [
+                    { serverName: "s", promptName: "p", commandKey: "mcp__s__p", source: "inline" },
+                  ],
+                },
+              }
+            : undefined
+        )
+      );
+      expect(result.success).toBe(true);
+      const history = await historyService.getHistoryFromLatestBoundary("ws-skill-routing");
+      if (!history.success) throw new Error(history.error);
+      expect(
+        history.data.some((message) => message.metadata?.muxMetadata?.type === "compaction-request")
+      ).toBe(true);
+      await session.dispose();
+    });
+  }
+
+  it("persists the resolved package's scope on the invocation row, not the client's", async () => {
+    // rowInvokesProjectSkill reads the persisted scope for request withholding
+    // (a repeated project invocation whose snapshot deduplicated has no
+    // snapshot row), so a stale or forged non-project client scope must be
+    // replaced by the authoritative scope of the package the backend resolved.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const { session, historyService } = await createRoutingHarness({ workspacePath });
+    const result = await session.sendMessage(
+      "Use skill done",
+      skillSendOptions({
+        muxMetadata: {
+          type: "agent-skill",
+          rawCommand: "/done",
+          skillName: "done",
+          scope: "global",
+          agentSkillRefs: [{ skillName: "done", scope: "global", source: "slash" }],
+        },
+      })
+    );
+    expect(result.success).toBe(true);
+    const history = await historyService.getHistoryFromLatestBoundary("ws-skill-routing");
+    if (!history.success) throw new Error(history.error);
+    const row = history.data.find(
+      (message) => message.role === "user" && message.metadata?.synthetic !== true
+    );
+    const muxMetadata = row?.metadata?.muxMetadata;
+    expect(muxMetadata?.type === "agent-skill" && muxMetadata.scope).toBe("project");
+    expect(muxMetadata?.agentSkillRefs?.map((ref) => ref.scope)).toEqual(["project"]);
+    await session.dispose();
+  });
+
   it("reads an unbound skill's package once when a class is configured", async () => {
     // Routing inspects the package's frontmatter even when the skill ends up
     // unbound; materialization must reuse that read (a full remote SKILL.md
@@ -2251,7 +2331,8 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
   it("withholds the reply to an earlier project skill invocation from a routed request in an untrusted project", async () => {
     // The snapshot row is dropped, but the model's reply to that turn can
     // quote it (prose, tool arguments, tool results): the turn's assistant
-    // rows are withheld whole, later turns untouched.
+    // rows are withheld whole — and so are later turns' replies, whose
+    // requests still carried the snapshot in context.
     const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
     const { session, streamed } = await sendRoutedGlobalSkillWithPendingState(
       {
@@ -2272,7 +2353,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
               timestamp: 3,
             }),
             createMuxMessage("u-plain", "user", "Unrelated question", { timestamp: 4 }),
-            createMuxMessage("a-plain", "assistant", "Unrelated answer stays", { timestamp: 5 }),
+            createMuxMessage("a-plain", "assistant", "Unrelated answer goes too", { timestamp: 5 }),
           ]) {
             await historyService.appendToHistory("ws-skill-routing", row);
           }
@@ -2284,8 +2365,10 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     const request = JSON.stringify(streamed[0].messages);
     expect(request).not.toContain("EARLIER PROJECT SKILL BODY");
     expect(request).toContain(PROJECT_SKILL_TURN_WITHHELD_MESSAGE);
-    expect(request).toContain("Unrelated answer stays");
+    expect(request).not.toContain("Unrelated answer goes too");
+    expect(request).toContain("Unrelated question");
     expect(streamed[0].messages.map((message) => message.id)).toContain("a-earlier");
+    expect(streamed[0].messages.map((message) => message.id)).toContain("a-plain");
     expect(await streamed[0].preDispatchConsentGate?.()).toBeNull();
     await session.dispose();
   });

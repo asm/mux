@@ -228,6 +228,8 @@ import { buildCompactionMessageText } from "@/common/utils/compaction/compaction
 import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCompactionCheck";
 import { ROUTED_SEND_COMPACTION_HEADROOM_PERCENT } from "@/common/constants/ui";
 import { MAX_AGENT_SKILL_SNAPSHOT_CHARS } from "@/common/constants/attachments";
+import { MCP_PROMPT_MAX_TEXT_BYTES } from "@/common/constants/toolLimits";
+import type { AgentSkillScope } from "@/common/types/agentSkill";
 import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
 import type { OpenAIWireFormat } from "@/common/types/providerOptions";
 import { getModelCapabilitiesResolved } from "@/common/utils/ai/modelCapabilities";
@@ -897,6 +899,37 @@ function gateContextCarriesProjectSkillContent(
     (context.stepMessages != null && stepMessagesCarryProjectSkillContent(context.stepMessages)) ||
     context.swappedPrefixCarriesProjectSkillContent === true
   );
+}
+
+/**
+ * Client-stamped skill scopes replaced by the AUTHORITATIVE scopes of the
+ * packages the backend resolved (slash invocation and inline refs alike).
+ * rowInvokesProjectSkill reads these durably for request withholding, so a
+ * stale or forged non-project scope on a project skill must not survive
+ * persistence. Returns the input when nothing changes.
+ */
+function withAuthoritativeSkillScopes(
+  muxMetadata: MuxMessageMetadata | undefined,
+  scopes: ReadonlyMap<string, AgentSkillScope>
+): MuxMessageMetadata | undefined {
+  if (muxMetadata == null || scopes.size === 0) return muxMetadata;
+  let next = muxMetadata;
+  if (next.type === "agent-skill") {
+    const scope = scopes.get(next.skillName);
+    if (scope != null && scope !== next.scope) next = { ...next, scope };
+  }
+  const refs = next.agentSkillRefs;
+  if (Array.isArray(refs)) {
+    let changed = false;
+    const rewritten = refs.map((ref) => {
+      const scope = scopes.get(ref.skillName);
+      if (scope == null || scope === ref.scope) return ref;
+      changed = true;
+      return { ...ref, scope };
+    });
+    if (changed) next = { ...next, agentSkillRefs: rewritten };
+  }
+  return next;
 }
 
 export interface AgentSessionChatEvent {
@@ -4451,6 +4484,7 @@ export class AgentSession {
     let preTruncationSkillSnapshots: {
       messages: MuxMessage[];
       carriesProjectSkillContent: boolean;
+      resolvedScopes: Map<string, AgentSkillScope>;
     } | null = null;
     // Whether project-scope skill content rides this routed turn: seeded
     // from the invoked package's scope, widened by materialization (an
@@ -4678,6 +4712,21 @@ export class AgentSession {
     // uncompacted history.
     const preRoutingOptions = optionsForStream;
     let muxMetadataForMessage = typedMuxMetadata;
+    // The invocation row's `scope` is CLIENT-stamped, yet the withholding
+    // tracker (rowInvokesProjectSkill) reads it durably — a repeated project
+    // invocation whose snapshot deduplicated leaves no snapshot row. Persist
+    // the AUTHORITATIVE scope of the package the resolver read: a stale or
+    // forged non-project scope on a project skill must not let the turn's
+    // reply escape withholding after a trust revocation. Inline refs get the
+    // same treatment after materialization (withAuthoritativeSkillScopes).
+    if (preResolvedSkillPackage != null) {
+      muxMetadataForMessage = withAuthoritativeSkillScopes(
+        muxMetadataForMessage,
+        new Map([
+          [preResolvedSkillPackage.package.directoryName, preResolvedSkillPackage.package.scope],
+        ])
+      );
+    }
     let routedThinkingLevel: ThinkingLevel | undefined;
     if (skillModelOverride != null) {
       modelForStream = skillModelOverride.model;
@@ -4995,6 +5044,17 @@ export class AgentSession {
                 (ref) => ref.source !== "slash"
               ).length,
               fileParts: effectiveFileParts,
+              // The @file snapshot is already built (exact size); MCP prompt
+              // snapshots materialize after this decision and their reference
+              // list is uncapped, so each is priced at the prompt text cap.
+              fileSnapshotChars:
+                snapshotResult?.snapshotMessage.parts.reduce(
+                  (sum, part) => sum + (part.type === "text" ? part.text.length : 0),
+                  0
+                ) ?? 0,
+              mcpPromptRefCount: dedupeMcpPromptRefs(
+                sanitizeMcpPromptRefs(typedMuxMetadata?.mcpPromptRefs)
+              ).length,
               model: modelForStream,
               use1MContext: this.is1MContextEnabledForModel(
                 modelForStream,
@@ -5290,6 +5350,12 @@ export class AgentSession {
             skillModelOverride?.kind === "override"
           ));
         skillSnapshotMessages = skillMaterialization.messages;
+        if (userMessage.metadata != null) {
+          userMessage.metadata.muxMetadata = withAuthoritativeSkillScopes(
+            userMessage.metadata.muxMetadata,
+            skillMaterialization.resolvedScopes
+          );
+        }
         if (skillMaterialization.carriesProjectSkillContent) {
           routedTurnCarriesProjectContent = true;
           // The user row's durable consent seed was computed from the invoked
@@ -6463,6 +6529,10 @@ export class AgentSession {
     skillBody: string | undefined;
     inlineSkillRefCount: number;
     fileParts: ReadonlyArray<{ url: string; mediaType: string }> | undefined;
+    /** Text size of the already-materialized @file mention snapshot (0 without one). */
+    fileSnapshotChars: number;
+    /** MCP prompt references, each priced at MCP_PROMPT_MAX_TEXT_BYTES (materialized later). */
+    mcpPromptRefCount: number;
     model: string;
     use1MContext: boolean;
     providersConfig: ProvidersConfigMap | null;
@@ -6501,6 +6571,8 @@ export class AgentSession {
       args.message.length +
       skillChars +
       args.inlineSkillRefCount * MAX_AGENT_SKILL_SNAPSHOT_CHARS +
+      args.fileSnapshotChars +
+      args.mcpPromptRefCount * MCP_PROMPT_MAX_TEXT_BYTES +
       textLikeChars;
     return ((Math.ceil(chars / APPROX_CHARS_PER_TOKEN) + mediaTokens) / limit) * 100;
   }
@@ -13501,8 +13573,14 @@ export class AgentSession {
     // (fresh or deduped-into-history) rides this routed turn — the later
     // consent gates must fire even when the routed invocation itself is
     // global/built-in but an inline $project-skill ref travels with it.
-  ): Promise<{ messages: MuxMessage[]; carriesProjectSkillContent: boolean }> {
-    const none = { messages: [], carriesProjectSkillContent: false };
+  ): Promise<{
+    messages: MuxMessage[];
+    carriesProjectSkillContent: boolean;
+    /** Authoritative scope of every package resolved, by skill name (withAuthoritativeSkillScopes). */
+    resolvedScopes: Map<string, AgentSkillScope>;
+  }> {
+    const resolvedScopes = new Map<string, AgentSkillScope>();
+    const none = { messages: [], carriesProjectSkillContent: false, resolvedScopes };
     const refs = extractAgentSkillRefs(muxMetadata);
     if (refs.length === 0) {
       return none;
@@ -13588,6 +13666,7 @@ export class AgentSession {
       }
 
       const skill = resolved.package;
+      resolvedScopes.set(parsedName.data, skill.scope);
 
       if (routedTurn === true && skill.scope === "project") {
         projectScopeRefSeen = true;
@@ -13721,11 +13800,16 @@ export class AgentSession {
         return {
           messages: snapshotMessages.filter((msg) => !projectScopeSnapshotIds.has(msg.id)),
           carriesProjectSkillContent: false,
+          resolvedScopes,
         };
       }
     }
 
-    return { messages: snapshotMessages, carriesProjectSkillContent: projectScopeRefSeen };
+    return {
+      messages: snapshotMessages,
+      carriesProjectSkillContent: projectScopeRefSeen,
+      resolvedScopes,
+    };
   }
 
   /**

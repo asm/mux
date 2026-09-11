@@ -5,7 +5,7 @@ import assert from "@/common/utils/assert";
 import { MAX_POST_COMPACTION_LOADED_SKILLS } from "@/common/constants/attachments";
 import type { LoadedSkillSnapshot } from "@/common/types/attachment";
 import type { AgentSkillFrontmatter, AgentSkillScope } from "@/common/types/agentSkill";
-import { isTurnStartingUserRow, type ModelMessage, type MuxMessage } from "@/common/types/message";
+import { type ModelMessage, type MuxMessage } from "@/common/types/message";
 import { AgentSkillPackageSchema, AgentSkillScopeSchema } from "@/common/orpc/schemas/agentSkill";
 import {
   extractAgentSkillBodyFromSnapshotText,
@@ -342,7 +342,7 @@ function summaryCarriesProjectSkillContent(message: MuxMessage): boolean {
  * can quote the (dropped) snapshot in prose, tool arguments or tool results.
  */
 export const PROJECT_SKILL_TURN_WITHHELD_MESSAGE =
-  "[Assistant turn withheld: it replied to a project skill invocation and this " +
+  "[Assistant turn withheld: project skill content was in its context and this " +
   "workspace's project is not trusted.]";
 
 /**
@@ -350,10 +350,11 @@ export const PROJECT_SKILL_TURN_WITHHELD_MESSAGE =
  * channel repository-controlled project skill content takes into a request:
  *
  * 1. project-scope skill snapshot rows are dropped;
- * 2. the assistant rows of the turns those snapshots opened are withheld
- *    whole — the model's reply can quote the snapshot in prose, tool
- *    arguments or tool results, and a row's dynamic-tool parts hold call and
- *    result together, so replacing the row keeps the pairing consistent;
+ * 2. every assistant row generated while project skill content was in the
+ *    segment's context is withheld whole — the model's output can quote it in
+ *    prose, tool arguments or tool results, and a row's dynamic-tool parts
+ *    hold call and result together, so replacing the row keeps the pairing
+ *    consistent;
  * 3. tool results carrying project skills, tainted code executions and
  *    provenance-stamped summaries are redacted (redactProjectSkillToolResults).
  *
@@ -374,31 +375,31 @@ export function rowInvokesProjectSkill(message: MuxMessage): boolean {
 
 export function withholdProjectSkillContentFromRequest(messages: MuxMessage[]): MuxMessage[] {
   const kept: MuxMessage[] = [];
-  // A turn persists its snapshot prefix immediately before its user row, so a
-  // project snapshot marks the NEXT turn-starting user row's turn. Synthetic
-  // user rows that are not turns of their own (a <system-file-update>
-  // notification between the user row and its reply, other snapshot prefixes)
-  // leave the turn tracking untouched.
-  let projectPrefixPending = false;
-  let inProjectTurn = false;
+  // Once project skill content has entered the segment — a project snapshot
+  // row, a project skill invocation (its repeated snapshot may have
+  // deduplicated, leaving no row), a tool result or a summary carrying it —
+  // EVERY later request of the segment carried it in context too, so any
+  // later assistant row (an ordinary follow-up asked to summarize or reuse
+  // the instructions included) can restate it: all of them are withheld, not
+  // only the invoking turn's. The segment starts at the latest context
+  // boundary, whose summary row carries the provenance forward when it is
+  // tainted. The carrying row itself keeps its structure for
+  // redactProjectSkillToolResults (tool result, prose and sibling parts).
+  let projectContentInContext = false;
   for (const message of messages) {
     if (message.role === "user") {
       if (message.metadata?.agentSkillSnapshot?.scope === "project") {
-        projectPrefixPending = true;
+        projectContentInContext = true;
         continue;
       }
-      if (isTurnStartingUserRow(message)) {
-        // A repeated invocation of the same project skill deduplicates its
-        // snapshot (no prefix row), so the invoking row's own skill metadata
-        // marks the turn as well — over-withholding is the safe direction.
-        inProjectTurn = projectPrefixPending || rowInvokesProjectSkill(message);
-        projectPrefixPending = false;
-      }
+      if (rowInvokesProjectSkill(message)) projectContentInContext = true;
       kept.push(message);
       continue;
     }
+    const withholdWhole = projectContentInContext;
+    if (rowCarriesProjectSkillContent(message)) projectContentInContext = true;
     kept.push(
-      inProjectTurn
+      withholdWhole
         ? { ...message, parts: [{ type: "text", text: PROJECT_SKILL_TURN_WITHHELD_MESSAGE }] }
         : message
     );

@@ -451,14 +451,16 @@ describe("project skill content in persisted tool results", () => {
         ],
       },
       createMuxMessage("u-next", "user", "Now something else", { timestamp: 2 }),
-      createMuxMessage("a-next", "assistant", "Unrelated reply stays", { timestamp: 3 }),
+      // The follow-up's request still carried the snapshot in context, so its
+      // reply can restate the skill: withheld as well.
+      createMuxMessage("a-next", "assistant", "Follow-up reply also goes", { timestamp: 3 }),
     ];
     const withheld = withholdProjectSkillContentFromRequest(rows);
     expect(withheld.map((row) => row.id)).toEqual(["u-invoke", "a-reply", "u-next", "a-next"]);
     const serialized = JSON.stringify(withheld);
     expect(serialized).not.toContain("PROJECT BODY");
+    expect(serialized).not.toContain("Follow-up reply also goes");
     expect(serialized).toContain(PROJECT_SKILL_TURN_WITHHELD_MESSAGE);
-    expect(withheld[3]).toBe(rows[4]);
     // History rows are untouched; a global snapshot's turn is left alone.
     expect(JSON.stringify(rows)).toContain("PROJECT BODY");
     const globalTurn = withholdProjectSkillContentFromRequest([
@@ -494,12 +496,12 @@ describe("project skill content in persisted tool results", () => {
       ),
       createMuxMessage("a-reply", "assistant", "Applying: PROJECT BODY", { timestamp: 3 }),
       createMuxMessage("u-next", "user", "Next", { timestamp: 4 }),
-      createMuxMessage("a-next", "assistant", "Unrelated reply stays", { timestamp: 5 }),
+      createMuxMessage("a-next", "assistant", "Follow-up reply also goes", { timestamp: 5 }),
     ]);
     const serialized = JSON.stringify(withheld);
     expect(serialized).not.toContain("PROJECT BODY");
     expect(serialized).toContain(PROJECT_SKILL_TURN_WITHHELD_MESSAGE);
-    expect(serialized).toContain("Unrelated reply stays");
+    expect(serialized).not.toContain("Follow-up reply also goes");
     expect(withheld.map((row) => row.id)).toEqual([
       "u-invoke",
       "sys-file-update",
@@ -540,11 +542,11 @@ describe("project skill content in persisted tool results", () => {
       }),
       createMuxMessage("a-second", "assistant", "Again: PROJECT BODY", { timestamp: 4 }),
       createMuxMessage("u-plain", "user", "Something else", { timestamp: 5 }),
-      createMuxMessage("a-plain", "assistant", "Unrelated reply stays", { timestamp: 6 }),
+      createMuxMessage("a-plain", "assistant", "Follow-up reply also goes", { timestamp: 6 }),
     ]);
     const serialized = JSON.stringify(withheld);
     expect(serialized).not.toContain("PROJECT BODY");
-    expect(serialized).toContain("Unrelated reply stays");
+    expect(serialized).not.toContain("Follow-up reply also goes");
     expect(withheld.map((row) => row.id)).toEqual([
       "u-first",
       "a-first",
@@ -553,6 +555,50 @@ describe("project skill content in persisted tool results", () => {
       "u-plain",
       "a-plain",
     ]);
+  });
+
+  it("withholds every assistant row generated after project content entered the segment", () => {
+    // Rows BEFORE the project content stay (their requests never carried it);
+    // a project skill read through a tool taints the segment from that row on,
+    // so an ordinary later turn's reply — which could summarize the still
+    // present instructions — is withheld too. A global-only segment is untouched.
+    const before = createMuxMessage("a-before", "assistant", "Earlier reply stays", {
+      timestamp: 1,
+    });
+    const read = createAgentSkillReadToolMessage({
+      id: "a-read",
+      skillName: "repo-conventions",
+      body: "PROJECT BODY",
+    });
+    const rows: MuxMessage[] = [
+      createMuxMessage("u-before", "user", "Hello", { timestamp: 0 }),
+      before,
+      createMuxMessage("u-read", "user", "Read the conventions", { timestamp: 2 }),
+      read,
+      createMuxMessage("u-after", "user", "Summarize what you know", { timestamp: 3 }),
+      createMuxMessage("a-after", "assistant", "Summary: PROJECT BODY", { timestamp: 4 }),
+    ];
+    const withheld = withholdProjectSkillContentFromRequest(rows);
+    expect(withheld[1]).toBe(before);
+    const serialized = JSON.stringify(withheld);
+    expect(serialized).toContain("Earlier reply stays");
+    expect(serialized).not.toContain("PROJECT BODY");
+    expect(serialized).toContain(PROJECT_SKILL_TURN_WITHHELD_MESSAGE);
+    const globalOnly = [
+      createSyntheticSkillSnapshotMessage({
+        id: "snap-global",
+        skillName: "team-style",
+        body: "GLOBAL BODY",
+        scope: "global",
+      }),
+      createMuxMessage("u-global", "user", "Use skill team-style", { timestamp: 5 }),
+      createMuxMessage("a-global", "assistant", "Applying: GLOBAL BODY", { timestamp: 6 }),
+      createMuxMessage("u-later", "user", "Later", { timestamp: 7 }),
+      createMuxMessage("a-later", "assistant", "Later reply stays", { timestamp: 8 }),
+    ];
+    expect(JSON.stringify(withholdProjectSkillContentFromRequest(globalOnly))).toContain(
+      "Later reply stays"
+    );
   });
 
   it("withholds sibling tool calls of a tainted assistant row", () => {
