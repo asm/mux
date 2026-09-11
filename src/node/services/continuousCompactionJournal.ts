@@ -407,4 +407,12 @@ export interface ContinuousPrefixSwap {
   prefix: ModelMessage[];
   firstTailToolCallId: string;
   journal: ContinuousCompactionJournal;
+  /**
+   * The provider-facing prefix carries project skill content kept under
+   * Project Trust (rows or loaded-skill attachments). Rebuilt into
+   * ModelMessages the rows lose their provenance and the per-step scan sees
+   * only tool results, so the swap carries its own verdict for the routed
+   * turn's consent gate (PreDispatchConsentGateContext).
+   */
+  carriesProjectSkillContent?: boolean;
 }

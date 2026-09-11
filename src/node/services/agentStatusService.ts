@@ -16,6 +16,11 @@ import {
   AGENT_STATUS_TICK_INTERVAL_MS,
 } from "@/constants/agentStatus";
 import type { Config } from "@/node/config";
+import { isProjectTrusted } from "@/node/utils/projectTrust";
+import {
+  messagesCarryProjectSkillContent,
+  withholdProjectSkillContentFromRequest,
+} from "@/node/services/agentSkills/loadedSkillSnapshots";
 import {
   collectRejectedTurnRowIds,
   excludeRejectedTurnRows,
@@ -272,7 +277,7 @@ export class AgentStatusService {
       // Unknown rejected-turn quarantine: nothing is generated this tick, and
       // the recency signal stays unconsumed so the next tick retries.
       if (snapshot === null) return;
-      const { transcript, rowIds } = snapshot;
+      const { transcript, rowIds, trustedProjectContent } = snapshot;
       // Two hashes, two purposes:
       //
       //   transcriptHash — keyed only on transcript bytes. Used by the
@@ -420,7 +425,7 @@ export class AgentStatusService {
       // routed row refused after a trust revocation). Re-verify the rows
       // immediately before the provider request; a stale snapshot is dropped
       // unsettled so the next tick regenerates from current history.
-      if (!(await this.trailingRowsStillEligible(workspaceId, rowIds))) {
+      if (!(await this.trailingRowsStillEligible(workspaceId, rowIds, trustedProjectContent))) {
         log.debug("AgentStatusService: transcript rows changed before dispatch; skipping", {
           workspaceId,
         });
@@ -431,7 +436,8 @@ export class AgentStatusService {
         streaming,
         // The generator awaits model construction before its request; the
         // same re-verification runs again on the far side of that await.
-        beforeDispatch: () => this.trailingRowsStillEligible(workspaceId, rowIds),
+        beforeDispatch: () =>
+          this.trailingRowsStillEligible(workspaceId, rowIds, trustedProjectContent),
         recordUsage: async (modelString, usage, usageOptions) => {
           const recorded = await this.sessionUsageService?.recordHeadlessUsage(
             workspaceId,
@@ -607,7 +613,7 @@ export class AgentStatusService {
    */
   private async buildTrailingTranscript(
     workspaceId: string
-  ): Promise<{ transcript: string; rowIds: string[] } | null> {
+  ): Promise<{ transcript: string; rowIds: string[]; trustedProjectContent: boolean } | null> {
     // The partial is read BEFORE the committed rows: a partial can only belong
     // to a turn whose user row is already persisted (the row lands before its
     // stream starts), so the history read below always contains the partial's
@@ -619,7 +625,7 @@ export class AgentStatusService {
       workspaceId,
       AGENT_STATUS_MAX_TRAILING_MESSAGES
     );
-    if (!result.success) return { transcript: "", rowIds: [] };
+    if (!result.success) return { transcript: "", rowIds: [], trustedProjectContent: false };
 
     const quarantine = await this.workspaceService.getQuarantinedRejectedRowIds(workspaceId);
     if (!quarantine.success) {
@@ -663,17 +669,32 @@ export class AgentStatusService {
       committedMessages = committedMessages.slice(0, turnStart);
       eligiblePartial = null;
     }
-    const rowIds = committedMessages.map((m) => m.id);
+    // SETTLED project skill content: the status model is configured apart from
+    // the workspace's model, so without Project Trust the transcript withholds
+    // it the way a routed request does — snapshot rows dropped, the replies of
+    // project skill turns (the partial included) and skill tool results
+    // withheld; content kept under trust is re-verified against trust right
+    // before dispatch (trailingRowsStillEligible). Fails closed: a workspace
+    // whose project cannot be found is not trusted.
+    const trusted = this.isWorkspaceProjectTrusted(workspaceId);
+    let transcriptRows = [...committedMessages, ...(eligiblePartial ? [eligiblePartial] : [])];
+    const trustedProjectContent = trusted && messagesCarryProjectSkillContent(transcriptRows);
+    if (!trusted) transcriptRows = withholdProjectSkillContentFromRequest(transcriptRows);
+    // Withholding drops only project snapshot (user) rows, so the partial — an
+    // assistant row appended last — is still the last row when present.
+    const partialRow = eligiblePartial ? transcriptRows.at(-1) : undefined;
+    const committedRows = eligiblePartial ? transcriptRows.slice(0, -1) : transcriptRows;
+    const rowIds = committedRows.map((m) => m.id);
 
     // Partial messages get an "(in progress)" role suffix so the model sees
     // they aren't finalized; committed messages render with their normal
     // role label. Doing this here keeps formatMessageForTranscript pure.
     const formattedParts = [
-      ...committedMessages.map((m) => formatMessageForTranscript(m, { partial: false })),
-      ...(eligiblePartial ? [formatMessageForTranscript(eligiblePartial, { partial: true })] : []),
+      ...committedRows.map((m) => formatMessageForTranscript(m, { partial: false })),
+      ...(partialRow ? [formatMessageForTranscript(partialRow, { partial: true })] : []),
     ];
     const formatted = formattedParts.filter((s) => s.length > 0);
-    if (formatted.length === 0) return { transcript: "", rowIds };
+    if (formatted.length === 0) return { transcript: "", rowIds, trustedProjectContent };
 
     // Trim from the front (oldest) until we fit the token budget. Trailing
     // messages carry the most signal for "what is the agent doing right now",
@@ -691,7 +712,7 @@ export class AgentStatusService {
       totalTokens -= tokenCounts[drop];
       drop += 1;
     }
-    return { transcript: formatted.slice(drop).join("\n\n"), rowIds };
+    return { transcript: formatted.slice(drop).join("\n\n"), rowIds, trustedProjectContent };
   }
 
   /**
@@ -700,7 +721,27 @@ export class AgentStatusService {
    * (also on an unreadable quarantine) means the snapshot is stale: a row was
    * stamped rejected, quarantined or truncated since it was taken.
    */
-  private async trailingRowsStillEligible(workspaceId: string, rowIds: string[]): Promise<boolean> {
+  /**
+   * Provider-selection trust for a workspace's project (fail closed): the
+   * status model is not the workspace's own model, so repository-controlled
+   * skill content leaves for it only under Project Trust.
+   */
+  private isWorkspaceProjectTrusted(workspaceId: string): boolean {
+    for (const [projectPath, project] of this.config.loadConfigOrDefault().projects) {
+      if (project.workspaces.some((workspace) => workspace.id === workspaceId)) {
+        return isProjectTrusted(this.config, projectPath);
+      }
+    }
+    return false;
+  }
+
+  private async trailingRowsStillEligible(
+    workspaceId: string,
+    rowIds: string[],
+    trustedProjectContent = false
+  ): Promise<boolean> {
+    // Content kept under trust at build time: trust must still hold at dispatch.
+    if (trustedProjectContent && !this.isWorkspaceProjectTrusted(workspaceId)) return false;
     if (rowIds.length === 0) return true;
     const result = await this.historyService.getLastMessages(
       workspaceId,

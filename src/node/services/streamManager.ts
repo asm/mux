@@ -282,6 +282,12 @@ export type OnStepSettled = (
 export interface PreDispatchConsentGateContext {
   midStream?: boolean;
   stepMessages?: readonly ModelMessage[];
+  /**
+   * A continuous-compaction prefix swapped into this stream carries project
+   * skill content kept under trust (ContinuousPrefixSwap.carriesProjectSkillContent):
+   * its rows are ModelMessages the step scan cannot classify.
+   */
+  swappedPrefixCarriesProjectSkillContent?: boolean;
 }
 export type PreDispatchConsentGate = (
   context?: PreDispatchConsentGateContext
@@ -2768,6 +2774,10 @@ export class StreamManager {
             // This step's messages: a project skill read by an earlier step of
             // this stream rides in them and must arm the gate now.
             stepMessages: rebuiltFirstStepMessages ?? effectiveMessages,
+            // A swapped prefix's rows carry no provenance any more; the swap
+            // carries the verdict of its own (filtered) sources.
+            swappedPrefixCarriesProjectSkillContent:
+              stepTracker?.consumedPrefixSwap?.carriesProjectSkillContent === true,
           });
           if (consentError) {
             throw new Error(formatSendMessageError(consentError).message);

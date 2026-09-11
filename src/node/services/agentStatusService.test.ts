@@ -89,7 +89,9 @@ describe("AgentStatusService", () => {
   function makeProjectsConfig(workspaces: Workspace[]): ProjectsConfig {
     return {
       projects: new Map<string, ProjectConfig>([
-        [projectPath, { workspaces } as unknown as ProjectConfig],
+        // Trusted: project skill content reaches the status model only under
+        // Project Trust (withholding tests flip it).
+        [projectPath, { workspaces, trusted: true } as unknown as ProjectConfig],
       ]),
     };
   }
@@ -420,6 +422,66 @@ describe("AgentStatusService", () => {
     expect(settled).toContain("ROUTED PROMPT");
     expect(settled).toContain("ROUTED SKILL BODY");
     expect(settled).toContain("Assistant: Applied the routed skill");
+  });
+
+  test("withholds settled project skill content without Project Trust and rechecks trust before dispatch", async () => {
+    // A settled routed project-skill turn can no longer be refused, but the
+    // status model is configured apart from the workspace's model: without
+    // Project Trust its snapshot and reply stay out of the prompt, and trust
+    // granted at build time is re-verified right before the provider request.
+    const history = historyHandle.historyService;
+    for (const row of [
+      createMuxMessage("u1", "user", "Please run the test suite"),
+      createMuxMessage("a1", "assistant", "Running tests now"),
+      createMuxMessage("snap-settled", "user", "SETTLED SKILL BODY", {
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "s" },
+      }),
+      createMuxMessage("u-settled", "user", "SETTLED PROMPT", {
+        retrySendOptions: {
+          model: "anthropic:claude-haiku-4-5",
+          agentId: "exec",
+          routedProjectConsent: true,
+        },
+      }),
+      createMuxMessage("a-settled", "assistant", "Applied the settled skill"),
+    ]) {
+      await history.appendToHistory(workspaceId, row);
+    }
+    const project = projectsConfig.projects.get(projectPath) as { trusted?: boolean };
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    expect(generateSpy.mock.calls[0][0]).toContain("SETTLED SKILL BODY");
+
+    project.trusted = false;
+    await history.appendToHistory(workspaceId, createMuxMessage("u2", "user", "What changed?"));
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(2);
+    const untrusted = generateSpy.mock.calls[1][0];
+    expect(untrusted).toContain("User: Please run the test suite");
+    expect(untrusted).toContain("What changed?");
+    for (const withheld of ["SETTLED SKILL BODY", "Applied the settled skill"]) {
+      expect(untrusted).not.toContain(withheld);
+    }
+
+    // Trust granted at build time, revoked during the generator's model
+    // construction: the dispatch recheck refuses.
+    project.trusted = true;
+    await history.appendToHistory(workspaceId, createMuxMessage("u3", "user", "And now?"));
+    let recheck: boolean | undefined;
+    generateSpy.mockImplementationOnce(async (_transcript, _candidates, _aiService, options) => {
+      project.trusted = false;
+      recheck = await options?.beforeDispatch?.();
+      return Ok({
+        status: { emoji: "🛠️", message: "Editing source" },
+        modelUsed: "anthropic:claude-haiku-4-5",
+      });
+    });
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(3);
+    expect(generateSpy.mock.calls[2][0]).toContain("SETTLED SKILL BODY");
+    expect(recheck).toBe(false);
   });
 
   test("correlates the partial with the history read instead of an older snapshot", async () => {

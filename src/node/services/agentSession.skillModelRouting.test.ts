@@ -2855,6 +2855,55 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     }
   });
 
+  it("arms the per-step gate from a swapped continuous-compaction prefix's provenance", async () => {
+    // A routed GLOBAL skill's request carries no project content, so its gate
+    // is armed only by what later steps bring in. A continuous-compaction
+    // prefix swapped in under trust carries project skill content as
+    // ModelMessages the step scan cannot classify; the swap's own verdict
+    // arms the gate, so a trust revocation before the prefix ships refuses.
+    const workspacePath = await createWorkspaceWithSkill({
+      skillName: "done",
+      metadataYaml: "metadata:\n  model-class: small\n",
+    });
+    const harnessArgs: Parameters<typeof createRoutingHarness>[0] = {
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" } },
+    };
+    const { session, streamed } = await createRoutingHarness(harnessArgs);
+    relabelInvokedPackageAsGlobal(session);
+    // The invocation row's own (client) scope feeds the request scan too, so
+    // the global relabel must cover it as well as the resolved package.
+    const result = await session.sendMessage(
+      "Use skill done",
+      skillSendOptions({
+        muxMetadata: {
+          type: "agent-skill",
+          rawCommand: "/done",
+          skillName: "done",
+          scope: "global",
+        },
+      })
+    );
+    expect(result.success).toBe(true);
+    expect(streamed).toHaveLength(1);
+    const gate = streamed[0].preDispatchConsentGate;
+    if (gate == null) throw new Error("routed turn must carry the provider-boundary gate");
+    harnessArgs.projectTrusted = false;
+    // Nothing project-scoped in the step itself: the gate stays open...
+    expect(await gate({ midStream: true, stepMessages: [] })).toBeNull();
+    // ...until the swapped prefix reports project content kept under trust.
+    expect(
+      JSON.stringify(
+        await gate({
+          midStream: true,
+          stepMessages: [],
+          swappedPrefixCarriesProjectSkillContent: true,
+        })
+      )
+    ).toMatch(/trust was revoked/i);
+    await session.dispose();
+  });
+
   it("refuses a manual resume of a routed row once trust is revoked and stamps it", async () => {
     const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
     const harnessArgs: Parameters<typeof createRoutingHarness>[0] = { workspacePath };

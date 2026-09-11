@@ -41,6 +41,11 @@ import {
 } from "@/common/types/refinement";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isProjectTrusted } from "@/node/utils/projectTrust";
+import {
+  messagesCarryProjectSkillContent,
+  withholdProjectSkillContentFromRequest,
+} from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import {
@@ -952,13 +957,20 @@ export class RefineService {
     }
     const snapshot = await this.snapshotActiveSegment(workspaceId, snapshotExclusion.data);
     if (!snapshot.success) return snapshot;
-    const { messages, activeSegment, takenAt, rejectedRowsPresent, snapshotRowFingerprints } =
-      snapshot.data;
+    const {
+      messages,
+      activeSegment,
+      transcriptRows,
+      trustedProjectContent,
+      takenAt,
+      rejectedRowsPresent,
+      snapshotRowFingerprints,
+    } = snapshot.data;
     // Reuse the branch-summary transcript builder: role-labeled,
     // thinking-stripped, char-bounded — exactly the evidence shape a
     // distillation pass needs. The tail cap preserves the prior bound on
     // transcript size.
-    const transcript = buildAbandonedBranchTranscript(activeSegment.slice(-REFINE_MAX_MESSAGES));
+    const transcript = buildAbandonedBranchTranscript(transcriptRows.slice(-REFINE_MAX_MESSAGES));
     if (transcript.length === 0) {
       // Empty trajectory: a clean first-class no-op without spending a model call.
       return Ok({ applied: [], summary: "Nothing worth distilling.", noOp: true });
@@ -1065,7 +1077,8 @@ export class RefineService {
         workspaceId,
         boundaryRow,
         activeSegment,
-        snapshotRowFingerprints
+        snapshotRowFingerprints,
+        trustedProjectContent
       );
       if (!preDispatch.success) return preDispatch;
       const result = await runRefinePass({
@@ -1198,7 +1211,8 @@ export class RefineService {
         workspaceId,
         boundaryRow,
         activeSegment,
-        snapshotRowFingerprints
+        snapshotRowFingerprints,
+        trustedProjectContent
       );
       if (!staging.success) return staging;
 
@@ -1604,7 +1618,11 @@ export class RefineService {
     Result<
       {
         messages: MuxMessage[];
+        /** Eligible history rows (fingerprinted for the prefix verification). */
         activeSegment: MuxMessage[];
+        /** Provider-facing copy of activeSegment (project content withheld without trust). */
+        transcriptRows: MuxMessage[];
+        trustedProjectContent: boolean;
         takenAt: number;
         rejectedRowsPresent: boolean;
         snapshotRowFingerprints: string[];
@@ -1642,9 +1660,20 @@ export class RefineService {
       const turnStart = activeSegment.findIndex((row) => turnRowIds.has(row.id));
       activeSegment = activeSegment.slice(0, turnStart);
     }
+    // SETTLED project skill content: the refinement (Dream) model is configured
+    // apart from the workspace's model, so without Project Trust the transcript
+    // COPY withholds it the way a routed request does; the fingerprints stay on
+    // the history rows (the withheld copy is provider-facing only). Content
+    // kept under trust is re-verified with the snapshot, before dispatch and at
+    // staging. Fails closed for an unknown workspace.
+    const trusted = this.isProjectTrustedNow(workspaceId);
     return Ok({
       messages: messagesResult.data,
       activeSegment,
+      transcriptRows: trusted
+        ? activeSegment
+        : withholdProjectSkillContentFromRequest(activeSegment),
+      trustedProjectContent: trusted && messagesCarryProjectSkillContent(activeSegment),
       takenAt,
       // The timeline input is selected by time alone, so the caller omits it
       // while the segment holds a withheld turn — rejected, quarantined or
@@ -1671,11 +1700,21 @@ export class RefineService {
     workspaceId: string,
     boundaryRow: MuxMessage | undefined,
     activeSegment: MuxMessage[],
-    snapshotRowFingerprints: string[]
+    snapshotRowFingerprints: string[],
+    trustedProjectContent: boolean
   ): Promise<Result<void, string>> {
     const recheckResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
     if (!recheckResult.success) {
       return Err(`could not re-verify workspace history: ${recheckResult.error}`);
+    }
+    // Project skill content kept under trust at snapshot time: trust must
+    // still hold now, or the pass would ship (or has distilled) content the
+    // routed path no longer sends to another provider.
+    if (trustedProjectContent && !this.isProjectTrustedNow(workspaceId)) {
+      return Err(
+        "Project Trust was revoked while the refine pass was running and the transcript " +
+          "carried project skill content under it — run /refine again"
+      );
     }
     const quarantine =
       (await this.options.getQuarantinedRowIds?.(workspaceId)) ?? Ok(new Set<string>());
@@ -1705,6 +1744,12 @@ export class RefineService {
       );
     }
     return Ok(undefined);
+  }
+
+  /** Provider-selection trust for the workspace's project (fail closed for an unknown workspace). */
+  private isProjectTrustedNow(workspaceId: string): boolean {
+    const workspace = this.config.findWorkspace(workspaceId);
+    return workspace != null && isProjectTrusted(this.config, workspace.projectPath);
   }
 
   private acquireTurnExclusionIfWired(workspaceId: string): Result<Disposable | null, string> {

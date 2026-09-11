@@ -41,6 +41,7 @@ import { resolveAgentForStream, type AgentResolutionResult } from "./agentResolu
 import type { SettledStepBudget } from "./streamManager";
 import type { TurnStreamHandle } from "./streamManager";
 import type { StreamManager } from "./streamManager";
+import type { PreDispatchConsentGateContext } from "./streamManager";
 import * as path from "path";
 import assert from "@/common/utils/assert";
 import { EventEmitter } from "events";
@@ -881,6 +882,23 @@ function excludeProjectLoadedSkills(
   });
 }
 
+/**
+ * Project skill content a per-step consent gate context carries BEYOND the
+ * assembly-time request scan: tool results appended by earlier steps of the
+ * same stream, and a continuous-compaction prefix swapped in under trust —
+ * its rows are ModelMessages by then, so the step scan cannot classify them
+ * and the swap carries its own verdict.
+ */
+function gateContextCarriesProjectSkillContent(
+  context: PreDispatchConsentGateContext | undefined
+): boolean {
+  if (context == null) return false;
+  return (
+    (context.stepMessages != null && stepMessagesCarryProjectSkillContent(context.stepMessages)) ||
+    context.swappedPrefixCarriesProjectSkillContent === true
+  );
+}
+
 export interface AgentSessionChatEvent {
   workspaceId: string;
   message: WorkspaceChatMessage;
@@ -1612,17 +1630,27 @@ export class AgentSession {
         );
         if (eligible === null) return null;
         const attachments = await this.buildContinuousCompactionAttachments(eligible.rows);
+        const swapAttachments = eligible.projectContentWithheld
+          ? (excludeProjectLoadedSkills(attachments) ?? [])
+          : attachments;
         return {
           ...prepared,
-          attachments: eligible.projectContentWithheld
-            ? (excludeProjectLoadedSkills(attachments) ?? [])
-            : attachments,
+          attachments: swapAttachments,
           prefixRows: (rows: MuxMessage[]) => {
             const filtered = this.excludeRejectedRows(rows);
             return eligible.projectContentWithheld
               ? withholdProjectSkillContentFromRequest(filtered)
               : filtered;
           },
+          // The swap's own consent verdict for the per-step gate: content kept
+          // under trust arms it (a revocation before the swapped prefix ships
+          // then refuses the step); withheld content never does — withheld
+          // copies keep their provenance stamps, so they must not be rescanned.
+          prefixCarriesProjectSkillContent: eligible.projectContentWithheld
+            ? () => false
+            : (rows: MuxMessage[]) =>
+                messagesCarryProjectSkillContent(rows) ||
+                carriesProjectLoadedSkills(swapAttachments),
         };
       },
       summarize: async (head, signal, context: SessionCompactionContext) => {
@@ -7012,9 +7040,7 @@ export class AgentSession {
     const carriesProjectContent = messagesCarryProjectSkillContent(rows);
     return (context) =>
       routedConsentRejection(
-        carriesProjectContent ||
-          (context?.stepMessages != null &&
-            stepMessagesCarryProjectSkillContent(context.stepMessages)),
+        carriesProjectContent || gateContextCarriesProjectSkillContent(context),
         context?.midStream === true
       );
   }
@@ -9171,9 +9197,7 @@ export class AgentSession {
         const carriesForGate = requestCarriesProjectContent || attachmentsCarryProjectSkills;
         preDispatchConsentGate = (context) =>
           routedConsentRejection(
-            carriesForGate ||
-              (context?.stepMessages != null &&
-                stepMessagesCarryProjectSkillContent(context.stepMessages)),
+            carriesForGate || gateContextCarriesProjectSkillContent(context),
             context?.midStream === true
           );
       }
