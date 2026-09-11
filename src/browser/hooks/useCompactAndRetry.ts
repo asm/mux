@@ -377,7 +377,12 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
       // For normal messages (not /compact), build follow-up content directly.
       const followUpContent = buildFollowUpFromSource(source, {
         providersConfig,
-        currentModel: workspaceState?.currentModel ?? null,
+        // Numeric one-shot thinking is model-relative: resolve the fallback
+        // against the model the retry will actually be sent with (the
+        // persisted send options), not the last streamed model — after a
+        // routed skill turn that is the previous class model. The backend
+        // re-resolves the raw index against the final model regardless.
+        currentModel: sendMessageOptions.model ?? workspaceState?.currentModel ?? null,
       });
       const result = await executeCompaction({
         api,
@@ -426,7 +431,12 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
       const sendMessageOptions = getSendOptionsFromStorage(props.workspaceId);
       const followUpContent = buildFollowUpFromSource(triggerUserMessage, {
         providersConfig,
-        currentModel: workspaceState?.currentModel ?? null,
+        // Numeric one-shot thinking is model-relative: resolve the fallback
+        // against the model the retry will actually be sent with (the
+        // persisted send options), not the last streamed model — after a
+        // routed skill turn that is the previous class model. The backend
+        // re-resolves the raw index against the final model regardless.
+        currentModel: sendMessageOptions.model ?? workspaceState?.currentModel ?? null,
       });
 
       const result = await executeCompaction({

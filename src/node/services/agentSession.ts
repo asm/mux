@@ -673,6 +673,36 @@ async function replacePreferenceFile(preferencePath: string, payload: string): P
 }
 
 /**
+ * Per-file serialization of auto-retry preference updates within this
+ * process. A live session's persistAutoRetryState and the closed-workspace
+ * marker sweep (clearProviderConfigFixableAbandonMarkers) target the same
+ * file when a workspace opens after the sweep began; each update's read,
+ * decision and write run as one unit, in order, so a sweep that scanned a
+ * stale marker cannot erase the repair key or rejection marker the session
+ * persisted meanwhile.
+ */
+const preferenceFileUpdates = new Map<string, Promise<void>>();
+async function serializePreferenceFileUpdate<T>(
+  preferencePath: string,
+  update: () => Promise<T>
+): Promise<T> {
+  const previous = preferenceFileUpdates.get(preferencePath) ?? Promise.resolve();
+  const run = previous.then(update, update);
+  const settled = run.then(
+    () => undefined,
+    () => undefined
+  );
+  preferenceFileUpdates.set(preferencePath, settled);
+  try {
+    return await run;
+  } finally {
+    if (preferenceFileUpdates.get(preferencePath) === settled) {
+      preferenceFileUpdates.delete(preferencePath);
+    }
+  }
+}
+
+/**
  * Clear provider-config-fixable startup abandon markers persisted by workspaces
  * WITHOUT a live AgentSession (closed chats). Live sessions clear their own
  * marker via handleProviderConfigChanged(); this sweep covers the rest so that
@@ -701,44 +731,52 @@ export async function clearProviderConfigFixableAbandonMarkers(
       }
 
       const preferencePath = path.join(sessionsDir, entry.name, AUTO_RETRY_PREFERENCE_FILE);
-      let parsed: {
-        enabled?: unknown;
-        startupAutoRetryAbandon?: unknown;
-        pendingRejectedTurnRepair?: unknown;
-      };
-      try {
-        parsed = JSON.parse(await readFile(preferencePath, "utf-8")) as typeof parsed;
-      } catch {
-        // Missing file is the default; corrupt files are self-healed by the
-        // session load path when the workspace reopens.
-        return;
-      }
+      // Read, decide and write as ONE serialized unit: the workspace may have
+      // opened since this sweep began (the skip set is a snapshot), and its
+      // session's writes queue behind — or ahead of — this one, never
+      // interleave with it. A marker the session already replaced (a
+      // rejection marker with its repair key) is therefore seen, not erased.
+      await serializePreferenceFileUpdate(preferencePath, async () => {
+        let parsed: {
+          enabled?: unknown;
+          startupAutoRetryAbandon?: unknown;
+          pendingRejectedTurnRepair?: unknown;
+        };
+        try {
+          parsed = JSON.parse(await readFile(preferencePath, "utf-8")) as typeof parsed;
+        } catch {
+          // Missing file is the default; a malformed file is the session's
+          // unknown-quarantine state (readAutoRetryState) and not this sweep's
+          // to touch.
+          return;
+        }
 
-      const abandon = parsed.startupAutoRetryAbandon;
-      const reason =
-        typeof abandon === "object" && abandon !== null && "reason" in abandon
-          ? (abandon as { reason?: unknown }).reason
-          : undefined;
-      if (typeof reason !== "string" || !isProviderConfigFixableError(reason)) {
-        return;
-      }
+        const abandon = parsed.startupAutoRetryAbandon;
+        const reason =
+          typeof abandon === "object" && abandon !== null && "reason" in abandon
+            ? (abandon as { reason?: unknown }).reason
+            : undefined;
+        if (typeof reason !== "string" || !isProviderConfigFixableError(reason)) {
+          return;
+        }
 
-      // Mirror persistAutoRetryState(): the file carries an opt-out, an abandon
-      // marker or the rejected-turn repair record, so dropping the last field
-      // deletes it. This sweep retires only the marker; the record (keys of
-      // refused turns whose stamp is outstanding) is carried over verbatim.
-      const repairRecord = parsed.pendingRejectedTurnRepair;
-      if (parsed.enabled === false || repairRecord != null) {
-        await replacePreferenceFile(
-          preferencePath,
-          JSON.stringify({
-            ...(parsed.enabled === false ? { enabled: false } : {}),
-            ...(repairRecord != null ? { pendingRejectedTurnRepair: repairRecord } : {}),
-          }) + "\n"
-        );
-      } else {
-        await unlink(preferencePath);
-      }
+        // Mirror persistAutoRetryState(): the file carries an opt-out, an abandon
+        // marker or the rejected-turn repair record, so dropping the last field
+        // deletes it. This sweep retires only the marker; the record (keys of
+        // refused turns whose stamp is outstanding) is carried over verbatim.
+        const repairRecord = parsed.pendingRejectedTurnRepair;
+        if (parsed.enabled === false || repairRecord != null) {
+          await replacePreferenceFile(
+            preferencePath,
+            JSON.stringify({
+              ...(parsed.enabled === false ? { enabled: false } : {}),
+              ...(repairRecord != null ? { pendingRejectedTurnRepair: repairRecord } : {}),
+            }) + "\n"
+          );
+        } else {
+          await unlink(preferencePath);
+        }
+      });
     })
   );
 }
@@ -2226,12 +2264,16 @@ export class AgentSession {
     const persisted = this.autoRetryPersistence
       .then(async () => {
         try {
-          if (payload === undefined) {
-            await unlink(preferencePath);
-          } else {
-            await mkdir(path.dirname(preferencePath), { recursive: true });
-            await replacePreferenceFile(preferencePath, payload);
-          }
+          // Serialized per file with the closed-workspace marker sweep, which
+          // may still be in flight for this workspace from before it opened.
+          await serializePreferenceFileUpdate(preferencePath, async () => {
+            if (payload === undefined) {
+              await unlink(preferencePath);
+            } else {
+              await mkdir(path.dirname(preferencePath), { recursive: true });
+              await replacePreferenceFile(preferencePath, payload);
+            }
+          });
         } catch (error) {
           if (payload !== undefined || !isErrnoWithCode(error, "ENOENT")) {
             log.warn("Failed to persist auto-retry preference", {
@@ -4576,6 +4618,21 @@ export class AgentSession {
           ...muxMetadataForMessage,
           requestedModel: skillModelOverride.model,
         };
+      }
+    } else if (options.oneShotThinkingIndex != null) {
+      // Unrouted (or no longer routable) send carrying a numeric one-shot: the
+      // frontend resolved the index against the model it believed would
+      // stream — after a compact-and-retry of a "/+N /skill" turn whose class
+      // binding is gone, that can be the previous class model rather than
+      // the selected one. The index is model-relative, so it is resolved here
+      // against the model that actually streams, routed or not.
+      const oneShotThinking = resolveThinkingInput(
+        options.oneShotThinkingIndex,
+        modelForStream,
+        this.getProvidersConfigSafe()
+      );
+      if (oneShotThinking != null) {
+        optionsForStream = { ...optionsForStream, thinkingLevel: oneShotThinking };
       }
     }
 

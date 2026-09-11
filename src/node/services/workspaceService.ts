@@ -200,6 +200,7 @@ import {
   excludeRejectedTurnRows,
   getCompactionFollowUpContent,
   isSameWorkspaceTurnTaskCorrelation,
+  findUnansweredRoutedTurnRow,
   parseWorkspaceTurnTaskCorrelation,
   pickPreservedSendOptions,
   type CompactionFollowUpRequest,
@@ -3243,6 +3244,45 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
       hold[Symbol.dispose]();
       return Err("a send is being admitted");
+    }
+    return Ok(hold);
+  }
+
+  /**
+   * Fork-time guard against the source's in-flight turn. The copied rows
+   * inherit only the quarantine known at copy time, and a SUCCESSFUL late
+   * stamp in the source is never reported by getQuarantinedRejectedRowIds, so
+   * a turn refused after the copy would leave the fork holding its rows and
+   * finalized partial unprotected. The source's turn admission is held across
+   * the copy (a queued turn cannot start preparing under it); a turn being
+   * prepared or admitted refuses the fork (retryable); a streaming turn's rows
+   * are persisted and final, and only a ROUTED turn's per-step gate can still
+   * refuse them, so the fork is refused while such a turn streams. Never
+   * creates a session — a workspace without one has no turn to overlap.
+   */
+  private async guardForkAgainstSourceTurn(
+    sourceWorkspaceId: string
+  ): Promise<Result<Disposable | null>> {
+    const session = this.sessions.get(sourceWorkspaceId);
+    const hold = session?.holdTurnAdmission() ?? null;
+    const streaming = this.aiService.isStreaming(sourceWorkspaceId);
+    if (
+      (this.preflightSendCounts.get(sourceWorkspaceId) ?? 0) > 0 ||
+      ((session?.hasActiveOrPendingTurnWork() ?? false) && !streaming)
+    ) {
+      hold?.[Symbol.dispose]();
+      return Err("Cannot fork while a message is being sent. Try again in a moment.");
+    }
+    if (streaming) {
+      const tail = await this.historyService.getHistoryFromLatestBoundary(sourceWorkspaceId);
+      if (!tail.success) {
+        hold?.[Symbol.dispose]();
+        return Err(`Cannot fork: the source history could not be read (${tail.error})`);
+      }
+      if (findUnansweredRoutedTurnRow(tail.data) !== undefined) {
+        hold?.[Symbol.dispose]();
+        return Err("Cannot fork while a routed skill turn is streaming. Wait for it to finish.");
+      }
     }
     return Ok(hold);
   }
@@ -10160,8 +10200,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (sourceMetadata.kind === "scratch") {
         return Err("Forking scratch chats is not supported yet");
       }
-      const partialSnapshot =
-        sourceMessageId == null ? await this.historyService.readPartial(sourceWorkspaceId) : null;
+      // Consent guard against the source's in-flight turn: checked early for a
+      // cheap refusal before any runtime work, then held around the history
+      // copy below (the partial is read there, under the hold).
+      const sourceTurnCheck = await this.guardForkAgainstSourceTurn(sourceWorkspaceId);
+      if (!sourceTurnCheck.success) {
+        return Err(sourceTurnCheck.error);
+      }
+      sourceTurnCheck.data?.[Symbol.dispose]();
       const foundProjectPath = sourceMetadata.projectPath;
       const projectName = sourceMetadata.projectName;
       const sourceRuntimeConfig = sourceMetadata.runtimeConfig;
@@ -10385,7 +10431,17 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // The source's rejected-turn quarantine (live set ∪ durable record),
       // applied to the copied rows below and to the abandoned tail's summary.
       let sourceRejectedQuarantine: ReadonlySet<string> = new Set();
+      // Held from the partial read through the quarantine propagation, so no
+      // turn starts preparing (and no routed turn is refused) between them.
+      let sourceTurnHold: Disposable | null = null;
       try {
+        const sourceTurnGuard = await this.guardForkAgainstSourceTurn(sourceWorkspaceId);
+        if (!sourceTurnGuard.success) {
+          throw new Error(sourceTurnGuard.error);
+        }
+        sourceTurnHold = sourceTurnGuard.data;
+        const partialSnapshot =
+          sourceMessageId == null ? await this.historyService.readPartial(sourceWorkspaceId) : null;
         const historyCopyResult = await this.historyService.copyHistorySnapshotToNewWorkspace(
           sourceWorkspaceId,
           newWorkspaceId
@@ -10463,6 +10519,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           throw new Error(quarantinePropagated.error);
         }
         sourceRejectedQuarantine = quarantinePropagated.data;
+        sourceTurnHold?.[Symbol.dispose]();
+        sourceTurnHold = null;
 
         const referencedStagedAttachmentPaths =
           await collectReferencedStagedAttachmentPaths(newSessionDir);
@@ -10498,6 +10556,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // historical costs from the copied messages.
         await resetForkedSessionUsage(this.sessionUsageService, newWorkspaceId, newSessionDir);
       } catch (copyError) {
+        sourceTurnHold?.[Symbol.dispose]();
+        sourceTurnHold = null;
         const forkTrusted = projectConfig.trusted ?? false;
         await targetRuntime.deleteWorkspace(
           foundProjectPath,

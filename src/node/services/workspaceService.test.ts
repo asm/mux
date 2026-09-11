@@ -19994,6 +19994,85 @@ describe("WorkspaceService fork", () => {
     }
   });
 
+  test("fork refuses while the source prepares a turn or streams a routed skill turn", async () => {
+    // The copied rows inherit only the quarantine known at copy time, and a
+    // SUCCESSFUL late stamp in the source is never reported by
+    // getQuarantinedRejectedRowIds: a turn refused after the copy would leave
+    // the fork holding its rows and finalized partial unprotected.
+    const sourceWorkspaceId = "turn-guard-source";
+    const newWorkspaceId = "turn-guard-fork";
+    const fixture = await createQuarantineForkFixture(sourceWorkspaceId, newWorkspaceId);
+    const internals = fixture.workspaceService as unknown as {
+      sessions: Map<string, unknown>;
+      aiService: { isStreaming: (workspaceId: string) => boolean };
+    };
+    let holds = 0;
+    let releases = 0;
+    let turnActive = true;
+    internals.sessions.set(sourceWorkspaceId, {
+      holdTurnAdmission: () => {
+        holds += 1;
+        return {
+          [Symbol.dispose]: () => {
+            releases += 1;
+          },
+        };
+      },
+      hasActiveOrPendingTurnWork: () => turnActive,
+      getQuarantinedRejectedRowIds: () => new Set<string>(),
+    });
+    try {
+      // A turn being prepared (active turn work, nothing streaming yet):
+      // refused, retryable, the probe hold released.
+      const preparing = await fixture.workspaceService.fork(sourceWorkspaceId, "fork-child");
+      expect(preparing.success).toBe(false);
+      if (!preparing.success) expect(preparing.error).toContain("being sent");
+      expect([holds, releases]).toEqual([1, 1]);
+
+      // A routed turn streaming with no committed reply: its per-step gate
+      // can still refuse and stamp it, so the fork waits for it to settle.
+      internals.aiService.isStreaming = () => true;
+      expect(
+        (
+          await historyService.appendToHistory(
+            sourceWorkspaceId,
+            createMuxMessage("u-routed", "user", "Use skill done", {
+              timestamp: 1,
+              retrySendOptions: {
+                model: "anthropic:claude-haiku-4-5",
+                agentId: "exec",
+                routedProjectConsent: true,
+              },
+            })
+          )
+        ).success
+      ).toBe(true);
+      const routedStreaming = await fixture.workspaceService.fork(sourceWorkspaceId, "fork-child");
+      expect(routedStreaming.success).toBe(false);
+      if (!routedStreaming.success) expect(routedStreaming.error).toContain("routed skill turn");
+
+      // Reply committed: the turn is settled. The fork proceeds and holds the
+      // source's turn admission across the copy (probe + copy), releasing it.
+      expect(
+        (
+          await historyService.appendToHistory(
+            sourceWorkspaceId,
+            createMuxMessage("a-routed", "assistant", "Applied the skill", { timestamp: 2 })
+          )
+        ).success
+      ).toBe(true);
+      turnActive = false;
+      internals.aiService.isStreaming = () => false;
+      const holdsBefore = holds;
+      const settled = await fixture.workspaceService.fork(sourceWorkspaceId, "fork-child");
+      expect(settled.success).toBe(true);
+      expect(holds - holdsBefore).toBe(2);
+      expect(releases).toBe(holds);
+    } finally {
+      fixture.restore();
+    }
+  });
+
   test("fork refuses when the source's rejected-turn record is unreadable", async () => {
     // Unknown quarantine state: copying the history could carry refused
     // content nobody can identify afterwards, so the fork fails closed.

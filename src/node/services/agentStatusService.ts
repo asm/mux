@@ -19,6 +19,7 @@ import type { Config } from "@/node/config";
 import {
   collectRejectedTurnRowIds,
   excludeRejectedTurnRows,
+  findUnansweredRoutedTurnRow,
   isTurnSnapshotPrefixRow,
   type MuxMessage,
 } from "@/common/types/message";
@@ -627,18 +628,12 @@ export class AgentStatusService {
         result.data.findLast((m) => m.role === "user") === latestUserRow)
         ? partial
         : null;
-    // A routed turn (the same predicate resumeStream gates on) without a
-    // committed reply can still be refused and stamped — by its own late
-    // gates, or by a Retry after its stream failed; withhold its rows and
-    // partial until it has one.
-    const latestRetry = latestUserRow?.metadata?.retrySendOptions;
-    const latestTurnRouted =
-      latestRetry?.routedProjectConsent === true || latestRetry?.compactionBaseOptions != null;
-    const latestTurnAnswered =
-      latestUserRow !== undefined &&
-      committedMessages.slice(latestUserIndex + 1).some((m) => m.role === "assistant");
-    if (latestUserRow !== undefined && latestTurnRouted && !latestTurnAnswered) {
-      const inFlight = collectRejectedTurnRowIds(committedMessages, [latestUserRow.id]);
+    // A routed turn without a committed reply can still be refused and
+    // stamped — by its own late gates, or by a Retry after its stream failed;
+    // withhold its rows and partial until it has one.
+    const inFlightRoutedRow = findUnansweredRoutedTurnRow(committedMessages);
+    if (inFlightRoutedRow !== undefined) {
+      const inFlight = collectRejectedTurnRowIds(committedMessages, [inFlightRoutedRow.id]);
       committedMessages = committedMessages.filter((m) => !inFlight.has(m.id));
       eligiblePartial = null;
     }

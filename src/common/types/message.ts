@@ -599,6 +599,29 @@ export function isTurnSnapshotPrefixRow(message: MuxMessage): boolean {
 }
 
 /**
+ * The latest user row of `messages` when it starts a ROUTED turn — retry
+ * options carrying the consent obligation or the routed compaction context,
+ * the same predicate resumeStream gates on — that has no committed assistant
+ * reply yet. Such a turn can still be refused and stamped by its late consent
+ * gates (pre-dispatch, per-step) or by a Retry of the unanswered row, so side
+ * channels and forks treat its rows (and its partial) as not yet settled.
+ */
+export function findUnansweredRoutedTurnRow(
+  messages: readonly MuxMessage[]
+): MuxMessage | undefined {
+  const index = messages.findLastIndex((message) => message.role === "user");
+  if (index === -1) {
+    return undefined;
+  }
+  const retry = messages[index].metadata?.retrySendOptions;
+  const routed = retry?.routedProjectConsent === true || retry?.compactionBaseOptions != null;
+  if (!routed || messages.slice(index + 1).some((message) => message.role === "assistant")) {
+    return undefined;
+  }
+  return messages[index];
+}
+
+/**
  * Rows a side-channel model call (refine, memory harvest — possibly on another
  * provider) must never read: every stamped pre-stream rejection, plus the
  * whole turn — user row and contiguous snapshot prefix — of each quarantined

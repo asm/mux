@@ -2980,6 +2980,50 @@ describe("RefineService", () => {
     expect(prompt).not.toContain("REFUSED ROUTED PROMPT");
   });
 
+  it("re-verifies the snapshot immediately before the provider call", async () => {
+    // The turn exclusion is released after the snapshot. A manual Retry of an
+    // idle, still-retryable routed turn can be refused and stamped before the
+    // model call; the pass must not ship the captured transcript then.
+    const prompts: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
+    });
+    await fixture.seedTrajectory(["Please run the tests for this repo."]);
+    await fixture.historyService.appendToHistory(
+      WORKSPACE_ID,
+      createMuxMessage("user-retryable", "user", "RETRYABLE ROUTED PROMPT", {
+        timestamp: Date.now(),
+      })
+    );
+    const readHistory = fixture.historyService.getHistoryFromLatestBoundary.bind(
+      fixture.historyService
+    );
+    let reads = 0;
+    const readSpy = spyOn(
+      fixture.historyService,
+      "getHistoryFromLatestBoundary"
+    ).mockImplementation(async (workspaceId: string) => {
+      reads += 1;
+      // Second read = the pre-dispatch re-verification: the turn was refused
+      // and stamped after the snapshot (first read), before the model call.
+      if (reads === 2) {
+        const stamped = await fixture.historyService.markMessagesPreStreamRejected(workspaceId, [
+          "user-retryable",
+        ]);
+        if (!stamped.success) throw new Error(stamped.error);
+      }
+      return readHistory(workspaceId);
+    });
+    try {
+      const result = await fixture.service.run(WORKSPACE_ID);
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("run /refine again");
+      expect(prompts).toHaveLength(0);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
   it("fails closed when the rejected-turn quarantine record cannot be read", async () => {
     // Without the record's keys the pass cannot tell which unstamped rows a
     // refusal still protects: no model call, an explicit error to retry.

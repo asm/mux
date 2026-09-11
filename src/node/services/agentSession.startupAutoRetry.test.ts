@@ -1832,6 +1832,58 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(persisted.startupAutoRetryAbandon).toBeUndefined();
   });
 
+  test("provider config sweep cannot erase a repair record persisted after its scan began", async () => {
+    // The sweep's skip set is a snapshot: a workspace can open — and refuse a
+    // routed turn whose stamp failed — after the sweep read its fixable
+    // marker. Both writers are serialized per preference file, so the sweep's
+    // read-decide-write sees the session's state instead of clobbering it.
+    const workspaceId = "startup-retry-sweep-serialized";
+    const { session, config, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+    const privateSession = session as unknown as {
+      persistStartupAutoRetryAbandon: (reason: string, userMessageId?: string) => Promise<void>;
+      persistAutoRetryState: () => Promise<void>;
+      getAutoRetryPreferencePath: () => string;
+      startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
+      pendingRejectedTurnRepair: { userMessageIds: string[] } | null;
+    };
+    await privateSession.persistStartupAutoRetryAbandon("authentication", "user-1");
+    const preferencePath = privateSession.getAutoRetryPreferencePath();
+
+    // Hold the sweep at its write: by then it has read the fixable marker.
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const { unlink } = fsPromises;
+    const unlinkSpy = spyOn(fsPromises, "unlink").mockImplementation(async (target) => {
+      if (target === preferencePath) {
+        entered.resolve();
+        await release.promise;
+      }
+      return unlink(target);
+    });
+    try {
+      const sweep = clearProviderConfigFixableAbandonMarkers(config.sessionsDir, new Set());
+      await entered.promise;
+      // The workspace opened meanwhile and refused a routed turn whose row
+      // stamp failed: rejection marker + repair key.
+      privateSession.startupAutoRetryAbandon = {
+        reason: "pre_stream_rejected",
+        userMessageId: "u-refused",
+      };
+      privateSession.pendingRejectedTurnRepair = { userMessageIds: ["u-refused"] };
+      const persisted = privateSession.persistAutoRetryState();
+      release.resolve();
+      await Promise.all([sweep, persisted]);
+      expect(JSON.parse(await Bun.file(preferencePath).text())).toEqual({
+        startupAutoRetryAbandon: { reason: "pre_stream_rejected", userMessageId: "u-refused" },
+        pendingRejectedTurnRepair: { userMessageIds: ["u-refused"] },
+      });
+    } finally {
+      release.resolve();
+      unlinkSpy.mockRestore();
+    }
+  });
+
   test("reschedules retry when resumeStream defers without starting a stream", async () => {
     const workspaceId = "startup-retry-resume-deferred";
     const { session, events, cleanup } = await createSessionBundle(workspaceId);

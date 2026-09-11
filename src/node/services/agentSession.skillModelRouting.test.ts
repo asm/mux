@@ -538,6 +538,37 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     await session.dispose();
   });
 
+  it("re-resolves a numeric one-shot against the caller's model when routing no longer applies", async () => {
+    // A compact-and-retry of a "/+0 /skill" turn whose class binding is gone:
+    // the frontend pre-resolved the level against the last STREAMED model (the
+    // previous class model), which is wrong for the model this send streams
+    // on. The raw index is model-relative and rides along, so the backend
+    // resolves it against the model that actually streams, routed or not.
+    const workspacePath = await createWorkspaceWithSkill({
+      skillName: "done",
+      metadataYaml: "metadata:\n  model-class: tiny\n",
+    });
+    const { session, streamed } = await createRoutingHarness({
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" } },
+    });
+    // The caller's model is haiku (index 0 = "off", no floor); the stale
+    // pre-resolved level is "high", so the two are distinguishable.
+    const result = await session.sendMessage(
+      "Use skill done",
+      skillSendOptions({
+        model: KNOWN_MODELS.HAIKU.id,
+        skipAiSettingsPersistence: true,
+        thinkingLevel: "high",
+        oneShotThinkingIndex: 0,
+      })
+    );
+    expect(result.success).toBe(true);
+    expect(streamed[0].modelString).toBe(KNOWN_MODELS.HAIKU.id);
+    expect(streamed[0].thinkingLevel).toBe("off");
+    await session.dispose();
+  });
+
   it("leaves frontmatter bindings to an undefined class inert (streams the caller's model)", async () => {
     const workspacePath = await createWorkspaceWithSkill({
       skillName: "done",
