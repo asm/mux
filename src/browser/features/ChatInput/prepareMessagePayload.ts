@@ -1,7 +1,7 @@
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import type { ChatAttachment } from "./ChatAttachments";
 import { chatAttachmentsToFileParts } from "@/browser/utils/attachmentsHandling";
-import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
+import type { FilePart, SendMessageOptions, ProvidersConfigMap } from "@/common/orpc/types";
 import {
   prepareUserMessageForSend,
   type AgentSkillReference,
@@ -44,6 +44,12 @@ interface PrepareMessagePayloadInput {
   /** True for slash skill invocations (routable unless a model override rides along). */
   hasSkillInvocation?: boolean;
   policyModel: string;
+  /**
+   * Provider configuration for model-relative thinking resolution: a numeric
+   * one-shot index maps into the SELECTED model's ladder, and a provider model
+   * configured with `mappedToModel` has its target's ladder, not the default.
+   */
+  providersConfig?: ProvidersConfigMap | null;
   transferredDraftProjectDiscovery: boolean;
   additionalSystemContextHydrated: boolean;
   additionalSystemContext: { enabled: boolean; content: string };
@@ -119,7 +125,7 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
   const rawThinkingOverride = oneShotOverride?.thinkingLevel;
   const thinkingOverride =
     rawThinkingOverride != null
-      ? resolveThinkingInput(rawThinkingOverride, input.policyModel)
+      ? resolveThinkingInput(rawThinkingOverride, input.policyModel, input.providersConfig)
       : undefined;
 
   return {
@@ -139,12 +145,12 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
       // override (/+2 /skill) layers on top of routing.
       ...(oneShotModelOverride ? { skipSkillModelRouting: true } : {}),
       // Numeric thinking is model-relative and thinkingOverride above was
-      // resolved against the workspace model. A routable skill send may stream
-      // on a different (class) model, so pass the raw index for the backend to
-      // re-resolve against whatever model actually streams.
-      ...(input.hasSkillInvocation === true &&
-      !oneShotModelOverride &&
-      typeof rawThinkingOverride === "number"
+      // resolved client-side. A routable skill send may stream on a different
+      // (class) model, and an explicit one-shot model's ladder depends on
+      // provider mappings the backend resolves authoritatively, so pass the
+      // raw index for the backend to re-resolve against whatever model
+      // actually streams.
+      ...(input.hasSkillInvocation === true && typeof rawThinkingOverride === "number"
         ? { oneShotThinkingIndex: rawThinkingOverride }
         : {}),
       ...(input.goalInterventionPolicy

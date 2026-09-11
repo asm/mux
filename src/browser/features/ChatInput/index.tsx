@@ -2154,6 +2154,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           skillOneShot: skillInvocation?.oneShot ?? null,
           hasSkillInvocation: skillInvocation != null,
           policyModel,
+          providersConfig,
           transferredDraftProjectDiscovery,
           additionalSystemContextHydrated,
           additionalSystemContext,

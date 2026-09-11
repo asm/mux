@@ -4899,6 +4899,11 @@ export class AgentSession {
           ? this.estimateRoutedPendingSendPercent({
               message,
               skillBody: skillModelOverride.resolvedPackage?.package.body,
+              // Inline $skill references materialize a snapshot each (bodies
+              // unknown until then); count every one at the snapshot cap.
+              inlineSkillRefCount: extractAgentSkillRefs(typedMuxMetadata).filter(
+                (ref) => ref.source !== "slash"
+              ).length,
               fileParts: effectiveFileParts,
               model: modelForStream,
               use1MContext: this.is1MContextEnabledForModel(
@@ -6363,13 +6368,16 @@ export class AgentSession {
   /**
    * Share of the routed model's window the pending send itself will occupy,
    * by the budget code's chars-per-token heuristic: the prompt, the invoked
-   * skill's body bounded to what its snapshot row will hold, and text
-   * attachments by size. 0 when the window is unknown (no compaction signal,
-   * as the monitor treats it).
+   * skill's body bounded to what its snapshot row will hold, every inline
+   * skill reference at that same cap (their bodies are resolved only at
+   * materialization, and neither the reference count nor their total size is
+   * bounded), and text attachments by size. 0 when the window is unknown (no
+   * compaction signal, as the monitor treats it).
    */
   private estimateRoutedPendingSendPercent(args: {
     message: string;
     skillBody: string | undefined;
+    inlineSkillRefCount: number;
     fileParts: ReadonlyArray<{ url: string; mediaType: string }> | undefined;
     model: string;
     use1MContext: boolean;
@@ -6383,6 +6391,7 @@ export class AgentSession {
     const chars =
       args.message.length +
       Math.min(args.skillBody?.length ?? 0, MAX_AGENT_SKILL_SNAPSHOT_CHARS) +
+      args.inlineSkillRefCount * MAX_AGENT_SKILL_SNAPSHOT_CHARS +
       attachmentChars;
     return (chars / APPROX_CHARS_PER_TOKEN / limit) * 100;
   }

@@ -1352,6 +1352,44 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     }
   });
 
+  it("counts inline skill references toward the routed pending payload", async () => {
+    // Inline $skill references materialize a snapshot each (up to the snapshot
+    // cap) and their number is unbounded; a one-line invoked body with four
+    // inline references must still take the compaction path at 86% recorded.
+    const workspacePath = await createWorkspaceWithSkill({
+      skillName: "done",
+      metadataYaml: "metadata:\n  model-class: small\n",
+    });
+    const { session, historyService } = await createRoutingHarness({
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" } },
+    });
+    stubCompactionMonitor(session, 86);
+    const result = await session.sendMessage(
+      "Use skill done",
+      skillSendOptions({
+        muxMetadata: {
+          type: "agent-skill",
+          rawCommand: "/done",
+          skillName: "done",
+          scope: "project",
+          agentSkillRefs: ["alpha", "beta", "gamma", "delta"].map((skillName) => ({
+            skillName,
+            scope: "project",
+            source: "inline",
+          })),
+        },
+      })
+    );
+    expect(result.success).toBe(true);
+    const history = await historyService.getHistoryFromLatestBoundary("ws-skill-routing");
+    if (!history.success) throw new Error(history.error);
+    expect(
+      history.data.some((message) => message.metadata?.muxMetadata?.type === "compaction-request")
+    ).toBe(true);
+    await session.dispose();
+  });
+
   it("marks a routed global skill's compaction request as routed-origin for its resume", async () => {
     // A routed GLOBAL skill carries no project content of its own, but the
     // history its on-send compaction summarizes can hold earlier project-skill

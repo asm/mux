@@ -135,6 +135,39 @@ describe("findUnansweredRoutedTurnRow", () => {
     ).toBeUndefined();
   });
 
+  it("is not settled by an interrupted partial or a failed reply", () => {
+    // A Retry replays the turn in both cases, and a routed turn's consent gate
+    // can refuse it then; only a reply that ran to completion settles it.
+    const routed = createMuxMessage("u-routed", "user", "Use skill done", {
+      timestamp: 1,
+      retrySendOptions: routedRetry,
+    });
+    expect(
+      findUnansweredRoutedTurnRow([
+        routed,
+        createMuxMessage("a-interrupted", "assistant", "partial output", {
+          timestamp: 2,
+          partial: true,
+        }),
+      ])?.id
+    ).toBe("u-routed");
+    expect(
+      findUnansweredRoutedTurnRow([
+        routed,
+        createMuxMessage("a-failed", "assistant", "some output", {
+          timestamp: 2,
+          error: "provider exploded",
+        }),
+      ])?.id
+    ).toBe("u-routed");
+    expect(
+      findUnansweredRoutedTurnRow([
+        routed,
+        createMuxMessage("a-done", "assistant", "finished", { timestamp: 2 }),
+      ])
+    ).toBeUndefined();
+  });
+
   it("treats a synthetic compaction request as the turn it is", () => {
     // Synthetic rows that START a turn carry retry options like any resumable
     // turn and are found; an unrouted latest turn yields nothing.

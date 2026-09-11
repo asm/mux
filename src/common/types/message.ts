@@ -637,15 +637,20 @@ export function findUnansweredRoutedTurnRow(
 }
 
 /**
- * An assistant row that carries a committed reply. TurnRequestBuilder appends
- * an EMPTY assistant placeholder when a stream starts and finalizes it in
- * place at stream end, so while the turn streams (and its per-step consent
- * gate can still refuse it) the row exists with no parts: only content —
- * text, reasoning, a tool call, a file — marks the turn answered.
+ * An assistant row that carries a TERMINAL reply — the turn ran to completion.
+ * TurnRequestBuilder appends an EMPTY assistant placeholder when a stream
+ * starts and finalizes it in place at stream end, so while the turn streams
+ * the row exists with no parts; an interrupted stream commits its partial
+ * output as a row flagged `partial`, and a failed one carries `error`. Neither
+ * settles the turn: a Retry replays it, and a routed turn's consent gate can
+ * still refuse it then. Only content (text, reasoning, a tool call, a file) on
+ * a row without those marks counts.
  */
 export function isCommittedAssistantReply(message: MuxMessage): boolean {
   return (
     message.role === "assistant" &&
+    message.metadata?.partial !== true &&
+    message.metadata?.error == null &&
     message.parts.some((part) => part.type !== "text" || part.text.trim().length > 0)
   );
 }

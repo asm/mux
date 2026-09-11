@@ -23,12 +23,23 @@ export function isRouteProviderConfigured(
   );
 }
 
-/** Gateway-catalog accessibility predicate; see isRouteProviderConfigured. */
+/**
+ * Gateway-catalog accessibility predicate; see isRouteProviderConfigured.
+ *
+ * A CUSTOM provider shadowing a built-in gateway id (github-copilot, coder…)
+ * is exempt from that gateway's authoritative-catalog rule: its `models` list
+ * is a non-exhaustive convenience, and the factory hands arbitrary model ids
+ * straight to the custom adapter — an ordinary send would work, so the class
+ * verdict must not reject every skill bound to such a model.
+ */
 export function isRouteGatewayModelAccessible(
   providersConfig: ProvidersConfigMap,
   gateway: string,
   modelId: string
 ): boolean {
+  if (isCustomProviderConfig(providersConfig[gateway])) {
+    return true;
+  }
   return isGatewayModelAccessibleFromAuthoritativeCatalog(
     gateway,
     modelId,

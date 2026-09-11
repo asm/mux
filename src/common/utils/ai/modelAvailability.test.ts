@@ -20,6 +20,41 @@ describe("isModelServableWithProvidersConfig", () => {
     ).toBe(true);
   });
 
+  test("a custom provider shadowing a built-in gateway id is not catalog-gated", () => {
+    // The factory hands arbitrary model ids straight to a custom adapter, so
+    // its non-exhaustive `models` list must not reject a class model the same
+    // send-path would serve. The built-in gateway keeps its authoritative rule.
+    const custom = {
+      "github-copilot": {
+        providerType: "openai-compatible",
+        isConfigured: true,
+        isEnabled: true,
+        models: [{ id: "listed-model" }],
+      },
+    } as unknown as ProvidersConfigMap;
+    expect(
+      isModelServableWithProvidersConfig({
+        canonicalModel: "github-copilot:team-model",
+        routePriority: ["direct"],
+        providersConfig: custom,
+      })
+    ).toBe(true);
+    const builtIn = {
+      "github-copilot": {
+        isConfigured: true,
+        isEnabled: true,
+        models: [{ id: "listed-model" }],
+      },
+    } as unknown as ProvidersConfigMap;
+    expect(
+      isModelServableWithProvidersConfig({
+        canonicalModel: "github-copilot:team-model",
+        routePriority: ["direct"],
+        providersConfig: builtIn,
+      })
+    ).toBe(false);
+  });
+
   test("rejects a model whose provider is not configured", () => {
     expect(
       isModelServableWithProvidersConfig({
