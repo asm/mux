@@ -2987,6 +2987,105 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     await session.dispose();
   });
 
+  it("arms the gate on tainted memories included under trust and excludes them without it", async () => {
+    // Memories harvested from a trusted project-skill epoch carry provenance.
+    // A routed turn's memory context reports it: under trust the gate arms on
+    // it (a revocation before dispatch refuses although the rows carry
+    // nothing), and a routed turn assembled without trust asks for a context
+    // that leaves such memories out.
+    const workspacePath = await createWorkspaceWithSkill({
+      skillName: "done",
+      metadataYaml: "metadata:\n  model-class: small\n",
+    });
+    const harnessArgs: Parameters<typeof createRoutingHarness>[0] = {
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" } },
+    };
+    const { session, streamed } = await createRoutingHarness(harnessArgs);
+    relabelInvokedPackageAsGlobal(session);
+    const build = mock(
+      (_ws: string, _model: string, options?: { excludeProjectSkillContent?: boolean }) =>
+        Promise.resolve({
+          indexEntries: [],
+          hotMemoriesBlock: null,
+          carriesProjectSkillContent: options?.excludeProjectSkillContent !== true,
+        })
+    );
+    (
+      session as unknown as { aiService: Record<string, unknown> }
+    ).aiService.buildMemorySessionContext = build;
+    const result = await session.sendMessage(
+      "Use skill done",
+      skillSendOptions({
+        muxMetadata: {
+          type: "agent-skill",
+          rawCommand: "/done",
+          skillName: "done",
+          scope: "global",
+        },
+      })
+    );
+    expect(result.success).toBe(true);
+    expect(streamed).toHaveLength(1);
+    const options = streamed[0] as unknown as {
+      resolveMemoryContext?: (model: string, o?: unknown) => Promise<unknown>;
+      preDispatchConsentGate?: (context?: unknown) => Promise<unknown>;
+    };
+    // Assembled under trust: the memory context is not narrowed...
+    await options.resolveMemoryContext?.(USER_MODEL, {});
+    expect(build.mock.calls.at(-1)?.[2]).toMatchObject({ excludeProjectSkillContent: false });
+    // ...and once it reported tainted memories, a revocation refuses the step.
+    harnessArgs.projectTrusted = false;
+    expect(
+      JSON.stringify(await options.preDispatchConsentGate?.({ midStream: true, stepMessages: [] }))
+    ).toMatch(/trust was revoked/i);
+    // A routed turn assembled WITHOUT trust narrows the context instead.
+    const consent = await (
+      session as unknown as {
+        createRoutedMemoryConsent: (
+          rejection: () => Promise<null>
+        ) => Promise<{ excludeProjectSkillContent: boolean }>;
+      }
+    ).createRoutedMemoryConsent(() => Promise.resolve(null));
+    expect(consent.excludeProjectSkillContent).toBe(true);
+    await session.dispose();
+  });
+
+  it("counts a PDF attachment by its pages toward the routed pending payload", async () => {
+    // Providers bill a PDF per page (text plus page image), never as one
+    // media unit: forty page objects at the per-page bound are ~60% of haiku's
+    // window, so at 60% recorded the send must take the compaction path.
+    const workspacePath = await createWorkspaceWithSkill({
+      skillName: "done",
+      metadataYaml: "metadata:\n  model-class: small\n",
+    });
+    const { session, historyService } = await createRoutingHarness({
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" } },
+    });
+    stubCompactionMonitor(session, 60);
+    const pdf = `%PDF-1.4\n${Array.from(
+      { length: 40 },
+      (_, index) => `${index + 1} 0 obj\n<< /Type /Page /Parent 1 0 R >>\nendobj`
+    ).join("\n")}\n%%EOF`;
+    const dataUrl = `data:application/pdf;base64,${Buffer.from(pdf, "latin1").toString("base64")}`;
+    const result = await session.sendMessage(
+      "Use skill done",
+      skillSendOptions({
+        fileParts: [
+          { type: "file", url: dataUrl, mediaType: "application/pdf", filename: "a.pdf" },
+        ],
+      })
+    );
+    expect(result.success).toBe(true);
+    const history = await historyService.getHistoryFromLatestBoundary("ws-skill-routing");
+    if (!history.success) throw new Error(history.error);
+    expect(
+      history.data.some((message) => message.metadata?.muxMetadata?.type === "compaction-request")
+    ).toBe(true);
+    await session.dispose();
+  });
+
   it("refuses a manual resume of a routed row once trust is revoked and stamps it", async () => {
     const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
     const harnessArgs: Parameters<typeof createRoutingHarness>[0] = { workspacePath };

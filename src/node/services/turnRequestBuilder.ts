@@ -318,6 +318,12 @@ export interface StreamMessageOptions {
     modelString: string,
     options?: { includeHotMemories?: boolean; onlyContextNotes?: boolean }
   ) => Promise<MemorySessionContext | undefined>;
+  /**
+   * The request's rows or attachments carry project skill content: memory
+   * files the turn writes inherit that provenance (the model can copy the
+   * content into them), so later routed requests can withhold them.
+   */
+  memoryWritesCarryProjectSkillContent?: boolean;
   experiments?: SendMessageOptions["experiments"];
   allowAgentSetGoal?: boolean;
   workspaceGoalService?: WorkspaceGoalService;
@@ -873,6 +879,7 @@ export class TurnRequestBuilder {
       recordFileState,
       postCompactionAttachments,
       resolveMemoryContext,
+      memoryWritesCarryProjectSkillContent,
       experiments: experimentsFromOptions,
       allowAgentSetGoal,
       workspaceGoalService,
@@ -2398,6 +2405,11 @@ export class TurnRequestBuilder {
       memoryService: this.dependencies.bindings.memoryService,
       memoryAccess,
       ...(contextBudgetFlushTurn ? { memoryWritePath: CONTEXT_NOTES_MEMORY_PATH } : {}),
+      // Write provenance: the request's own project content, or a preloaded /
+      // indexed memory that already carries it.
+      memoryWriteCarriesProjectSkillContent:
+        memoryWritesCarryProjectSkillContent === true ||
+        memoryContext?.carriesProjectSkillContent === true,
       contextBudgetRolloverAvailable,
       // Experiments for inheritance to subagents and workflow tool gating.
       experiments: {

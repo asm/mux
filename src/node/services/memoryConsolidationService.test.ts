@@ -75,12 +75,13 @@ function scriptedModel(capturePrompt?: (prompt: string) => void): MockLanguageMo
   });
 }
 
-function harvestCandidateModel(): MockLanguageModelV3 {
+function harvestCandidateModel(capturePrompt?: (prompt: string) => void): MockLanguageModelV3 {
   let streamCount = 0;
   return new MockLanguageModelV3({
     doStream: (options) => {
       streamCount++;
       const prompt = userPromptText(options);
+      capturePrompt?.(prompt);
       const isHarvest = prompt.includes("just-compacted transcript epoch");
       const chunks: LanguageModelV3StreamPart[] =
         isHarvest && streamCount === 1
@@ -626,7 +627,12 @@ describe("MemoryConsolidationService", () => {
     // content leaves for it only while the project is trusted. The epoch
     // summary (stamped by compaction) and the snapshot rows are both inputs.
     for (const trusted of [true, false]) {
-      using fixture = await createFixture();
+      // A candidate-submitting model so the harvest writes an inbox whose
+      // provenance can be checked below.
+      const prompts: string[] = [];
+      using fixture = await createFixture({
+        modelFactory: () => harvestCandidateModel((prompt) => prompts.push(prompt)),
+      });
       await fixture.config.editConfig((cfg) => {
         const project = cfg.projects.get("/projects/demo");
         if (project) project.trusted = trusted;
@@ -645,7 +651,7 @@ describe("MemoryConsolidationService", () => {
       });
 
       expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
-      const harvestPrompt = fixture.modelPrompts.find((prompt) =>
+      const harvestPrompt = prompts.find((prompt) =>
         prompt.includes("just-compacted transcript epoch")
       );
       expect(harvestPrompt).toBeDefined();
@@ -657,6 +663,19 @@ describe("MemoryConsolidationService", () => {
         expect(harvestPrompt).not.toContain("PROJECT SKILL BODY");
         expect(harvestPrompt).toContain(COMPACTION_SUMMARY_WITHHELD_MESSAGE);
       }
+      // The accepted candidates distill the input: an inbox harvested from
+      // project skill content under trust carries the provenance (sidecar),
+      // so routed requests after a revocation can withhold what derives from it.
+      const inbox = (
+        await fixture.memoryService.listIndexEntries({
+          runtime: null,
+          checkoutCwd: "",
+          workspaceId: "ws-dream",
+          projectPath: "/projects/demo",
+        })
+      ).find((entry) => entry.path.startsWith("/memories/workspace/harvest/"));
+      expect(inbox).toBeDefined();
+      expect(inbox?.carriesProjectSkillContent).toBe(trusted);
     }
   });
 

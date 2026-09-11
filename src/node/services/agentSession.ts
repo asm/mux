@@ -19,6 +19,8 @@ import {
   CONTEXT_WARNING_DEDUPE_KEY,
   FLUSH_RESERVE_TOKENS,
   OUTPUT_RESERVE_TOKENS,
+  IMAGE_TOKEN_ESTIMATE,
+  PDF_TOKENS_PER_PAGE_ESTIMATE,
 } from "@/common/constants/contextBudget";
 import {
   evaluateStepBudget,
@@ -309,6 +311,12 @@ import { ContinuousCompactor, type ContinuousCompactionContext } from "./continu
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { summarizeContinuousCompaction } from "./continuousCompactionSummary";
 
+/** See AgentSession.createRoutedMemoryConsent. Mutable: the resolver records what it included. */
+interface RoutedMemoryConsent {
+  excludeProjectSkillContent: boolean;
+  carriesProjectSkillContent: boolean;
+}
+
 type SessionCompactionContext = ContinuousCompactionContext & {
   sendOptions?: SendMessageOptions;
   /**
@@ -538,6 +546,27 @@ function normalizeMediaType(mediaType: string): string {
  */
 function decodedAttachmentChars(url: string): number {
   return estimateBase64DataUrlBytes(url) ?? url.length;
+}
+
+/**
+ * Conservative token cost of a PDF attachment. Providers bill a PDF per page
+ * (extracted text plus a page image), not as one media unit: count the page
+ * objects of the decoded document and price each at the per-page upper bound;
+ * a document whose page objects live in compressed object streams (none
+ * visible) falls back to its decoded size as text — over-estimating is the
+ * safe direction here (it only compacts earlier).
+ */
+function estimatePdfAttachmentTokens(url: string): number {
+  if (!url.startsWith("data:")) return IMAGE_TOKEN_ESTIMATE;
+  const commaIndex = url.indexOf(",");
+  if (commaIndex === -1 || !url.slice(0, commaIndex).includes(";base64")) {
+    return IMAGE_TOKEN_ESTIMATE;
+  }
+  const bytes = Buffer.from(url.slice(commaIndex + 1), "base64");
+  const pages = bytes.toString("latin1").match(/\/Type\s*\/Page(?![s])/g)?.length ?? 0;
+  return pages > 0
+    ? pages * PDF_TOKENS_PER_PAGE_ESTIMATE
+    : Math.max(IMAGE_TOKEN_ESTIMATE, Math.ceil(bytes.length / APPROX_CHARS_PER_TOKEN));
 }
 
 function estimateBase64DataUrlBytes(dataUrl: string): number | null {
@@ -1013,6 +1042,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
       includeHotMemories?: boolean;
       tokenBudgetActive?: boolean;
       onlyContextNotes?: boolean;
+      excludeProjectSkillContent?: boolean;
     }
   ): Promise<MemorySessionContext | null>;
   isClaudeSkillsCompatEnabled?(): boolean;
@@ -1088,6 +1118,7 @@ interface CachedMemoryContext {
   tokenBudgetActive: boolean;
   memoryEnabled: boolean;
   hotSetEnabled: boolean;
+  excludesProjectSkillContent: boolean;
 }
 
 interface SendMessageInternalOptions {
@@ -5674,6 +5705,7 @@ export class AgentSession {
       if (contextRollover) {
         assert(requestAssemblySnapshot != null, "Rollover must pin request assembly");
         const generation = this.contextBudgetGeneration;
+        const rolloverMemoryConsent = await this.createRoutedMemoryConsent(streamConsentRejection);
         const candidate = await this.prepareRolloverRequest(
           batch,
           optionsForStream.model,
@@ -5687,7 +5719,8 @@ export class AgentSession {
           // A prepared request bakes its turn options in NOW, not at start():
           // the gate streamWithHistory passes later cannot be added to it, so
           // the routed turn's consent gate rides the preparation itself.
-          this.bindRolloverConsentGate(streamConsentRejection, batch)
+          this.bindRolloverConsentGate(streamConsentRejection, batch, rolloverMemoryConsent),
+          rolloverMemoryConsent
         );
         if (candidate.success) attempt.preparedRequest = candidate.data;
         if (await cancelBeforeAcceptance()) return Ok(undefined);
@@ -6550,9 +6583,15 @@ export class AgentSession {
     const textLikeChars = (args.fileParts ?? [])
       .filter(textLike)
       .reduce((sum, part) => sum + decodedAttachmentChars(part.url), 0);
+    // PDFs are billed per page, never as one media unit (estimatePdfAttachmentTokens).
+    const isPdf = (part: { mediaType: string }) =>
+      normalizeMediaType(part.mediaType) === "application/pdf";
+    const pdfTokens = (args.fileParts ?? [])
+      .filter(isPdf)
+      .reduce((sum, part) => sum + estimatePdfAttachmentTokens(part.url), 0);
     const mediaTokens = estimateFreshRequestTokens({
       userText: "",
-      attachments: (args.fileParts ?? []).filter((part) => !textLike(part)),
+      attachments: (args.fileParts ?? []).filter((part) => !textLike(part) && !isPdf(part)),
       // The recorded usage already includes the system prompt.
       systemFloorTokens: 0,
     });
@@ -6574,7 +6613,7 @@ export class AgentSession {
       args.fileSnapshotChars +
       args.mcpPromptRefCount * MCP_PROMPT_MAX_TEXT_BYTES +
       textLikeChars;
-    return ((Math.ceil(chars / APPROX_CHARS_PER_TOKEN) + mediaTokens) / limit) * 100;
+    return ((Math.ceil(chars / APPROX_CHARS_PER_TOKEN) + mediaTokens + pdfTokens) / limit) * 100;
   }
 
   private is1MContextEnabledForModel(
@@ -7031,6 +7070,9 @@ export class AgentSession {
         return Ok(undefined);
       if (!freshBudget.success) return freshBudget;
       const rows = [...retryPrelude, continuation];
+      const retryMemoryConsent = await this.createRoutedMemoryConsent(
+        context.routedConsentRejection
+      );
       const candidate = await this.prepareRolloverRequest(
         rows,
         model,
@@ -7041,7 +7083,8 @@ export class AgentSession {
         undefined,
         // The fresh window copies the routed turn's snapshot rows: the class
         // provider must not receive them without the turn's consent verdict.
-        this.bindRolloverConsentGate(context.routedConsentRejection, rows)
+        this.bindRolloverConsentGate(context.routedConsentRejection, rows, retryMemoryConsent),
+        retryMemoryConsent
       );
       if (!candidate.success) return candidate;
       let transferred = false;
@@ -7106,13 +7149,16 @@ export class AgentSession {
    */
   private bindRolloverConsentGate(
     routedConsentRejection: RoutedConsentRejection | undefined,
-    rows: MuxMessage[]
+    rows: MuxMessage[],
+    memoryConsent?: RoutedMemoryConsent
   ): StreamMessageOptions["preDispatchConsentGate"] {
     if (routedConsentRejection == null) return undefined;
     const carriesProjectContent = messagesCarryProjectSkillContent(rows);
     return (context) =>
       routedConsentRejection(
-        carriesProjectContent || gateContextCarriesProjectSkillContent(context),
+        carriesProjectContent ||
+          memoryConsent?.carriesProjectSkillContent === true ||
+          gateContextCarriesProjectSkillContent(context),
         context?.midStream === true
       );
   }
@@ -7127,7 +7173,9 @@ export class AgentSession {
     manualIntervention?: { enqueuedAtMs?: number },
     // The request is built NOW (turn options included), not at start(): a
     // routed turn's consent gate must be part of the preparation.
-    preDispatchConsentGate?: StreamMessageOptions["preDispatchConsentGate"]
+    preDispatchConsentGate?: StreamMessageOptions["preDispatchConsentGate"],
+    // Same routed turn's memory channel (createRoutedMemoryConsent).
+    memoryConsent?: RoutedMemoryConsent
   ): Promise<Result<PreparedStreamMessage, SendMessageError>> {
     if (!this.aiService.prepareStreamMessage)
       return Err({
@@ -7202,12 +7250,22 @@ export class AgentSession {
         ),
         recordFileState: this.fileChangeTracker.record.bind(this.fileChangeTracker),
         postCompactionAttachments: null,
-        resolveMemoryContext: (model, memoryOptions) =>
-          this.resolveMemoryContext(
+        resolveMemoryContext: async (model, memoryOptions) => {
+          const memoryContext = await this.resolveMemoryContext(
             model,
-            { ...memoryOptions, tokenBudgetActive: this.isTokenBudgetActive(options) },
+            {
+              ...memoryOptions,
+              tokenBudgetActive: this.isTokenBudgetActive(options),
+              excludeProjectSkillContent: memoryConsent?.excludeProjectSkillContent === true,
+            },
             cache
-          ),
+          );
+          if (memoryConsent && memoryContext?.carriesProjectSkillContent === true) {
+            memoryConsent.carriesProjectSkillContent = true;
+          }
+          return memoryContext;
+        },
+        memoryWritesCarryProjectSkillContent: messagesCarryProjectSkillContent(messages),
         workspaceGoalService: this.workspaceGoalService,
         prospectiveGoalStatusForToolAvailability,
         allowAgentSetGoal: options?.allowAgentSetGoal === true,
@@ -9231,6 +9289,9 @@ export class AgentSession {
       // invocation is global. The gate performs the rejection bookkeeping; the
       // caller converts the Err into an accepted pre-stream failure.
       let preDispatchConsentGate: StreamMessageOptions["preDispatchConsentGate"];
+      // Third channel, resolved later inside AIService: the memory context
+      // (index + preloaded files). Excluded without trust, gate-arming with it.
+      const memoryConsent = await this.createRoutedMemoryConsent(routedConsentRejection);
       if (routedConsentRejection) {
         // Every channel repository-controlled project skill content takes into
         // a request: synthetic snapshot rows AND agent_skill_read results — a
@@ -9244,7 +9305,7 @@ export class AgentSession {
         let attachmentsCarryProjectSkills = carriesProjectLoadedSkills(postCompactionAttachments);
         if (
           (requestCarriesProjectContent || attachmentsCarryProjectSkills) &&
-          !(await this.isRoutedProjectSkillTurnStillTrusted())
+          memoryConsent?.excludeProjectSkillContent === true
         ) {
           // Historical project content in an UNTRUSTED workspace: exclude it
           // from the routed request (least privilege, mirroring the
@@ -9269,10 +9330,18 @@ export class AgentSession {
         const carriesForGate = requestCarriesProjectContent || attachmentsCarryProjectSkills;
         preDispatchConsentGate = (context) =>
           routedConsentRejection(
-            carriesForGate || gateContextCarriesProjectSkillContent(context),
+            carriesForGate ||
+              memoryConsent?.carriesProjectSkillContent === true ||
+              gateContextCarriesProjectSkillContent(context),
             context?.midStream === true
           );
       }
+      // Memory files this turn writes inherit the request's provenance (the
+      // model can copy project content into them); an untrusted routed
+      // request already withheld it above, so this scans the FINAL rows.
+      const memoryWritesCarryProjectSkillContent =
+        messagesCarryProjectSkillContent(requestMessages) ||
+        carriesProjectLoadedSkills(postCompactionAttachments);
 
       this.activeStreamHadPostCompactionInjection =
         postCompactionAttachments !== null && postCompactionAttachments.length > 0;
@@ -9318,11 +9387,18 @@ export class AgentSession {
         // listing needs a running runtime). Still ordered after the
         // post-compaction check above: a just-consumed compaction boundary has
         // already reset the segment cache, so this stream recomputes the context.
-        resolveMemoryContext: (forModelString, memoryOptions) =>
-          this.resolveMemoryContext(forModelString, {
+        resolveMemoryContext: async (forModelString, memoryOptions) => {
+          const memoryContext = await this.resolveMemoryContext(forModelString, {
             ...memoryOptions,
             tokenBudgetActive: this.isTokenBudgetActive(options),
-          }),
+            excludeProjectSkillContent: memoryConsent?.excludeProjectSkillContent === true,
+          });
+          if (memoryConsent && memoryContext?.carriesProjectSkillContent === true) {
+            memoryConsent.carriesProjectSkillContent = true;
+          }
+          return memoryContext;
+        },
+        memoryWritesCarryProjectSkillContent,
         allowAgentSetGoal: options?.allowAgentSetGoal === true,
         workspaceGoalService: this.workspaceGoalService,
         experiments: options?.experiments,
@@ -12402,12 +12478,15 @@ export class AgentSession {
       includeHotMemories?: boolean;
       tokenBudgetActive?: boolean;
       onlyContextNotes?: boolean;
+      /** Routed turn without Project Trust: withhold memories carrying project skill provenance. */
+      excludeProjectSkillContent?: boolean;
     },
     cache = this.memoryContextByModelString
   ): Promise<MemorySessionContext | undefined> {
     assert(modelString.length > 0, "resolveMemoryContext requires a model string");
     const includeHotMemories = options?.includeHotMemories !== false;
     const tokenBudgetActive = options?.tokenBudgetActive === true;
+    const excludeProjectSkillContent = options?.excludeProjectSkillContent === true;
     if (options?.onlyContextNotes === true) {
       // SECURITY: a final-flush turn must not see other memories (index or preloaded
       // contents); this narrowed context is never cached for ordinary turns.
@@ -12417,6 +12496,7 @@ export class AgentSession {
               includeHotMemories,
               tokenBudgetActive,
               onlyContextNotes: true,
+              excludeProjectSkillContent,
             })
           : null;
       return narrowed ?? undefined;
@@ -12432,6 +12512,7 @@ export class AgentSession {
       cached?.tokenBudgetActive === tokenBudgetActive &&
       cached.memoryEnabled === memoryEnabled &&
       cached.hotSetEnabled === hotSetEnabled &&
+      cached.excludesProjectSkillContent === excludeProjectSkillContent &&
       (cached.includesHotMemories || !includeHotMemories)
     ) {
       return cached.context ?? undefined;
@@ -12443,6 +12524,7 @@ export class AgentSession {
         ? await this.aiService.buildMemorySessionContext(this.workspaceId, modelString, {
             includeHotMemories,
             tokenBudgetActive,
+            excludeProjectSkillContent,
           })
         : null;
     cache.set(modelString, {
@@ -12451,6 +12533,7 @@ export class AgentSession {
       tokenBudgetActive,
       memoryEnabled,
       hotSetEnabled,
+      excludesProjectSkillContent: excludeProjectSkillContent,
     });
     return context ?? undefined;
   }
@@ -13051,6 +13134,24 @@ export class AgentSession {
       log.debug(`skill model routing: fail-open for skill send: ${getErrorMessage(error)}`);
       return null;
     }
+  }
+
+  /**
+   * Memory channel of a ROUTED turn: memories the turn's system prompt and
+   * tool description carry can hold project skill content (harvested from a
+   * trusted project-skill epoch, written under such content). Without trust
+   * they are excluded from the memory context; under trust their presence
+   * (recorded by the resolver callback) arms the consent gate so a revocation
+   * before dispatch refuses. Undefined for unrouted turns.
+   */
+  private async createRoutedMemoryConsent(
+    routedConsentRejection: RoutedConsentRejection | undefined
+  ): Promise<RoutedMemoryConsent | undefined> {
+    if (routedConsentRejection == null) return undefined;
+    return {
+      excludeProjectSkillContent: !(await this.isRoutedProjectSkillTurnStillTrusted()),
+      carriesProjectSkillContent: false,
+    };
   }
 
   /**
