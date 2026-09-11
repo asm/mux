@@ -20,6 +20,7 @@ import type { AIService, StreamMessageOptions } from "@/node/services/aiService"
 import {
   COMPACTION_SUMMARY_WITHHELD_MESSAGE,
   PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE,
+  PROJECT_SKILL_TURN_WITHHELD_MESSAGE,
 } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { readDurableRejectedTurnKeys } from "@/node/services/rejectedTurnRepairRecord";
 import type { HistoryService } from "@/node/services/historyService";
@@ -2092,6 +2093,48 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     await session.dispose();
   });
 
+  it("withholds the reply to an earlier project skill invocation from a routed request in an untrusted project", async () => {
+    // The snapshot row is dropped, but the model's reply to that turn can
+    // quote it (prose, tool arguments, tool results): the turn's assistant
+    // rows are withheld whole, later turns untouched.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const { session, streamed } = await sendRoutedGlobalSkillWithPendingState(
+      {
+        workspacePath,
+        projectTrusted: false,
+        configValues: { modelClasses: { small: "haiku+0" }, skillModelClasses: { done: "small" } },
+      },
+      {
+        seedHistory: async (historyService) => {
+          for (const row of [
+            createMuxMessage("snap-earlier", "user", "EARLIER PROJECT SKILL BODY", {
+              timestamp: 1,
+              synthetic: true,
+              agentSkillSnapshot: { skillName: "repo-conventions", scope: "project", sha256: "x" },
+            }),
+            createMuxMessage("u-earlier", "user", "Use skill repo-conventions", { timestamp: 2 }),
+            createMuxMessage("a-earlier", "assistant", "Applying: EARLIER PROJECT SKILL BODY", {
+              timestamp: 3,
+            }),
+            createMuxMessage("u-plain", "user", "Unrelated question", { timestamp: 4 }),
+            createMuxMessage("a-plain", "assistant", "Unrelated answer stays", { timestamp: 5 }),
+          ]) {
+            await historyService.appendToHistory("ws-skill-routing", row);
+          }
+        },
+        loadedSkills: [],
+      }
+    );
+
+    const request = JSON.stringify(streamed[0].messages);
+    expect(request).not.toContain("EARLIER PROJECT SKILL BODY");
+    expect(request).toContain(PROJECT_SKILL_TURN_WITHHELD_MESSAGE);
+    expect(request).toContain("Unrelated answer stays");
+    expect(streamed[0].messages.map((message) => message.id)).toContain("a-earlier");
+    expect(await streamed[0].preDispatchConsentGate?.()).toBeNull();
+    await session.dispose();
+  });
+
   it("arms the provider-boundary gate on a project skill read through agent_skill_read under trust", async () => {
     const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
     const harnessArgs: Parameters<typeof createRoutingHarness>[0] = {
@@ -2433,6 +2476,18 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
           agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
         }),
         createMuxMessage("u-unanswered", "user", "refused prompt", { timestamp: 4 }),
+        // A routed turn with a committed (interrupted) reply: a trust-revoked
+        // Retry of it can be the refused turn, so it is a candidate too.
+        createMuxMessage("snap-routed-answered", "user", "ROUTED SKILL BODY", {
+          timestamp: 5,
+          synthetic: true,
+          agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "y" },
+        }),
+        createMuxMessage("u-routed-answered", "user", "Use skill done", {
+          timestamp: 6,
+          retrySendOptions: { model: USER_MODEL, agentId: "exec", routedProjectConsent: true },
+        }),
+        createMuxMessage("a-routed-partial", "assistant", "partial reply", { timestamp: 7 }),
       ]) {
         await historyService.appendToHistory(workspaceId, row);
       }
@@ -2454,11 +2509,22 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
         expect(streamed).toHaveLength(1);
         const requestIds = streamed[0].messages.map((message) => message.id);
         expect(requestIds).toContain("u-answered");
-        expect(requestIds).not.toContain("u-unanswered");
-        expect(requestIds).not.toContain("snap-unanswered");
+        for (const id of [
+          "u-unanswered",
+          "snap-unanswered",
+          "snap-routed-answered",
+          "u-routed-answered",
+        ]) {
+          expect(requestIds).not.toContain(id);
+        }
         const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
         if (!history.success) throw new Error(history.error);
-        for (const id of ["snap-unanswered", "u-unanswered"]) {
+        for (const id of [
+          "snap-unanswered",
+          "u-unanswered",
+          "snap-routed-answered",
+          "u-routed-answered",
+        ]) {
           expect(history.data.find((row) => row.id === id)?.metadata?.preStreamRejected).toBe(true);
         }
         expect(

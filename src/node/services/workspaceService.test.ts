@@ -20224,6 +20224,16 @@ describe("WorkspaceService fork", () => {
       ).abandonedMessages.map((row) => row.id);
       // The refused turn (prompt and snapshot prefix) is gone; the rest remains.
       expect(abandoned).toEqual(["u-after"]);
+      // The summarizer re-verifies the rows against the SOURCE right before
+      // its request: a turn refused and stamped after the copy abandons it.
+      const { beforeDispatch } = summarySpy.mock.calls[0][0] as {
+        beforeDispatch?: () => Promise<boolean>;
+      };
+      expect(await beforeDispatch?.()).toBe(true);
+      expect(
+        (await historyService.markMessagesPreStreamRejected(sourceWorkspaceId, ["u-after"])).success
+      ).toBe(true);
+      expect(await beforeDispatch?.()).toBe(false);
     } finally {
       summarySpy.mockRestore();
       fixture.restore();

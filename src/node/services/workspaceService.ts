@@ -3260,6 +3260,27 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * refuse them, so the fork is refused while such a turn streams. Never
    * creates a session — a workspace without one has no turn to overlap.
    */
+  /**
+   * Whether every abandoned-tail row a fork's background summary was built
+   * from is still present and provider-eligible in the SOURCE — re-read from
+   * current history with a fresh quarantine. False (also on an unreadable
+   * quarantine) means a row was stamped, quarantined or truncated since the
+   * copy: the summary is abandoned rather than sent from stale rows.
+   */
+  private async abandonedRowsStillEligible(
+    sourceWorkspaceId: string,
+    rowIds: readonly string[]
+  ): Promise<boolean> {
+    const history = await this.historyService.getHistoryFromLatestBoundary(sourceWorkspaceId);
+    if (!history.success) return false;
+    const quarantine = await this.getQuarantinedRejectedRowIds(sourceWorkspaceId);
+    if (!quarantine.success) return false;
+    const eligible = new Set(
+      excludeRejectedTurnRows(history.data, quarantine.data).map((row) => row.id)
+    );
+    return rowIds.every((id) => eligible.has(id));
+  }
+
   private async guardForkAgainstSourceTurn(
     sourceWorkspaceId: string
   ): Promise<Result<Disposable | null>> {
@@ -10753,6 +10774,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // stat-visible before the fork IPC returns (r55): an immediate first
         // send handled by another backend must find it; generation itself
         // still runs in the background.
+        // The removed tail can hold the source's refused turn (rows still
+        // unstamped there): the summarizer, possibly on another provider,
+        // must not read it any more than the fork's request may.
+        const abandonedForSummary = excludeRejectedTurnRows(
+          abandonedBranchMessages,
+          sourceRejectedQuarantine
+        );
+        const abandonedRowIds = abandonedForSummary.map((row) => row.id);
         await startAbandonedBranchSummaryInBackground({
           historyService: this.historyService,
           aiService: this.aiService,
@@ -10760,13 +10789,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           // Cross-process pending marker home (r48): lets a first send served
           // by another backend wait for the in-flight summary.
           sessionDir: path.join(this.config.sessionsDir, newWorkspaceId),
-          // The removed tail can hold the source's refused turn (rows still
-          // unstamped there): the summarizer, possibly on another provider,
-          // must not read it any more than the fork's request may.
-          abandonedMessages: excludeRejectedTurnRows(
-            abandonedBranchMessages,
-            sourceRejectedQuarantine
-          ),
+          abandonedMessages: abandonedForSummary,
+          // The source hold is released by now and the tail was read under
+          // it: re-verify the rows against the source's CURRENT history and
+          // quarantine right before the summarizer's request (a Retry can
+          // refuse and stamp a source turn meanwhile).
+          beforeDispatch: () => this.abandonedRowsStillEligible(sourceWorkspaceId, abandonedRowIds),
           isExperimentEnabled: (experimentId) => this.isExperimentEnabled(experimentId),
           guardTailMessageId: sourceMessageId,
           // The fork target's metadata carries no model settings yet (its

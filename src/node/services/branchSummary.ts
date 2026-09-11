@@ -349,6 +349,8 @@ async function generateAbandonedBranchSummaryText(input: {
   prompt: string;
   timeoutMs: number;
   cancellationSignal?: AbortSignal;
+  /** See AbandonedBranchSummaryInput.beforeDispatch. */
+  beforeDispatch?: () => Promise<boolean>;
   /**
    * Cost telemetry for the side-channel call (mirrors the status generator's
    * hook): invoked after a cleanly finished stream so this spend reaches
@@ -419,6 +421,15 @@ async function generateAbandonedBranchSummaryText(input: {
       continue;
     }
     try {
+      // The rows behind `prompt` were read before this background call; a
+      // stale verdict abandons the summary outright (there is nothing else to
+      // send) and lets the finally release the model.
+      if (input.beforeDispatch !== undefined && !(await input.beforeDispatch())) {
+        log.debug("Branch summary: abandoned rows changed before dispatch; skipping", {
+          workspaceId: input.workspaceId,
+        });
+        return null;
+      }
       // streamText (not generateText): Codex OAuth endpoints require
       // stream:true in the request body (same rationale as workspaceTitleGenerator).
       // No thinking provider options are passed, so the call itself stays
@@ -642,6 +653,14 @@ export interface AbandonedBranchSummaryInput {
   workspaceId: string;
   /** The removed tail, as returned by HistoryService.truncateAfterMessage. */
   abandonedMessages: MuxMessage[];
+  /**
+   * Re-verification run after a candidate model is created, immediately
+   * before the summarizer's request. The tail was read under the fork's
+   * source hold, which is released long before this background call: a
+   * Retry can refuse and stamp a source turn in between, and the stale
+   * rows/quarantine set would not show it. `false` abandons the summary.
+   */
+  beforeDispatch?: () => Promise<boolean>;
   /** Send-option experiments when available (edit path); omit for IPC ops without send options (fork). */
   experiments?: RlmExperimentFlags;
   /**
@@ -747,6 +766,7 @@ export async function maybeAppendAbandonedBranchSummary(
 
     const sessionUsageService = input.sessionUsageService;
     const summaryText = await generateAbandonedBranchSummaryText({
+      beforeDispatch: input.beforeDispatch,
       aiService: input.aiService,
       workspaceId: input.workspaceId,
       candidates,

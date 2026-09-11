@@ -8,6 +8,8 @@ import {
   extractLoadedSkillSnapshotsFromMessages,
   PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE,
   PROJECT_SKILL_TEXT_WITHHELD_MESSAGE,
+  PROJECT_SKILL_TURN_WITHHELD_MESSAGE,
+  withholdProjectSkillContentFromRequest,
   redactProjectSkillToolResults,
   rowCarriesProjectSkillContent,
 } from "./loadedSkillSnapshots";
@@ -395,6 +397,57 @@ describe("project skill content in persisted tool results", () => {
       expect(rowCarriesProjectSkillContent(redacted)).toBe(true);
     }
     expect(redactProjectSkillToolResults([clean])[0]).toBe(clean);
+  });
+
+  it("withholds the assistant rows of a project skill invocation's turn along with its snapshot", () => {
+    // A slash-skill snapshot is its own user row; the reply to that turn can
+    // quote it in prose, tool arguments or tool results. Dropping the snapshot
+    // alone would leave the copies, so the whole turn's assistant rows go.
+    const rows: MuxMessage[] = [
+      createSyntheticSkillSnapshotMessage({
+        id: "snap-project",
+        skillName: "repo-conventions",
+        body: "PROJECT BODY",
+      }),
+      createMuxMessage("u-invoke", "user", "Use skill repo-conventions", { timestamp: 1 }),
+      {
+        id: "a-reply",
+        role: "assistant",
+        parts: [
+          { type: "text", text: "Applying: PROJECT BODY" },
+          {
+            type: "dynamic-tool",
+            toolCallId: "edit-1",
+            toolName: "file_edit_replace_string",
+            state: "output-available",
+            input: { path: "x", new_string: "PROJECT BODY" },
+            output: { success: true },
+          },
+        ],
+      },
+      createMuxMessage("u-next", "user", "Now something else", { timestamp: 2 }),
+      createMuxMessage("a-next", "assistant", "Unrelated reply stays", { timestamp: 3 }),
+    ];
+    const withheld = withholdProjectSkillContentFromRequest(rows);
+    expect(withheld.map((row) => row.id)).toEqual(["u-invoke", "a-reply", "u-next", "a-next"]);
+    const serialized = JSON.stringify(withheld);
+    expect(serialized).not.toContain("PROJECT BODY");
+    expect(serialized).toContain(PROJECT_SKILL_TURN_WITHHELD_MESSAGE);
+    expect(withheld[3]).toBe(rows[4]);
+    // History rows are untouched; a global snapshot's turn is left alone.
+    expect(JSON.stringify(rows)).toContain("PROJECT BODY");
+    const globalTurn = withholdProjectSkillContentFromRequest([
+      createSyntheticSkillSnapshotMessage({
+        id: "snap-global",
+        skillName: "team-style",
+        body: "GLOBAL BODY",
+        scope: "global",
+      }),
+      createMuxMessage("u-global", "user", "Use skill team-style", { timestamp: 4 }),
+      createMuxMessage("a-global", "assistant", "Applying: GLOBAL BODY", { timestamp: 5 }),
+    ]);
+    expect(JSON.stringify(globalTurn)).toContain("Applying: GLOBAL BODY");
+    expect(globalTurn).toHaveLength(3);
   });
 
   function skillFileReadMessage(id: string, result: Record<string, unknown>): MuxMessage {

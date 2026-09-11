@@ -5,7 +5,11 @@ import assert from "@/common/utils/assert";
 import { MAX_POST_COMPACTION_LOADED_SKILLS } from "@/common/constants/attachments";
 import type { LoadedSkillSnapshot } from "@/common/types/attachment";
 import type { AgentSkillFrontmatter, AgentSkillScope } from "@/common/types/agentSkill";
-import type { ModelMessage, MuxMessage } from "@/common/types/message";
+import {
+  isTurnSnapshotPrefixRow,
+  type ModelMessage,
+  type MuxMessage,
+} from "@/common/types/message";
 import { AgentSkillPackageSchema, AgentSkillScopeSchema } from "@/common/orpc/schemas/agentSkill";
 import {
   extractAgentSkillBodyFromSnapshotText,
@@ -314,6 +318,57 @@ function outputIsStampedCodeExecution(output: unknown): boolean {
 export const COMPACTION_SUMMARY_WITHHELD_MESSAGE =
   "[Compaction summary withheld: it summarized project skill content and this " +
   "workspace's project is not trusted.]";
+
+/**
+ * Replaces an assistant row that replied to a project skill invocation, in a
+ * REQUEST copy for an untrusted workspace (history is untouched): the reply
+ * can quote the (dropped) snapshot in prose, tool arguments or tool results.
+ */
+export const PROJECT_SKILL_TURN_WITHHELD_MESSAGE =
+  "[Assistant turn withheld: it replied to a project skill invocation and this " +
+  "workspace's project is not trusted.]";
+
+/**
+ * Request-copy withholding for an UNTRUSTED workspace's routed request — every
+ * channel repository-controlled project skill content takes into a request:
+ *
+ * 1. project-scope skill snapshot rows are dropped;
+ * 2. the assistant rows of the turns those snapshots opened are withheld
+ *    whole — the model's reply can quote the snapshot in prose, tool
+ *    arguments or tool results, and a row's dynamic-tool parts hold call and
+ *    result together, so replacing the row keeps the pairing consistent;
+ * 3. tool results carrying project skills, tainted code executions and
+ *    provenance-stamped summaries are redacted (redactProjectSkillToolResults).
+ *
+ * Rows are copied, never mutated.
+ */
+export function withholdProjectSkillContentFromRequest(messages: MuxMessage[]): MuxMessage[] {
+  const kept: MuxMessage[] = [];
+  // A turn persists its snapshot prefix immediately before its user row, so a
+  // project snapshot marks the NEXT non-snapshot user row's turn.
+  let projectPrefixPending = false;
+  let inProjectTurn = false;
+  for (const message of messages) {
+    if (message.role === "user") {
+      if (message.metadata?.agentSkillSnapshot?.scope === "project") {
+        projectPrefixPending = true;
+        continue;
+      }
+      if (!isTurnSnapshotPrefixRow(message)) {
+        inProjectTurn = projectPrefixPending;
+        projectPrefixPending = false;
+      }
+      kept.push(message);
+      continue;
+    }
+    kept.push(
+      inProjectTurn
+        ? { ...message, parts: [{ type: "text", text: PROJECT_SKILL_TURN_WITHHELD_MESSAGE }] }
+        : message
+    );
+  }
+  return redactProjectSkillToolResults(kept);
+}
 
 /**
  * Replaces the prose of an assistant row whose project skill tool output was
