@@ -429,6 +429,9 @@ export class AgentStatusService {
       if (this.stopped) return;
       const result = await generateWorkspaceStatus(transcript, candidates, this.aiService, {
         streaming,
+        // The generator awaits model construction before its request; the
+        // same re-verification runs again on the far side of that await.
+        beforeDispatch: () => this.trailingRowsStillEligible(workspaceId, rowIds),
         recordUsage: async (modelString, usage, usageOptions) => {
           const recorded = await this.sessionUsageService?.recordHeadlessUsage(
             workspaceId,
@@ -449,6 +452,14 @@ export class AgentStatusService {
       // Re-check after the generator returns: the same hazard at a later
       // await boundary.
       if (this.stopped) return;
+      if (!result.success && result.error.staleTranscript === true) {
+        // Nothing was sent; the transcript changed under the generator. Not a
+        // provider failure and not settled: the next tick regenerates.
+        log.debug("AgentStatusService: transcript rows changed during model creation; skipping", {
+          workspaceId,
+        });
+        return;
+      }
       if (!result.success) {
         // Do not let provider-side misses freeze the sidebar until the next
         // chat turn. Models occasionally ignore propose_status or hit transient

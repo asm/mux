@@ -928,6 +928,33 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     await session.dispose();
   });
 
+  it("excludes a stamped assistant partial from the provider request", async () => {
+    // A refused turn's surviving partial committed as an assistant row (a fork
+    // commits the source's partial) and stamped provider-ineligible: its tool
+    // output can hold the refused project content, so the request must drop
+    // it like a stamped user row.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const { session, streamed, historyService } = await createRoutingHarness({ workspacePath });
+    const workspaceId = "ws-skill-routing";
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u-earlier", "user", "earlier prompt", { timestamp: 1 })
+    );
+    const stampedPartial = projectSkillReadRow("a-refused-partial", "REFUSED PARTIAL PROJECT BODY");
+    await historyService.appendToHistory(workspaceId, {
+      ...stampedPartial,
+      metadata: { ...stampedPartial.metadata, timestamp: 2, preStreamRejected: true },
+    });
+
+    const result = await session.sendMessage("next prompt", { model: USER_MODEL, agentId: "exec" });
+    expect(result.success).toBe(true);
+    expect(streamed).toHaveLength(1);
+    const request = streamed[0].messages;
+    expect(request.map((message) => message.id)).not.toContain("a-refused-partial");
+    expect(JSON.stringify(request)).not.toContain("REFUSED PARTIAL PROJECT BODY");
+    await session.dispose();
+  });
+
   it("keeps a durable repair key when the acceptance-time restamp fails", async () => {
     // The accepted send legitimately clears the abandon marker; if the repair
     // it ran first could only quarantine the rows in memory, a durable key

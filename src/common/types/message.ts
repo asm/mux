@@ -545,16 +545,17 @@ function isMcpPromptSnapshotBaseShape(
  * exists and still references the same prompt.
  */
 /**
- * Drop user rows persisted by pre-stream gate rejections from provider
- * requests. The transcript keeps showing them (they document what was
- * rejected and why), but the send never streamed: replaying the text would
- * duplicate the prompt once the user retries, and a PDF rejected for model
- * incompatibility would re-fail every later request it rides along in.
+ * Drop rows stamped by pre-stream gate rejections from provider requests. The
+ * transcript keeps showing them (they document what was rejected and why),
+ * but the send never streamed: replaying the text would duplicate the prompt
+ * once the user retries, and a PDF rejected for model incompatibility would
+ * re-fail every later request it rides along in. EVERY stamped row goes, not
+ * only user rows: a refused turn's surviving partial can be committed as an
+ * assistant row (a fork commits the source's partial, a repair stamps a
+ * promoted one) and its tool output can hold the refused project content.
  */
 export function filterPreStreamRejectedRows(messages: MuxMessage[]): MuxMessage[] {
-  return messages.filter(
-    (message) => !(message.role === "user" && message.metadata?.preStreamRejected === true)
-  );
+  return messages.filter((message) => message.metadata?.preStreamRejected !== true);
 }
 
 /**

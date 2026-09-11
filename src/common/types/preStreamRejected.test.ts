@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { collectRejectedTurnRowIds, createMuxMessage, excludeRejectedTurnRows } from "./message";
+import {
+  collectRejectedTurnRowIds,
+  createMuxMessage,
+  excludeRejectedTurnRows,
+  filterPreStreamRejectedRows,
+} from "./message";
 
 describe("collectRejectedTurnRowIds", () => {
   const rows = [
@@ -68,5 +73,28 @@ describe("excludeRejectedTurnRows", () => {
       "a-kept",
       "u-kept",
     ]);
+  });
+});
+
+describe("filterPreStreamRejectedRows", () => {
+  it("drops every stamped row, assistant partials included", () => {
+    // A refused turn's surviving partial can be committed as an assistant row
+    // (a fork commits the source's partial) and stamped there; its tool output
+    // can hold the refused project content, so the stamp must exclude it from
+    // requests regardless of role.
+    const rows = [
+      createMuxMessage("u-kept", "user", "kept prompt", { timestamp: 1 }),
+      createMuxMessage("a-stamped", "assistant", "refused partial output", {
+        timestamp: 2,
+        preStreamRejected: true,
+      }),
+      createMuxMessage("u-stamped", "user", "refused prompt", {
+        timestamp: 3,
+        preStreamRejected: true,
+      }),
+      createMuxMessage("a-kept", "assistant", "kept answer", { timestamp: 4 }),
+    ];
+    expect(filterPreStreamRejectedRows(rows).map((row) => row.id)).toEqual(["u-kept", "a-kept"]);
+    expect(excludeRejectedTurnRows(rows, []).map((row) => row.id)).toEqual(["u-kept", "a-kept"]);
   });
 });

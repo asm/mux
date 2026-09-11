@@ -459,6 +459,41 @@ describe("AgentStatusService", () => {
     }
   });
 
+  test("passes the row re-verification into the generator and drops a stale result unsettled", async () => {
+    // The generator awaits model construction before its request; a Retry can
+    // refuse and stamp a captured row during that await. The service hands the
+    // generator the same re-verification, and a stale outcome is neither
+    // persisted nor settled, so the next tick regenerates from current rows.
+    const history = historyHandle.historyService;
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please run the test suite")
+    );
+    generateSpy.mockImplementationOnce(async (_transcript, _candidates, _aiService, options) => {
+      // Model construction window: the captured row is refused and stamped.
+      const stamped = await history.markMessagesPreStreamRejected(workspaceId, ["u1"]);
+      if (!stamped.success) throw new Error(stamped.error);
+      expect(await options?.beforeDispatch?.()).toBe(false);
+      return Err({
+        error: { type: "unknown", raw: "stale" },
+        reachedProvider: false,
+        staleTranscript: true,
+      });
+    });
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    expect(setSidebarStatusMock).not.toHaveBeenCalled();
+
+    // Not settled: a later tick regenerates, now without the stamped row.
+    await history.appendToHistory(workspaceId, createMuxMessage("u2", "user", "Try again"));
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(2);
+    expect(generateSpy.mock.calls[1][0]).not.toContain("Please run the test suite");
+    expect(generateSpy.mock.calls[1][0]).toContain("User: Try again");
+  });
+
   test("drops a trailing snapshot prefix whose user row has not landed yet", async () => {
     // PREPARING persists the snapshot prefix before the user row; a tick in
     // between must not read the prefix as settled history.
