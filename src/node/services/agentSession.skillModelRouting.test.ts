@@ -2490,6 +2490,42 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     await session.dispose();
   });
 
+  it("refuses a heartbeat reset while the durable repair record is malformed", async () => {
+    // A malformed record is an UNKNOWN quarantine: it yields no keys for the
+    // compaction handler's filter, so a reset could cache a refused turn's
+    // project snapshot in the carried-over state and seal its rows behind the
+    // boundary. Like request builds, the reset fails closed until the record
+    // is removed.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const probe = await createRoutingHarness({ workspacePath });
+    const preferencePath = (
+      probe.session as unknown as { getAutoRetryPreferencePath(): string }
+    ).getAutoRetryPreferencePath();
+    await probe.session.dispose();
+    try {
+      await fs.mkdir(path.dirname(preferencePath), { recursive: true });
+      await fs.writeFile(
+        preferencePath,
+        JSON.stringify({ pendingRejectedTurnRepair: { userMessageIds: 42 } }) + "\n"
+      );
+      const { session, historyService } = await createRoutingHarness({ workspacePath });
+      await appendRoutedTurnRows(historyService, "ws-skill-routing");
+      const result = await session.appendHeartbeatContextResetBoundary({
+        boundaryText: "Heartbeat context reset",
+        pendingFollowUp: { text: "Continue", model: USER_MODEL, agentId: "exec" },
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/record of refused turns/);
+      // No boundary landed.
+      const history = await historyService.getHistoryFromLatestBoundary("ws-skill-routing");
+      if (!history.success) throw new Error(history.error);
+      expect(history.data.some((row) => row.metadata?.compactionBoundary === true)).toBe(false);
+      await session.dispose();
+    } finally {
+      await fs.rm(preferencePath, { force: true });
+    }
+  });
+
   it("repairs a refused turn before a heartbeat reset seals it behind a boundary", async () => {
     // A restart can run the heartbeat reset before startup recovery repaired a
     // refused turn whose stamp failed. The rows must be stamped BEFORE the

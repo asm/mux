@@ -11456,6 +11456,42 @@ describe("WorkspaceService pending auto-title", () => {
     expect(autoTitleSpy).toHaveBeenCalledWith(workspaceId, "Continue with auth hardening");
   });
 
+  test("sendMessage leaves the pending auto-title untouched for a turn accepted without a stream", async () => {
+    // A late consent refusal is reported as accepted without a stream: the
+    // refused turn's text was withheld from the provider and must not reach
+    // the title model either. The claim is released so the next streaming
+    // turn still titles the fork.
+    const autoTitleSpy = spyOn(
+      workspaceService as unknown as {
+        maybeRunPendingAutoTitleFromMessage: (
+          workspaceId: string,
+          message: string
+        ) => Promise<void>;
+      },
+      "maybeRunPendingAutoTitleFromMessage"
+    ).mockResolvedValue(undefined);
+    fakeSession.sendMessage.mockResolvedValueOnce(Ok({ acceptedWithoutStream: true }));
+
+    const refused = await workspaceService.sendMessage(workspaceId, "/done secret arguments", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+    expect(refused.success).toBe(true);
+    expect(autoTitleSpy).not.toHaveBeenCalled();
+
+    const streamed = await workspaceService.sendMessage(
+      workspaceId,
+      "Continue with auth hardening",
+      {
+        model: "openai:gpt-4o-mini",
+        agentId: "exec",
+      }
+    );
+    expect(streamed.success).toBe(true);
+    expect(autoTitleSpy).toHaveBeenCalledTimes(1);
+    expect(autoTitleSpy).toHaveBeenCalledWith(workspaceId, "Continue with auth hardening");
+  });
+
   test("concurrent sends only claim one pending auto-title generation", async () => {
     const releaseSend = createDeferred<Result<void, SendMessageError>>();
     fakeSession.sendMessage.mockImplementation(() => releaseSend.promise);

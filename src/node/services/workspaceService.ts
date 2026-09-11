@@ -11865,6 +11865,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return result;
       }
 
+      if (claimedAutoTitle && result.data?.acceptedWithoutStream === true) {
+        // A late consent refusal recorded as a transcript row: nothing
+        // streamed, and the refused text must not reach the title model
+        // either. Release the claim; the pending auto-title stays armed for
+        // the next turn that actually streams.
+        this.autoTitlingWorkspaces.delete(workspaceId);
+        claimedAutoTitle = false;
+      }
+
       if (claimedAutoTitle) {
         const autoTitlePromise = this.maybeRunPendingAutoTitleFromMessage(workspaceId, message);
         autoTitlePromise

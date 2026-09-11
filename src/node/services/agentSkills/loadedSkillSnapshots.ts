@@ -300,6 +300,14 @@ export const COMPACTION_SUMMARY_WITHHELD_MESSAGE =
   "[Compaction summary withheld: it summarized project skill content and this " +
   "workspace's project is not trusted.]";
 
+/**
+ * Replaces the prose of an assistant row whose project skill tool output was
+ * withheld, in a REQUEST copy (history is untouched): the text may quote it.
+ */
+export const PROJECT_SKILL_TEXT_WITHHELD_MESSAGE =
+  "[Assistant text withheld: it followed a project skill read and this workspace's " +
+  "project is not trusted.]";
+
 /** Replaces a withheld project skill's tool output in a REQUEST copy (history is untouched). */
 export const PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE =
   "Project skill content withheld: Project Trust is not granted for this workspace.";
@@ -384,7 +392,7 @@ export function redactProjectSkillToolResults(messages: MuxMessage[]): MuxMessag
     if (message.metadata?.carriesProjectSkillContent === true) {
       return {
         ...message,
-        parts: [{ type: "text", text: COMPACTION_SUMMARY_WITHHELD_MESSAGE, state: "done" }],
+        parts: [{ type: "text", text: COMPACTION_SUMMARY_WITHHELD_MESSAGE }],
       };
     }
     let changed = false;
@@ -409,7 +417,19 @@ export function redactProjectSkillToolResults(messages: MuxMessage[]): MuxMessag
       }
       return part;
     });
-    return changed ? { ...message, parts } : message;
+    if (!changed) return message;
+    // The stream persists a tool result and the prose that follows it in ONE
+    // assistant row, and that prose can be the model's copy of the withheld
+    // output. A tainted row therefore loses its text (and reasoning) as well;
+    // the tool parts keep the call/result pairing.
+    return {
+      ...message,
+      parts: parts
+        .filter((part) => part.type !== "reasoning")
+        .map((part) =>
+          part.type === "text" ? { ...part, text: PROJECT_SKILL_TEXT_WITHHELD_MESSAGE } : part
+        ),
+    };
   });
 }
 

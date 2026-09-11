@@ -13527,6 +13527,14 @@ export class AgentSession {
     if (this.coordinator.disposed || this.coordinator.closing) {
       return Err("Cannot reset heartbeat context while the session is closing.");
     }
+    // FAIL CLOSED like request builds: a malformed record yields no keys for
+    // the handler's quarantine filter, so the reset could cache a refused
+    // turn's project snapshot in the carried-over state and seal its rows
+    // behind the boundary — content a later follow-up would replay once the
+    // record is removed.
+    if (this.corruptRejectedTurnRecord !== null) {
+      return Err(rejectedTurnRecordCorruptMessage(this.getAutoRetryPreferencePath()));
+    }
 
     const result = await this.compactionHandler.appendHeartbeatContextResetBoundary({
       boundaryText: params.boundaryText,

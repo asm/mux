@@ -7,6 +7,7 @@ import {
   COMPACTION_SUMMARY_WITHHELD_MESSAGE,
   extractLoadedSkillSnapshotsFromMessages,
   PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE,
+  PROJECT_SKILL_TEXT_WITHHELD_MESSAGE,
   redactProjectSkillToolResults,
   rowCarriesProjectSkillContent,
 } from "./loadedSkillSnapshots";
@@ -305,6 +306,32 @@ describe("project skill content in persisted tool results", () => {
     expect(JSON.stringify(redacted)).toContain(COMPACTION_SUMMARY_WITHHELD_MESSAGE);
     expect(redacted.metadata).toEqual(stamped.metadata);
     expect(untouched).toBe(plain);
+  });
+
+  it("withholds the prose of a row whose project skill output was withheld", () => {
+    // The stream persists the tool result and the prose that follows it in one
+    // assistant row, and the prose can be the model's copy of the output.
+    const tainted = createAgentSkillReadToolMessage({
+      id: "tainted",
+      skillName: "repo-conventions",
+      body: "PROJECT BODY",
+    });
+    tainted.parts = [
+      { type: "reasoning", text: "I will quote the PROJECT BODY" },
+      ...tainted.parts,
+      { type: "text", text: "Here it is verbatim: PROJECT BODY" },
+    ];
+    const clean = createMuxMessage("clean", "assistant", "Unrelated prose stays", {
+      timestamp: 2,
+    });
+    const [redacted, untouched] = redactProjectSkillToolResults([tainted, clean]);
+    const serialized = JSON.stringify(redacted);
+    expect(serialized).not.toContain("PROJECT BODY");
+    expect(serialized).toContain(PROJECT_SKILL_TEXT_WITHHELD_MESSAGE);
+    expect(redacted.parts.some((part) => part.type === "reasoning")).toBe(false);
+    // The tool call/result pairing the provider requires survives.
+    expect(redacted.parts.some((part) => part.type === "dynamic-tool")).toBe(true);
+    expect(untouched).toBe(clean);
   });
 
   function skillFileReadMessage(id: string, result: Record<string, unknown>): MuxMessage {
