@@ -54,6 +54,7 @@ import {
   mergeLoadedSkillSnapshots,
   type PersistedLoadedSkillSnapshotInput,
   extractLoadedSkillSnapshotsFromMessages,
+  rowCarriesProjectSkillContent,
 } from "@/node/services/agentSkills/loadedSkillSnapshots";
 
 /**
@@ -900,6 +901,11 @@ export class CompactionHandler {
         synthetic: true,
         uiVisible: true,
         compacted: "heartbeat",
+        // Provenance of the rows this boundary replaces (see
+        // MuxMessageMetadata.carriesProjectSkillContent).
+        ...(messages.some(rowCarriesProjectSkillContent)
+          ? { carriesProjectSkillContent: true as const }
+          : {}),
         compactionEpoch: nextCompactionEpoch,
         compactionBoundary: true,
         muxMetadata: {
@@ -1291,6 +1297,11 @@ export class CompactionHandler {
       {
         timestamp: Date.now(),
         compacted: "user",
+        // Provenance of the rows this boundary replaces (see
+        // MuxMessageMetadata.carriesProjectSkillContent).
+        ...(params.messages.some(rowCarriesProjectSkillContent)
+          ? { carriesProjectSkillContent: true as const }
+          : {}),
         compactionBoundary: true,
         compactionEpoch: getNextCompactionEpoch(params.messages),
         model: params.model,
@@ -1489,6 +1500,13 @@ export class CompactionHandler {
         // compaction cache/context token displays.
         timestamp,
         compacted: isIdleCompaction ? "idle" : "user",
+        // Provenance of the rows this summary replaces (see
+        // MuxMessageMetadata.carriesProjectSkillContent): the summary text may
+        // quote a project skill a summarized turn loaded, and the consent scan
+        // recognizes only tagged rows.
+        ...(messages.some(rowCarriesProjectSkillContent)
+          ? { carriesProjectSkillContent: true as const }
+          : {}),
         compactionEpoch: nextCompactionEpoch,
         compactionBoundary: true,
         model: metadata.model,

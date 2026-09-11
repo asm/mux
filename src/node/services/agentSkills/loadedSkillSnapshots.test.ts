@@ -4,6 +4,7 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
 
 import {
+  COMPACTION_SUMMARY_WITHHELD_MESSAGE,
   extractLoadedSkillSnapshotsFromMessages,
   PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE,
   redactProjectSkillToolResults,
@@ -282,6 +283,28 @@ describe("project skill content in persisted tool results", () => {
     const [redactedDirect] = redactProjectSkillToolResults([direct]);
     expect(JSON.stringify(redactedDirect)).not.toContain("Direct body");
     expect(rowCarriesProjectSkillContent(redactedDirect)).toBe(false);
+  });
+
+  it("treats a provenance-stamped compaction summary as project content and withholds its text", () => {
+    // The summary is ordinary assistant text that may quote a project skill a
+    // summarized turn loaded; only the stamp identifies it. The request copy
+    // withholds the text but keeps the row — it marks the context boundary.
+    const stamped = createMuxMessage("summary", "assistant", "Summary quoting the PROJECT BODY", {
+      compacted: "user",
+      compactionBoundary: true,
+      carriesProjectSkillContent: true,
+    });
+    const plain = createMuxMessage("summary-plain", "assistant", "Summary of ordinary chat", {
+      compacted: "user",
+      compactionBoundary: true,
+    });
+    expect(rowCarriesProjectSkillContent(stamped)).toBe(true);
+    expect(rowCarriesProjectSkillContent(plain)).toBe(false);
+    const [redacted, untouched] = redactProjectSkillToolResults([stamped, plain]);
+    expect(JSON.stringify(redacted)).not.toContain("PROJECT BODY");
+    expect(JSON.stringify(redacted)).toContain(COMPACTION_SUMMARY_WITHHELD_MESSAGE);
+    expect(redacted.metadata).toEqual(stamped.metadata);
+    expect(untouched).toBe(plain);
   });
 
   function skillFileReadMessage(id: string, result: Record<string, unknown>): MuxMessage {

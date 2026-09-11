@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useOptionalAPI } from "@/browser/contexts/API";
+import { getErrorMessage } from "@/common/utils/errors";
 
 export interface ModelClassesState {
   /** Class name → model value in one-shot syntax ("haiku+0"). */
@@ -18,6 +19,13 @@ export interface ModelClassesState {
    * value and overwrite the first edit.
    */
   pendingWrites: Record<string, number>;
+  /**
+   * The backend's message for the most recent write that failed (config.json
+   * read-only or full, the RPC rejecting). The map reverts to backend truth on
+   * the failure's refetch, so without this the selection would silently snap
+   * back; consumers must show it. Cleared when the next write is attempted.
+   */
+  writeError: string | null;
   // Arrow-function property type so consumers can destructure without
   // tripping @typescript-eslint/unbound-method.
   /** Set (or clear, with null/empty) one class's model value. */
@@ -36,6 +44,7 @@ export function useModelClasses(): ModelClassesState {
   const api = useOptionalAPI()?.api ?? null;
   const [modelClasses, setMap] = useState<Record<string, string>>({});
   const [loaded, setLoaded] = useState(false);
+  const [writeError, setWriteError] = useState<string | null>(null);
   // Ignore stale config fetches so backend refreshes can't overwrite newer optimistic edits.
   const fetchVersionRef = useRef(0);
   // Bumped whenever the API client changes: write acknowledgements (and their
@@ -223,6 +232,7 @@ export function useModelClasses(): ModelClassesState {
 
     const trimmed = value?.trim() ?? "";
     setPendingWrites((current) => ({ ...current, [key]: (current[key] ?? 0) + 1 }));
+    setWriteError(null);
 
     // Await whichever fetch currently owns the latest version, not just the
     // one this chain started: a peer notification can supersede our refetch
@@ -288,7 +298,7 @@ export function useModelClasses(): ModelClassesState {
         await refetchRef.current();
         await awaitLatestFetch();
       })
-      .catch(async () => {
+      .catch(async (error: unknown) => {
         // If the write fails, re-fetch so the UI reverts to the backend's
         // actual value rather than displaying a class routing never applies.
         // A stale-generation failure is not ours to handle: refetchRef already
@@ -300,6 +310,9 @@ export function useModelClasses(): ModelClassesState {
         if (clientGenerationRef.current !== writeGeneration) {
           return;
         }
+        // The revert alone would look like the selection silently snapping
+        // back; surface the backend's actionable message with it.
+        setWriteError(getErrorMessage(error));
         await refetchRef.current();
         await awaitLatestFetch();
       })
@@ -324,6 +337,7 @@ export function useModelClasses(): ModelClassesState {
     modelClasses,
     loaded,
     pendingWrites,
+    writeError,
     setModelClass,
   };
 }

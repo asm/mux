@@ -410,6 +410,55 @@ describe("AgentStatusService", () => {
     expect(settled).toContain("Assistant: Applied the routed skill");
   });
 
+  test("correlates the partial with the history read instead of an older snapshot", async () => {
+    // A routed turn can persist its rows and start streaming between the
+    // history read and the partial read. Its in-flight text then belongs to
+    // a turn the transcript never verified; the partial is read first and
+    // attached only to the latest user row of the history read that follows.
+    const history = historyHandle.historyService;
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please run the test suite")
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("a1", "assistant", "Running tests now")
+    );
+    const readPartial = history.readPartial.bind(history);
+    const partialSpy = spyOn(history, "readPartial").mockImplementation(async (id: string) => {
+      // The new routed turn lands (rows, then its partial) around this read.
+      await history.appendToHistory(
+        id,
+        createMuxMessage("snap-late", "user", "LATE ROUTED SKILL BODY", {
+          synthetic: true,
+          agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "l" },
+        })
+      );
+      await history.appendToHistory(
+        id,
+        createMuxMessage("u-late", "user", "LATE ROUTED PROMPT", {
+          retrySendOptions: {
+            model: "anthropic:claude-haiku-4-5",
+            agentId: "exec",
+            routedProjectConsent: true,
+          },
+        })
+      );
+      await history.writePartial(id, createMuxMessage("a-late", "assistant", "LATE ROUTED OUTPUT"));
+      partialSpy.mockRestore();
+      return readPartial(id);
+    });
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const prompt = generateSpy.mock.calls[0][0];
+    expect(prompt).toContain("User: Please run the test suite");
+    for (const withheld of ["LATE ROUTED SKILL BODY", "LATE ROUTED PROMPT", "LATE ROUTED OUTPUT"]) {
+      expect(prompt).not.toContain(withheld);
+    }
+  });
+
   test("drops a trailing snapshot prefix whose user row has not landed yet", async () => {
     // PREPARING persists the snapshot prefix before the user row; a tick in
     // between must not read the prefix as settled history.

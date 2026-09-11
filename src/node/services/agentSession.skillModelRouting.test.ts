@@ -17,7 +17,10 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
 import type { ResolvedAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
-import { PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE } from "@/node/services/agentSkills/loadedSkillSnapshots";
+import {
+  COMPACTION_SUMMARY_WITHHELD_MESSAGE,
+  PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE,
+} from "@/node/services/agentSkills/loadedSkillSnapshots";
 import type { HistoryService } from "@/node/services/historyService";
 import {
   createUnknownSendMessageError,
@@ -2013,6 +2016,49 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
         )
       )
     ).toBe(true);
+    // Nothing project-scoped was kept, so the gate has nothing to guard.
+    expect(await streamed[0].preDispatchConsentGate?.()).toBeNull();
+    await session.dispose();
+  });
+
+  it("withholds a compaction summary carrying project-skill provenance from a routed request in an untrusted project", async () => {
+    // A summary is ordinary assistant text that may quote the project skill a
+    // summarized turn loaded. The scan recognizes it by its provenance stamp,
+    // and the untrusted request copy withholds its text while keeping the row
+    // that marks the context boundary.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const { session, streamed } = await sendRoutedGlobalSkillWithPendingState(
+      {
+        workspacePath,
+        projectTrusted: false,
+        configValues: { modelClasses: { small: "haiku+0" }, skillModelClasses: { done: "small" } },
+      },
+      {
+        seedHistory: async (historyService) => {
+          await historyService.appendToHistory(
+            "ws-skill-routing",
+            createMuxMessage(
+              "summary-stamped",
+              "assistant",
+              "SUMMARY QUOTING THE PROJECT SKILL BODY",
+              {
+                timestamp: Date.now(),
+                compacted: "user",
+                compactionBoundary: true,
+                compactionEpoch: 1,
+                carriesProjectSkillContent: true,
+                muxMetadata: { type: "compaction-summary" },
+              }
+            )
+          );
+        },
+        loadedSkills: [],
+      }
+    );
+
+    const request = JSON.stringify(streamed[0].messages);
+    expect(request).not.toContain("SUMMARY QUOTING THE PROJECT SKILL BODY");
+    expect(request).toContain(COMPACTION_SUMMARY_WITHHELD_MESSAGE);
     // Nothing project-scoped was kept, so the gate has nothing to guard.
     expect(await streamed[0].preDispatchConsentGate?.()).toBeNull();
     await session.dispose();

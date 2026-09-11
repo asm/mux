@@ -262,6 +262,11 @@ export function rowCarriesProjectSkillContent(message: MuxMessage): boolean {
   if (message.metadata?.agentSkillSnapshot?.scope === "project") {
     return true;
   }
+  // A compaction summary stamped with the provenance of the rows it replaced:
+  // its text may quote a project skill the summarized turns loaded.
+  if (message.metadata?.carriesProjectSkillContent === true) {
+    return true;
+  }
   return message.parts.some((part) => {
     if (part.type !== "dynamic-tool" || part.state !== "output-available") return false;
     return toolOutputCarriesProjectSkillContent(part.toolName, part.output);
@@ -286,6 +291,14 @@ function toolOutputCarriesProjectSkillContent(toolName: unknown, output: unknown
   }
   return false;
 }
+
+/**
+ * Replaces the text of a compaction summary that summarized project skill
+ * content, in a REQUEST copy for an untrusted workspace (history is untouched).
+ */
+export const COMPACTION_SUMMARY_WITHHELD_MESSAGE =
+  "[Compaction summary withheld: it summarized project skill content and this " +
+  "workspace's project is not trusted.]";
 
 /** Replaces a withheld project skill's tool output in a REQUEST copy (history is untouched). */
 export const PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE =
@@ -364,6 +377,16 @@ function redactCodeExecutionOutput(output: unknown): { output: unknown; changed:
  */
 export function redactProjectSkillToolResults(messages: MuxMessage[]): MuxMessage[] {
   return messages.map((message) => {
+    // A provenance-stamped compaction summary (see
+    // MuxMessageMetadata.carriesProjectSkillContent) is plain assistant text
+    // with no structure to redact around: its text is withheld whole, the row
+    // (and the context boundary it marks) kept.
+    if (message.metadata?.carriesProjectSkillContent === true) {
+      return {
+        ...message,
+        parts: [{ type: "text", text: COMPACTION_SUMMARY_WITHHELD_MESSAGE, state: "done" }],
+      };
+    }
     let changed = false;
     const parts = message.parts.map((part) => {
       if (part.type !== "dynamic-tool" || part.state !== "output-available") return part;

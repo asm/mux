@@ -20,6 +20,7 @@ import {
   collectRejectedTurnRowIds,
   excludeRejectedTurnRows,
   findUnansweredRoutedTurnRow,
+  isCommittedAssistantReply,
   isTurnSnapshotPrefixRow,
   type MuxMessage,
 } from "@/common/types/message";
@@ -596,13 +597,19 @@ export class AgentStatusService {
   private async buildTrailingTranscript(
     workspaceId: string
   ): Promise<{ transcript: string; rowIds: string[] } | null> {
+    // The partial is read BEFORE the committed rows: a partial can only belong
+    // to a turn whose user row is already persisted (the row lands before its
+    // stream starts), so the history read below always contains the partial's
+    // turn, and correlating the partial with the LATEST user row of that read
+    // cannot attach a newer turn's in-flight text to an older turn whose rows
+    // are the only ones verified.
+    const partial = await this.historyService.readPartial(workspaceId);
     const result = await this.historyService.getLastMessages(
       workspaceId,
       AGENT_STATUS_MAX_TRAILING_MESSAGES
     );
     if (!result.success) return { transcript: "", rowIds: [] };
 
-    const partial = await this.historyService.readPartial(workspaceId);
     const quarantine = await this.workspaceService.getQuarantinedRejectedRowIds(workspaceId);
     if (!quarantine.success) {
       log.warn("AgentStatusService: rejected-turn quarantine unreadable; skipping status", {
@@ -618,14 +625,18 @@ export class AgentStatusService {
     while (committedMessages.length > 0 && isTurnSnapshotPrefixRow(committedMessages.at(-1)!)) {
       committedMessages = committedMessages.slice(0, -1);
     }
-    // The partial is the in-flight reply to the latest user turn; a refused
-    // turn's surviving output (its deletion failed) goes with that turn.
+    // The partial is the in-flight reply to the latest user turn: the latest
+    // user row of the read, still eligible after the filters above, with no
+    // committed reply yet. Anything else — a refused turn's surviving output
+    // whose row was filtered, a partial without a turn, a stale partial of a
+    // turn that already has its reply — is dropped.
     const latestUserIndex = committedMessages.findLastIndex((m) => m.role === "user");
     const latestUserRow = latestUserIndex >= 0 ? committedMessages[latestUserIndex] : undefined;
     let eligiblePartial =
       partial != null &&
-      (latestUserRow === undefined ||
-        result.data.findLast((m) => m.role === "user") === latestUserRow)
+      latestUserRow !== undefined &&
+      result.data.findLast((m) => m.role === "user") === latestUserRow &&
+      !committedMessages.slice(latestUserIndex + 1).some(isCommittedAssistantReply)
         ? partial
         : null;
     // A routed turn without a committed reply can still be refused and

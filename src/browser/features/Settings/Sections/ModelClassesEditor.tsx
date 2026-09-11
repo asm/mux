@@ -50,7 +50,13 @@ const THINKING_DEFAULT_OPTION = "default";
  * here.
  */
 export function ModelClassesEditor() {
-  const { modelClasses, loaded: classesLoaded, pendingWrites, setModelClass } = useModelClasses();
+  const {
+    modelClasses,
+    loaded: classesLoaded,
+    pendingWrites,
+    writeError,
+    setModelClass,
+  } = useModelClasses();
   const { models } = useModelsFromSettings();
   const { config: providersConfig } = useProvidersConfig();
   const routing = useRouting();
@@ -228,6 +234,14 @@ export function ModelClassesEditor() {
       </p>
 
       <div className="space-y-1.5">{canonicalNames.map((name) => renderClassRow(name))}</div>
+
+      {writeError != null && (
+        // A failed write reverts the selection to the backend's value; without
+        // this the change would appear to snap back for no reason.
+        <p role="alert" className="text-error text-xs break-words">
+          Could not save the model class: {writeError}
+        </p>
+      )}
 
       {customEntries.length > 0 && (
         // break-all: hand-edited values can be long unbroken model ids that

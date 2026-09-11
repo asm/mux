@@ -162,6 +162,33 @@ describe("ModelClassesEditor", () => {
     expect(queryByLabelText("Clear model class small")).toBeNull();
   });
 
+  test("a failed write surfaces the backend's error and the selection reverts", async () => {
+    // config.json read-only or full, or the RPC rejecting: the selection snaps
+    // back on the failure's refetch, and the user must be told the change was
+    // not saved rather than watching it revert silently.
+    apiMock = createApiMock({ small: "anthropic:claude-haiku-4-5+0" });
+    let failWrites = true;
+    apiMock.config.updateModelClass = mock(() =>
+      failWrites
+        ? Promise.reject(new Error("EROFS: read-only file system"))
+        : Promise.resolve(undefined)
+    );
+    const { getByLabelText, getByRole, queryByLabelText, queryByRole } = render(
+      <ModelClassesEditor />
+    );
+
+    await waitFor(() => expect(queryByLabelText("Clear model class small")).not.toBeNull());
+    fireEvent.click(getByLabelText("Clear model class small"));
+    await waitFor(() => expect(getByRole("alert").textContent).toContain("read-only file system"));
+    // Reverted to the backend's value: the class is still configured.
+    expect(queryByLabelText("Clear model class small")).not.toBeNull();
+
+    // The next write attempt clears the stale error.
+    failWrites = false;
+    fireEvent.click(getByLabelText("Clear model class small"));
+    await waitFor(() => expect(queryByRole("alert")).toBeNull());
+  });
+
   test("a fetch resolving after the subscription dies cannot enable editing", async () => {
     // Transport death race: the subscription ends (without abort-driven
     // cleanup) while the post-subscribe getConfig is still pending. Letting

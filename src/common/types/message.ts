@@ -1251,6 +1251,16 @@ export interface MuxMetadata {
   // Readers should use helper: isCompacted = compacted !== undefined && compacted !== false
   compacted?: "user" | "idle" | "heartbeat" | boolean;
   /**
+   * Provenance stamp on a compaction summary — any form: user/idle summary,
+   * continuous boundary, heartbeat reset boundary — whose summarized rows
+   * carried repository-controlled PROJECT skill content. The summary is
+   * ordinary assistant text that may quote that content, so it inherits the
+   * consent obligation of the rows it replaced: the routed-request scan
+   * treats it like a project snapshot row, and an untrusted workspace's
+   * request copy withholds its text. Sticky across chained compactions.
+   */
+  carriesProjectSkillContent?: true;
+  /**
    * Monotonic compaction epoch identifier.
    *
    * Legacy histories may omit this; compaction code backfills by counting historical compacted summaries.

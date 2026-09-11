@@ -2460,6 +2460,35 @@ describe("RefineService", () => {
     }
   });
 
+  it("caps timeline events at the snapshot instant", async () => {
+    // The exclusion is released after the snapshot; a turn admitted then can
+    // emit its `turn.user` digest before the timeline read, and if it is later
+    // refused, the prefix verification cannot see the event. Events stamped
+    // after the snapshot contribute nothing.
+    const prompts: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
+      timelineEvents: [
+        { kind: "milestone", description: "shipped the fix", ts: 1_700_000_000_000 },
+        {
+          kind: "turn.user",
+          description: "LATE ROUTED PROMPT (digest)",
+          ts: Date.now() + 60_000,
+        },
+      ],
+      enabledExperiments: [
+        EXPERIMENT_IDS.RLM,
+        EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
+        EXPERIMENT_IDS.TIMELINE,
+      ],
+    });
+    await fixture.seedTrajectory();
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    const prompt = prompts.at(-1) ?? "";
+    expect(prompt).toContain("shipped the fix");
+    expect(prompt).not.toContain("LATE ROUTED PROMPT");
+  });
+
   it("confines the refine input to the active context segment (r37)", async () => {
     // SECURITY: after /clear --soft, pre-reset rows are discarded context —
     // a pre-reset prompt injection must not steer a staged proposal that is
@@ -2470,8 +2499,10 @@ describe("RefineService", () => {
     using fixture = await createFixture({
       modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
       timelineEvents: [
+        // Event timestamps predate the snapshot instant (the timeline is capped
+        // there); the post-reset one lies between the boundary and the snapshot.
         { kind: "milestone", description: "pre-reset timeline lore", ts: now - 60_000 },
-        { kind: "milestone", description: "post-reset timeline note", ts: now + 60_000 },
+        { kind: "milestone", description: "post-reset timeline note", ts: now - 500 },
       ],
       enabledExperiments: [
         EXPERIMENT_IDS.RLM,
@@ -2483,7 +2514,7 @@ describe("RefineService", () => {
     await fixture.historyService.appendToHistory(
       WORKSPACE_ID,
       createMuxMessage("reset-boundary-1", "assistant", "", {
-        timestamp: now,
+        timestamp: now - 1000,
         contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
       })
     );
@@ -2780,8 +2811,9 @@ describe("RefineService", () => {
     const prompts: string[] = [];
     const now = Date.now();
     const timelineEvents = [
-      { kind: "milestone", description: "same-millisecond pre-reset digest", ts: now },
-      { kind: "milestone", description: "recent post-reset digest", ts: now + 60_000 },
+      // Event timestamps predate the snapshot instant (the timeline is capped there).
+      { kind: "milestone", description: "same-millisecond pre-reset digest", ts: now - 1000 },
+      { kind: "milestone", description: "recent post-reset digest", ts: now - 500 },
     ];
     const experiments = [
       EXPERIMENT_IDS.RLM,
@@ -2828,7 +2860,7 @@ describe("RefineService", () => {
       await fixture.historyService.appendToHistory(
         WORKSPACE_ID,
         createMuxMessage("reset-same-ms", "assistant", "", {
-          timestamp: now,
+          timestamp: now - 1000,
           contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
         })
       );

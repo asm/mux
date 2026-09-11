@@ -946,7 +946,8 @@ export class RefineService {
     }
     const snapshot = await this.snapshotActiveSegment(workspaceId, snapshotExclusion.data);
     if (!snapshot.success) return snapshot;
-    const { messages, activeSegment, rejectedRowsPresent, snapshotRowFingerprints } = snapshot.data;
+    const { messages, activeSegment, takenAt, rejectedRowsPresent, snapshotRowFingerprints } =
+      snapshot.data;
     // Reuse the branch-summary transcript builder: role-labeled,
     // thinking-stripped, char-bounded — exactly the evidence shape a
     // distillation pass needs. The tail cap preserves the prior bound on
@@ -977,11 +978,14 @@ export class RefineService {
     // Timeline events are selected by timestamp alone, and a `turn.user` event
     // carries the prompt's digest recorded before its row was refused. While
     // the segment holds a rejected (stamped or quarantined) turn, the timeline
-    // is omitted entirely (fail closed) rather than correlated event by event.
+    // is omitted entirely (fail closed) rather than correlated event by event;
+    // and it is capped at the snapshot instant, so a turn that starts after
+    // the exclusion is released (and may still be refused) contributes nothing
+    // even though the prefix verification cannot see its event.
     const timelineText =
       rejectedRowsPresent || (boundaryRow !== undefined && !boundaryTsUsable)
         ? undefined
-        : await this.buildTimelineText(workspaceId, timelineSinceTs);
+        : await this.buildTimelineText(workspaceId, timelineSinceTs, takenAt);
 
     // Model: reuse the dream-agent inherit cascade — refine is the same class
     // of background self-maintenance agent, so a per-workspace dream override
@@ -1509,7 +1513,8 @@ export class RefineService {
   /** Timeline digest when the Timeline experiment is on; undefined otherwise. */
   private async buildTimelineText(
     workspaceId: string,
-    sinceTs?: number
+    sinceTs: number | undefined,
+    untilTs: number
   ): Promise<string | undefined> {
     if (!this.experiments.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE)) return undefined;
     if (this.options.timelineService === undefined) return undefined;
@@ -1522,8 +1527,12 @@ export class RefineService {
       // after: timestamps are millisecond-resolution, so a pre-reset event
       // sharing the boundary's millisecond must be dropped (excluding a
       // legitimate same-millisecond post-reset event is the safe direction).
-      const events =
-        sinceTs === undefined ? page.events : page.events.filter((event) => event.ts > sinceTs);
+      // The upper bound is the snapshot instant, STRICTLY before for the same
+      // reason: a turn admitted right after the exclusion was released can
+      // emit within the snapshot's millisecond.
+      const events = page.events.filter(
+        (event) => (sinceTs === undefined || event.ts > sinceTs) && event.ts < untilTs
+      );
       if (events.length === 0) return undefined;
       // list() returns newest-first; present oldest-first for the model.
       return [...events]
@@ -1590,6 +1599,7 @@ export class RefineService {
       {
         messages: MuxMessage[];
         activeSegment: MuxMessage[];
+        takenAt: number;
         rejectedRowsPresent: boolean;
         snapshotRowFingerprints: string[];
       },
@@ -1609,11 +1619,15 @@ export class RefineService {
           "run /refine again once the workspace has been opened"
       );
     }
+    // Captured under the exclusion: no turn is preparing or streaming, so
+    // every timeline event a later turn emits is stamped after this instant.
+    const takenAt = Date.now();
     const segment = sliceMessagesForProviderFromLatestContextBoundary(messagesResult.data);
     const activeSegment = excludeRejectedTurnRows(segment, quarantine.data);
     return Ok({
       messages: messagesResult.data,
       activeSegment,
+      takenAt,
       // The timeline input is selected by time alone, so the caller omits it
       // while the segment holds a rejected turn (see runLocked).
       rejectedRowsPresent: activeSegment.length !== segment.length,

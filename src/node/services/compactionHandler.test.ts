@@ -280,6 +280,41 @@ describe("CompactionHandler", () => {
       expect(metadata?.previousBoundaryHistorySequence).toBe(1);
     });
 
+    it("stamps the summary with the provenance of project skill content it summarizes", async () => {
+      // The summary is ordinary assistant text that may quote a project skill
+      // a summarized turn loaded, and the routed-request consent scan
+      // recognizes only tagged rows: the summary inherits the rows' obligation.
+      // Plain chat first: no stamp.
+      await seedHistory(
+        createMuxMessage("u0", "user", "Ordinary chat"),
+        createCompactionRequest("compact-request-plain")
+      );
+      expect(await handler.handleCompletion(createStreamEndEvent("Plain summary"))).toBe(true);
+      const afterPlain = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!afterPlain.success) throw new Error(afterPlain.error);
+      const plainSummary = afterPlain.data.filter((m) => m.metadata?.compactionBoundary).at(-1);
+      expect(plainSummary?.metadata?.carriesProjectSkillContent).toBeUndefined();
+
+      // A project skill snapshot in the summarized range: stamped.
+      for (const row of [
+        createMuxMessage("snap", "user", "PROJECT SKILL BODY", {
+          synthetic: true,
+          agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
+        }),
+        createMuxMessage("u1", "user", "Use skill done"),
+        createCompactionRequest("compact-request-project"),
+      ]) {
+        const appended = await historyService.appendToHistory(workspaceId, row);
+        if (!appended.success) throw new Error(appended.error);
+      }
+      expect(await handler.handleCompletion(createStreamEndEvent("Project summary"))).toBe(true);
+      const afterProject = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!afterProject.success) throw new Error(afterProject.error);
+      const projectSummary = afterProject.data.filter((m) => m.metadata?.compactionBoundary).at(-1);
+      expect(projectSummary?.id).not.toBe(plainSummary?.id);
+      expect(projectSummary?.metadata?.carriesProjectSkillContent).toBe(true);
+    });
+
     describe("onIdleCompactionOutcome", () => {
       const createIdleCompactionRequest = (id = "idle-req"): MuxMessage =>
         createMuxMessage(id, "user", "Please summarize the conversation", {
