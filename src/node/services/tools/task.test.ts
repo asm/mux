@@ -10,6 +10,7 @@ import {
   isBuiltInTaskTool,
   TASK_PROJECT_SKILL_CONTENT_WITHHELD_ERROR,
 } from "./task";
+import { TASK_REPORT_WITHHELD_MESSAGE } from "./taskReportProvenance";
 import { createTestToolConfig, mockToolCallOptions, TestTempDir } from "./testHelpers";
 import { Ok, Err } from "@/common/types/result";
 import { ForegroundWaitBackgroundedError, type TaskService } from "@/node/services/taskService";
@@ -1126,6 +1127,8 @@ describe("task tool", () => {
       expect(didEmitTaskCreated).toBe(true);
       return Promise.resolve({
         reportMarkdown: "Hello from child",
+        // A live report carries its provenance; this one is clean.
+        carriesProjectSkillContent: false,
         title: "Result",
       });
     });
@@ -1452,5 +1455,67 @@ describe("task tool project skill content sink", () => {
     });
     await cleanTool.execute!(spawnArgs, mockToolCallOptions);
     expect(clean.mock.calls[0]?.[0]).not.toHaveProperty("carriesProjectSkillContent");
+  });
+});
+
+describe("task tool report provenance", () => {
+  const spawnArgs = {
+    agentId: "explore",
+    prompt: "summarize the repository",
+    title: "Summary",
+    run_in_background: false,
+  };
+  const taskServiceWithReport = (carriesProjectSkillContent: boolean | undefined) =>
+    ({
+      create: mock(() =>
+        Ok({ taskId: "child", kind: "agent" as const, status: "running" as const })
+      ),
+      waitForAgentReport: () =>
+        Promise.resolve({
+          reportMarkdown: "The project skill says X",
+          title: "Findings",
+          structuredOutput: { x: 1 },
+          carriesProjectSkillContent,
+        }),
+    }) as unknown as TaskService;
+
+  it("withholds a report distilled from project skill content when the turn excludes it", async () => {
+    using tempDir = new TestTempDir("test-task-tool-report-withheld");
+    const tool = createTaskTool({
+      ...createTestToolConfig(tempDir.path),
+      taskService: taskServiceWithReport(true),
+      excludeProjectSkillContent: true,
+    });
+    const result = (await tool.execute!(spawnArgs, mockToolCallOptions)) as Record<string, unknown>;
+    expect(result.status).toBe("completed");
+    expect(result.reportMarkdown).toBe(TASK_REPORT_WITHHELD_MESSAGE);
+    expect(result.title).toBeUndefined();
+    expect(result.structuredOutput).toBeUndefined();
+    expect(result.carriesProjectSkillContent).toBeUndefined();
+  });
+
+  it("stamps a carrying report under trust and leaves a clean one unstamped", async () => {
+    using tempDir = new TestTempDir("test-task-tool-report-stamped");
+    for (const provenance of [true]) {
+      const tool = createTaskTool({
+        ...createTestToolConfig(tempDir.path),
+        taskService: taskServiceWithReport(provenance),
+      });
+      const result = (await tool.execute!(spawnArgs, mockToolCallOptions)) as Record<
+        string,
+        unknown
+      >;
+      expect(result.reportMarkdown).toBe("The project skill says X");
+      expect(result.carriesProjectSkillContent).toBe(true);
+    }
+    const clean = createTaskTool({
+      ...createTestToolConfig(tempDir.path),
+      taskService: taskServiceWithReport(false),
+    });
+    const result = (await clean.execute!(spawnArgs, mockToolCallOptions)) as Record<
+      string,
+      unknown
+    >;
+    expect(result.carriesProjectSkillContent).toBeUndefined();
   });
 });

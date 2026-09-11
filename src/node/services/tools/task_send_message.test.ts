@@ -185,3 +185,27 @@ describe("task_send_message project skill content sink", () => {
     expect(sendAgentTreeMessage).not.toHaveBeenCalled();
   });
 });
+
+describe("task_send_message provenance", () => {
+  it("forwards the sender context's project skill provenance under trust", async () => {
+    using tempDir = new TestTempDir("task-send-message-provenance");
+    const sendAgentTreeMessage = mock(
+      (): Promise<TreeSendResult> =>
+        Promise.resolve(Ok({ delivery: "accepted", relation: "target_descendant" }))
+    );
+    const tool = createTaskSendMessageTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "parent" }),
+      taskService: { sendAgentTreeMessage } as unknown as TaskService,
+      projectSkillContentInContext: () => true,
+      projectSkillContentStillReadable: () => Promise.resolve(true),
+    });
+    await tool.execute!({ task_id: "child", message: "the skill says ..." }, toolCallOptions);
+    expect(sendAgentTreeMessage).toHaveBeenCalledWith(
+      "parent",
+      "child",
+      "the skill says ...",
+      undefined,
+      { carriesProjectSkillContent: true }
+    );
+  });
+});

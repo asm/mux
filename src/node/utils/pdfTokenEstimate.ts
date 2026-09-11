@@ -87,12 +87,17 @@ export function estimatePdfAttachmentTokens(url: string): number {
   }
   const bytes = Buffer.from(url.slice(commaIndex + 1), "base64");
   const text = bytes.toString("latin1");
-  let pages = Math.max(countPageObjects(text), maxPageTreeCount(text));
-  if (pages === 0) {
+  let pageObjects = countPageObjects(text);
+  let treeCount = maxPageTreeCount(text);
+  if (pageObjects === 0 && treeCount === 0) {
     for (const decoded of inflatedStreams(bytes, text)) {
-      pages += countPageObjects(decoded);
-      pages = Math.max(pages, maxPageTreeCount(decoded));
+      // Page objects are summed across streams (each dictionary lives in
+      // exactly one); the tree count is a maximum. The two sources are
+      // compared once below, never added to each other.
+      pageObjects += countPageObjects(decoded);
+      treeCount = Math.max(treeCount, maxPageTreeCount(decoded));
     }
   }
+  const pages = Math.max(pageObjects, treeCount);
   return (pages > 0 ? pages : PDF_MAX_PAGES_ESTIMATE) * PDF_TOKENS_PER_PAGE_ESTIMATE;
 }

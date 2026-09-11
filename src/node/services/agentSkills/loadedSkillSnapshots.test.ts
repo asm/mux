@@ -938,3 +938,54 @@ describe("project skill content in persisted tool results", () => {
     expect(redacted).toContain("GLOBAL BODY");
   });
 });
+
+describe("stamped server-generated rows and task report outputs", () => {
+  it("withholds a stamped synthetic user row even when it starts the turn", () => {
+    // A child's progress report or a forwarded agent message wakes the parent
+    // as the turn's own user row; stamped as carrying, its text IS the content.
+    const wake = createMuxMessage("progress-wake", "user", "Child update: the skill says X", {
+      synthetic: true,
+      carriesProjectSkillContent: true,
+      retrySendOptions: { model: "anthropic:claude-haiku-4-5", agentId: "exec" },
+    });
+    const reply = createMuxMessage("reply", "assistant", "Noted the update");
+    const withheld = withholdProjectSkillContentFromRequest([wake, reply]);
+    expect(withheld[0].parts).toEqual([
+      { type: "text", text: PROJECT_SKILL_SYNTHETIC_ROW_WITHHELD_MESSAGE },
+    ]);
+    expect(withheld[1].parts).toEqual([
+      { type: "text", text: PROJECT_SKILL_TURN_WITHHELD_MESSAGE },
+    ]);
+    // The user's own (non-synthetic) turn-starting prompt stays verbatim.
+    const own = createMuxMessage("own", "user", "Continue");
+    expect(withholdProjectSkillContentFromRequest([own])[0]).toBe(own);
+  });
+
+  it("classifies task and task_await results by their report provenance stamp", () => {
+    expect(
+      toolOutputCarriesProjectSkillContent("task", {
+        status: "completed",
+        taskId: "t1",
+        reportMarkdown: "quotes the skill",
+        carriesProjectSkillContent: true,
+      })
+    ).toBe(true);
+    expect(
+      toolOutputCarriesProjectSkillContent("task", {
+        status: "completed",
+        taskIds: ["t1", "t2"],
+        reports: [
+          { taskId: "t1", reportMarkdown: "clean" },
+          { taskId: "t2", reportMarkdown: "quotes the skill", carriesProjectSkillContent: true },
+        ],
+      })
+    ).toBe(true);
+    expect(
+      toolOutputCarriesProjectSkillContent("task_await", {
+        status: "completed",
+        taskId: "t1",
+        reportMarkdown: "clean",
+      })
+    ).toBe(false);
+  });
+});

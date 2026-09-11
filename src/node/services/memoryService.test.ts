@@ -1787,3 +1787,78 @@ describe("MemoryService write provenance persistence", () => {
     }
   });
 });
+
+describe("MemoryService rename provenance", () => {
+  it("fails a rename whose provenance move cannot persist and leaves the file in place", async () => {
+    // A sidecar failure after the physical move would leave the destination's
+    // stale marker beside content of another provenance; the move persists
+    // first or the rename is refused.
+    using fixture = await createFixture("ws-rename-provenance");
+    const tainted = {
+      ...fixture.ctx,
+      writeProvenance: { carriesProjectSkillContent: true as const },
+    };
+    await fixture.service.create(tainted, "/memories/global/from-skill.md", "quotes it", "agent");
+    const move = spyOn(fixture.metaService, "renameKeys").mockRejectedValueOnce(
+      new Error("sidecar is read-only")
+    );
+    try {
+      const failed = await fixture.service.rename(
+        fixture.ctx,
+        "/memories/global/from-skill.md",
+        "/memories/global/renamed.md",
+        "agent"
+      );
+      expect(failed.success).toBe(false);
+      if (!failed.success) expect(failed.error).toContain("provenance");
+      const meta = await fixture.metaService.getEntries();
+      expect(meta.get("global:from-skill.md")?.carriesProjectSkillContent).toBe(true);
+      expect(meta.has("global:renamed.md")).toBe(false);
+      // The file never moved: the same rename applies once the sidecar writes again.
+      const retried = await fixture.service.rename(
+        fixture.ctx,
+        "/memories/global/from-skill.md",
+        "/memories/global/renamed.md",
+        "agent"
+      );
+      expect(retried.success).toBe(true);
+      expect(
+        (await fixture.metaService.getEntries()).get("global:renamed.md")
+          ?.carriesProjectSkillContent
+      ).toBe(true);
+    } finally {
+      move.mockRestore();
+    }
+  });
+
+  it("does not let a stale verified-clean destination marker survive a rename of unknown provenance", async () => {
+    // A marker left behind by an external deletion must not vouch for whatever
+    // is renamed onto that path later.
+    using fixture = await createFixture("ws-rename-stale-marker");
+    await fixture.service.create(fixture.ctx, "/memories/global/notes.md", "clean", "agent");
+    await fixture.service.deletePath(fixture.ctx, "/memories/global/notes.md", "agent");
+    // Plant the stale marker a crashed deletion could leave.
+    await fixture.metaService.recordAccess("global:notes.md", {
+      write: true,
+      replacesContent: true,
+    });
+    expect(
+      (await fixture.metaService.getEntries()).get("global:notes.md")?.carriesProjectSkillContent
+    ).toBe(false);
+    // A legacy file written straight to disk has no sidecar entry (unknown provenance).
+    await fsPromises.writeFile(
+      path.join(fixture.xumHome, "memory", "global", "legacy.md"),
+      "legacy contents\n"
+    );
+    const renamed = await fixture.service.rename(
+      fixture.ctx,
+      "/memories/global/legacy.md",
+      "/memories/global/notes.md",
+      "agent"
+    );
+    expect(renamed.success).toBe(true);
+    expect(
+      (await fixture.metaService.getEntries()).get("global:notes.md")?.carriesProjectSkillContent
+    ).toBeUndefined();
+  });
+});

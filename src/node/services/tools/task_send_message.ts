@@ -41,15 +41,29 @@ export const createTaskSendMessageTool: ToolFactory = (config: ToolConfiguration
       if (await contextProjectSkillContentWithheld(config)) {
         throw new Error(TASK_MESSAGE_PROJECT_SKILL_CONTENT_WITHHELD_ERROR);
       }
+      // Under trust the forwarded text can restate project skill content this
+      // turn's context holds: the target's rows are stamped so its own
+      // provenance tracking inherits it (see TaskService.sendAgentTreeMessage).
+      const contextCarriesProjectSkillContent =
+        config.memoryWriteCarriesProjectSkillContent === true ||
+        config.projectSkillContentInContext?.() === true;
 
       // The default dispatch mode depends on the target's relation (ancestors default to
       // turn-end), which only the service can compute — pass the raw arg through.
-      const result = await taskService.sendAgentTreeMessage(
-        workspaceId,
-        args.task_id,
-        args.message,
-        args.queue_dispatch_mode ?? undefined
-      );
+      const result = contextCarriesProjectSkillContent
+        ? await taskService.sendAgentTreeMessage(
+            workspaceId,
+            args.task_id,
+            args.message,
+            args.queue_dispatch_mode ?? undefined,
+            { carriesProjectSkillContent: true }
+          )
+        : await taskService.sendAgentTreeMessage(
+            workspaceId,
+            args.task_id,
+            args.message,
+            args.queue_dispatch_mode ?? undefined
+          );
 
       if (result.success) {
         const targetRelation = targetRelationLabel(result.data.relation);

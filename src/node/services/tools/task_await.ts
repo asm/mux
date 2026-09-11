@@ -2,6 +2,11 @@ import { tool } from "ai";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { readSubagentGitPatchArtifact } from "@/node/services/subagentGitPatchArtifacts";
+import { toolExcludesProjectSkillContent } from "@/node/services/tools/projectSkillContentGate";
+import {
+  applyTaskReportProvenance,
+  workspaceHistoryCarriesProjectSkillContent,
+} from "@/node/services/tools/taskReportProvenance";
 import { WorkflowRunRecordSchema } from "@/common/orpc/schemas";
 import {
   COMPLETED_REPORT_REFETCH_NOTE,
@@ -594,13 +599,24 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           // several await paths (immediate snapshot, task-signal abort race, timeout
           // race, and generic wait rejection). Build the shared shape once so those
           // paths cannot drift on the reported fields or fallback copy.
+          // Report provenance: the turn ran in the target workspace, whose active
+          // segment is the report's context (see taskReportProvenance).
+          const workspaceTurnReportProvenance = {
+            carries: await workspaceHistoryCarriesProjectSkillContent(config, snapshot.workspaceId),
+            excludes: await toolExcludesProjectSkillContent(config),
+          };
           const completedWorkspaceTurnResult = (record: WorkspaceTurnTaskHandleRecord) => ({
             status: "completed" as const,
             taskId,
             ...workspaceTurnIdentityFields(record.workspaceId),
-            reportMarkdown:
-              record.reportMarkdown ?? "Workspace turn completed without final text output.",
-            title: record.title,
+            ...applyTaskReportProvenance(
+              {
+                reportMarkdown:
+                  record.reportMarkdown ?? "Workspace turn completed without final text output.",
+                title: record.title,
+              },
+              workspaceTurnReportProvenance
+            ),
             messageId: record.messageId,
             finalMessageRef: record.finalMessageRef,
             note: COMPLETED_REPORT_REFETCH_NOTE,
@@ -659,8 +675,10 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               status: "completed" as const,
               taskId,
               ...workspaceTurnIdentityFields(report.workspaceId),
-              reportMarkdown: report.reportMarkdown,
-              title: report.title,
+              ...applyTaskReportProvenance(
+                { reportMarkdown: report.reportMarkdown, title: report.title },
+                workspaceTurnReportProvenance
+              ),
               messageId: report.messageId,
               finalMessageRef: report.finalMessageRef,
               note: COMPLETED_REPORT_REFETCH_NOTE,
@@ -808,9 +826,17 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             return {
               status: "completed" as const,
               taskId,
-              reportMarkdown: report.reportMarkdown,
-              structuredOutput: report.structuredOutput,
-              title: report.title,
+              ...applyTaskReportProvenance(
+                {
+                  reportMarkdown: report.reportMarkdown,
+                  structuredOutput: report.structuredOutput,
+                  title: report.title,
+                },
+                {
+                  carries: report.carriesProjectSkillContent === true,
+                  excludes: await toolExcludesProjectSkillContent(config),
+                }
+              ),
               ...(report.model != null ? { modelString: report.model } : {}),
               ...(report.thinkingLevel != null ? { thinkingLevel: report.thinkingLevel } : {}),
               ...getAgentTaskElapsedField(taskId),
@@ -838,9 +864,20 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           return {
             status: "completed" as const,
             taskId,
-            reportMarkdown: report.reportMarkdown,
-            structuredOutput: report.structuredOutput,
-            title: report.title,
+            // Provenance persisted with the report (TaskService reads a legacy
+            // report as carrying): withheld when this turn excludes project
+            // skill content, stamped otherwise.
+            ...applyTaskReportProvenance(
+              {
+                reportMarkdown: report.reportMarkdown,
+                structuredOutput: report.structuredOutput,
+                title: report.title,
+              },
+              {
+                carries: report.carriesProjectSkillContent === true,
+                excludes: await toolExcludesProjectSkillContent(config),
+              }
+            ),
             ...(report.model != null ? { modelString: report.model } : {}),
             ...(report.thinkingLevel != null ? { thinkingLevel: report.thinkingLevel } : {}),
             ...getAgentTaskElapsedField(taskId),

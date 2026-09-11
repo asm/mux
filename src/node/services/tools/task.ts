@@ -16,7 +16,14 @@ import {
   type RuntimeMode,
 } from "@/common/types/runtime";
 import type { TaskCreatedEvent } from "@/common/types/stream";
-import { contextProjectSkillContentWithheld } from "@/node/services/tools/projectSkillContentGate";
+import {
+  contextProjectSkillContentWithheld,
+  toolExcludesProjectSkillContent,
+} from "@/node/services/tools/projectSkillContentGate";
+import {
+  applyTaskReportProvenance,
+  workspaceHistoryCarriesProjectSkillContent,
+} from "@/node/services/tools/taskReportProvenance";
 import { log } from "@/node/services/log";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 
@@ -166,6 +173,8 @@ interface PendingTaskInfo {
 interface CompletedTaskInfo {
   taskId: string;
   reportMarkdown: string;
+  /** The report's context carried project skill content (see taskReportProvenance). */
+  carriesProjectSkillContent?: boolean;
   structuredOutput?: unknown;
   title?: string;
   agentId: string;
@@ -222,6 +231,7 @@ function serializeCompletedReport(report: CompletedTaskInfo) {
   return {
     taskId: report.taskId,
     reportMarkdown: report.reportMarkdown,
+    ...(report.carriesProjectSkillContent === true ? { carriesProjectSkillContent: true } : {}),
     structuredOutput: report.structuredOutput,
     title: report.title,
     agentId: report.agentId,
@@ -312,6 +322,7 @@ function buildCompletedTaskResult(params: {
       status: "completed",
       taskId: report.taskId,
       reportMarkdown: report.reportMarkdown,
+      ...(report.carriesProjectSkillContent === true ? { carriesProjectSkillContent: true } : {}),
       structuredOutput: report.structuredOutput,
       title: report.title,
       agentId: report.agentId,
@@ -326,6 +337,10 @@ function buildCompletedTaskResult(params: {
     status: "completed",
     taskIds: serializedReports.map((report) => report.taskId),
     reports: serializedReports,
+    // The grouped result is classified as a whole (one carrying report taints it).
+    ...(serializedReports.some((report) => report.carriesProjectSkillContent === true)
+      ? { carriesProjectSkillContent: true }
+      : {}),
   };
 }
 
@@ -513,15 +528,26 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
             requestingWorkspaceId: workspaceId,
             backgroundOnMessageQueued: true,
           });
+          const targetWorkspaceId = report.workspaceId ?? created.data.workspaceId;
           return parseToolResult(
             TaskToolResultSchema,
             {
               status: "completed" as const,
               taskId: created.data.taskId,
-              workspaceId: report.workspaceId ?? created.data.workspaceId,
+              workspaceId: targetWorkspaceId,
               handleKind: "workspace_turn" as const,
-              reportMarkdown: report.reportMarkdown,
-              title: report.title,
+              // The turn ran in the target workspace: its active segment is the
+              // report's context.
+              ...applyTaskReportProvenance(
+                { reportMarkdown: report.reportMarkdown, title: report.title },
+                {
+                  carries: await workspaceHistoryCarriesProjectSkillContent(
+                    config,
+                    targetWorkspaceId
+                  ),
+                  excludes: await toolExcludesProjectSkillContent(config),
+                }
+              ),
               messageId: report.messageId,
               finalMessageRef: report.finalMessageRef,
               ...(completedSupersedeNote != null ? { note: completedSupersedeNote } : {}),
@@ -678,13 +704,30 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
               backgroundOnMessageQueued: true,
             });
 
+            // Provenance persisted with the report (TaskService reads a legacy
+            // report of unknown provenance as carrying): withheld when this turn
+            // excludes project skill content, stamped otherwise.
+            const classified = applyTaskReportProvenance(
+              {
+                reportMarkdown: report.reportMarkdown,
+                title: report.title,
+                structuredOutput: report.structuredOutput,
+              },
+              {
+                carries: report.carriesProjectSkillContent === true,
+                excludes: await toolExcludesProjectSkillContent(config),
+              }
+            );
             return {
               kind: "completed",
               report: {
                 taskId: createdTask.taskId,
-                reportMarkdown: report.reportMarkdown,
-                structuredOutput: report.structuredOutput,
-                title: report.title,
+                reportMarkdown: classified.reportMarkdown,
+                ...(classified.carriesProjectSkillContent === true
+                  ? { carriesProjectSkillContent: true }
+                  : {}),
+                structuredOutput: classified.structuredOutput,
+                title: classified.title,
                 agentId: requestedAgentId,
                 agentType: requestedAgentId,
                 // Prefer the settings the report was produced with: a plan child that

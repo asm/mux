@@ -10387,6 +10387,79 @@ describe("TaskService", () => {
     expect(report.thinkingLevel).toBe("high");
   });
 
+  test("waitForAgentReport carries the child's project skill provenance, persisted with the artifact", async () => {
+    // The child's context held project skill content: its report is classified
+    // once at finalize (while the child's history exists) and the verdict rides
+    // the cached report, the waiter result and every persisted artifact copy,
+    // so a later task_await refetch classifies the same way.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-report-provenance";
+    const childTaskId = "task-report-provenance";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        {
+          path: path.join(projectPath, "child-task"),
+          id: childTaskId,
+          name: "agent_exec_child",
+          parentWorkspaceId,
+          agentType: "exec",
+          taskStatus: "running",
+          taskModelString: "anthropic:claude-opus-5",
+        },
+      ],
+      testTaskSettings()
+    );
+    const { aiService } = createAIServiceMocks(config);
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { taskService, historyService } = createTaskServiceHarness(config, {
+      aiService,
+      workspaceService,
+    });
+    await historyService.appendToHistory(
+      childTaskId,
+      createMuxMessage("snap-project", "user", "PROJECT SKILL BODY", {
+        timestamp: Date.now(),
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "s" },
+      })
+    );
+
+    await handleTaskServiceStreamEndForTest(taskService, {
+      type: "stream-end",
+      workspaceId: childTaskId,
+      messageId: "assistant-child-report-provenance",
+      metadata: { model: "anthropic:claude-opus-5", finishReason: "stop" },
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "agent-report-provenance-call",
+          toolName: "agent_report",
+          input: { reportMarkdown: "Applied the skill", title: "Result" },
+          state: "output-available",
+          output: {
+            success: true,
+            report: { reportMarkdown: "Applied the skill", title: "Result" },
+          },
+        },
+        { type: "text", text: "Done" },
+      ],
+    });
+
+    const report = await taskService.waitForAgentReport(childTaskId, {
+      requestingWorkspaceId: parentWorkspaceId,
+    });
+    expect(report.carriesProjectSkillContent).toBe(true);
+    const artifact = await readSubagentReportArtifact(
+      path.join(config.sessionsDir, parentWorkspaceId),
+      childTaskId
+    );
+    expect(artifact?.carriesProjectSkillContent).toBe(true);
+  });
+
   test("workflow-owned child reports do not resume the parent directly", async () => {
     const config = await createTestConfig(rootDir);
 
@@ -10930,6 +11003,25 @@ describe("TaskService", () => {
     expect(internal.skipAutoResumeReset).toBe(true);
     expect(internal.removableQueueDedupeKey).toBe(true);
     expect(internal.queueDedupeKey).toStartWith("agent-msg:sib-a:");
+
+    // A sender whose context carries project skill content stamps both rows it
+    // delivers, so the target's provenance tracking inherits it.
+    const stamped = await taskService.sendAgentTreeMessage(
+      "sib-a",
+      "sib-b",
+      "The project skill says: rename the schema.",
+      undefined,
+      { carriesProjectSkillContent: true }
+    );
+    expect(stamped.success).toBe(true);
+    const [, , , stampedInternal] = sendMessage.mock.calls[1] as [
+      string,
+      string,
+      unknown,
+      { preTurnMessages?: MuxMessage[]; userRowCarriesProjectSkillContent?: boolean },
+    ];
+    expect(stampedInternal.userRowCarriesProjectSkillContent).toBe(true);
+    expect(stampedInternal.preTurnMessages?.[0]?.metadata?.carriesProjectSkillContent).toBe(true);
   });
 
   test("sendAgentTreeMessage delivers ancestor messages with a turn-end default and descendant relationship", async () => {
@@ -16442,6 +16534,7 @@ describe("TaskService", () => {
 
     expect(report).toEqual({
       reportMarkdown: "persisted report",
+      carriesProjectSkillContent: true,
       title: "persisted title",
       planFilePath,
     });
@@ -16495,7 +16588,11 @@ describe("TaskService", () => {
       requestingWorkspaceId: parentId,
     });
 
-    expect(report).toEqual({ reportMarkdown: "persisted report", title: "persisted title" });
+    expect(report).toEqual({
+      carriesProjectSkillContent: true,
+      reportMarkdown: "persisted report",
+      title: "persisted title",
+    });
     expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("reported");
     expect(patchGeneration).toHaveBeenCalledWith(
       parentId,
@@ -18490,7 +18587,11 @@ describe("TaskService", () => {
     });
 
     const report = await waiter;
-    expect(report).toEqual({ reportMarkdown: "Hello from child", title: "Result" });
+    expect(report).toEqual({
+      reportMarkdown: "Hello from child",
+      title: "Result",
+      carriesProjectSkillContent: false,
+    });
 
     const artifactAfterStreamEnd = await readSubagentGitPatchArtifact(parentSessionDir, childId);
     expect(
@@ -18825,7 +18926,11 @@ describe("TaskService", () => {
     });
 
     const report = await waiter;
-    expect(report).toEqual({ reportMarkdown: "Hello from child", title: "Result" });
+    expect(report).toEqual({
+      reportMarkdown: "Hello from child",
+      title: "Result",
+      carriesProjectSkillContent: false,
+    });
 
     const artifactAfterStreamEnd = await readSubagentGitPatchArtifact(parentSessionDir, childId);
     expect(
@@ -19494,6 +19599,7 @@ describe("TaskService", () => {
     const report = await waiter;
     expect(report).toEqual({
       reportMarkdown: "Interrupted child report",
+      carriesProjectSkillContent: false,
       title: "Result",
       model: "openai:gpt-4o-mini",
     });
@@ -19512,6 +19618,7 @@ describe("TaskService", () => {
     });
     expect(persisted).toEqual({
       reportMarkdown: "Interrupted child report",
+      carriesProjectSkillContent: false,
       title: "Result",
       model: "openai:gpt-4o-mini",
     });
@@ -19660,17 +19767,31 @@ describe("TaskService", () => {
     );
 
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
 
     await taskService.reportAgentProgress(childId, "progress-1", {
       reportMarkdown: "Found a correctness issue.",
       title: "Finding",
     });
+    // The child's context holds project skill content from here on: the later
+    // wake row carries that provenance (the parent's routed requests and side
+    // channels withhold it after a revocation).
+    await historyService.appendToHistory(
+      childId,
+      createMuxMessage("snap-project", "user", "PROJECT SKILL BODY", {
+        timestamp: Date.now(),
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "s" },
+      })
+    );
     await taskService.reportAgentProgress(childId, "progress-2", {
       reportMarkdown: "Found a second issue.",
     });
 
     expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(sendMessage.mock.calls[1]?.[3]).toMatchObject({
+      userRowCarriesProjectSkillContent: true,
+    });
     expect(sendMessage).toHaveBeenNthCalledWith(
       1,
       parentId,
@@ -22964,6 +23085,7 @@ describe("TaskService", () => {
       const report = await waiter;
       expect(report).toEqual({
         reportMarkdown: "# Proposed workflow plan\n\nDo the tiny safe change.\n",
+        carriesProjectSkillContent: false,
         title: "Proposed plan",
         planFilePath: planPath,
         model: "openai:gpt-4o-mini",
@@ -23052,6 +23174,7 @@ describe("TaskService", () => {
       const report = await taskService.waitForAgentReport(childId, { timeoutMs: 5_000 });
       expect(report).toEqual({
         reportMarkdown: "# Interrupted workflow plan\n\nStill complete.\n",
+        carriesProjectSkillContent: false,
         title: "Proposed plan",
         planFilePath: planPath,
         model: "openai:gpt-4o-mini",
@@ -24153,7 +24276,11 @@ describe("TaskService", () => {
       timeoutMs: 10,
       requestingWorkspaceId: parentId,
     });
-    expect(report).toEqual({ reportMarkdown: "real report", title: "done" });
+    expect(report).toEqual({
+      carriesProjectSkillContent: true,
+      reportMarkdown: "real report",
+      title: "done",
+    });
   });
 
   test("handoff kickoff sendMessage failure keeps task status as running for restart recovery", async () => {

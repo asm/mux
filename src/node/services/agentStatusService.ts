@@ -742,14 +742,14 @@ export class AgentStatusService {
    * stamped rejected, quarantined or truncated since it was taken.
    */
   /**
-   * Per-workspace memo of the inherited project provenance: the first row of
-   * the last slice, whether the rows before it carried project content, and
+   * Per-workspace memo of the inherited project provenance: the newest row of
+   * the last slice, whether the rows before that slice carried project content, and
    * which rows of that slice carry it (so the rows leaving the window on the
    * next tick are classified without another read).
    */
   private readonly inheritedProjectContext = new Map<
     string,
-    { firstRowId: string; inherited: boolean; carryingRowIds: string[] }
+    { lastRowId: string; inherited: boolean; carryingRowIds: string[] }
   >();
 
   /**
@@ -774,10 +774,17 @@ export class AgentStatusService {
     }
     const memo = this.inheritedProjectContext.get(workspaceId);
     const sliceIds = new Set(slice.map((row) => row.id));
+    // The slices overlap when the previous slice's newest row is still in the
+    // window: every row that left since then sat in that slice. A burst that
+    // pushed it out (a /clear reset plus a window's worth of rows between two
+    // ticks) can have carried a boundary through unseen, so the memo — the
+    // sticky taint included — is dropped and the segment rescanned; the scan
+    // stops at that boundary and a stale taint ends with it.
+    const overlaps = memo !== undefined && sliceIds.has(memo.lastRowId);
     let inherited: boolean;
-    if (memo?.inherited === true) {
+    if (overlaps && memo.inherited) {
       inherited = true;
-    } else if (memo !== undefined && sliceIds.has(memo.firstRowId)) {
+    } else if (overlaps) {
       inherited = memo.carryingRowIds.some((id) => !sliceIds.has(id));
     } else {
       const segment = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
@@ -791,7 +798,7 @@ export class AgentStatusService {
         );
     }
     this.inheritedProjectContext.set(workspaceId, {
-      firstRowId: first.id,
+      lastRowId: slice[slice.length - 1].id,
       inherited,
       carryingRowIds: slice
         .filter((row) => messagesCarryProjectSkillContent([row]))

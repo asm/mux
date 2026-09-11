@@ -717,6 +717,58 @@ export class MemoryService extends EventEmitter {
     await this.recordUsage(ctx, scope, parsed.relPath, { write: false });
   }
 
+  /**
+   * Sidecar entries (pins, stats, provenance) move BEFORE the content on a
+   * rename: a sidecar failure after the physical move would leave the
+   * destination's stale marker — a verified-clean one from an earlier external
+   * deletion, say — beside content of another provenance, which a later
+   * untrusted routed read would trust. A move that cannot persist fails the
+   * rename instead.
+   */
+  private async commitRenameProvenance(
+    ctx: MemoryScopeContext,
+    scope: MemoryScope,
+    oldRelPath: string,
+    newRelPath: string
+  ): Promise<void> {
+    const oldKey = this.logicalKeyFor(ctx, scope, oldRelPath);
+    const newKey = this.logicalKeyFor(ctx, scope, newRelPath);
+    if (oldKey === null || newKey === null) return;
+    try {
+      await this.metaService.renameKeys(oldKey, newKey);
+    } catch (error) {
+      throw new MemoryCommandError(
+        `Could not move the provenance of ${toVirtualPath(scope, oldRelPath)}; the rename was not applied (${getErrorMessage(error)})`
+      );
+    }
+  }
+
+  /**
+   * Best-effort inverse of commitRenameProvenance for a physical rename that
+   * failed after the sidecar moved; a failure here leaves both paths without
+   * an entry — unknown provenance, the conservative state.
+   */
+  private async revertRenameProvenance(
+    ctx: MemoryScopeContext,
+    scope: MemoryScope,
+    oldRelPath: string,
+    newRelPath: string
+  ): Promise<void> {
+    const oldKey = this.logicalKeyFor(ctx, scope, oldRelPath);
+    const newKey = this.logicalKeyFor(ctx, scope, newRelPath);
+    if (oldKey === null || newKey === null) return;
+    try {
+      await this.metaService.renameKeys(newKey, oldKey);
+    } catch (error) {
+      log.debug("[MemoryService] failed to move memory provenance back after a failed rename", {
+        scope,
+        oldRelPath,
+        newRelPath,
+        error,
+      });
+    }
+  }
+
   private async recordRename(
     ctx: MemoryScopeContext,
     scope: MemoryScope,
@@ -724,11 +776,10 @@ export class MemoryService extends EventEmitter {
     newRelPath: string
   ): Promise<void> {
     try {
-      const oldKey = this.logicalKeyFor(ctx, scope, oldRelPath);
       const newKey = this.logicalKeyFor(ctx, scope, newRelPath);
-      if (oldKey === null || newKey === null) return;
-      // Pins and stats follow the file; the rename itself counts as a use.
-      await this.metaService.renameKeys(oldKey, newKey);
+      if (newKey === null) return;
+      // Pins, stats and provenance already moved (commitRenameProvenance);
+      // the rename itself counts as a use — best-effort, like every stat.
       await this.metaService.recordAccess(newKey, { write: true });
     } catch (error) {
       log.debug("[MemoryService] failed to move memory usage stats on rename", {
@@ -1594,7 +1645,13 @@ export class MemoryService extends EventEmitter {
           throw new MemoryCommandError(`Destination ${newVirtualPath} already exists`);
         }
         await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, oldVirtualPath);
-        await store.rename(oldParsed.relPath, newParsed.relPath);
+        await this.commitRenameProvenance(ctx, scope, oldParsed.relPath, newParsed.relPath);
+        try {
+          await store.rename(oldParsed.relPath, newParsed.relPath);
+        } catch (error) {
+          await this.revertRenameProvenance(ctx, scope, oldParsed.relPath, newParsed.relPath);
+          throw error;
+        }
         // Row is written before the rename is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,

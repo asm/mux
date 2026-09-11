@@ -271,6 +271,12 @@ export class MemoryMetaService {
       newLogicalKey: string
     ): Effect.Effect<void, MemoryMetaWriteError> =>
       this.mutate((entries) => {
+        // The destination subtree is cleared first: a stale entry left there
+        // by an external or crashed deletion (a verified-clean marker, say)
+        // must not survive beside content whose own provenance is unknown.
+        for (const key of Object.keys(entries)) {
+          if (keyInSubtree(key, newLogicalKey)) delete entries[key];
+        }
         for (const [key, entry] of Object.entries(entries)) {
           if (!keyInSubtree(key, oldLogicalKey)) continue;
           delete entries[key];

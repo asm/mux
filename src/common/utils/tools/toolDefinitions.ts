@@ -613,6 +613,8 @@ const TaskToolCompletedReportSchema = z
   .object({
     taskId: z.string(),
     reportMarkdown: z.string(),
+    /** The report's context carried project skill content (see task tool provenance). */
+    carriesProjectSkillContent: z.boolean().optional(),
     title: z.string().optional(),
     structuredOutput: z.unknown().optional(),
     planFilePath: z.string().optional(),
@@ -666,6 +668,8 @@ export const TaskToolCompletedResultSchema = z
     taskId: z.string().optional(),
     taskIds: z.array(z.string()).min(1).optional(),
     reportMarkdown: z.string().optional(),
+    /** Any delivered report's context carried project skill content. */
+    carriesProjectSkillContent: z.boolean().optional(),
     title: z.string().optional(),
     structuredOutput: z.unknown().optional(),
     planFilePath: z.string().optional(),
@@ -853,6 +857,8 @@ export const TaskAwaitToolCompletedResultSchema = z
     status: z.literal("completed"),
     taskId: z.string(),
     reportMarkdown: z.string(),
+    /** The report's context carried project skill content (see task tool provenance). */
+    carriesProjectSkillContent: z.boolean().optional(),
     handleKind: TaskHandleKindSchema.optional(),
     workspaceId: z.string().optional(),
     messageId: z.string().optional(),

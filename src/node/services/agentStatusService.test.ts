@@ -1,3 +1,4 @@
+import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { PROJECT_SKILL_TURN_WITHHELD_MESSAGE } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "fs";
@@ -569,6 +570,62 @@ describe("AgentStatusService", () => {
     expect(generateSpy.mock.calls[1][0]).not.toContain("Answer 90 restates the skill");
     expect(segmentReads).not.toHaveBeenCalled();
     segmentReads.mockRestore();
+  });
+
+  test("ends the inherited taint when a reset boundary crossed the whole window between ticks", async () => {
+    // The memoized taint is sticky only while the slice still overlaps the
+    // memoized one. A /clear reset followed by a window's worth of rows between
+    // two ticks pushes both the reset and the previous anchor out of the slice;
+    // the segment is rescanned (it stops at the reset) instead of keeping the
+    // old taint forever.
+    const history = historyHandle.historyService;
+    for (const row of [
+      createMuxMessage("snap-project", "user", "PROJECT SKILL BODY", {
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "s" },
+      }),
+      createMuxMessage("u-project", "user", "Use skill done", {
+        retrySendOptions: {
+          model: "anthropic:claude-haiku-4-5",
+          agentId: "exec",
+          routedProjectConsent: true,
+        },
+      }),
+      createMuxMessage("a-project", "assistant", "Applied the skill"),
+    ]) {
+      await history.appendToHistory(workspaceId, row);
+    }
+    for (let i = 0; i < 90; i++) {
+      await history.appendToHistory(workspaceId, createMuxMessage(`u-${i}`, "user", `Q ${i}`));
+      await history.appendToHistory(
+        workspaceId,
+        createMuxMessage(`a-${i}`, "assistant", `Answer ${i} restates the skill`)
+      );
+    }
+    (projectsConfig.projects.get(projectPath) as { trusted?: boolean }).trusted = false;
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    expect(generateSpy.mock.calls[0][0]).not.toContain("Answer 89 restates the skill");
+
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("reset", "assistant", "", {
+        contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
+      })
+    );
+    for (let i = 100; i < 190; i++) {
+      await history.appendToHistory(workspaceId, createMuxMessage(`u-${i}`, "user", `Q ${i}`));
+      await history.appendToHistory(
+        workspaceId,
+        createMuxMessage(`a-${i}`, "assistant", `Fresh answer ${i}`)
+      );
+    }
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(2);
+    const prompt = generateSpy.mock.calls[1][0];
+    expect(prompt).toContain("Fresh answer 189");
+    expect(prompt).not.toContain(PROJECT_SKILL_TURN_WITHHELD_MESSAGE);
   });
 
   test("correlates the partial with the history read instead of an older snapshot", async () => {

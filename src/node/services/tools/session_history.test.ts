@@ -1,3 +1,4 @@
+import * as fsPromises from "node:fs/promises";
 import {
   HistoryAppendProvenance,
   HISTORY_PROVENANCE_MAX_RECEIPT_BYTES,
@@ -126,6 +127,60 @@ afterEach(async () => {
 });
 
 describe("session_history project skill provenance", () => {
+  test("taints the window of a row skipped as oversized", async () => {
+    // A near-cap skill read serializes past the line cap: the scanner skips the
+    // row unparsed, so it can never be classified. The rows after it in the
+    // same window are treated like rows after a classified source.
+    await fsPromises.appendFile(
+      chatPath,
+      JSON.stringify({
+        ...createMuxMessage("oversized-read", "assistant", "read something", { timestamp: 2 }),
+        padding: "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES),
+      }) + "\n"
+    );
+    await fixture.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("after-oversized", "assistant", "Applying what was read", { timestamp: 3 })
+    );
+    // The oversized row exhausts a page's scan budget, so the walk pages: the
+    // window taint rides the cursor to the next page.
+    const runAll = async (excludeProjectSkillContent: boolean) => {
+      const config = createTestToolConfig(fixture.tempDir, { workspaceId });
+      config.historyService = fixture.historyService;
+      config.excludeProjectSkillContent = excludeProjectSkillContent;
+      const tool = createSessionHistoryTool(config);
+      const texts: string[] = [];
+      let carries = false;
+      let withheld = 0;
+      let oversized = 0;
+      let cursor: string | undefined;
+      do {
+        const page = TOOL_DEFINITIONS.session_history.resultSchema.parse(
+          await tool.execute!(
+            { action: "list_items", role: "assistant", ...(cursor ? { cursor } : {}) },
+            mockToolCallOptions
+          )
+        );
+        expect(page.success).toBe(true);
+        texts.push(...(page.items ?? []).map((item) => item.text));
+        carries ||= page.carriesProjectSkillContent === true;
+        withheld += page.withheldProjectSkillRows ?? 0;
+        oversized += page.skipped_oversized_rows ?? 0;
+        cursor = page.nextCursor;
+      } while (cursor);
+      return { texts, carries, withheld, oversized };
+    };
+    const open = await runAll(false);
+    // A skipped row spanning a page boundary is counted on each page it touches.
+    expect(open.oversized).toBeGreaterThanOrEqual(1);
+    expect(open.texts).toEqual(["opening facts", "Applying what was read"]);
+    expect(open.carries).toBe(true);
+
+    const excluding = await runAll(true);
+    expect(excluding.texts).toEqual(["opening facts"]);
+    expect(excluding.withheld).toBe(1);
+  });
+
   test("stamps results carrying a project skill read and leaves such rows out when excluded", async () => {
     // A rollover hides earlier rows from the request's own filter; the tool
     // can still reach them. A returned row carrying a project skill read

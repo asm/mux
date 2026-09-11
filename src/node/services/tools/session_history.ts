@@ -408,6 +408,12 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           recentFirst: args.recent_first === true,
           requireExistingHistory: foreign,
           budget,
+          // A row skipped as oversized (a near-cap agent_skill_read result, say) is never
+          // classified: its window is tainted conservatively so the rows after it are
+          // withheld or stamped like the rows after a classified source.
+          onOversizedRow: ({ windowId }) => {
+            taintedWindows.add(windowId);
+          },
           visit: ({ message, itemId, windowId, windowBoundaryKind, startsWindow }) => {
             if (args.action === "list_windows") {
               if (!startsWindow) return true;

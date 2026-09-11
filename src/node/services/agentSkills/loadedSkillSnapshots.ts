@@ -289,6 +289,12 @@ export function toolOutputCarriesProjectSkillContent(toolName: unknown, output: 
   if (toolName === "memory" || toolName === "intuition" || toolName === "session_history") {
     return outputIsStampedCodeExecution(output);
   }
+  // Completed task / task_await results carry a child's report: stamped by the
+  // task tools from the persisted report provenance (a grouped result stamps
+  // each report and the result).
+  if (toolName === "task" || toolName === "task_await") {
+    return outputIsStampedCodeExecution(output) || taskReportsCarryProjectSkillContent(output);
+  }
   if (toolName === "code_execution") {
     // The execution's own provenance stamp (CodeExecutionResult
     // .carriesProjectSkillContent) covers content the guest copied into the
@@ -300,6 +306,12 @@ export function toolOutputCarriesProjectSkillContent(toolName: unknown, output: 
     );
   }
   return false;
+}
+
+function taskReportsCarryProjectSkillContent(output: unknown): boolean {
+  if (typeof output !== "object" || output === null) return false;
+  const reports = (output as { reports?: unknown }).reports;
+  return Array.isArray(reports) && reports.some(outputIsStampedCodeExecution);
 }
 
 function outputIsStampedCodeExecution(output: unknown): boolean {
@@ -432,11 +444,13 @@ export function withholdProjectSkillContentFromRequest(
       // Server-generated user rows (background task reports, file-change
       // notifications, prompt snapshots) were produced while the content was
       // in context too; only the user's own prompts and turn-starting
-      // synthetic requests stay verbatim.
+      // synthetic requests stay verbatim — unless the row itself is stamped as
+      // carrying (a child's progress report, a forwarded agent message): its
+      // text IS the content, wherever it sits in the turn.
       if (
-        projectContentInContext &&
         message.metadata?.synthetic === true &&
-        !isTurnStartingUserRow(message)
+        (message.metadata.carriesProjectSkillContent === true ||
+          (projectContentInContext && !isTurnStartingUserRow(message)))
       ) {
         kept.push({
           ...message,
@@ -592,7 +606,10 @@ export function redactProjectSkillToolResults(messages: MuxMessage[]): MuxMessag
     // MuxMessageMetadata.carriesProjectSkillContent) is plain assistant text
     // with no structure to redact around: its text is withheld whole, the row
     // (and the context boundary it marks) kept.
-    if (summaryCarriesProjectSkillContent(message)) {
+    // Stamped USER rows (a child's report or progress wake, a forwarded agent
+    // message) are withheld by withholdProjectSkillContentFromRequest with
+    // their own message; this pass covers assistant rows only.
+    if (message.role === "assistant" && summaryCarriesProjectSkillContent(message)) {
       return {
         ...message,
         parts: [{ type: "text", text: COMPACTION_SUMMARY_WITHHELD_MESSAGE }],
@@ -605,7 +622,9 @@ export function redactProjectSkillToolResults(messages: MuxMessage[]): MuxMessag
         (SKILL_CONTENT_TOOLS.has(part.toolName) ||
           part.toolName === "memory" ||
           part.toolName === "intuition" ||
-          part.toolName === "session_history") &&
+          part.toolName === "session_history" ||
+          part.toolName === "task" ||
+          part.toolName === "task_await") &&
         toolOutputCarriesProjectSkillContent(part.toolName, part.output)
       ) {
         changed = true;
