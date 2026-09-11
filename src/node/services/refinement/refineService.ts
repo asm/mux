@@ -1108,6 +1108,10 @@ export class RefineService {
         projectSkillContentStillReadable: projectTrusted
           ? () => Promise.resolve(this.isProjectTrustedNow(workspaceId))
           : undefined,
+        // The transcript kept project content under trust: every provider step
+        // of the pass retransmits it, so trust is re-read before each.
+        beforeDispatch: () =>
+          Promise.resolve(!trustedProjectContent || this.isProjectTrustedNow(workspaceId)),
         transcript,
         timelineText,
         skillWriteAvailable,

@@ -192,6 +192,19 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
       // turn without trust leaves such rows out, and any returned row carrying
       // it stamps the result for the per-step consent scan.
       const excludeProjectSkillContent = await toolExcludesProjectSkillContent(config);
+      // Taint is tracked per context window in scan order (a source row precedes the replies
+      // that can quote it); recent_first would surface those replies first. A routed turn
+      // (trust re-read wired) or an excluding turn cannot classify such a page: refuse it.
+      if (
+        args.recent_first === true &&
+        (excludeProjectSkillContent || config.projectSkillContentStillReadable !== undefined)
+      )
+        return {
+          success: false,
+          error: "recent_first_unavailable",
+          exhausted: false,
+          skipped_oversized_rows: 0,
+        };
       if (args.action === "search" && !args.query)
         return {
           success: false,
@@ -302,6 +315,8 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             ? new RegExp(args.query!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "iu")
             : null;
         const cursor = args.cursor != null ? decodeHistoryCursor(args.cursor, binding) : undefined;
+        // Windows already known to carry project skill content (this page or earlier pages).
+        const taintedWindows = new Set<string>(cursor?.taintedWindows ?? []);
         // One page budget is shared by the authorization scan and the target scan.
         const budget = {
           maxBytes: SESSION_HISTORY_MAX_SCAN_BYTES,
@@ -341,6 +356,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
                 result.exhausted = false;
                 result.nextCursor = encodeHistoryCursor({
                   ...binding,
+                  taintedWindows: [...taintedWindows],
                   scan: cursor?.scan ?? null,
                   authorization,
                 });
@@ -355,6 +371,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               // Keep any target progress made while the in-flight receipt still authorized.
               result.nextCursor = encodeHistoryCursor({
                 ...binding,
+                taintedWindows: [...taintedWindows],
                 scan: cursor?.scan ?? null,
                 authorization,
               });
@@ -379,6 +396,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             result.exhausted = false;
             result.nextCursor = encodeHistoryCursor({
               ...binding,
+              taintedWindows: [...taintedWindows],
               scan: cursor?.scan ?? null,
               authorization,
             });
@@ -404,6 +422,16 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               return true;
             }
             if (foundItem) return false;
+            // Classified BEFORE every filter so the source row is seen even when the page
+            // returns only later rows: once a row of this window carries project skill
+            // content, every later row of the window can quote it — withheld for a turn that
+            // excludes project content, otherwise the result is stamped for the consent scan.
+            if (messagesCarryProjectSkillContent([message])) taintedWindows.add(windowId);
+            const rowTainted = taintedWindows.has(windowId);
+            if (rowTainted && excludeProjectSkillContent) {
+              result.withheldProjectSkillRows = (result.withheldProjectSkillRows ?? 0) + 1;
+              return true;
+            }
             if (args.window_id != null && args.window_id !== windowId) return true;
             const legacyItemId = getHistoryItemId(message);
             // Keep sequence and m:id inputs working, but return the exact row ID
@@ -415,13 +443,6 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             )
               return true;
             if (args.role != null && message.role !== args.role) return true;
-            if (messagesCarryProjectSkillContent([message])) {
-              if (excludeProjectSkillContent) {
-                result.withheldProjectSkillRows = (result.withheldProjectSkillRows ?? 0) + 1;
-                return true;
-              }
-              result.carriesProjectSkillContent = true;
-            }
             const projected = projectHistory(message);
             // Same-length replacements keep UTF-16 offsets stable for already
             // damaged source strings without emitting unpaired surrogates.
@@ -459,6 +480,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               text: text.slice(start, end),
               nextCharOffset: undefined as number | undefined,
             };
+            if (rowTainted) result.carriesProjectSkillContent = true;
             items.push(item);
             if (byteLength() > payloadBudget && items.length > 1) {
               items.pop();
@@ -485,7 +507,12 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
         result.exhausted = foundItem || scan.cursor == null;
         result.malformedLines = scan.malformedLines;
         if (scan.cursor && !foundItem)
-          result.nextCursor = encodeHistoryCursor({ ...binding, scan: scan.cursor, authorization });
+          result.nextCursor = encodeHistoryCursor({
+            ...binding,
+            taintedWindows: [...taintedWindows],
+            scan: scan.cursor,
+            authorization,
+          });
         if (args.action === "read_item" && !foundItem && !scan.cursor) {
           result.success = false;
           result.error = "item_not_found";

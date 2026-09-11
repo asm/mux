@@ -282,6 +282,11 @@ export async function runMemoryHarvest(args: {
       break;
     }
     activeEvidenceIds = chunk.evidenceIds;
+    // Per-step gate outcome. A throw inside prepareStep is swallowed by the
+    // SDK's step loop (logged, no error part), so the gate aborts the stream
+    // and flags the chunk instead; the flag decides the outcome below.
+    let stale = false;
+    const gate = new AbortController();
     const stream = streamText({
       model: args.model,
       system: args.agentBody,
@@ -292,12 +297,29 @@ export async function runMemoryHarvest(args: {
         `Transcript chunk ${index + 1}/${chunks.length} as JSON evidence rows:\n${chunk.transcript}`,
       tools: { submit_memory_candidates: submitCandidates },
       stopWhen: stepCountIs(HARVEST_MAX_STEPS),
-      abortSignal: args.abortSignal,
+      abortSignal:
+        args.abortSignal === undefined
+          ? gate.signal
+          : AbortSignal.any([args.abortSignal, gate.signal]),
+      // Each chunk is a multi-step tool loop: the gate runs again before every
+      // provider step, so a revocation after the first step stops the next
+      // request instead of retransmitting the input.
+      prepareStep:
+        args.beforeDispatch === undefined
+          ? undefined
+          : async () => {
+              if (!stale && !(await args.beforeDispatch!())) {
+                stale = true;
+                gate.abort(new Error(HARVEST_INPUT_STALE_MESSAGE));
+              }
+              return undefined;
+            },
     });
 
     await stream.consumeStream({
       onError: (error) => streamErrors.push(getErrorMessage(error)),
     });
+    if (stale) streamErrors.unshift(HARVEST_INPUT_STALE_MESSAGE);
     if (streamErrors.length > 0) break;
 
     try {

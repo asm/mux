@@ -220,6 +220,12 @@ export interface ToolConfiguration {
    */
   memoryWriteCarriesProjectSkillContent?: boolean;
   /**
+   * Live per-stream counterpart of memoryWriteCarriesProjectSkillContent: true once a step of
+   * THIS stream carried project skill content (a project skill read in an earlier step), so a
+   * memory write in a later step records the provenance even though the pre-stream rows were clean.
+   */
+  projectSkillContentInContext?: () => boolean;
+  /**
    * Routed turn without Project Trust: reads of project skill content are
    * refused or left out — `memory view` of a file carrying (or of unknown)
    * provenance, tainted entries of the intuition index and directory

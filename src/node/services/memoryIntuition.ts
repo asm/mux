@@ -303,6 +303,10 @@ async function authorizeIntuitionIndex(
   return authorized.filter((entry): entry is MemoryIndexEntry => entry !== undefined);
 }
 
+/** Intuition aborted: Project Trust was revoked while the selected index still carried project skill content. */
+export const INTUITION_INPUT_STALE_MESSAGE =
+  "intuition input changed before dispatch (Project Trust); retry";
+
 /** Headless, read-only recall. The public tool records recalls only for recognized paths it returns. */
 export async function runMemoryIntuition(args: {
   createModel: () => Promise<IntuitionModel>;
@@ -320,6 +324,12 @@ export async function runMemoryIntuition(args: {
    * and therefore out of its reads (reads are bound to the selected index).
    */
   excludeProjectSkillContent?: boolean;
+  /**
+   * Routed turn under trust: trust re-read right before the intuition prompt
+   * is built and before every provider step (index loading, hooks, model
+   * creation and body loading are all revocation windows).
+   */
+  projectSkillContentStillReadable?: () => Promise<boolean>;
   recordUsage?: (
     usage: LanguageModelV2Usage,
     providerMetadata?: Record<string, unknown>,
@@ -394,6 +404,23 @@ export async function runMemoryIntuition(args: {
     const body = await untilAborted(signal, args.resolveAgentBody);
     if (!body?.trim())
       return { kind: "error", message: "Intuition agent definition is missing", stats };
+    // Trust can be revoked during the awaits above: re-read it right before the
+    // prompt is built (and again before every provider step below), narrowing
+    // the index to files without project skill provenance.
+    const excludeAtDispatch = async (): Promise<boolean> =>
+      args.excludeProjectSkillContent === true ||
+      (args.projectSkillContentStillReadable !== undefined &&
+        !(await args.projectSkillContentStillReadable()));
+    if (
+      selection.entries.some((entry) => entry.carriesProjectSkillContent) &&
+      (await excludeAtDispatch())
+    ) {
+      selection = selectIndexForCue(
+        selection.entries.filter((entry) => !entry.carriesProjectSkillContent),
+        cue
+      );
+      if (selection.entries.length === 0) return { kind: "no_report", stats };
+    }
     const allowed = new Set(selection.entries.map((entry) => entry.path));
     const physicalReads = new Map<string, Promise<MemoryReadFileResult>>();
     let reservedBytes = 0;
@@ -484,6 +511,7 @@ export async function runMemoryIntuition(args: {
     };
     const report: { items?: IntuitionReportToolArgs["items"] } = {};
     const errors: string[] = [];
+    let stale = false;
     assert(typeof model !== "string", "intuition requires a pinned model instance");
     const stream = streamText({
       model: wrapLanguageModel({
@@ -559,6 +587,20 @@ export async function runMemoryIntuition(args: {
         }),
       },
       stopWhen: [stepCountIs(MEMORY_INTUITION_MAX_STEPS), hasToolCall("intuition_report")],
+      // Per provider step: a revocation mid-loop must not ship the (still
+      // tainted) index and reads on the next request. A throw here would be
+      // swallowed by the SDK's step loop, so the gate aborts and flags instead.
+      prepareStep: async () => {
+        if (
+          !stale &&
+          selection.entries.some((entry) => entry.carriesProjectSkillContent) &&
+          (await excludeAtDispatch())
+        ) {
+          stale = true;
+          abort();
+        }
+        return undefined;
+      },
       maxOutputTokens: MEMORY_INTUITION_MAX_OUTPUT_TOKENS,
       maxRetries: 0,
       abortSignal: signal,
@@ -589,6 +631,7 @@ export async function runMemoryIntuition(args: {
     } catch (error) {
       errors.push(getErrorMessage(error));
     }
+    if (stale) return { kind: "error", message: INTUITION_INPUT_STALE_MESSAGE, stats };
     const classified =
       report.items === undefined
         ? undefined

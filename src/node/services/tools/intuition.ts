@@ -63,6 +63,7 @@ export const createIntuitionTool: ToolFactory = (config: ToolConfiguration) => {
           // Re-read at the call: the intuition submodel is dispatched to its own
           // provider BEFORE the parent stream's next-step gate could run.
           excludeProjectSkillContent: await toolExcludesProjectSkillContent(config),
+          projectSkillContentStillReadable: config.projectSkillContentStillReadable,
           recordUsage: (usage, providerMetadata, metadataModel) =>
             Promise.resolve(
               config.reportModelUsage?.({

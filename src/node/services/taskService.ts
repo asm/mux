@@ -1,3 +1,4 @@
+import { messagesCarryProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
@@ -7361,6 +7362,14 @@ export class TaskService implements AgentTaskIntegration {
           timestamp,
           synthetic: true,
           uiVisible: true,
+          // Same provenance stamp as the live delivery path.
+          ...(report != null
+            ? {
+                carriesProjectSkillContent: await this.reportCarriesProjectSkillContent(
+                  notification.sourceId
+                ),
+              }
+            : {}),
           ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
         }
       );
@@ -13601,6 +13610,9 @@ export class TaskService implements AgentTaskIntegration {
       timestamp: Date.now(),
       synthetic: true,
       uiVisible: true,
+      // The child's report can restate project skill content its own context
+      // carried; the parent's routed requests withhold it after a revocation.
+      carriesProjectSkillContent: await this.reportCarriesProjectSkillContent(childWorkspaceId),
       ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     });
 
@@ -13622,6 +13634,16 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     return [];
+  }
+
+  /**
+   * Provenance of a child's report: its whole active context is what the
+   * report distills, so any project skill content there taints the report;
+   * an unreadable child history reads as carrying (fail closed).
+   */
+  private async reportCarriesProjectSkillContent(childWorkspaceId: string): Promise<boolean> {
+    const childHistory = await this.historyService.getHistoryFromLatestBoundary(childWorkspaceId);
+    return !childHistory.success || messagesCarryProjectSkillContent(childHistory.data);
   }
 
   private async tryFinalizePendingTaskToolCallInPartial(

@@ -1,3 +1,4 @@
+import { TASK_REPORT_MESSAGE_ID_PREFIX } from "@/node/services/utils/messageIds";
 import { createHash } from "crypto";
 import YAML from "yaml";
 
@@ -332,13 +333,17 @@ function summaryCarriesProjectSkillContent(message: MuxMessage): boolean {
   if (metadata?.carriesProjectSkillContent === false) return false;
   const kind = metadata?.muxMetadata?.type;
   // Every durable summary row a side channel distills from the transcript:
-  // compaction and branch summaries, and /refine's proposal/audit rows.
+  // compaction and branch summaries, /refine's proposal/audit rows, and a
+  // child task's report (distilled from the child's whole context).
   return (
     metadata?.compactionBoundary === true ||
     (metadata?.compacted !== undefined && metadata.compacted !== false) ||
     kind === "compaction-summary" ||
     kind === "branch-summary" ||
-    kind === "refine-summary"
+    kind === "refine-summary" ||
+    (message.role === "user" &&
+      metadata?.synthetic === true &&
+      message.id.startsWith(TASK_REPORT_MESSAGE_ID_PREFIX))
   );
 }
 
@@ -419,7 +424,11 @@ export function withholdProjectSkillContentFromRequest(
         projectContentInContext = true;
         continue;
       }
-      if (rowInvokesProjectSkill(message)) projectContentInContext = true;
+      // An invocation, or a server-generated row stamped as carrying (a child
+      // task's report distilled from a context that held project content).
+      if (rowInvokesProjectSkill(message) || rowCarriesProjectSkillContent(message)) {
+        projectContentInContext = true;
+      }
       // Server-generated user rows (background task reports, file-change
       // notifications, prompt snapshots) were produced while the content was
       // in context too; only the user's own prompts and turn-starting

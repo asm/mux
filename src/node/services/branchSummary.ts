@@ -16,7 +16,10 @@
  */
 
 import { streamText } from "ai";
-import { messagesCarryProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
+import {
+  messagesCarryProjectSkillContent,
+  withholdProjectSkillContentFromRequest,
+} from "@/node/services/agentSkills/loadedSkillSnapshots";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
@@ -672,6 +675,15 @@ export interface AbandonedBranchSummaryInput {
    */
   priorContextCarriesProjectSkillContent?: boolean;
   /**
+   * The workspace's project is trusted. The summarizer may run on another
+   * provider: without trust the transcript is built from a copy that withholds
+   * project skill content (withholdProjectSkillContentFromRequest, seeded with
+   * the prior-context provenance) and the row is stamped clean.
+   */
+  projectTrusted: boolean;
+  /** Trust re-read right before the summarizer's request when content was kept under trust. */
+  recheckProjectTrust?: () => Promise<boolean>;
+  /**
    * Re-verification run after a candidate model is created, immediately
    * before the summarizer's request. The tail was read under the fork's
    * source hold, which is released long before this background call: a
@@ -770,7 +782,19 @@ export async function maybeAppendAbandonedBranchSummary(
       return null;
     }
 
-    const transcript = buildAbandonedBranchTranscript(abandonedMessages);
+    // Provenance of what the summary distills; without trust the copy the
+    // summarizer sees withholds it (and the row is then stamped clean).
+    const carriesProjectSkillContent =
+      input.projectTrusted &&
+      (input.priorContextCarriesProjectSkillContent === true ||
+        messagesCarryProjectSkillContent(abandonedMessages));
+    const transcript = buildAbandonedBranchTranscript(
+      input.projectTrusted
+        ? abandonedMessages
+        : withholdProjectSkillContentFromRequest(abandonedMessages, {
+            projectContentInContext: input.priorContextCarriesProjectSkillContent === true,
+          })
+    );
     if (transcript.length === 0) {
       return null;
     }
@@ -784,7 +808,12 @@ export async function maybeAppendAbandonedBranchSummary(
 
     const sessionUsageService = input.sessionUsageService;
     const summaryText = await generateAbandonedBranchSummaryText({
-      beforeDispatch: input.beforeDispatch,
+      // Rows still eligible AND, for content kept under trust, trust still granted.
+      beforeDispatch: async () =>
+        (input.beforeDispatch === undefined || (await input.beforeDispatch())) &&
+        (!carriesProjectSkillContent ||
+          input.recheckProjectTrust === undefined ||
+          (await input.recheckProjectTrust())),
       aiService: input.aiService,
       workspaceId: input.workspaceId,
       candidates,
@@ -838,11 +867,7 @@ export async function maybeAppendAbandonedBranchSummary(
     // revocation withhold a summary distilled from project skill content. The
     // row-set detector also counts a project skill invocation whose repeated
     // snapshot deduplicated (no snapshot row, a reply that can quote it).
-    const summaryMessage = createBranchSummaryMessage(
-      summaryText,
-      input.priorContextCarriesProjectSkillContent === true ||
-        messagesCarryProjectSkillContent(input.abandonedMessages)
-    );
+    const summaryMessage = createBranchSummaryMessage(summaryText, carriesProjectSkillContent);
     if (input.guardTailMessageId !== undefined) {
       const guardedResult = await input.historyService.appendToHistoryIfTailMatches(
         input.workspaceId,

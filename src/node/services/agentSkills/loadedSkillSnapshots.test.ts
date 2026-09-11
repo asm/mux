@@ -781,6 +781,38 @@ describe("project skill content in persisted tool results", () => {
     });
   });
 
+  it("treats task reports by their provenance stamp, unknown when legacy, and withholds them", () => {
+    // A child's report is distilled from the child's whole context; stamped
+    // reports carry their verdict, legacy (unstamped) reports are unknown.
+    const legacy = createMuxMessage("task-report-1-legacy", "user", "Report text", {
+      timestamp: 1,
+      synthetic: true,
+    });
+    const clean = createMuxMessage("task-report-2-clean", "user", "Report text", {
+      timestamp: 2,
+      synthetic: true,
+      carriesProjectSkillContent: false,
+    });
+    const tainted = createMuxMessage("task-report-3-tainted", "user", "Report: PROJECT BODY", {
+      timestamp: 3,
+      synthetic: true,
+      carriesProjectSkillContent: true,
+    });
+    expect(rowCarriesProjectSkillContent(legacy)).toBe(true);
+    expect(rowCarriesProjectSkillContent(clean)).toBe(false);
+    expect(rowCarriesProjectSkillContent(tainted)).toBe(true);
+    // A tainted report in an otherwise clean parent is withheld itself, and
+    // taints what follows it.
+    const withheld = withholdProjectSkillContentFromRequest([
+      createMuxMessage("u-clean", "user", "Delegate it", { timestamp: 0 }),
+      tainted,
+      createMuxMessage("a-after", "assistant", "Using the report: PROJECT BODY", { timestamp: 4 }),
+    ]);
+    const serialized = JSON.stringify(withheld);
+    expect(serialized).not.toContain("PROJECT BODY");
+    expect(serialized).toContain("Delegate it");
+  });
+
   it("treats a stamped memory view as project skill content and redacts it", () => {
     // MemoryService.view stamps the result when the file carries project
     // skill provenance; the per-step scan and request redaction read the stamp.

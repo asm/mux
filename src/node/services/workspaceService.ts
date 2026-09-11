@@ -1,3 +1,4 @@
+import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { messagesCarryProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import type { RestartBlocker } from "@/common/orpc/types";
 import { Effect, type Scope } from "effect";
@@ -10799,6 +10800,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           !retainedForkRows.success || messagesCarryProjectSkillContent(retainedForkRows.data);
         await startAbandonedBranchSummaryInBackground({
           priorContextCarriesProjectSkillContent,
+          // Same trust rule as the edit path: the summarizer may run on another provider.
+          projectTrusted: isProjectTrusted(this.config, sourceMetadata.projectPath),
+          recheckProjectTrust: () =>
+            Promise.resolve(isProjectTrusted(this.config, sourceMetadata.projectPath)),
           historyService: this.historyService,
           aiService: this.aiService,
           workspaceId: newWorkspaceId,

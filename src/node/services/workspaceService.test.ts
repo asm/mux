@@ -8455,6 +8455,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         >,
     };
     await startAbandonedBranchSummaryInBackground({
+      projectTrusted: true,
       historyService,
       aiService: summaryAiService,
       workspaceId,

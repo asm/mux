@@ -107,6 +107,9 @@ const CursorSchema = z
       .object({ branchRoot: z.string(), scan: HistoryScanStateSchema, proven: z.boolean() })
       .strict()
       .nullable(),
+    // Context windows in which a row carrying project skill content was already seen: the
+    // next page keeps withholding/stamping their later rows without re-seeing the source.
+    taintedWindows: z.array(z.string()).optional(),
   })
   .strict();
 export type HistoryCursor = z.infer<typeof CursorSchema>;
@@ -121,7 +124,7 @@ export function encodeHistoryCursor(cursor: Omit<HistoryCursor, "version">): str
 export function decodeHistoryCursor(
   value: string,
   binding: Pick<HistoryCursor, "workspaceId" | "action" | "query">
-): Pick<HistoryCursor, "scan" | "authorization"> {
+): Pick<HistoryCursor, "scan" | "authorization" | "taintedWindows"> {
   try {
     const envelope = z
       .object({ data: z.string(), signature: z.string().regex(/^[a-f0-9]{64}$/) })
@@ -136,7 +139,11 @@ export function decodeHistoryCursor(
       cursor.query !== binding.query
     )
       throw new Error();
-    return { scan: cursor.scan, authorization: cursor.authorization };
+    return {
+      scan: cursor.scan,
+      authorization: cursor.authorization,
+      taintedWindows: cursor.taintedWindows,
+    };
   } catch {
     throw new Error("invalid_cursor");
   }

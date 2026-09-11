@@ -426,6 +426,10 @@ export async function runMemoryConsolidation(args: {
       streamError: CONSOLIDATION_INPUT_STALE_MESSAGE,
     };
   }
+  // Per-step gate outcome: a throw inside prepareStep is swallowed by the SDK's
+  // step loop, so the gate aborts the stream and flags the run instead.
+  let stale = false;
+  const gate = new AbortController();
   const stream = streamText({
     model: args.model,
     system: args.agentBody,
@@ -434,14 +438,20 @@ export async function runMemoryConsolidation(args: {
       finalPassPrompt,
     tools: { memory: memoryTool },
     stopWhen: stepCountIs(MEMORY_CONSOLIDATION_MAX_STEPS),
-    abortSignal: args.abortSignal,
+    abortSignal:
+      args.abortSignal === undefined
+        ? gate.signal
+        : AbortSignal.any([args.abortSignal, gate.signal]),
     // The tool loop is multi-step: the gate runs again before every provider
     // step, so a revocation after step one stops the next request.
     prepareStep:
       args.beforeDispatch === undefined
         ? undefined
         : async () => {
-            if (!(await args.beforeDispatch!())) throw new Error(CONSOLIDATION_INPUT_STALE_MESSAGE);
+            if (!stale && !(await args.beforeDispatch!())) {
+              stale = true;
+              gate.abort(new Error(CONSOLIDATION_INPUT_STALE_MESSAGE));
+            }
             return undefined;
           },
   });
@@ -456,6 +466,7 @@ export async function runMemoryConsolidation(args: {
       streamErrors.push(getErrorMessage(error));
     },
   });
+  if (stale) streamErrors.unshift(CONSOLIDATION_INPUT_STALE_MESSAGE);
   const summary =
     streamErrors.length === 0 ? (await stream.text).trim() : `stream error: ${streamErrors[0]}`;
 

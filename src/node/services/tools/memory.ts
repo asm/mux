@@ -109,7 +109,7 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
   // it — the assembly-time flag alone would let a view-then-create launder it.
   let contextTainted = baseCtx.writeProvenance?.carriesProjectSkillContent === true;
   const commandCtx = (): MemoryScopeContext =>
-    contextTainted
+    contextTainted || config.projectSkillContentInContext?.() === true
       ? { ...baseCtx, writeProvenance: { carriesProjectSkillContent: true as const } }
       : baseCtx;
   // Normalized once so trailing slashes or whitespace in a call cannot bypass the pin.

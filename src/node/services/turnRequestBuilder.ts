@@ -1,3 +1,4 @@
+import { stepMessagesCarryProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/common/utils/shell";
 import type { OnStepSettled } from "./streamManager";
@@ -2205,8 +2206,13 @@ export class TurnRequestBuilder {
       }
       return created.data;
     };
+    // Live per-stream project provenance: set by onStepMessages below when a
+    // step's messages carry project skill content (a project skill read by an
+    // earlier step), read by the memory tool at each write.
+    const liveProjectTaint = { carries: false };
     // Hoisted so refusal fallback can rebuild tools without changing their context.
     const toolsForModelConfig: ToolConfiguration = {
+      projectSkillContentInContext: () => liveProjectTaint.carries,
       cwd: workspacePath,
       runtime,
       projects: getProjects(metadata),
@@ -3251,14 +3257,19 @@ export class TurnRequestBuilder {
         headers: requestHeaders,
         callSettingsOverrides: resolvedOverrides.standard,
         onChunk: advisorToolEligible ? onAdvisorChunk : undefined,
-        onStepMessages: advisorToolEligible
-          ? (stepMessages) => {
-              advisorTranscriptRef.messages = stepMessages;
-              advisorStepCaptureRef.currentStepText = "";
-              advisorStepCaptureRef.currentStepReasoning = "";
-              advisorStepCaptureRef.frozenSnapshotsByToolCallId.clear();
-            }
-          : undefined,
+        onStepMessages: (stepMessages) => {
+          // A project skill read by an earlier step rides in these messages
+          // before this step's tool calls execute: later memory writes of the
+          // stream record the provenance.
+          if (!liveProjectTaint.carries && stepMessagesCarryProjectSkillContent(stepMessages)) {
+            liveProjectTaint.carries = true;
+          }
+          if (!advisorToolEligible) return;
+          advisorTranscriptRef.messages = stepMessages;
+          advisorStepCaptureRef.currentStepText = "";
+          advisorStepCaptureRef.currentStepReasoning = "";
+          advisorStepCaptureRef.frozenSnapshotsByToolCallId.clear();
+        },
         providedRuntimeTempDir: runtimeTempDir,
         modelFallback,
         toolSearchState: toolSearchRuntime?.state,

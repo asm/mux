@@ -4728,6 +4728,11 @@ export class AgentSession {
           abandonedMessages: this.excludeRejectedRows(truncateResult.data.removedMessages),
           priorContextCarriesProjectSkillContent:
             !retainedRows.success || messagesCarryProjectSkillContent(retainedRows.data),
+          // The summarizer may run on another provider: without Project Trust it
+          // sees a copy that withholds project skill content, and content kept
+          // under trust is re-verified right before its request.
+          projectTrusted: await this.isRoutedProjectSkillTurnStillTrusted(),
+          recheckProjectTrust: () => this.isRoutedProjectSkillTurnStillTrusted(),
           experiments: options?.experiments,
           isExperimentEnabled:
             typeof this.aiService.isExperimentEnabled === "function"

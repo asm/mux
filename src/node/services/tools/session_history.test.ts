@@ -149,6 +149,13 @@ describe("session_history project skill provenance", () => {
       ],
       metadata: { timestamp: 2, historySequence: 2 },
     });
+    // A later reply in the same context window can quote the read: tainted too.
+    await fixture.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("downstream-reply", "assistant", "Applying the conventions", {
+        timestamp: 3,
+      })
+    );
     const run = async (excludeProjectSkillContent: boolean) => {
       const config = createTestToolConfig(fixture.tempDir, { workspaceId });
       config.historyService = fixture.historyService;
@@ -170,7 +177,28 @@ describe("session_history project skill provenance", () => {
     expect(excluded.success).toBe(true);
     expect(excluded.items).toEqual([]);
     expect(excluded.carriesProjectSkillContent).toBeUndefined();
-    expect(excluded.withheldProjectSkillRows).toBe(1);
+    // The read AND the downstream reply of its window are withheld.
+    expect(excluded.withheldProjectSkillRows).toBe(2);
+
+    // The downstream reply alone (no tool filter) is withheld/stamped through
+    // its window's taint, and a routed turn cannot browse recent-first.
+    const config = createTestToolConfig(fixture.tempDir, { workspaceId });
+    config.historyService = fixture.historyService;
+    config.projectSkillContentStillReadable = () => Promise.resolve(true);
+    const routedTool = createSessionHistoryTool(config);
+    const stamped = TOOL_DEFINITIONS.session_history.resultSchema.parse(
+      await routedTool.execute!(
+        { action: "search", query: "Applying the conventions" },
+        mockToolCallOptions
+      )
+    );
+    expect(stamped.items).toHaveLength(1);
+    expect(stamped.carriesProjectSkillContent).toBe(true);
+    const refused = TOOL_DEFINITIONS.session_history.resultSchema.parse(
+      await routedTool.execute!({ action: "list_items", recent_first: true }, mockToolCallOptions)
+    );
+    expect(refused.success).toBe(false);
+    if (!refused.success) expect(refused.error).toBe("recent_first_unavailable");
   });
 });
 

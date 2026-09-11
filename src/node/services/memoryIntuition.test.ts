@@ -314,6 +314,29 @@ describe("runMemoryIntuition", () => {
     expect(await considered(true)).toBe(1);
   });
 
+  it("re-reads trust before dispatch and drops tainted memories the initial verdict admitted", async () => {
+    // Trusted at the call, revoked during index/model/body loading: the prompt
+    // is narrowed before the provider sees it — here to nothing, so no step runs.
+    using f = await fixture();
+    await f.memoryService.create(
+      { ...f.ctx, writeProvenance: { carriesProjectSkillContent: true as const } },
+      "/memories/global/from-skill.md",
+      "Locks per the project skill.",
+      "agent"
+    );
+    const createModel = mock(() => Promise.resolve(pinned(scriptedModel([]))));
+    const result = await runMemoryIntuition({
+      ...f,
+      cue: "locks",
+      modelString: "mock:test",
+      createModel,
+      resolveAgentBody: body,
+      projectSkillContentStillReadable: () => Promise.resolve(false),
+    });
+    expect(result.kind).toBe("no_report");
+    expect(result.stats.steps).toBe(0);
+  });
+
   it("does not create a model, resolve a body, or record usage for an empty index", async () => {
     using f = await fixture();
     const createModel = mock(() => Promise.resolve(pinned(scriptedModel([]))));

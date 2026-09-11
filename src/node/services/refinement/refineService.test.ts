@@ -3116,6 +3116,57 @@ describe("RefineService", () => {
     }
   });
 
+  it("re-verifies trust before every refinement step and aborts the pass when it is revoked mid-loop", async () => {
+    // The pre-dispatch check passes and step 1 runs; trust is revoked while
+    // the model answers step 1, so the gate before step 2 must refuse instead
+    // of retransmitting the trusted transcript. A real transport rejects a
+    // request whose signal is already aborted, which the mock mirrors.
+    let revokeTrust: () => Promise<void> = () => Promise.resolve();
+    let dispatched = 0;
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: async (options) => {
+            if (options.abortSignal?.aborted === true) {
+              throw new DOMException("The operation was aborted.", "AbortError");
+            }
+            dispatched++;
+            if (dispatched === 1) {
+              await revokeTrust();
+              const chunks: LanguageModelV3StreamPart[] = [
+                {
+                  type: "tool-call",
+                  toolCallId: "refine-midloop-1",
+                  toolName: "memory",
+                  input: JSON.stringify({
+                    command: "create",
+                    path: LESSON_PATH,
+                    file_text: "lesson\n",
+                  }),
+                },
+                finishChunk("tool-calls"),
+              ];
+              return { stream: simulateReadableStream({ chunks }) };
+            }
+            return { stream: simulateReadableStream({ chunks: textChunks("Distilled.") }) };
+          },
+        }),
+    });
+    revokeTrust = async () => {
+      await fixture.config.editConfig((cfg) => {
+        const project = cfg.projects.get("/projects/demo");
+        if (project) project.trusted = false;
+        return cfg;
+      });
+    };
+    await fixture.seedTrajectory(["Please run the tests for this repo."]);
+    await seedSettledProjectTurn(fixture);
+    const result = await fixture.service.run(WORKSPACE_ID);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("refine input changed before dispatch");
+    expect(dispatched).toBe(1);
+  });
+
   async function seedSettledProjectTurn(fixture: Fixture): Promise<void> {
     for (const row of [
       createMuxMessage("snap-settled", "user", "SETTLED SKILL BODY", {

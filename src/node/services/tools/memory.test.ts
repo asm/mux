@@ -153,6 +153,21 @@ describe("memory tool sub-project workspaces", () => {
     ).toBe(true);
   });
 
+  it("records provenance for writes made after the stream's context turned tainted", async () => {
+    // Pre-stream rows were clean; a project skill read by an earlier step of
+    // the same stream taints later writes through the live accessor.
+    using fixture = await createFixture();
+    let carries = false;
+    fixture.config.projectSkillContentInContext = () => carries;
+    const tool = createMemoryTool(fixture.config);
+    await run(tool, { command: "create", path: "/memories/global/before.md", file_text: "a" });
+    carries = true;
+    await run(tool, { command: "create", path: "/memories/global/after.md", file_text: "b" });
+    const meta = await new MemoryMetaService(fixture.xumHome).getEntries();
+    expect(meta.get("global:before.md")?.carriesProjectSkillContent).toBe(false);
+    expect(meta.get("global:after.md")?.carriesProjectSkillContent).toBe(true);
+  });
+
   it("resolves project memory from the project identity, not the execution cwd", async () => {
     using fixture = await createFixture();
     // Simulate a sub-project workspace: tools execute in <checkout>/packages/app.
