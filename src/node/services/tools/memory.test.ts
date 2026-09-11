@@ -140,7 +140,7 @@ describe("memory tool sub-project workspaces", () => {
     expect(meta.get("global:derived.md")?.carriesProjectSkillContent).toBe(true);
     expect(meta.get("global:clean.md")?.carriesProjectSkillContent).toBe(false);
 
-    fixture.config.memoryReadsExcludeProjectSkillContent = true;
+    fixture.config.excludeProjectSkillContent = true;
     const excludingTool = createMemoryTool(fixture.config);
     const refused = await run(excludingTool, {
       command: "view",

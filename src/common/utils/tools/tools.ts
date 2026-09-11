@@ -220,11 +220,19 @@ export interface ToolConfiguration {
    */
   memoryWriteCarriesProjectSkillContent?: boolean;
   /**
-   * Routed turn without Project Trust: `memory view` of a file carrying (or of
-   * unknown) project skill provenance is refused — the index and preload
-   * already withhold it, and an exact-path read must not be the way around.
+   * Routed turn without Project Trust: reads of project skill content are
+   * refused or left out — `memory view` of a file carrying (or of unknown)
+   * provenance, tainted entries of the intuition index and directory
+   * listings, tainted session_history rows.
    */
-  memoryReadsExcludeProjectSkillContent?: boolean;
+  excludeProjectSkillContent?: boolean;
+  /**
+   * Routed turn under trust: re-reads Project Trust at a tool call (see
+   * toolExcludesProjectSkillContent) — a revocation between request assembly
+   * and a tool that dispatches to another provider or reads history cannot
+   * wait for the next step's consent gate. Undefined for unrouted turns.
+   */
+  projectSkillContentStillReadable?: () => Promise<boolean>;
   /** Callback to record file state for external edit detection (plan files) */
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
   /** Callback to notify that provider/config was written (triggers hot-reload). */

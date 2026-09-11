@@ -24,6 +24,7 @@ import {
   CANONICAL_MODEL_CLASSES,
   parseModelClassValue,
   splitModelClassValue,
+  withModelClassThinking,
 } from "@/common/utils/ai/skillModelClasses";
 import { getThinkingPolicyForModel, resolveThinkingInput } from "@/common/utils/thinking/policy";
 
@@ -175,7 +176,14 @@ export function ModelClassesEditor() {
           onValueChange={(level) =>
             setModelClass(
               className,
-              buildModelClassValue(selectedModel, level === THINKING_DEFAULT_OPTION ? null : level)
+              // Only the thinking changes: keep the model part as authored (an
+              // alias must not be rewritten to the id it resolves to today).
+              rawValue
+                ? withModelClassThinking(rawValue, level === THINKING_DEFAULT_OPTION ? null : level)
+                : buildModelClassValue(
+                    selectedModel,
+                    level === THINKING_DEFAULT_OPTION ? null : level
+                  )
             )
           }
           disabled={!selectedModel || rowDisabled}

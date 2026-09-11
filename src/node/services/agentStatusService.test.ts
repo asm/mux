@@ -485,6 +485,36 @@ describe("AgentStatusService", () => {
     expect(recheck).toBe(false);
   });
 
+  test("keeps rows behind the latest context boundary out of the status prompt", async () => {
+    // A short active epoch makes the bounded tail read reach into sealed
+    // history; the status model must see the current context only. The
+    // boundary row, stamped clean, resets inherited provenance.
+    const history = historyHandle.historyService;
+    for (const row of [
+      createMuxMessage("u-old", "user", "OLD EPOCH QUESTION"),
+      createMuxMessage("a-old", "assistant", "OLD EPOCH ANSWER"),
+      createMuxMessage("summary", "assistant", "Summary of the old epoch", {
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: 1,
+        carriesProjectSkillContent: false,
+        muxMetadata: { type: "compaction-summary" },
+      }),
+      createMuxMessage("u-new", "user", "NEW EPOCH QUESTION"),
+      createMuxMessage("a-new", "assistant", "NEW EPOCH ANSWER"),
+    ]) {
+      await history.appendToHistory(workspaceId, row);
+    }
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const prompt = generateSpy.mock.calls[0][0];
+    expect(prompt).toContain("NEW EPOCH ANSWER");
+    expect(prompt).toContain("Summary of the old epoch");
+    expect(prompt).not.toContain("OLD EPOCH QUESTION");
+    expect(prompt).not.toContain("OLD EPOCH ANSWER");
+  });
+
   test("inherits project skill taint from active-segment rows outside the trailing slice", async () => {
     // The transcript is a bounded trailing slice, but every row of the active
     // segment is still in the model's context: a project skill turn that fell

@@ -7304,7 +7304,11 @@ export class AgentSession {
           return memoryContext;
         },
         memoryWritesCarryProjectSkillContent: messagesCarryProjectSkillContent(messages),
-        memoryReadsExcludeProjectSkillContent: memoryConsent?.excludeProjectSkillContent === true,
+        excludeProjectSkillContent: memoryConsent?.excludeProjectSkillContent === true,
+        projectSkillContentStillReadable:
+          memoryConsent !== undefined
+            ? () => this.isRoutedProjectSkillTurnStillTrusted()
+            : undefined,
         workspaceGoalService: this.workspaceGoalService,
         prospectiveGoalStatusForToolAvailability,
         allowAgentSetGoal: options?.allowAgentSetGoal === true,
@@ -9438,7 +9442,14 @@ export class AgentSession {
           return memoryContext;
         },
         memoryWritesCarryProjectSkillContent,
-        memoryReadsExcludeProjectSkillContent: memoryConsent?.excludeProjectSkillContent === true,
+        excludeProjectSkillContent: memoryConsent?.excludeProjectSkillContent === true,
+        // Routed turn: tools that read memories/history or dispatch to another
+        // provider re-read trust at the call (a revocation cannot wait for the
+        // next step's gate).
+        projectSkillContentStillReadable:
+          memoryConsent !== undefined
+            ? () => this.isRoutedProjectSkillTurnStillTrusted()
+            : undefined,
         allowAgentSetGoal: options?.allowAgentSetGoal === true,
         workspaceGoalService: this.workspaceGoalService,
         experiments: options?.experiments,

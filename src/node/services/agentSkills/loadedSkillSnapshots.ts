@@ -285,7 +285,7 @@ export function toolOutputCarriesProjectSkillContent(toolName: unknown, output: 
   // A memory view of a file carrying project skill provenance is stamped by
   // MemoryService.view (harvested or written from such content); an intuition
   // report whose recognized memories or leads carry it is stamped the same way.
-  if (toolName === "memory" || toolName === "intuition") {
+  if (toolName === "memory" || toolName === "intuition" || toolName === "session_history") {
     return outputIsStampedCodeExecution(output);
   }
   if (toolName === "code_execution") {
@@ -595,7 +595,8 @@ export function redactProjectSkillToolResults(messages: MuxMessage[]): MuxMessag
       if (
         (SKILL_CONTENT_TOOLS.has(part.toolName) ||
           part.toolName === "memory" ||
-          part.toolName === "intuition") &&
+          part.toolName === "intuition" ||
+          part.toolName === "session_history") &&
         toolOutputCarriesProjectSkillContent(part.toolName, part.output)
       ) {
         changed = true;

@@ -1104,7 +1104,10 @@ export class RefineService {
         memoryService: this.memoryService,
         metaService: this.metaService,
         ctx,
-        memoryReadsExcludeProjectSkillContent: !projectTrusted,
+        excludeProjectSkillContent: !projectTrusted,
+        projectSkillContentStillReadable: projectTrusted
+          ? () => Promise.resolve(this.isProjectTrustedNow(workspaceId))
+          : undefined,
         transcript,
         timelineText,
         skillWriteAvailable,

@@ -1072,17 +1072,30 @@ export class MemoryService extends EventEmitter {
       // Provenance gate BEFORE the read: the index and preload already hide
       // tainted files from an untrusted routed turn, and an exact-path view
       // must not be the way around them. A stamped result lets the per-step
-      // consent scan and request redaction classify the output.
-      const provenanceKey = this.logicalKeyFor(ctx, parsed.scope, parsed.relPath);
-      const carriesProjectSkillContent = memoryEntryCarriesProjectSkillContent(
-        provenanceKey === null
-          ? undefined
-          : (await this.metaService.getEntries()).get(provenanceKey)
+      // consent scan and request redaction classify the output. Check and read
+      // run under the target's mutation lock: writers replace the file and
+      // record its provenance inside that lock, so a view can never pair a
+      // stale "clean" marker with freshly tainted content.
+      const fileScope = this.requireFilePath(parsed, virtualPath);
+      const { content, carriesProjectSkillContent } = await withTargetMutationLock(
+        this.config.rootDir,
+        this.storeLockKey(store),
+        async () => {
+          const provenanceKey = this.logicalKeyFor(ctx, fileScope, parsed.relPath);
+          const carries = memoryEntryCarriesProjectSkillContent(
+            provenanceKey === null
+              ? undefined
+              : (await this.metaService.getEntries()).get(provenanceKey)
+          );
+          if (carries && options?.excludeProjectSkillContent === true) {
+            throw new MemoryCommandError(MEMORY_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE);
+          }
+          return {
+            content: await this.readBoundedTextFile(store, parsed.relPath, virtualPath),
+            carriesProjectSkillContent: carries,
+          };
+        }
       );
-      if (carriesProjectSkillContent && options?.excludeProjectSkillContent === true) {
-        throw new MemoryCommandError(MEMORY_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE);
-      }
-      const content = await this.readBoundedTextFile(store, parsed.relPath, virtualPath);
       const output = renderFileView(content, options);
       await this.recordUsage(ctx, parsed.scope, parsed.relPath, { write: false });
       return {

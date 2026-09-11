@@ -25,6 +25,7 @@
  * TODO(#3534, phase 2): net-shrink enforcement needs a byte-size API on
  * MemoryService; until then the journal is the only post-run signal.
  */
+import { toolExcludesProjectSkillContent } from "./tools/projectSkillContentGate";
 import { tool, streamText, stepCountIs, type LanguageModel, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
@@ -231,7 +232,9 @@ export function createConsolidationMemoryTool(args: {
    */
   abortSignal?: AbortSignal;
   /** Untrusted project: views of memories carrying project skill provenance are refused. */
-  memoryReadsExcludeProjectSkillContent?: boolean;
+  excludeProjectSkillContent?: boolean;
+  /** Trusted at setup: trust re-read at each read (a revocation mid-run must not wait). */
+  projectSkillContentStillReadable?: () => Promise<boolean>;
 }): { tool: Tool; getMutationCount: () => number } {
   const { memoryService, metaService, ctx, dryRun, journal } = args;
   const budget = args.budget ?? createMutationBudget(MEMORY_CONSOLIDATION_OP_BUDGET);
@@ -291,7 +294,7 @@ export function createConsolidationMemoryTool(args: {
         // Reads (and malformed inputs, which fail validation inside) pass through,
         // under the run's provenance exclusion.
         return executeMemoryCommand(memoryService, ctx, input, () => null, toolCallId, {
-          memoryReadsExcludeProjectSkillContent: args.memoryReadsExcludeProjectSkillContent,
+          excludeProjectSkillContent: await toolExcludesProjectSkillContent(args),
         });
       }
 
@@ -381,11 +384,13 @@ export async function runMemoryConsolidation(args: {
     providerMetadata?: Record<string, unknown>
   ) => Promise<void>;
   /** See createConsolidationMemoryTool. */
-  memoryReadsExcludeProjectSkillContent?: boolean;
+  excludeProjectSkillContent?: boolean;
+  /** See createConsolidationMemoryTool. */
+  projectSkillContentStillReadable?: () => Promise<boolean>;
   /**
-   * Re-verification immediately before the provider call (model creation
-   * and tool setup are trust-revocation windows): false ends the run with a
-   * retryable stream error and no request.
+   * Re-verification immediately before EVERY provider step (model creation,
+   * tool setup and each tool-driven step are trust-revocation windows): false
+   * ends the run with a retryable stream error before the request.
    */
   beforeDispatch?: () => Promise<boolean>;
 }): Promise<MemoryConsolidationResult> {
@@ -397,7 +402,8 @@ export async function runMemoryConsolidation(args: {
     ctx: args.ctx,
     dryRun: args.dryRun,
     journal,
-    memoryReadsExcludeProjectSkillContent: args.memoryReadsExcludeProjectSkillContent,
+    excludeProjectSkillContent: args.excludeProjectSkillContent,
+    projectSkillContentStillReadable: args.projectSkillContentStillReadable,
     // r59: workspace removal aborts this signal — a tool execution wedged in
     // filesystem I/O must not commit durable memory (or recreate the deleted
     // session directory via its journal row) once the I/O unblocks.
@@ -429,6 +435,15 @@ export async function runMemoryConsolidation(args: {
     tools: { memory: memoryTool },
     stopWhen: stepCountIs(MEMORY_CONSOLIDATION_MAX_STEPS),
     abortSignal: args.abortSignal,
+    // The tool loop is multi-step: the gate runs again before every provider
+    // step, so a revocation after step one stops the next request.
+    prepareStep:
+      args.beforeDispatch === undefined
+        ? undefined
+        : async () => {
+            if (!(await args.beforeDispatch!())) throw new Error(CONSOLIDATION_INPUT_STALE_MESSAGE);
+            return undefined;
+          },
   });
 
   // Drain the stream; tool executions happen as the loop runs. consumeStream

@@ -30,7 +30,10 @@ import {
   type MuxMessage,
 } from "@/common/types/message";
 import { isWorkspaceArchived } from "@/common/utils/archive";
-import { isDurableContextBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
+import {
+  isDurableContextBoundaryMarker,
+  sliceMessagesForProviderFromLatestContextBoundary,
+} from "@/common/utils/messages/compactionBoundary";
 import type { AIService } from "./aiService";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { HistoryService } from "./historyService";
@@ -622,11 +625,15 @@ export class AgentStatusService {
     // cannot attach a newer turn's in-flight text to an older turn whose rows
     // are the only ones verified.
     const partial = await this.historyService.readPartial(workspaceId);
-    const result = await this.historyService.getLastMessages(
+    const tail = await this.historyService.getLastMessages(
       workspaceId,
       AGENT_STATUS_MAX_TRAILING_MESSAGES
     );
-    if (!result.success) return { transcript: "", rowIds: [], trustedProjectContent: false };
+    if (!tail.success) return { transcript: "", rowIds: [], trustedProjectContent: false };
+    // The bounded tail can reach back past a compaction or context reset (it is
+    // filled from the sealed archive when the active epoch is short): only the
+    // active context is the agent's current work.
+    const result = { data: sliceMessagesForProviderFromLatestContextBoundary(tail.data) };
 
     const quarantine = await this.workspaceService.getQuarantinedRejectedRowIds(workspaceId);
     if (!quarantine.success) {

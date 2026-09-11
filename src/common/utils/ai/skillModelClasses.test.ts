@@ -6,9 +6,20 @@ import {
   parseModelClassValue,
   resolveSkillModelClassBinding,
   splitModelClassValue,
+  withModelClassThinking,
 } from "./skillModelClasses";
 
 describe("parseModelClassValue", () => {
+  it("keeps the authored model part when only the thinking level changes", () => {
+    // An alias class ("haiku+0") must keep following alias/model churn: the
+    // editor rebuilds the value from the raw model part, never from the
+    // concrete id the alias currently resolves to. Model ids containing "+"
+    // keep their own "+" as well.
+    expect(withModelClassThinking("haiku+0", "high")).toBe("haiku+high");
+    expect(withModelClassThinking("haiku+0", null)).toBe("haiku");
+    expect(withModelClassThinking("openai:gpt-5.5", "low")).toBe("openai:gpt-5.5+low");
+    expect(withModelClassThinking("proxy:model+v2+low", "off")).toBe("proxy:model+v2+off");
+  });
   test("resolves a bare alias without a thinking level", () => {
     expect(parseModelClassValue("haiku")).toEqual({ model: KNOWN_MODELS.HAIKU.id });
   });

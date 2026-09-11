@@ -1,3 +1,4 @@
+import { toolExcludesProjectSkillContent } from "./projectSkillContentGate";
 import { tool } from "ai";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -59,7 +60,9 @@ export const createIntuitionTool: ToolFactory = (config: ToolConfiguration) => {
           ctx,
           cue,
           abortSignal: signal,
-          excludeProjectSkillContent: config.memoryReadsExcludeProjectSkillContent === true,
+          // Re-read at the call: the intuition submodel is dispatched to its own
+          // provider BEFORE the parent stream's next-step gate could run.
+          excludeProjectSkillContent: await toolExcludesProjectSkillContent(config),
           recordUsage: (usage, providerMetadata, metadataModel) =>
             Promise.resolve(
               config.reportModelUsage?.({

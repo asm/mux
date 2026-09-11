@@ -114,7 +114,7 @@ describe("consolidation memory tool rails", () => {
       ctx: fixture.ctx,
       dryRun: false,
       journal: [],
-      memoryReadsExcludeProjectSkillContent: true,
+      excludeProjectSkillContent: true,
     });
     const refused = await execute(excluding, {
       command: "view",
@@ -129,6 +129,34 @@ describe("consolidation memory tool rails", () => {
       (await execute(fixture.tool, { command: "view", path: "/memories/global/from-skill.md" }))
         .success
     ).toBe(true);
+  });
+
+  it("re-reads trust at each view so a mid-run revocation refuses tainted memories", async () => {
+    // A sweep that started trusted keeps its tool for the whole multi-step
+    // loop; the read gate re-reads trust per call instead of freezing the
+    // setup-time verdict.
+    using fixture = await createFixture();
+    await fixture.memoryService.create(
+      { ...fixture.ctx, writeProvenance: { carriesProjectSkillContent: true as const } },
+      "/memories/global/from-skill.md",
+      "quotes the skill",
+      "agent"
+    );
+    let trusted = true;
+    const { tool } = createConsolidationMemoryTool({
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+      journal: [],
+      projectSkillContentStillReadable: () => Promise.resolve(trusted),
+    });
+    const view = () => execute(tool, { command: "view", path: "/memories/global/from-skill.md" });
+    expect((await view()).success).toBe(true);
+    trusted = false;
+    const refused = await view();
+    expect(refused.success).toBe(false);
+    if (!refused.success) expect(refused.error).toContain("withheld");
   });
 
   it("a mutation wedged before commit refuses once the pass is cancelled (r59)", async () => {

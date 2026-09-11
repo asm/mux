@@ -739,6 +739,17 @@ describe("project skill content in persisted tool results", () => {
       carriesProjectSkillContent: true,
     };
     expect(toolOutputCarriesProjectSkillContent("intuition", stamped)).toBe(true);
+    // session_history results are stamped the same way when a returned row carries it.
+    expect(
+      toolOutputCarriesProjectSkillContent("session_history", {
+        success: true,
+        items: [],
+        carriesProjectSkillContent: true,
+      })
+    ).toBe(true);
+    expect(
+      toolOutputCarriesProjectSkillContent("session_history", { success: true, items: [] })
+    ).toBe(false);
     expect(
       toolOutputCarriesProjectSkillContent("intuition", {
         ...stamped,

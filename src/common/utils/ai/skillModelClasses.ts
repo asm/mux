@@ -93,6 +93,15 @@ export function buildModelClassValue(model: string, thinkingSuffix: string | nul
 }
 
 /**
+ * The class value after changing ONLY its thinking level: the model part stays
+ * exactly as authored, so an alias such as `haiku` keeps following alias and
+ * model churn instead of freezing to the concrete id it currently resolves to.
+ */
+export function withModelClassThinking(rawValue: string, thinkingSuffix: string | null): string {
+  return buildModelClassValue(splitModelClassValue(rawValue.trim()).modelPart, thinkingSuffix);
+}
+
+/**
  * Class names surfaced as fixed slots in the Settings → Models editor. The
  * config map accepts arbitrary names (hand-edited custom classes are preserved
  * and keep routing), but skills are portable across machines only when they

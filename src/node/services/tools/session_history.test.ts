@@ -125,6 +125,55 @@ afterEach(async () => {
   await fixture.cleanup();
 });
 
+describe("session_history project skill provenance", () => {
+  test("stamps results carrying a project skill read and leaves such rows out when excluded", async () => {
+    // A rollover hides earlier rows from the request's own filter; the tool
+    // can still reach them. A returned row carrying a project skill read
+    // stamps the result (the consent gate arms on it); a turn that must not
+    // read project content never receives the row.
+    await fixture.historyService.appendToHistory(workspaceId, {
+      id: "skill-read-row",
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "skill-1",
+          toolName: "agent_skill_read",
+          state: "output-available",
+          input: { name: "repo-conventions" },
+          output: {
+            success: true,
+            skill: { name: "repo-conventions", scope: "project", body: "PROJECT SKILL BODY" },
+          },
+        },
+      ],
+      metadata: { timestamp: 2, historySequence: 2 },
+    });
+    const run = async (excludeProjectSkillContent: boolean) => {
+      const config = createTestToolConfig(fixture.tempDir, { workspaceId });
+      config.historyService = fixture.historyService;
+      config.excludeProjectSkillContent = excludeProjectSkillContent;
+      const tool = createSessionHistoryTool(config);
+      return TOOL_DEFINITIONS.session_history.resultSchema.parse(
+        await tool.execute!(
+          { action: "list_items", tool_name: "agent_skill_read" },
+          mockToolCallOptions
+        )
+      );
+    };
+    const open = await run(false);
+    expect(open.success).toBe(true);
+    expect(open.items).toHaveLength(1);
+    expect(open.items?.[0].text).toContain("repo-conventions");
+    expect(open.carriesProjectSkillContent).toBe(true);
+    const excluded = await run(true);
+    expect(excluded.success).toBe(true);
+    expect(excluded.items).toEqual([]);
+    expect(excluded.carriesProjectSkillContent).toBeUndefined();
+    expect(excluded.withheldProjectSkillRows).toBe(1);
+  });
+});
+
 describe("session_history real disk recovery", () => {
   test("an interior same-length rewrite followed by append cannot retain cursor trust", async () => {
     const victim = JSON.stringify(createMuxMessage("rewrite-victim", "assistant", "x".repeat(600)));

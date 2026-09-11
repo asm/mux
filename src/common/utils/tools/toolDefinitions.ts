@@ -2480,6 +2480,10 @@ export const TOOL_DEFINITIONS = {
       success: z.boolean(),
       exhausted: z.boolean(),
       skipped_oversized_rows: z.number().int().nonnegative(),
+      /** A returned row carries project skill provenance (a routed turn's consent gate arms on it). */
+      carriesProjectSkillContent: z.literal(true).optional(),
+      /** Rows left out because the turn must not read project skill content. */
+      withheldProjectSkillRows: z.number().int().nonnegative().optional(),
       error: z.string().optional(),
       notice: z.string().optional(),
       items: z

@@ -840,7 +840,10 @@ export class MemoryConsolidationService extends EventEmitter {
           metaService: self.metaService,
           ctx,
           dryRun: false,
-          memoryReadsExcludeProjectSkillContent: !sweepTrusted,
+          excludeProjectSkillContent: !sweepTrusted,
+          projectSkillContentStillReadable: sweepTrusted
+            ? () => Promise.resolve(self.isHarvestProjectTrusted(workspaceId))
+            : undefined,
           beforeDispatch: () =>
             Promise.resolve(!sweepTrusted || self.isHarvestProjectTrusted(workspaceId)),
           finalPass: trigger === "archive",

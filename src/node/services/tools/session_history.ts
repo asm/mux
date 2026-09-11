@@ -1,3 +1,5 @@
+import { toolExcludesProjectSkillContent } from "./projectSkillContentGate";
+import { messagesCarryProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { createHash } from "node:crypto";
 import { tool } from "ai";
 import type { z } from "zod";
@@ -185,6 +187,11 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
     inputSchema: TOOL_DEFINITIONS.session_history.schema,
     execute: async (input): Promise<SessionHistoryResult> => {
       const args = TOOL_DEFINITIONS.session_history.schema.parse(input);
+      // Rows behind a rollover can carry project skill content the request's
+      // own filter never saw (an earlier trusted agent_skill_read): a routed
+      // turn without trust leaves such rows out, and any returned row carrying
+      // it stamps the result for the per-step consent scan.
+      const excludeProjectSkillContent = await toolExcludesProjectSkillContent(config);
       if (args.action === "search" && !args.query)
         return {
           success: false,
@@ -408,6 +415,13 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             )
               return true;
             if (args.role != null && message.role !== args.role) return true;
+            if (messagesCarryProjectSkillContent([message])) {
+              if (excludeProjectSkillContent) {
+                result.withheldProjectSkillRows = (result.withheldProjectSkillRows ?? 0) + 1;
+                return true;
+              }
+              result.carriesProjectSkillContent = true;
+            }
             const projected = projectHistory(message);
             // Same-length replacements keep UTF-16 offsets stable for already
             // damaged source strings without emitting unpaired surrogates.

@@ -203,7 +203,9 @@ export async function runRefinePass(args: {
   model: LanguageModel;
   memoryService: MemoryService;
   /** See createConsolidationMemoryTool. */
-  memoryReadsExcludeProjectSkillContent?: boolean;
+  excludeProjectSkillContent?: boolean;
+  /** See createConsolidationMemoryTool. */
+  projectSkillContentStillReadable?: () => Promise<boolean>;
   metaService: MemoryMetaService;
   ctx: MemoryScopeContext;
   /** Pre-built, bounded, thinking-stripped trajectory transcript. */
@@ -246,7 +248,8 @@ export async function runRefinePass(args: {
     budget,
     // The refinement model may differ from the workspace's: without Project
     // Trust it must not view memories carrying project skill provenance.
-    memoryReadsExcludeProjectSkillContent: args.memoryReadsExcludeProjectSkillContent,
+    excludeProjectSkillContent: args.excludeProjectSkillContent,
+    projectSkillContentStillReadable: args.projectSkillContentStillReadable,
     // r59 defense in depth: dry-run stages in memory only (nothing durable),
     // but a cancelled pass must not start new validation work either, and
     // the shared signal keeps this posture if dry-run semantics ever change.

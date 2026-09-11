@@ -1,3 +1,4 @@
+import { toolExcludesProjectSkillContent } from "./projectSkillContentGate";
 import { tool } from "ai";
 import assert from "@/common/utils/assert";
 import type { MemoryToolResult } from "@/common/types/tools";
@@ -232,7 +233,8 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
         input,
         checkWriteAccess,
         toolCallId,
-        { memoryReadsExcludeProjectSkillContent: config.memoryReadsExcludeProjectSkillContent }
+        // Re-evaluated per call: a routed turn's trust can be revoked mid-turn.
+        { excludeProjectSkillContent: await toolExcludesProjectSkillContent(config) }
       );
       if (result.success && result.carriesProjectSkillContent === true) contextTainted = true;
       return result;
@@ -278,8 +280,8 @@ export async function executeMemoryCommand(
      * I/O unblocks. Ignored by reads.
      */
     abortSignal?: AbortSignal;
-    /** See ToolConfiguration.memoryReadsExcludeProjectSkillContent. */
-    memoryReadsExcludeProjectSkillContent?: boolean;
+    /** See ToolConfiguration.excludeProjectSkillContent. */
+    excludeProjectSkillContent?: boolean;
   }
 ): Promise<MemoryToolResult> {
   try {
@@ -291,7 +293,7 @@ export async function executeMemoryCommand(
         return await memoryService.view(ctx, input.path, {
           offset: input.offset ?? undefined,
           limit: input.limit ?? undefined,
-          excludeProjectSkillContent: options?.memoryReadsExcludeProjectSkillContent === true,
+          excludeProjectSkillContent: options?.excludeProjectSkillContent === true,
         });
       }
       case "create": {
