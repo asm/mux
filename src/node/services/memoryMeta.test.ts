@@ -5,14 +5,20 @@ import { Effect } from "effect";
 
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import { MemoryMetaService, memoryLogicalKey } from "./memoryMeta";
+import {
+  MemoryMetaService,
+  memoryLogicalKey,
+  memoryEntryCarriesProjectSkillContent,
+} from "./memoryMeta";
 import { TestTempDir } from "./tools/testHelpers";
 
 describe("memoryLogicalKey", () => {
   it("records project skill provenance on tainted writes and keeps it across clean uses", async () => {
     // A write made with project skill content in the writer's context marks
-    // the file; later reads and clean writes never launder it, and the flag
-    // survives a reload of the sidecar.
+    // the file for good — later reads, clean edits and even a clean full
+    // rewrite never launder it. A clean write that replaces the whole content
+    // verifies a file clean; an edit of an unclassified (legacy) file leaves
+    // it unknown, which reads as tainted. The state survives a reload.
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "memory-meta-provenance-"));
     try {
       const service = new MemoryMetaService(home);
@@ -21,8 +27,9 @@ describe("memoryLogicalKey", () => {
         carriesProjectSkillContent: true,
       });
       await service.recordAccess("global:from-skill.md", { write: false });
-      await service.recordAccess("global:from-skill.md", { write: true });
-      await service.recordAccess("global:clean.md", { write: true });
+      await service.recordAccess("global:from-skill.md", { write: true, replacesContent: true });
+      await service.recordAccess("global:clean.md", { write: true, replacesContent: true });
+      await service.recordAccess("global:legacy-edited.md", { write: true });
       // A read with the flag is not a write: it must not taint.
       await service.recordAccess("global:read-only.md", {
         write: false,
@@ -32,7 +39,12 @@ describe("memoryLogicalKey", () => {
       const entries = await reloaded.getEntries();
       expect(entries.get("global:from-skill.md")?.carriesProjectSkillContent).toBe(true);
       expect(entries.get("global:clean.md")?.carriesProjectSkillContent).toBe(false);
-      expect(entries.get("global:read-only.md")?.carriesProjectSkillContent).toBe(false);
+      expect(entries.get("global:legacy-edited.md")?.carriesProjectSkillContent).toBeUndefined();
+      expect(memoryEntryCarriesProjectSkillContent(entries.get("global:legacy-edited.md"))).toBe(
+        true
+      );
+      expect(memoryEntryCarriesProjectSkillContent(entries.get("global:clean.md"))).toBe(false);
+      expect(memoryEntryCarriesProjectSkillContent(entries.get("global:read-only.md"))).toBe(true);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }
@@ -238,16 +250,17 @@ describe("MemoryMetaService", () => {
         accessCount: 3,
         lastAccessedAt: 1000,
         lastWriteAt: null,
-        carriesProjectSkillContent: false,
       });
-      // Invalid fields heal to defaults; the pin itself survives.
+      // Invalid fields heal to defaults; the pin itself survives. A legacy
+      // entry carries no provenance marker: unknown, never coerced to clean.
       expect(entries.get("global:bad-count.md")).toEqual({
         pinned: true,
         accessCount: 0,
         lastAccessedAt: null,
         lastWriteAt: null,
-        carriesProjectSkillContent: false,
       });
+      expect(memoryEntryCarriesProjectSkillContent(entries.get("global:ok.md"))).toBe(true);
+      expect(memoryEntryCarriesProjectSkillContent(undefined)).toBe(true);
       // Entirely-default entries are dropped.
       expect(entries.has("global:all-defaults.md")).toBe(false);
     });

@@ -2311,6 +2311,8 @@ export const MemoryToolResultSchema = z.union([
   z.object({
     success: z.literal(true),
     output: z.string(),
+    /** The viewed memory carries project skill provenance (MemoryService.view). */
+    carriesProjectSkillContent: z.literal(true).optional(),
   }),
   z.object({
     success: z.literal(false),

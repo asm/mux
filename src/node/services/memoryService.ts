@@ -46,7 +46,11 @@ import {
   memoryMutationLockKey,
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
-import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
+import {
+  memoryLogicalKey,
+  type MemoryMetaService,
+  memoryEntryCarriesProjectSkillContent,
+} from "@/node/services/memoryMeta";
 import {
   REFINEMENT_CAPTURE_MAX_FILES,
   REFINEMENT_CAPTURE_MAX_TOTAL_BYTES,
@@ -92,8 +96,21 @@ export interface MemoryScopeContext {
 export type MemoryActor = "agent" | "user";
 
 export type MemoryCommandResult =
-  | { success: true; output: string }
+  | {
+      success: true;
+      output: string;
+      /**
+       * The viewed file carries project skill provenance (or none is recorded
+       * for it): a routed turn's per-step consent gate arms on this result and
+       * an untrusted routed request redacts it like a project skill read.
+       */
+      carriesProjectSkillContent?: true;
+    }
   | { success: false; error: string };
+
+/** A `view` refused because the turn must not read project skill content (routed, untrusted). */
+export const MEMORY_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE =
+  "Memory withheld: it carries project skill content and Project Trust is not granted for this workspace.";
 
 export interface MemoryChangeEvent {
   scope: MemoryScope;
@@ -631,7 +648,7 @@ export class MemoryService extends EventEmitter {
     ctx: MemoryScopeContext,
     scope: MemoryScope,
     relPath: string,
-    options: { write: boolean }
+    options: { write: boolean; replacesContent?: boolean }
   ): Promise<void> {
     try {
       const key = this.logicalKeyFor(ctx, scope, relPath);
@@ -639,9 +656,11 @@ export class MemoryService extends EventEmitter {
       await this.metaService.recordAccess(key, {
         write: options.write,
         // Provenance rides the context: a write made with project skill
-        // content in the writer's context marks the file (sticky).
+        // content in the writer's context marks the file (sticky); a clean
+        // write replacing the whole content verifies it clean.
         carriesProjectSkillContent:
           options.write && ctx.writeProvenance?.carriesProjectSkillContent === true,
+        replacesContent: options.replacesContent,
       });
     } catch (error) {
       log.debug("[MemoryService] failed to record memory usage", { scope, relPath, error });
@@ -972,7 +991,12 @@ export class MemoryService extends EventEmitter {
   async view(
     ctx: MemoryScopeContext,
     virtualPath: string,
-    options?: { offset?: number; limit?: number }
+    options?: {
+      offset?: number;
+      limit?: number;
+      /** Routed turn without Project Trust: refuse files carrying (or of unknown) provenance. */
+      excludeProjectSkillContent?: boolean;
+    }
   ): Promise<MemoryCommandResult> {
     return this.runCommand(async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -1016,10 +1040,27 @@ export class MemoryService extends EventEmitter {
         throw new MemoryCommandError(`No memory file or directory at ${virtualPath}`);
       }
 
+      // Provenance gate BEFORE the read: the index and preload already hide
+      // tainted files from an untrusted routed turn, and an exact-path view
+      // must not be the way around them. A stamped result lets the per-step
+      // consent scan and request redaction classify the output.
+      const provenanceKey = this.logicalKeyFor(ctx, parsed.scope, parsed.relPath);
+      const carriesProjectSkillContent = memoryEntryCarriesProjectSkillContent(
+        provenanceKey === null
+          ? undefined
+          : (await this.metaService.getEntries()).get(provenanceKey)
+      );
+      if (carriesProjectSkillContent && options?.excludeProjectSkillContent === true) {
+        throw new MemoryCommandError(MEMORY_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE);
+      }
       const content = await this.readBoundedTextFile(store, parsed.relPath, virtualPath);
       const output = renderFileView(content, options);
       await this.recordUsage(ctx, parsed.scope, parsed.relPath, { write: false });
-      return { success: true, output };
+      return {
+        success: true,
+        output,
+        ...(carriesProjectSkillContent ? { carriesProjectSkillContent: true } : {}),
+      };
     });
   }
 
@@ -1066,7 +1107,7 @@ export class MemoryService extends EventEmitter {
           toolCallId,
           [{ path: store.physicalPath(parsed.relPath), content: fileText }]
         );
-        await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
+        await this.recordUsage(ctx, scope, parsed.relPath, { write: true, replacesContent: true });
         this.emitChange(ctx, scope, parsed.relPath, actor);
         return {
           success: true as const,
@@ -1258,7 +1299,10 @@ export class MemoryService extends EventEmitter {
           toolCallId,
           [{ path: physicalPath, content: updated }]
         );
-        await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
+        await this.recordUsage(ctx, scope, parsed.relPath, {
+          write: true,
+          replacesContent: mutation.command === "create",
+        });
         this.emitChange(ctx, scope, parsed.relPath, actor);
         return {
           success: true as const,
@@ -1632,7 +1676,10 @@ export class MemoryService extends EventEmitter {
           }
           await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
           await store.writeFile(parsed.relPath, content);
-          await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
+          await this.recordUsage(ctx, scope, parsed.relPath, {
+            write: true,
+            replacesContent: true,
+          });
           this.emitChange(ctx, scope, parsed.relPath, actor);
           return { success: true as const, data: { sha256: sha256Hex(content) } };
         }
@@ -1716,8 +1763,10 @@ export class MemoryService extends EventEmitter {
             scope,
             relPath,
             description,
-            carriesProjectSkillContent:
-              key !== null && meta.get(key)?.carriesProjectSkillContent === true,
+            // Unknown provenance (legacy entry, never-classified file) is tainted.
+            carriesProjectSkillContent: memoryEntryCarriesProjectSkillContent(
+              key === null ? undefined : meta.get(key)
+            ),
           });
         }
       } catch (error) {

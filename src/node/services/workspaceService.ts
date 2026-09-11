@@ -1,3 +1,4 @@
+import { messagesCarryProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import type { RestartBlocker } from "@/common/orpc/types";
 import { Effect, type Scope } from "effect";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
@@ -10789,7 +10790,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           sourceRejectedQuarantine
         );
         const abandonedRowIds = abandonedForSummary.map((row) => row.id);
+        // The abandoned replies were generated with the RETAINED context (the
+        // fork's history up to the branch point) in the model's context; a
+        // project skill there taints them even though its row stays behind.
+        const retainedForkRows =
+          await this.historyService.getHistoryFromLatestBoundary(newWorkspaceId);
+        const priorContextCarriesProjectSkillContent =
+          !retainedForkRows.success || messagesCarryProjectSkillContent(retainedForkRows.data);
         await startAbandonedBranchSummaryInBackground({
+          priorContextCarriesProjectSkillContent,
           historyService: this.historyService,
           aiService: this.aiService,
           workspaceId: newWorkspaceId,

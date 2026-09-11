@@ -479,6 +479,19 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         experiments: RLM_ON,
       });
       expect(deduplicated?.metadata?.carriesProjectSkillContent).toBe(true);
+
+      // The abandoned replies were generated with the RETAINED context in the
+      // model's context: a project skill before the branch point taints the
+      // summary even when no abandoned row carries it itself.
+      const inherited = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        aiService: fakeAiService(summaryModel("Summary quoting the skill.")),
+        workspaceId: "ws-provenance-inherited",
+        abandonedMessages: meatyExchange("inherited"),
+        priorContextCarriesProjectSkillContent: true,
+        experiments: RLM_ON,
+      });
+      expect(inherited?.metadata?.carriesProjectSkillContent).toBe(true);
     } finally {
       await cleanup();
     }

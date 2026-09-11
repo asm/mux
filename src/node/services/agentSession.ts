@@ -109,6 +109,7 @@ import {
 } from "@/common/orpc/schemas";
 import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { roundToBase2 } from "@/common/telemetry/utils";
 import {
   normalizePersistedAgentCandidate,
@@ -738,12 +739,41 @@ async function replacePreferenceFile(preferencePath: string, payload: string): P
  * persisted meanwhile.
  */
 const preferenceFileUpdates = new Map<string, Promise<void>>();
+/**
+ * Cross-process guard for the same read-decide-write cycles: two backends
+ * over one sessions directory (a closed-workspace sweep in one, a live
+ * session's persist in the other) must not interleave either. Lockfiles live
+ * in a sibling directory of the session directories, keyed by workspace: not
+ * under the preference path (its write seams stay distinguishable) and not
+ * inside the session directory (taking the lock must never recreate a removed
+ * workspace's directory).
+ */
+const AUTO_RETRY_PREFERENCE_LOCK_TIMEOUT_MS = 5_000;
+const AUTO_RETRY_PREFERENCE_LOCK_DIR = ".auto-retry-preference-locks";
+function preferenceFileLockPath(preferencePath: string): string {
+  const sessionDir = path.dirname(preferencePath);
+  return path.join(
+    path.dirname(sessionDir),
+    AUTO_RETRY_PREFERENCE_LOCK_DIR,
+    `${path.basename(sessionDir)}.lock`
+  );
+}
 async function serializePreferenceFileUpdate<T>(
   preferencePath: string,
   update: () => Promise<T>
 ): Promise<T> {
+  const locked = async (): Promise<T> => {
+    await using _lock = await acquireProcessFileLock({
+      lockPath: preferenceFileLockPath(preferencePath),
+      timeoutMs: AUTO_RETRY_PREFERENCE_LOCK_TIMEOUT_MS,
+      label: "auto-retry preference lock",
+    });
+    // Awaited INSIDE the held lock: a bare `return update()` would release the
+    // lock before the update settles and detach its failure from the caller.
+    return await update();
+  };
   const previous = preferenceFileUpdates.get(preferencePath) ?? Promise.resolve();
-  const run = previous.then(update, update);
+  const run = previous.then(locked, locked);
   const settled = run.then(
     () => undefined,
     () => undefined
@@ -4682,6 +4712,12 @@ export class AgentSession {
         // P1): workspace removal racing this await must find a cancellation
         // handle in clearPendingBranchSummary, or the writer's late append
         // could recreate the just-deleted session directory.
+        // The abandoned replies were generated with the RETAINED context in
+        // the model's context; a project skill there taints them even though
+        // its row survives the truncation. Unreadable history: assume tainted.
+        const retainedRows = await this.historyService.getHistoryFromLatestBoundary(
+          this.workspaceId
+        );
         const branchSummaryMessage = await runInlineAbandonedBranchSummary({
           historyService: this.historyService,
           aiService: this.aiService,
@@ -4690,6 +4726,8 @@ export class AgentSession {
           // stamp) are transcript-only: the side-channel summarizer must not
           // distill them either.
           abandonedMessages: this.excludeRejectedRows(truncateResult.data.removedMessages),
+          priorContextCarriesProjectSkillContent:
+            !retainedRows.success || messagesCarryProjectSkillContent(retainedRows.data),
           experiments: options?.experiments,
           isExperimentEnabled:
             typeof this.aiService.isExperimentEnabled === "function"
@@ -7266,6 +7304,7 @@ export class AgentSession {
           return memoryContext;
         },
         memoryWritesCarryProjectSkillContent: messagesCarryProjectSkillContent(messages),
+        memoryReadsExcludeProjectSkillContent: memoryConsent?.excludeProjectSkillContent === true,
         workspaceGoalService: this.workspaceGoalService,
         prospectiveGoalStatusForToolAvailability,
         allowAgentSetGoal: options?.allowAgentSetGoal === true,
@@ -9399,6 +9438,7 @@ export class AgentSession {
           return memoryContext;
         },
         memoryWritesCarryProjectSkillContent,
+        memoryReadsExcludeProjectSkillContent: memoryConsent?.excludeProjectSkillContent === true,
         allowAgentSetGoal: options?.allowAgentSetGoal === true,
         workspaceGoalService: this.workspaceGoalService,
         experiments: options?.experiments,

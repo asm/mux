@@ -71,8 +71,19 @@ export interface MemoryMetaEntry {
    * (pins and stats follow renames). Routed requests after a Project Trust
    * revocation withhold such memories (MemoryScopeContext.writeProvenance,
    * MemorySessionContext.carriesProjectSkillContent).
+   *
+   * Tri-state: `true` tainted, `false` verified clean (the file's whole
+   * content was written by this build with a clean context), ABSENT unknown —
+   * a legacy entry or file nobody classified, treated as tainted
+   * (memoryEntryCarriesProjectSkillContent). Edits keep the state; only a
+   * full-content clean write can establish `false`.
    */
-  carriesProjectSkillContent: boolean;
+  carriesProjectSkillContent?: boolean;
+}
+
+/** Unknown provenance is tainted: only a verified-clean entry reads as clean. */
+export function memoryEntryCarriesProjectSkillContent(entry: MemoryMetaEntry | undefined): boolean {
+  return entry?.carriesProjectSkillContent !== false;
 }
 
 const EMPTY_ENTRY: MemoryMetaEntry = {
@@ -80,7 +91,6 @@ const EMPTY_ENTRY: MemoryMetaEntry = {
   accessCount: 0,
   lastAccessedAt: null,
   lastWriteAt: null,
-  carriesProjectSkillContent: false,
 };
 
 function isEmptyEntry(entry: MemoryMetaEntry): boolean {
@@ -89,7 +99,7 @@ function isEmptyEntry(entry: MemoryMetaEntry): boolean {
     entry.accessCount === 0 &&
     entry.lastAccessedAt === null &&
     entry.lastWriteAt === null &&
-    !entry.carriesProjectSkillContent
+    entry.carriesProjectSkillContent === undefined
   );
 }
 
@@ -124,7 +134,10 @@ function sanitizeMetaFile(raw: unknown): MemoryMetaFile {
       accessCount: sanitizeCount(record.accessCount),
       lastAccessedAt: sanitizeTimestamp(record.lastAccessedAt),
       lastWriteAt: sanitizeTimestamp(record.lastWriteAt),
-      carriesProjectSkillContent: record.carriesProjectSkillContent === true,
+      // Legacy entries carry no marker: unknown, never coerced to clean.
+      ...(typeof record.carriesProjectSkillContent === "boolean"
+        ? { carriesProjectSkillContent: record.carriesProjectSkillContent }
+        : {}),
     };
     if (isEmptyEntry(entry)) continue;
     entries[key] = entry;
@@ -208,20 +221,27 @@ export class MemoryMetaService {
     /** Record a use (read or write) of a memory file at the MemoryService chokepoint. */
     recordAccess: (
       logicalKey: string,
-      options: { write: boolean; carriesProjectSkillContent?: boolean }
+      options: { write: boolean; carriesProjectSkillContent?: boolean; replacesContent?: boolean }
     ): Effect.Effect<void, MemoryMetaWriteError> =>
       this.mutate((entries) => {
         const current = entries[logicalKey] ?? EMPTY_ENTRY;
         const now = Date.now();
+        // A tainted write marks the file for good; a clean write that
+        // REPLACES the whole content (create, UI save) verifies it clean;
+        // reads and edits keep the state — an edited legacy file stays unknown.
+        const provenance =
+          current.carriesProjectSkillContent === true ||
+          (options.write && options.carriesProjectSkillContent === true)
+            ? true
+            : options.write && options.replacesContent === true
+              ? false
+              : current.carriesProjectSkillContent;
         entries[logicalKey] = {
           ...current,
           accessCount: current.accessCount + 1,
           lastAccessedAt: now,
           lastWriteAt: options.write ? now : current.lastWriteAt,
-          // A tainted write marks the file for good; reads never clear it.
-          carriesProjectSkillContent:
-            current.carriesProjectSkillContent ||
-            (options.write && options.carriesProjectSkillContent === true),
+          ...(provenance === undefined ? {} : { carriesProjectSkillContent: provenance }),
         };
       }),
 
@@ -351,7 +371,7 @@ export class MemoryMetaService {
   /** Record a use (read or write) of a memory file at the MemoryService chokepoint. */
   async recordAccess(
     logicalKey: string,
-    options: { write: boolean; carriesProjectSkillContent?: boolean }
+    options: { write: boolean; carriesProjectSkillContent?: boolean; replacesContent?: boolean }
   ): Promise<void> {
     await Effect.runPromise(this.effects.recordAccess(logicalKey, options));
   }

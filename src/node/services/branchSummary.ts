@@ -665,6 +665,13 @@ export interface AbandonedBranchSummaryInput {
   /** The removed tail, as returned by HistoryService.truncateAfterMessage. */
   abandonedMessages: MuxMessage[];
   /**
+   * The RETAINED active context before the branch point carries project skill
+   * content: the abandoned replies were generated with it in context and can
+   * quote it even though its source row stays behind, so the summary inherits
+   * the provenance.
+   */
+  priorContextCarriesProjectSkillContent?: boolean;
+  /**
    * Re-verification run after a candidate model is created, immediately
    * before the summarizer's request. The tail was read under the fork's
    * source hold, which is released long before this background call: a
@@ -833,7 +840,8 @@ export async function maybeAppendAbandonedBranchSummary(
     // snapshot deduplicated (no snapshot row, a reply that can quote it).
     const summaryMessage = createBranchSummaryMessage(
       summaryText,
-      messagesCarryProjectSkillContent(input.abandonedMessages)
+      input.priorContextCarriesProjectSkillContent === true ||
+        messagesCarryProjectSkillContent(input.abandonedMessages)
     );
     if (input.guardTailMessageId !== undefined) {
       const guardedResult = await input.historyService.appendToHistoryIfTailMatches(

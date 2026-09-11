@@ -621,11 +621,16 @@ export class AgentStatusService {
     // cannot attach a newer turn's in-flight text to an older turn whose rows
     // are the only ones verified.
     const partial = await this.historyService.readPartial(workspaceId);
-    const result = await this.historyService.getLastMessages(
-      workspaceId,
-      AGENT_STATUS_MAX_TRAILING_MESSAGES
+    // The whole active segment is read (not just the trailing slice): rows
+    // before the slice are still in the model's context, so a project skill
+    // among them taints every later reply the slice does contain.
+    const segmentResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!segmentResult.success) return { transcript: "", rowIds: [], trustedProjectContent: false };
+    const trailingStart = Math.max(
+      0,
+      segmentResult.data.length - AGENT_STATUS_MAX_TRAILING_MESSAGES
     );
-    if (!result.success) return { transcript: "", rowIds: [], trustedProjectContent: false };
+    const result = { data: segmentResult.data.slice(trailingStart) };
 
     const quarantine = await this.workspaceService.getQuarantinedRejectedRowIds(workspaceId);
     if (!quarantine.success) {
@@ -635,6 +640,9 @@ export class AgentStatusService {
       });
       return null;
     }
+    const inheritedProjectContext = messagesCarryProjectSkillContent(
+      excludeRejectedTurnRows(segmentResult.data.slice(0, trailingStart), quarantine.data)
+    );
     let committedMessages: MuxMessage[] = excludeRejectedTurnRows(result.data, quarantine.data);
     // A turn persists its snapshot prefix before its user row: trailing prefix
     // rows belong to a turn still being written (PREPARING), whose gate has
@@ -678,8 +686,13 @@ export class AgentStatusService {
     // whose project cannot be found is not trusted.
     const trusted = this.isWorkspaceProjectTrusted(workspaceId);
     let transcriptRows = [...committedMessages, ...(eligiblePartial ? [eligiblePartial] : [])];
-    const trustedProjectContent = trusted && messagesCarryProjectSkillContent(transcriptRows);
-    if (!trusted) transcriptRows = withholdProjectSkillContentFromRequest(transcriptRows);
+    const trustedProjectContent =
+      trusted && (inheritedProjectContext || messagesCarryProjectSkillContent(transcriptRows));
+    if (!trusted) {
+      transcriptRows = withholdProjectSkillContentFromRequest(transcriptRows, {
+        projectContentInContext: inheritedProjectContext,
+      });
+    }
     // Withholding drops only project snapshot (user) rows, so the partial — an
     // assistant row appended last — is still the last row when present.
     const partialRow = eligiblePartial ? transcriptRows.at(-1) : undefined;

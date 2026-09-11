@@ -282,6 +282,9 @@ const SKILL_CONTENT_TOOLS = new Set(["agent_skill_read", "agent_skill_read_file"
 export function toolOutputCarriesProjectSkillContent(toolName: unknown, output: unknown): boolean {
   if (toolName === "agent_skill_read") return outputRetainsProjectSkill(output);
   if (toolName === "agent_skill_read_file") return outputIsProjectSkillFile(output);
+  // A memory view of a file carrying project skill provenance is stamped by
+  // MemoryService.view (harvested or written from such content).
+  if (toolName === "memory") return outputIsStampedCodeExecution(output);
   if (toolName === "code_execution") {
     // The execution's own provenance stamp (CodeExecutionResult
     // .carriesProjectSkillContent) covers content the guest copied into the
@@ -373,7 +376,18 @@ export function rowInvokesProjectSkill(message: MuxMessage): boolean {
   return Array.isArray(refs) && refs.some((ref) => ref.scope === "project");
 }
 
-export function withholdProjectSkillContentFromRequest(messages: MuxMessage[]): MuxMessage[] {
+export function withholdProjectSkillContentFromRequest(
+  messages: MuxMessage[],
+  options?: {
+    /**
+     * Project content already sat in the model's context BEFORE these rows
+     * (active-segment rows the caller does not pass — a bounded status slice,
+     * the retained context before a branch point): every assistant row is
+     * withheld from the first one on.
+     */
+    projectContentInContext?: boolean;
+  }
+): MuxMessage[] {
   const kept: MuxMessage[] = [];
   // Once project skill content has entered the segment — a project snapshot
   // row, a project skill invocation (its repeated snapshot may have
@@ -385,7 +399,7 @@ export function withholdProjectSkillContentFromRequest(messages: MuxMessage[]): 
   // boundary, whose summary row carries the provenance forward when it is
   // tainted. The carrying row itself keeps its structure for
   // redactProjectSkillToolResults (tool result, prose and sibling parts).
-  let projectContentInContext = false;
+  let projectContentInContext = options?.projectContentInContext === true;
   for (const message of messages) {
     if (message.role === "user") {
       if (message.metadata?.agentSkillSnapshot?.scope === "project") {
@@ -551,7 +565,7 @@ export function redactProjectSkillToolResults(messages: MuxMessage[]): MuxMessag
     const parts = message.parts.map((part) => {
       if (part.type !== "dynamic-tool" || part.state !== "output-available") return part;
       if (
-        SKILL_CONTENT_TOOLS.has(part.toolName) &&
+        (SKILL_CONTENT_TOOLS.has(part.toolName) || part.toolName === "memory") &&
         toolOutputCarriesProjectSkillContent(part.toolName, part.output)
       ) {
         changed = true;

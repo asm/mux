@@ -324,6 +324,8 @@ export interface StreamMessageOptions {
    * content into them), so later routed requests can withhold them.
    */
   memoryWritesCarryProjectSkillContent?: boolean;
+  /** Routed turn without Project Trust: the memory tool refuses views of tainted files. */
+  memoryReadsExcludeProjectSkillContent?: boolean;
   experiments?: SendMessageOptions["experiments"];
   allowAgentSetGoal?: boolean;
   workspaceGoalService?: WorkspaceGoalService;
@@ -880,6 +882,7 @@ export class TurnRequestBuilder {
       postCompactionAttachments,
       resolveMemoryContext,
       memoryWritesCarryProjectSkillContent,
+      memoryReadsExcludeProjectSkillContent,
       experiments: experimentsFromOptions,
       allowAgentSetGoal,
       workspaceGoalService,
@@ -2410,6 +2413,7 @@ export class TurnRequestBuilder {
       memoryWriteCarriesProjectSkillContent:
         memoryWritesCarryProjectSkillContent === true ||
         memoryContext?.carriesProjectSkillContent === true,
+      memoryReadsExcludeProjectSkillContent: memoryReadsExcludeProjectSkillContent === true,
       contextBudgetRolloverAvailable,
       // Experiments for inheritance to subagents and workflow tool gating.
       experiments: {

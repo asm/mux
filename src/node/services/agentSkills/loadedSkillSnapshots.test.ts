@@ -13,6 +13,7 @@ import {
   redactProjectSkillToolResults,
   rowCarriesProjectSkillContent,
   messagesCarryProjectSkillContent,
+  toolOutputCarriesProjectSkillContent,
 } from "./loadedSkillSnapshots";
 
 function createAgentSkillReadToolMessage(args: {
@@ -680,6 +681,33 @@ describe("project skill content in persisted tool results", () => {
     expect(messagesCarryProjectSkillContent([invocation("u-global", "global", 3), reply])).toBe(
       false
     );
+  });
+
+  it("treats a stamped memory view as project skill content and redacts it", () => {
+    // MemoryService.view stamps the result when the file carries project
+    // skill provenance; the per-step scan and request redaction read the stamp.
+    const stamped = { success: true, output: "quotes the skill", carriesProjectSkillContent: true };
+    expect(toolOutputCarriesProjectSkillContent("memory", stamped)).toBe(true);
+    expect(toolOutputCarriesProjectSkillContent("memory", { success: true, output: "clean" })).toBe(
+      false
+    );
+    const row: MuxMessage = {
+      id: "a-memory",
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "memory-1",
+          toolName: "memory",
+          state: "output-available",
+          input: { command: "view", path: "/memories/global/from-skill.md" },
+          output: stamped,
+        },
+        { type: "text", text: "Summary: quotes the skill" },
+      ],
+    };
+    expect(rowCarriesProjectSkillContent(row)).toBe(true);
+    expect(JSON.stringify(redactProjectSkillToolResults([row]))).not.toContain("quotes the skill");
   });
 
   it("treats an unstamped legacy summary as project content, a summary stamped clean as clean", () => {

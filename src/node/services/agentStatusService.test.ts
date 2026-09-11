@@ -1,3 +1,4 @@
+import { PROJECT_SKILL_TURN_WITHHELD_MESSAGE } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
@@ -482,6 +483,48 @@ describe("AgentStatusService", () => {
     expect(generateSpy).toHaveBeenCalledTimes(3);
     expect(generateSpy.mock.calls[2][0]).toContain("SETTLED SKILL BODY");
     expect(recheck).toBe(false);
+  });
+
+  test("inherits project skill taint from active-segment rows outside the trailing slice", async () => {
+    // The transcript is a bounded trailing slice, but every row of the active
+    // segment is still in the model's context: a project skill turn that fell
+    // outside the slice taints the later replies the slice does contain.
+    const history = historyHandle.historyService;
+    for (const row of [
+      createMuxMessage("snap-project", "user", "PROJECT SKILL BODY", {
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "s" },
+      }),
+      createMuxMessage("u-project", "user", "Use skill done", {
+        retrySendOptions: {
+          model: "anthropic:claude-haiku-4-5",
+          agentId: "exec",
+          routedProjectConsent: true,
+        },
+      }),
+      createMuxMessage("a-project", "assistant", "Applied the skill"),
+    ]) {
+      await history.appendToHistory(workspaceId, row);
+    }
+    for (let i = 0; i < 90; i++) {
+      await history.appendToHistory(
+        workspaceId,
+        createMuxMessage(`u-${i}`, "user", `Question ${i}`)
+      );
+      await history.appendToHistory(
+        workspaceId,
+        createMuxMessage(`a-${i}`, "assistant", `Answer ${i} restates the skill`)
+      );
+    }
+    (projectsConfig.projects.get(projectPath) as { trusted?: boolean }).trusted = false;
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const prompt = generateSpy.mock.calls[0][0];
+    expect(prompt).toContain("Question 89");
+    expect(prompt).not.toContain("Answer 89 restates the skill");
+    expect(prompt).not.toContain("PROJECT SKILL BODY");
+    expect(prompt).toContain(PROJECT_SKILL_TURN_WITHHELD_MESSAGE);
   });
 
   test("correlates the partial with the history read instead of an older snapshot", async () => {

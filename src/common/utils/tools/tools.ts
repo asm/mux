@@ -219,6 +219,12 @@ export interface ToolConfiguration {
    * routed requests after a Project Trust revocation can withhold the files.
    */
   memoryWriteCarriesProjectSkillContent?: boolean;
+  /**
+   * Routed turn without Project Trust: `memory view` of a file carrying (or of
+   * unknown) project skill provenance is refused — the index and preload
+   * already withhold it, and an exact-path read must not be the way around.
+   */
+  memoryReadsExcludeProjectSkillContent?: boolean;
   /** Callback to record file state for external edit detection (plan files) */
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
   /** Callback to notify that provider/config was written (triggers hot-reload). */
