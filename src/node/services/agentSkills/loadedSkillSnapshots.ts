@@ -289,9 +289,7 @@ export function toolOutputCarriesProjectSkillContent(toolName: unknown, output: 
     // the nested scan covers outputs persisted before the stamp existed.
     return (
       outputIsStampedCodeExecution(output) ||
-      nestedSkillContentRecords(output).some((record) =>
-        toolOutputCarriesProjectSkillContent(record.toolName, record.result)
-      )
+      nestedSkillContentRecords(output).some(nestedSkillRecordCarriesProjectSkillContent)
     );
   }
   return false;
@@ -429,20 +427,40 @@ function outputIsProjectSkillFile(output: unknown): boolean {
   return result.skillScope === "project" || result.skillScope === undefined;
 }
 
+interface NestedSkillContentRecord {
+  toolName?: unknown;
+  result?: unknown;
+  error?: unknown;
+  ok?: unknown;
+}
+
 /** Every nested skill-content record of a code_execution output, regardless of its status. */
-function nestedSkillContentRecords(
-  output: unknown
-): Array<{ toolName?: unknown; result?: unknown }> {
+function nestedSkillContentRecords(output: unknown): NestedSkillContentRecord[] {
   if (typeof output !== "object" || output === null) return [];
   const toolCalls = (output as { toolCalls?: unknown }).toolCalls;
   if (!Array.isArray(toolCalls)) return [];
   return toolCalls.filter(
-    (record): record is { toolName?: unknown; result?: unknown } =>
+    (record): record is NestedSkillContentRecord =>
       typeof record === "object" &&
       record !== null &&
       typeof (record as { toolName?: unknown }).toolName === "string" &&
       SKILL_CONTENT_TOOLS.has((record as { toolName: string }).toolName)
   );
+}
+
+/**
+ * Whether a nested skill-read record carries (or may carry) project skill
+ * content. A record whose RESULT is gone was compacted by a build that did not
+ * stamp the execution (kernel mode summarized non-exempt records to
+ * `{toolName, ok, bytes}`): the call succeeded, its content can have been
+ * copied into the outer result or console, and nothing says which scope it
+ * had — unknown, so it counts. A failed call retained nothing.
+ */
+function nestedSkillRecordCarriesProjectSkillContent(record: NestedSkillContentRecord): boolean {
+  if (record.result === undefined) {
+    return record.error === undefined && record.ok !== false;
+  }
+  return toolOutputCarriesProjectSkillContent(record.toolName, record.result);
 }
 
 /**

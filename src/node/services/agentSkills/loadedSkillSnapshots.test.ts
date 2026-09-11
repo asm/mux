@@ -337,6 +337,29 @@ describe("project skill content in persisted tool results", () => {
     expect(untouched).toBe(clean);
   });
 
+  it("treats a legacy result-less nested skill-file read as project content unless it failed", () => {
+    // Pre-stamp kernel-mode history compacted nested agent_skill_read_file
+    // records to {toolName, ok, bytes}: the content may have been copied into
+    // the outer result or console and its scope is unknown. A failed call
+    // retained nothing.
+    const legacy = (record: Record<string, unknown>) =>
+      nestedRecordsMessage([
+        { toolName: "agent_skill_read_file", args: { name: "repo" }, ...record },
+      ]);
+    expect(rowCarriesProjectSkillContent(legacy({ ok: true, bytes: 120 }))).toBe(true);
+    expect(rowCarriesProjectSkillContent(legacy({ bytes: 120 }))).toBe(true);
+    expect(rowCarriesProjectSkillContent(legacy({ ok: false, bytes: 0 }))).toBe(false);
+    expect(rowCarriesProjectSkillContent(legacy({ error: "denied" }))).toBe(false);
+    // A retained global result is still recognized as clean.
+    expect(
+      rowCarriesProjectSkillContent(
+        legacy({ result: { success: true, skillScope: "global", content: "x" } })
+      )
+    ).toBe(false);
+    const [redacted] = redactProjectSkillToolResults([legacy({ ok: true, bytes: 120 })]);
+    expect(JSON.stringify(redacted)).toContain(PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE);
+  });
+
   it("withholds a tainted code_execution output whole, stamped or nested", () => {
     // The guest can copy a nested project skill result into the return value
     // or console output, and kernel-mode compaction can drop the nested record

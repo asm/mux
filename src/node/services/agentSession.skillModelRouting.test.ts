@@ -17,6 +17,7 @@ import { Err, Ok } from "@/common/types/result";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
 import type { ResolvedAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
+import * as agentSkillsModule from "@/node/services/agentSkills/agentSkillsService";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
 import {
   COMPACTION_SUMMARY_WITHHELD_MESSAGE,
@@ -1379,6 +1380,62 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
             source: "inline",
           })),
         },
+      })
+    );
+    expect(result.success).toBe(true);
+    const history = await historyService.getHistoryFromLatestBoundary("ws-skill-routing");
+    if (!history.success) throw new Error(history.error);
+    expect(
+      history.data.some((message) => message.metadata?.muxMetadata?.type === "compaction-request")
+    ).toBe(true);
+    await session.dispose();
+  });
+
+  it("reads an unbound skill's package once when a class is configured", async () => {
+    // Routing inspects the package's frontmatter even when the skill ends up
+    // unbound; materialization must reuse that read (a full remote SKILL.md
+    // read in runtime-backed workspaces) instead of repeating it.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const { session, streamed } = await createRoutingHarness({
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" } },
+    });
+    const original = agentSkillsModule.readAgentSkill;
+    const readSpy = spyOn(agentSkillsModule, "readAgentSkill").mockImplementation((...args) =>
+      original(...args)
+    );
+    try {
+      const result = await session.sendMessage("Use skill done", skillSendOptions());
+      expect(result.success).toBe(true);
+      expect(streamed).toHaveLength(1);
+      expect(streamed[0].modelString).toBe(USER_MODEL);
+      expect(readSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      readSpy.mockRestore();
+    }
+    await session.dispose();
+  });
+
+  it("counts a text-like attachment toward the routed pending payload", async () => {
+    // Composer attachments are images (SVG included) or PDFs, never text/*.
+    // An SVG is inlined as text for the provider, so its decoded size counts
+    // against the routed window like the prompt does.
+    const workspacePath = await createWorkspaceWithSkill({
+      skillName: "done",
+      metadataYaml: "metadata:\n  model-class: small\n",
+    });
+    const { session, historyService } = await createRoutingHarness({
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" } },
+    });
+    stubCompactionMonitor(session, 86);
+    // ~60k decoded chars (≈15k tokens, ≈7.5% of haiku's window) as a data URL.
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg">${"<g/>".repeat(15_000)}</svg>`;
+    const dataUrl = `data:image/svg+xml;base64,${Buffer.from(svg, "utf8").toString("base64")}`;
+    const result = await session.sendMessage(
+      "Use skill done",
+      skillSendOptions({
+        fileParts: [{ type: "file", url: dataUrl, mediaType: "image/svg+xml", filename: "a.svg" }],
       })
     );
     expect(result.success).toBe(true);

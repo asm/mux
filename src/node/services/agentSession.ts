@@ -26,6 +26,7 @@ import {
   getContextBudgetHardCeiling,
   getContextBudgetRolloverPoint,
   resolveContextBudgetFlushThinking,
+  estimateFreshRequestTokens,
 } from "@/common/utils/compaction/contextBudget";
 import {
   createRolloverPrefix,
@@ -226,6 +227,7 @@ import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCom
 import { ROUTED_SEND_COMPACTION_HEADROOM_PERCENT } from "@/common/constants/ui";
 import { MAX_AGENT_SKILL_SNAPSHOT_CHARS } from "@/common/constants/attachments";
 import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
+import type { OpenAIWireFormat } from "@/common/types/providerOptions";
 import { getModelCapabilitiesResolved } from "@/common/utils/ai/modelCapabilities";
 import {
   getExplicitGatewayPrefix,
@@ -514,6 +516,14 @@ function extractAgentSkillRefs(metadata: MuxMessageMetadata | undefined): AgentS
 
 function normalizeMediaType(mediaType: string): string {
   return mediaType.toLowerCase().trim().split(";")[0];
+}
+
+/**
+ * Character count of an attachment's content as the provider will see it: a
+ * data URL's decoded payload (base64 inflates by 4/3), otherwise the URL text.
+ */
+function decodedAttachmentChars(url: string): number {
+  return estimateBase64DataUrlBytes(url) ?? url.length;
 }
 
 function estimateBase64DataUrlBytes(dataUrl: string): number | null {
@@ -4081,9 +4091,21 @@ export class AgentSession {
     // surfaced as a stream-error — a bare Err would let sendQueuedMessages()
     // drop the user's queued input with no visible feedback.
     const typedMuxMetadata = options?.muxMetadata as MuxMessageMetadata | undefined;
+    const inspectedSkill: { package?: ResolvedAgentSkill } = {};
     const skillModelOverride = options
-      ? await this.resolveSkillModelClassOverride(typedMuxMetadata, options)
+      ? await this.resolveSkillModelClassOverride(typedMuxMetadata, options, inspectedSkill)
       : null;
+    // Package reuse for materialization: a routed turn's consent-anchoring
+    // package, or the package the resolver already read to inspect an UNBOUND
+    // skill's frontmatter — one (possibly remote) SKILL.md read per
+    // invocation, not two.
+    const preResolvedSkillPackage =
+      (skillModelOverride?.kind === "override" ? skillModelOverride.resolvedPackage : undefined) ??
+      inspectedSkill.package;
+    const preResolvedSkills =
+      preResolvedSkillPackage != null
+        ? new Map([[preResolvedSkillPackage.package.directoryName, preResolvedSkillPackage]])
+        : undefined;
     if (await cancelBeforeAcceptance()) {
       return Ok(undefined);
     }
@@ -4459,14 +4481,7 @@ export class AgentSession {
           options?.disableWorkspaceAgents,
           // Not a fresh context window: the dedupe is skipped below anyway.
           false,
-          skillModelOverride?.kind === "override" && skillModelOverride.resolvedPackage != null
-            ? new Map([
-                [
-                  skillModelOverride.resolvedPackage.package.directoryName,
-                  skillModelOverride.resolvedPackage,
-                ],
-              ])
-            : undefined,
+          preResolvedSkills,
           skillModelOverride?.kind === "override",
           true
         );
@@ -4705,10 +4720,15 @@ export class AgentSession {
       if (userModel == null) {
         return optionsForStream;
       }
+      // Each option set's own OpenAI wire format decides whether the Codex
+      // OAuth cap applies to its window: a Chat Completions send with an API
+      // key has the full public window, and inferring the OAuth cap here would
+      // misjudge which model can compact the history.
       const userLimit = getEffectiveContextLimit(
         userModel,
         this.is1MContextEnabledForModel(userModel, preRoutingOptions, providersConfigForWindows),
-        providersConfigForWindows
+        providersConfigForWindows,
+        { openaiWireFormat: preRoutingOptions.providerOptions?.openai?.wireFormat }
       );
       const routedLimit = getEffectiveContextLimit(
         skillModelOverride.model,
@@ -4717,7 +4737,8 @@ export class AgentSession {
           optionsForStream,
           providersConfigForWindows
         ),
-        providersConfigForWindows
+        providersConfigForWindows,
+        { openaiWireFormat: optionsForStream.providerOptions?.openai?.wireFormat }
       );
       return (routedLimit ?? 0) > (userLimit ?? 0) ? optionsForStream : preRoutingOptions;
     })();
@@ -4912,6 +4933,7 @@ export class AgentSession {
                 providersConfigForCompaction
               ),
               providersConfig: providersConfigForCompaction,
+              openaiWireFormat: optionsForStream.providerOptions?.openai?.wireFormat,
             })
           : 0;
       const routedSendNearsWindow =
@@ -5195,14 +5217,7 @@ export class AgentSession {
             typedMuxMetadata,
             options?.disableWorkspaceAgents,
             contextRollover,
-            skillModelOverride?.kind === "override" && skillModelOverride.resolvedPackage != null
-              ? new Map([
-                  [
-                    skillModelOverride.resolvedPackage.package.directoryName,
-                    skillModelOverride.resolvedPackage,
-                  ],
-                ])
-              : undefined,
+            preResolvedSkills,
             skillModelOverride?.kind === "override"
           ));
         skillSnapshotMessages = skillMaterialization.messages;
@@ -6382,18 +6397,32 @@ export class AgentSession {
     model: string;
     use1MContext: boolean;
     providersConfig: ProvidersConfigMap | null;
+    openaiWireFormat: OpenAIWireFormat | null | undefined;
   }): number {
-    const limit = getEffectiveContextLimit(args.model, args.use1MContext, args.providersConfig);
+    const limit = getEffectiveContextLimit(args.model, args.use1MContext, args.providersConfig, {
+      openaiWireFormat: args.openaiWireFormat,
+    });
     if (limit == null || limit <= 0) return 0;
-    const attachmentChars = (args.fileParts ?? [])
-      .filter((part) => part.mediaType.startsWith("text/"))
-      .reduce((sum, part) => sum + part.url.length, 0);
+    // Composer attachments are images (SVG included) or PDFs. Text-like media
+    // (SVG is inlined as text) counts by decoded size; the rest is priced the
+    // way the budget code prices a fresh request's attachments (per part).
+    const textLike = (part: { mediaType: string }) =>
+      part.mediaType.startsWith("text/") || part.mediaType === "image/svg+xml";
+    const textLikeChars = (args.fileParts ?? [])
+      .filter(textLike)
+      .reduce((sum, part) => sum + decodedAttachmentChars(part.url), 0);
+    const mediaTokens = estimateFreshRequestTokens({
+      userText: "",
+      attachments: (args.fileParts ?? []).filter((part) => !textLike(part)),
+      // The recorded usage already includes the system prompt.
+      systemFloorTokens: 0,
+    });
     const chars =
       args.message.length +
       Math.min(args.skillBody?.length ?? 0, MAX_AGENT_SKILL_SNAPSHOT_CHARS) +
       args.inlineSkillRefCount * MAX_AGENT_SKILL_SNAPSHOT_CHARS +
-      attachmentChars;
-    return (chars / APPROX_CHARS_PER_TOKEN / limit) * 100;
+      textLikeChars;
+    return ((Math.ceil(chars / APPROX_CHARS_PER_TOKEN) + mediaTokens) / limit) * 100;
   }
 
   private is1MContextEnabledForModel(
@@ -12652,7 +12681,11 @@ export class AgentSession {
    */
   private async resolveSkillModelClassOverride(
     muxMetadata: MuxMessageMetadata | undefined,
-    options: SendMessageOptions
+    options: SendMessageOptions,
+    // Out-channel for the package this resolver read (a possibly remote
+    // SKILL.md): an UNBOUND skill still had its frontmatter inspected, and
+    // materialization must reuse that read instead of repeating it.
+    inspection?: { package?: ResolvedAgentSkill }
   ): Promise<
     | {
         kind: "override";
@@ -12769,6 +12802,7 @@ export class AgentSession {
         workspacePath,
         disableWorkspaceAgents: options.disableWorkspaceAgents,
       })(skillName);
+      if (inspection) inspection.package = resolved;
       if (resolved.package.scope === "project" && !projectTrusted) {
         return null;
       }
