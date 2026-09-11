@@ -576,21 +576,26 @@ export function collectRejectedTurnRowIds(
     if (index === -1 || messages[index].role !== "user") {
       continue;
     }
-    for (let i = index - 1; i >= 0; i--) {
-      const metadata = messages[i].metadata;
-      if (
-        metadata?.synthetic === true &&
-        (metadata.agentSkillSnapshot != null ||
-          metadata.mcpPromptSnapshot != null ||
-          metadata.fileAtMentionSnapshot != null)
-      ) {
-        ids.add(messages[i].id);
-        continue;
-      }
-      break;
+    for (let i = index - 1; i >= 0 && isTurnSnapshotPrefixRow(messages[i]); i--) {
+      ids.add(messages[i].id);
     }
   }
   return ids;
+}
+
+/**
+ * A synthetic row a turn persists immediately before its user row: a skill,
+ * MCP prompt or @file-mention snapshot. Such rows carry repository content and
+ * belong to the user row that follows them.
+ */
+export function isTurnSnapshotPrefixRow(message: MuxMessage): boolean {
+  const metadata = message.metadata;
+  return (
+    metadata?.synthetic === true &&
+    (metadata.agentSkillSnapshot != null ||
+      metadata.mcpPromptSnapshot != null ||
+      metadata.fileAtMentionSnapshot != null)
+  );
 }
 
 /**

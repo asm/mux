@@ -2142,6 +2142,86 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     await session.dispose();
   });
 
+  it("persists the consent obligation widened by an inline project reference", async () => {
+    // The user row's retry options seed routedProjectConsent from the invoked
+    // package's scope; an inline $project-skill reference is only discovered
+    // by materialization, later. Startup recovery and manual Retry read the
+    // obligation from the persisted row, so the widened value must reach it —
+    // the in-memory resume state alone dies with the process.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const harnessArgs: Parameters<typeof createRoutingHarness>[0] = {
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" }, skillModelClasses: { done: "small" } },
+    };
+    const relabelInvokedPackageAsGlobal = (session: object) => {
+      const withResolve = session as unknown as {
+        resolveSkillModelClassOverride: (...resolveArgs: unknown[]) => Promise<unknown>;
+      };
+      const originalResolve = withResolve.resolveSkillModelClassOverride.bind(session);
+      spyOn(withResolve, "resolveSkillModelClassOverride").mockImplementation(
+        async (...resolveArgs: unknown[]) => {
+          const resolved = await originalResolve(...resolveArgs);
+          // The invoked package itself is global, so the seed is false.
+          const override = resolved as {
+            kind?: string;
+            resolvedPackage?: { package: { scope: string } };
+          };
+          if (override.kind === "override" && override.resolvedPackage != null) {
+            override.resolvedPackage.package.scope = "global";
+          }
+          return resolved;
+        }
+      );
+    };
+    const persistedConsent = async (
+      historyService: Awaited<ReturnType<typeof createRoutingHarness>>["historyService"]
+    ) => {
+      const history = await historyService.getHistoryFromLatestBoundary("ws-skill-routing");
+      if (!history.success) throw new Error(history.error);
+      const row = history.data.find(
+        (message) => message.role === "user" && message.metadata?.synthetic !== true
+      );
+      return row?.metadata?.retrySendOptions?.routedProjectConsent;
+    };
+
+    // Control: a routed global invocation with no project content seeds no obligation.
+    {
+      const { session, streamed, historyService } = await createRoutingHarness(harnessArgs);
+      relabelInvokedPackageAsGlobal(session);
+      expect((await session.sendMessage("Use skill done", skillSendOptions())).success).toBe(true);
+      expect(streamed).toHaveLength(1);
+      expect(await persistedConsent(historyService)).toBeUndefined();
+      await session.dispose();
+    }
+
+    // Materialization discovers an inline project reference: the persisted row
+    // and the live resume state both carry the widened obligation.
+    {
+      const { session, streamed, historyService } = await createRoutingHarness(harnessArgs);
+      relabelInvokedPackageAsGlobal(session);
+      const withMaterialize = session as unknown as {
+        materializeAgentSkillSnapshots: (
+          ...args: unknown[]
+        ) => Promise<{ messages: unknown[]; carriesProjectSkillContent: boolean }>;
+      };
+      const originalMaterialize = withMaterialize.materializeAgentSkillSnapshots.bind(session);
+      spyOn(withMaterialize, "materializeAgentSkillSnapshots").mockImplementation(
+        async (...args: unknown[]) => ({
+          ...(await originalMaterialize(...args)),
+          carriesProjectSkillContent: true,
+        })
+      );
+      expect((await session.sendMessage("Use skill done", skillSendOptions())).success).toBe(true);
+      expect(streamed).toHaveLength(1);
+      expect(await persistedConsent(historyService)).toBe(true);
+      const resumeState = (
+        session as unknown as { lastAutoRetryResumeRequest?: { routedProjectConsent?: boolean } }
+      ).lastAutoRetryResumeRequest;
+      expect(resumeState?.routedProjectConsent).toBe(true);
+      await session.dispose();
+    }
+  });
+
   it("refuses a manual resume while the tail's consent record cannot be read", async () => {
     // FAIL CLOSED: an unreadable tail is not "no consent obligation". The
     // replayed row may be a routed project-skill turn whose trust has since

@@ -4664,10 +4664,10 @@ export class AgentSession {
           agentInitiated,
           goalKind,
           compactionBaseOptionsForRoutedTurn,
-          // Durable consent seed (invoked package's scope; this row persists
-          // before materialization can widen the flag for inline refs — the
-          // in-memory resume state below carries the final value). A
-          // compaction replacing a routed stream inherits the obligation.
+          // Durable consent seed (invoked package's scope). Materialization
+          // below can widen it for inline project references; it rewrites
+          // this row's retry options before the row persists. A compaction
+          // replacing a routed stream inherits the obligation.
           routedTurnCarriesProjectContent || inheritsRoutedConsent
         ),
         muxMetadata: stampedMuxMetadata, // Frontend metadata; requestedModel re-stamped when routing applied
@@ -5098,6 +5098,22 @@ export class AgentSession {
         skillSnapshotMessages = skillMaterialization.messages;
         if (skillMaterialization.carriesProjectSkillContent) {
           routedTurnCarriesProjectContent = true;
+          // The user row's durable consent seed was computed from the invoked
+          // package's scope. The row persists below, and startup recovery and
+          // manual Retry read the obligation FROM it (the in-memory resume
+          // state dies with the process), so it must carry the widened value:
+          // otherwise a crash after acceptance and a later trust revocation
+          // would replay the persisted project snapshot on the class model
+          // with no consent gate armed.
+          if (userMessage.metadata != null) {
+            userMessage.metadata.retrySendOptions = pickStartupRetrySendOptions(
+              optionsForStream,
+              agentInitiated,
+              goalKind,
+              compactionBaseOptionsForRoutedTurn,
+              true
+            );
+          }
         }
         mcpPromptSnapshotMessages = await this.materializeMcpPromptSnapshots(
           typedMuxMetadata,

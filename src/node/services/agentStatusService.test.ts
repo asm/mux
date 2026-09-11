@@ -345,6 +345,109 @@ describe("AgentStatusService", () => {
     expect(generateSpy).toHaveBeenCalledTimes(1);
   });
 
+  test("withholds a routed turn's rows and partial until it has a committed reply", async () => {
+    // A routed turn (the retry options the resume path gates on) can still be
+    // refused and stamped — by its pre-dispatch or per-step gate, or by a
+    // Retry after a failed stream — until a reply is committed; the status
+    // prompt must not carry what that refusal would withhold.
+    const history = historyHandle.historyService;
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please run the test suite")
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("a1", "assistant", "Running tests now")
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("snap-routed", "user", "ROUTED SKILL BODY", {
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "z" },
+      })
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u-routed", "user", "ROUTED PROMPT", {
+        retrySendOptions: {
+          model: "anthropic:claude-haiku-4-5",
+          agentId: "exec",
+          routedProjectConsent: true,
+        },
+      })
+    );
+    await history.writePartial(
+      workspaceId,
+      createMuxMessage("a-partial", "assistant", "ROUTED PARTIAL OUTPUT")
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const inFlight = generateSpy.mock.calls[0][0];
+    expect(inFlight).toContain("User: Please run the test suite");
+    for (const withheld of ["ROUTED SKILL BODY", "ROUTED PROMPT", "ROUTED PARTIAL OUTPUT"]) {
+      expect(inFlight).not.toContain(withheld);
+    }
+
+    // Settled: with the reply committed the turn can no longer be refused.
+    await history.deletePartial(workspaceId);
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("a-routed", "assistant", "Applied the routed skill")
+    );
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(2);
+    const settled = generateSpy.mock.calls[1][0];
+    expect(settled).toContain("ROUTED PROMPT");
+    expect(settled).toContain("ROUTED SKILL BODY");
+    expect(settled).toContain("Assistant: Applied the routed skill");
+  });
+
+  test("drops a trailing snapshot prefix whose user row has not landed yet", async () => {
+    // PREPARING persists the snapshot prefix before the user row; a tick in
+    // between must not read the prefix as settled history.
+    const history = historyHandle.historyService;
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please run the test suite")
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("snap-pending", "user", "PENDING SKILL BODY", {
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "p" },
+      })
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    expect(generateSpy.mock.calls[0][0]).toContain("User: Please run the test suite");
+    expect(generateSpy.mock.calls[0][0]).not.toContain("PENDING SKILL BODY");
+  });
+
+  test("re-verifies the snapshotted rows right before dispatch", async () => {
+    // A settled row can still be refused and stamped by a later Retry between
+    // the snapshot and the provider call; the stale snapshot is dropped
+    // without settling the tick.
+    const history = historyHandle.historyService;
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please run the test suite")
+    );
+    getCandidatesMock.mockImplementation(async () => {
+      const stamped = await history.markMessagesPreStreamRejected(workspaceId, ["u1"]);
+      if (!stamped.success) throw new Error(stamped.error);
+      return ["anthropic:claude-haiku-4-5"];
+    });
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).not.toHaveBeenCalled();
+    expect(setSidebarStatusMock).not.toHaveBeenCalled();
+  });
+
   test("transcript tags in-flight tool calls 'running' and completed ones 'done'", async () => {
     // Lifecycle markers are the highest-signal datum the status model has
     // for distinguishing "Deploying service" (call still running) from
