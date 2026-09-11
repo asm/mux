@@ -334,6 +334,69 @@ describe("project skill content in persisted tool results", () => {
     expect(untouched).toBe(clean);
   });
 
+  it("withholds a tainted code_execution output whole, stamped or nested", () => {
+    // The guest can copy a nested project skill result into the return value
+    // or console output, and kernel-mode compaction can drop the nested record
+    // itself: the execution's provenance stamp classifies the output, and the
+    // redaction replaces it whole (shape kept, pairing intact).
+    const codeExecutionRow = (output: Record<string, unknown>): MuxMessage => ({
+      id: "exec",
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "tool-exec",
+          toolName: "code_execution",
+          state: "output-available",
+          input: { code: "..." },
+          output,
+        },
+      ],
+    });
+    const stampedOnly = codeExecutionRow({
+      success: true,
+      result: "copied: PROJECT BODY",
+      consoleOutput: [{ level: "log", args: ["PROJECT BODY again"], timestamp: 1 }],
+      toolCalls: [],
+      duration_ms: 3,
+      carriesProjectSkillContent: true,
+    });
+    const nestedWithCopy = codeExecutionRow({
+      success: true,
+      result: "copied: PROJECT BODY",
+      toolCalls: [
+        {
+          toolName: "agent_skill_read",
+          args: { name: "repo-conventions" },
+          result: projectResult("repo-conventions", "PROJECT BODY"),
+        },
+      ],
+      consoleOutput: [],
+      duration_ms: 3,
+    });
+    const clean = codeExecutionRow({
+      success: true,
+      result: "plain",
+      toolCalls: [],
+      consoleOutput: [],
+      duration_ms: 1,
+    });
+    expect(rowCarriesProjectSkillContent(stampedOnly)).toBe(true);
+    expect(rowCarriesProjectSkillContent(nestedWithCopy)).toBe(true);
+    expect(rowCarriesProjectSkillContent(clean)).toBe(false);
+    for (const tainted of [stampedOnly, nestedWithCopy]) {
+      const [redacted] = redactProjectSkillToolResults([tainted]);
+      const serialized = JSON.stringify(redacted);
+      expect(serialized).not.toContain("PROJECT BODY");
+      expect(serialized).toContain(PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE);
+      const part = redacted.parts[0];
+      expect(part.type === "dynamic-tool" && part.toolCallId).toBe("tool-exec");
+      // Still classified after redaction, so a later scan agrees.
+      expect(rowCarriesProjectSkillContent(redacted)).toBe(true);
+    }
+    expect(redactProjectSkillToolResults([clean])[0]).toBe(clean);
+  });
+
   function skillFileReadMessage(id: string, result: Record<string, unknown>): MuxMessage {
     return {
       id,

@@ -21,6 +21,7 @@ import {
   COMPACTION_SUMMARY_WITHHELD_MESSAGE,
   PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE,
 } from "@/node/services/agentSkills/loadedSkillSnapshots";
+import { readDurableRejectedTurnKeys } from "@/node/services/rejectedTurnRepairRecord";
 import type { HistoryService } from "@/node/services/historyService";
 import {
   createUnknownSendMessageError,
@@ -2408,59 +2409,67 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     await session.dispose();
   });
 
-  it("refuses sends while the durable repair record is malformed instead of reading it as empty", async () => {
+  it("reconstructs a malformed durable repair record from unanswered turns instead of bricking the workspace", async () => {
     // The record names the refused turns whose row stamp failed, and nothing
     // else knows them: a record that cannot be parsed is an UNKNOWN
-    // quarantine, so no request leaves, and the malformed value is written
-    // back verbatim so side channels keep failing closed after a restart.
+    // quarantine. Rather than refusing forever, the session conservatively
+    // treats every unanswered turn as refused (a pre-stream refusal never gets
+    // a reply), stamps it, and rewrites the sidecar as a valid document — for
+    // a malformed nested record and for a torn document alike.
     const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
     const probe = await createRoutingHarness({ workspacePath });
-    const internals = (session: object) =>
-      session as unknown as {
-        getAutoRetryPreferencePath(): string;
-        persistAutoRetryState(): Promise<void>;
-      };
-    const preferencePath = internals(probe.session).getAutoRetryPreferencePath();
+    const preferencePath = (
+      probe.session as unknown as { getAutoRetryPreferencePath(): string }
+    ).getAutoRetryPreferencePath();
     await probe.session.dispose();
-    const malformedRecord = { userMessageIds: 42 };
-    try {
-      await fs.mkdir(path.dirname(preferencePath), { recursive: true });
-      await fs.writeFile(
-        preferencePath,
-        JSON.stringify({ pendingRejectedTurnRepair: malformedRecord }) + "\n"
-      );
-      const { session, streamed } = await createRoutingHarness({ workspacePath });
-      const refused = await session.sendMessage("next prompt", {
-        model: USER_MODEL,
-        agentId: "exec",
-      });
-      expect(refused.success).toBe(false);
-      expect(JSON.stringify(refused)).toMatch(/record of refused turns/);
-      expect(streamed).toHaveLength(0);
-
-      // A state write preserves the malformed record rather than healing it
-      // into "no keys".
-      await internals(session).persistAutoRetryState();
-      expect(JSON.parse(await fs.readFile(preferencePath, "utf-8"))).toEqual({
-        pendingRejectedTurnRepair: malformedRecord,
-      });
-      await session.dispose();
-
-      // A torn document (the file exists but is not JSON) is the same unknown.
-      await fs.writeFile(preferencePath, "{ not json");
-      const torn = await createRoutingHarness({ workspacePath });
-      const refusedAgain = await torn.session.sendMessage("next prompt", {
-        model: USER_MODEL,
-        agentId: "exec",
-      });
-      expect(refusedAgain.success).toBe(false);
-      expect(JSON.stringify(refusedAgain)).toMatch(/record of refused turns/);
-      expect(torn.streamed).toHaveLength(0);
-      await internals(torn.session).persistAutoRetryState();
-      expect(await fs.readFile(preferencePath, "utf-8")).toBe("{ not json");
-      await torn.session.dispose();
-    } finally {
-      await fs.rm(preferencePath, { force: true });
+    const workspaceId = "ws-skill-routing";
+    const seedTurns = async (historyService: HistoryService) => {
+      for (const row of [
+        createMuxMessage("u-answered", "user", "answered prompt", { timestamp: 1 }),
+        createMuxMessage("a-answered", "assistant", "the answer", { timestamp: 2 }),
+        createMuxMessage("snap-unanswered", "user", "PROJECT SKILL BODY", {
+          timestamp: 3,
+          synthetic: true,
+          agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
+        }),
+        createMuxMessage("u-unanswered", "user", "refused prompt", { timestamp: 4 }),
+      ]) {
+        await historyService.appendToHistory(workspaceId, row);
+      }
+    };
+    for (const corruptDocument of [
+      JSON.stringify({ pendingRejectedTurnRepair: { userMessageIds: 42 } }) + "\n",
+      "{ not json",
+    ]) {
+      try {
+        await fs.mkdir(path.dirname(preferencePath), { recursive: true });
+        await fs.writeFile(preferencePath, corruptDocument);
+        const { session, streamed, historyService } = await createRoutingHarness({ workspacePath });
+        await seedTurns(historyService);
+        const result = await session.sendMessage("next prompt", {
+          model: USER_MODEL,
+          agentId: "exec",
+        });
+        expect(result.success).toBe(true);
+        expect(streamed).toHaveLength(1);
+        const requestIds = streamed[0].messages.map((message) => message.id);
+        expect(requestIds).toContain("u-answered");
+        expect(requestIds).not.toContain("u-unanswered");
+        expect(requestIds).not.toContain("snap-unanswered");
+        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        if (!history.success) throw new Error(history.error);
+        for (const id of ["snap-unanswered", "u-unanswered"]) {
+          expect(history.data.find((row) => row.id === id)?.metadata?.preStreamRejected).toBe(true);
+        }
+        expect(
+          history.data.find((row) => row.id === "u-answered")?.metadata?.preStreamRejected
+        ).toBeUndefined();
+        // The sidecar is a valid document again (or gone: nothing left to record).
+        expect((await readDurableRejectedTurnKeys(preferencePath)).success).toBe(true);
+        await session.dispose();
+      } finally {
+        await fs.rm(preferencePath, { force: true });
+      }
     }
   });
 
@@ -2490,12 +2499,12 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     await session.dispose();
   });
 
-  it("refuses a heartbeat reset while the durable repair record is malformed", async () => {
+  it("reconstructs a malformed repair record before a heartbeat reset seals the rows", async () => {
     // A malformed record is an UNKNOWN quarantine: it yields no keys for the
     // compaction handler's filter, so a reset could cache a refused turn's
     // project snapshot in the carried-over state and seal its rows behind the
-    // boundary. Like request builds, the reset fails closed until the record
-    // is removed.
+    // boundary. The reset first reconstructs the record (unanswered turns are
+    // stamped) and only then lands the boundary.
     const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
     const probe = await createRoutingHarness({ workspacePath });
     const preferencePath = (
@@ -2514,12 +2523,31 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
         boundaryText: "Heartbeat context reset",
         pendingFollowUp: { text: "Continue", model: USER_MODEL, agentId: "exec" },
       });
-      expect(result.success).toBe(false);
-      if (!result.success) expect(result.error).toMatch(/record of refused turns/);
-      // No boundary landed.
-      const history = await historyService.getHistoryFromLatestBoundary("ws-skill-routing");
-      if (!history.success) throw new Error(history.error);
-      expect(history.data.some((row) => row.metadata?.compactionBoundary === true)).toBe(false);
+      expect(result.success).toBe(true);
+      const rows: MuxMessage[] = [];
+      const read = await historyService.iterateFullHistory(
+        "ws-skill-routing",
+        "forward",
+        (chunk) => {
+          rows.push(...chunk);
+        }
+      );
+      expect(read.success).toBe(true);
+      // Stamped before the boundary sealed them...
+      for (const id of ["snap-routed", "u-routed"]) {
+        expect(rows.find((row) => row.id === id)?.metadata?.preStreamRejected).toBe(true);
+      }
+      // ...nothing project-scoped rode into the carried-over pending state...
+      const pending = await (
+        session as unknown as {
+          compactionHandler: {
+            peekPendingState: () => Promise<{ loadedSkills: Array<{ name: string }> } | null>;
+          };
+        }
+      ).compactionHandler.peekPendingState();
+      expect(pending?.loadedSkills.some((skill) => skill.name === "done") ?? false).toBe(false);
+      // ...and the sidecar is a valid document again.
+      expect((await readDurableRejectedTurnKeys(preferencePath)).success).toBe(true);
       await session.dispose();
     } finally {
       await fs.rm(preferencePath, { force: true });
@@ -2564,6 +2592,53 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     // ...and nothing project-scoped rode into the carried-over pending state.
     const pending = await internals.compactionHandler.peekPendingState();
     expect(pending?.loadedSkills.some((skill) => skill.name === "done") ?? false).toBe(false);
+    await session.dispose();
+  });
+
+  it("reports the delivery of a compaction-deferred send for the deferred fork auto-title", async () => {
+    // An on-send compaction answers { queued: true }; the service releases its
+    // fork auto-title claim then and titles only when the follow-up actually
+    // streams, which the session reports here with the delivered text.
+    const workspacePath = await createWorkspaceWithSkill({
+      skillName: "done",
+      metadataYaml: "metadata:\n  model-class: small\n",
+    });
+    const { session, streamed, historyService } = await createRoutingHarness({
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" } },
+    });
+    await historyService.appendToHistory(
+      "ws-skill-routing",
+      createMuxMessage("summary-deferred", "assistant", "Summary of the work", {
+        timestamp: Date.now(),
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: 1,
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: "Use skill done",
+            model: USER_MODEL,
+            agentId: "exec",
+            muxMetadata: {
+              type: "agent-skill",
+              rawCommand: "/done",
+              skillName: "done",
+              scope: "project",
+            },
+          },
+        },
+      })
+    );
+    const delivered = mock((_text: string) => undefined);
+    (
+      session as unknown as { onDeferredSendDelivered?: (text: string) => void }
+    ).onDeferredSendDelivered = delivered;
+
+    expect(await session.dispatchPendingCompactionFollowUpIfNeeded("summary-deferred")).toBe(true);
+    expect(streamed).toHaveLength(1);
+    expect(delivered).toHaveBeenCalledTimes(1);
+    expect(delivered).toHaveBeenCalledWith("Use skill done");
     await session.dispose();
   });
 

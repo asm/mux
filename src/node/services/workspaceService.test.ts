@@ -11492,6 +11492,38 @@ describe("WorkspaceService pending auto-title", () => {
     expect(autoTitleSpy).toHaveBeenCalledWith(workspaceId, "Continue with auth hardening");
   });
 
+  test("sendMessage defers the pending auto-title for a send queued behind an on-send compaction", async () => {
+    // On-send compaction answers { queued: true }: the follow-up carrying the
+    // text can still be refused by its consent gate, so the title model must
+    // not see the text until the session reports the delivery.
+    const autoTitleSpy = spyOn(
+      workspaceService as unknown as {
+        maybeRunPendingAutoTitleFromMessage: (
+          workspaceId: string,
+          message: string
+        ) => Promise<void>;
+      },
+      "maybeRunPendingAutoTitleFromMessage"
+    ).mockResolvedValue(undefined);
+    fakeSession.sendMessage.mockResolvedValueOnce(Ok({ queued: true }));
+
+    const queued = await workspaceService.sendMessage(workspaceId, "/done secret arguments", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+    expect(queued.success).toBe(true);
+    expect(autoTitleSpy).not.toHaveBeenCalled();
+
+    // Delivery reported by the session: the still-pending title runs now.
+    (
+      workspaceService as unknown as {
+        runAutoTitleForDeliveredSend: (workspaceId: string, text: string) => void;
+      }
+    ).runAutoTitleForDeliveredSend(workspaceId, "/done secret arguments");
+    expect(autoTitleSpy).toHaveBeenCalledTimes(1);
+    expect(autoTitleSpy).toHaveBeenCalledWith(workspaceId, "/done secret arguments");
+  });
+
   test("concurrent sends only claim one pending auto-title generation", async () => {
     const releaseSend = createDeferred<Result<void, SendMessageError>>();
     fakeSession.sendMessage.mockImplementation(() => releaseSend.promise);

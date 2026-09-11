@@ -253,6 +253,15 @@ export async function reclaimExcessResultHandleBlobs(
 export type SandboxMountLifetime = "ephemeral" | "persistent";
 
 /**
+ * Reserved guest `vars` key carrying a persistent mount's project-skill taint
+ * (see SandboxMount.projectSkillTainted) through the vars snapshot, so the
+ * taint survives restarts together with the vars that may hold the content.
+ * Guest code can delete the key, so the host re-asserts it before every
+ * snapshot.
+ */
+export const PROJECT_SKILL_TAINT_VAR = "__xumProjectSkillTaint";
+
+/**
  * Cap on undrained host events per mount. Guests that never call
  * mux.events() must not grow the queue unboundedly across a long-lived
  * workspace; oldest events are dropped first (the queue is best-effort —
@@ -401,6 +410,14 @@ const GUEST_NEXT_HANDLE_SEQ_SOURCE = `
 export class SandboxMount {
   private readonly hostEventQueue: unknown[] = [];
   private disposed = false;
+  /**
+   * A nested agent_skill_read(_file) on this mount returned PROJECT-scope
+   * skill content: vars can hold it for later calls, so every later
+   * code_execution result on the mount is stamped as project content (see
+   * CodeExecutionResult.carriesProjectSkillContent). Restored from the vars
+   * snapshot (PROJECT_SKILL_TAINT_VAR) and re-asserted before each persist.
+   */
+  projectSkillTainted = false;
 
   constructor(
     public readonly runtime: IJSRuntime,
@@ -495,7 +512,11 @@ export class SandboxMount {
     assert(this.grants.vars, "restoreVars requires the vars grant");
     // Parse host-side first: crash-fast on corrupted snapshots instead of
     // injecting garbage into the guest.
-    JSON.parse(varsJson);
+    const restored: unknown = JSON.parse(varsJson);
+    this.projectSkillTainted =
+      typeof restored === "object" &&
+      restored !== null &&
+      (restored as Record<string, unknown>)[PROJECT_SKILL_TAINT_VAR] === "1";
     const literal = JSON.stringify(varsJson);
     const result = await this.runtime.eval(
       `globalThis.vars = JSON.parse(${literal}); return true;`
@@ -510,6 +531,9 @@ export class SandboxMount {
       this.persistSnapshot,
       "persistVars is only available on persistent mounts with a session dir"
     );
+    if (this.projectSkillTainted) {
+      this.runtime.setVarsProperty(PROJECT_SKILL_TAINT_VAR, "1");
+    }
     const varsJson = await this.snapshotVars();
     // Hard per-snapshot budget over ALL vars: retention only manages handle
     // and load keys, but every key is guest-writable — without this bound a

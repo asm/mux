@@ -156,6 +156,7 @@ import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverrid
 import {
   collectRejectedTurnRowIds,
   filterPreStreamRejectedRows,
+  isCommittedAssistantReply,
   createMuxMessage,
   STARTUP_RETRY_DURABLE_SEND_OPTION_KEYS,
   dedupeAgentSkillRefs,
@@ -989,6 +990,14 @@ interface AgentSessionOptions {
   /** Called when post-compaction context state may have changed (plan/file edits) */
   onPostCompactionStateChange?: () => void;
   /**
+   * Called when a send whose delivery was deferred (an on-send compaction
+   * answered `{ queued: true }`) actually streams, with the delivered text.
+   * The service defers the fork auto-title to this moment: the deferred text
+   * may still be refused by the follow-up's consent gate, and it must not
+   * reach the title model before the primary request was allowed to leave.
+   */
+  onDeferredSendDelivered?: (text: string) => void;
+  /**
    * Codex P1 (PRRT_kwDOPxxmWM6cRJD-): true while a service-level send is in
    * its preflight (counted in WorkspaceService.preflightSendCounts but not
    * yet queued or holding the turn phase). Session queue/phase state cannot
@@ -1140,6 +1149,7 @@ export class AgentSession {
   private readonly keepBackgroundProcesses: boolean;
   private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
   private readonly onPostCompactionStateChange?: () => void;
+  private readonly onDeferredSendDelivered?: (text: string) => void;
   private readonly hasExternalSendPreflight?: () => boolean;
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
@@ -1465,6 +1475,7 @@ export class AgentSession {
       onCompactionComplete,
       onIdleCompactionOutcome,
       onPostCompactionStateChange,
+      onDeferredSendDelivered,
       hasExternalSendPreflight,
     } = options;
 
@@ -1494,6 +1505,7 @@ export class AgentSession {
     this.keepBackgroundProcesses = keepBackgroundProcesses ?? false;
     this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
+    this.onDeferredSendDelivered = onDeferredSendDelivered;
     this.hasExternalSendPreflight = hasExternalSendPreflight;
 
     this.compactionHandler = new CompactionHandler({
@@ -6015,6 +6027,9 @@ export class AgentSession {
               messageLength: message.length,
               thinkingLevel: result.data?.routedThinkingLevel ?? optionsForStream.thinkingLevel,
             });
+            // The original answer was deferred ({ queued: true }): the
+            // service's fork auto-title waited for this delivery too.
+            this.onDeferredSendDelivered?.(message);
           }
         })
         .catch((error: unknown) => {
@@ -8620,10 +8635,13 @@ export class AgentSession {
       // assistant into an unmarked history row the repair no longer finds.
       // Marker-gated — a no-op in the common case.
       await this.loadAutoRetryEnabledPreference();
-      if (this.corruptRejectedTurnRecord !== null) {
+      if (
+        this.corruptRejectedTurnRecord !== null &&
+        !(await this.recoverFromCorruptRejectedTurnRecord())
+      ) {
         // FAIL CLOSED: which earlier turns a refusal still protects is unknown
-        // (see corruptRejectedTurnRecord), so no request leaves until the
-        // record is removed by hand.
+        // (see corruptRejectedTurnRecord) and the reconstruction could not be
+        // made durable, so no request leaves.
         return await fail(
           createUnknownSendMessageError(
             rejectedTurnRecordCorruptMessage(this.getAutoRetryPreferencePath())
@@ -11997,6 +12015,12 @@ export class AgentSession {
         });
       }
     }
+    // Delivery of a deferred send: the service's fork auto-title waited for
+    // this (see onDeferredSendDelivered). Not when this dispatch deferred
+    // again — its own delivery reports then.
+    if (sendResult.data?.queued !== true) {
+      this.onDeferredSendDelivered?.(finalText);
+    }
 
     return true;
   }
@@ -12912,6 +12936,71 @@ export class AgentSession {
    * this pass it; acceptance excludes the row the accepted send itself just
    * persisted.
    */
+  /**
+   * Self-healing for a malformed rejected-turn record (or preference
+   * document): its keys — the refused turns whose row stamp failed — are
+   * recorded nowhere else, so they are RECONSTRUCTED conservatively rather
+   * than requiring the user to delete the file. A pre-stream refusal never
+   * gets an assistant reply, so every retry-eligible user turn in the active
+   * segment without a committed reply is treated as refused: its rows (and
+   * snapshot prefix) are stamped provider-ineligible, a surviving partial is
+   * deleted, and the record is rewritten as a valid document. Interrupted
+   * turns caught by the same rule become non-resumable and must be re-sent —
+   * the price of not knowing, paid only after external corruption. False when
+   * the reconstruction itself could not be made durable; the caller keeps
+   * refusing.
+   */
+  private async recoverFromCorruptRejectedTurnRecord(): Promise<boolean> {
+    const corrupt = this.corruptRejectedTurnRecord;
+    if (corrupt === null) return true;
+    const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    if (!historyResult.success) return false;
+    const rows = historyResult.data;
+    const candidates: string[] = [];
+    rows.forEach((row, index) => {
+      if (!this.shouldUseUserMessageForRetry(row)) return;
+      const rest = rows.slice(index + 1);
+      const nextTurn = rest.findIndex(
+        (message) => message.role === "user" && !isSyntheticSnapshotUserMessage(message)
+      );
+      const turnRows = nextTurn === -1 ? rest : rest.slice(0, nextTurn);
+      if (!turnRows.some(isCommittedAssistantReply)) candidates.push(row.id);
+    });
+    // A refused turn's in-flight output may still sit in partial.json.
+    const partialDeleted = await this.historyService.deletePartial(this.workspaceId);
+    if (!partialDeleted.success) return false;
+    const stamp = await this.historyService.markMessagesPreStreamRejected(this.workspaceId, [
+      ...collectRejectedTurnRowIds(rows, candidates),
+    ]);
+    // Rows that could not be stamped stay protected by the (now valid) record.
+    const outstanding = stamp.success ? [] : candidates;
+    for (const id of outstanding) this.unstampedRejectedRowIds.add(id);
+    this.corruptRejectedTurnRecord = null;
+    if (outstanding.length > 0) {
+      const keys = new Set([
+        ...(this.pendingRejectedTurnRepair?.userMessageIds ?? []),
+        ...outstanding,
+      ]);
+      this.pendingRejectedTurnRepair = { userMessageIds: [...keys] };
+    }
+    // Rewrite the sidecar unconditionally (a clean default state unlinks it):
+    // the malformed bytes must not survive, or every side channel reading
+    // them through the strict reader stays closed.
+    await this.persistAutoRetryState();
+    if (this.autoRetryStateUnrecorded) {
+      // The sidecar could not be rewritten: stay in the unknown state (the
+      // stamps that landed still protect their rows).
+      this.corruptRejectedTurnRecord = corrupt;
+      return false;
+    }
+    log.warn("Rejected-turn repair record was malformed; reconstructed it from unanswered turns", {
+      workspaceId: this.workspaceId,
+      quarantinedTurns: candidates.length,
+      unstamped: outstanding.length,
+    });
+    return true;
+  }
+
   private async repairUnstampedRejectedTurn(context?: {
     recoverKeylessMarker?: { excludeRowId?: string };
   }): Promise<RejectedTurnRepairOutcome> {
@@ -13527,12 +13616,15 @@ export class AgentSession {
     if (this.coordinator.disposed || this.coordinator.closing) {
       return Err("Cannot reset heartbeat context while the session is closing.");
     }
-    // FAIL CLOSED like request builds: a malformed record yields no keys for
-    // the handler's quarantine filter, so the reset could cache a refused
-    // turn's project snapshot in the carried-over state and seal its rows
-    // behind the boundary — content a later follow-up would replay once the
-    // record is removed.
-    if (this.corruptRejectedTurnRecord !== null) {
+    // Like request builds: a malformed record yields no keys for the handler's
+    // quarantine filter, so the reset could cache a refused turn's project
+    // snapshot in the carried-over state and seal its rows behind the
+    // boundary — content a later follow-up would replay. Reconstruct the
+    // record first; fail closed if that cannot be made durable.
+    if (
+      this.corruptRejectedTurnRecord !== null &&
+      !(await this.recoverFromCorruptRejectedTurnRecord())
+    ) {
       return Err(rejectedTurnRecordCorruptMessage(this.getAutoRetryPreferencePath()));
     }
 

@@ -63,14 +63,17 @@ export const REJECTED_TURN_RECORD_UNRECORDED_MESSAGE =
 
 /**
  * The durable rejected-turn record (or the preference document carrying it)
- * exists but cannot be parsed, so WHICH earlier turns a refusal still protects
- * is unknown and nobody can recover the keys. The path is in the message
- * because removing the file by hand is the only remedy.
+ * exists but cannot be parsed, and the session's conservative reconstruction
+ * (AgentSession.recoverFromCorruptRejectedTurnRecord) could not be made
+ * durable either, so WHICH earlier turns a refusal still protects is unknown.
+ * The path is in the message because removing the file by hand is the
+ * remaining remedy.
  */
 export const rejectedTurnRecordCorruptMessage = (recordPath: string): string =>
-  `The record of refused turns (${recordPath}) is unreadable, so this message was ` +
-  "not sent: which earlier turns must stay withheld from providers is unknown. " +
-  "Remove that file and reopen the workspace to continue.";
+  `The record of refused turns (${recordPath}) is unreadable and could not be ` +
+  "repaired automatically, so this message was not sent: which earlier turns must " +
+  "stay withheld from providers is unknown. Retry; if this persists, remove that " +
+  "file and reopen the workspace.";
 
 export const createUnknownSendMessageError = (raw: string): SendMessageError => {
   assert(typeof raw === "string", "Expected raw error to be a string");

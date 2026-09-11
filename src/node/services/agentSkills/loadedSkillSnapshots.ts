@@ -281,15 +281,30 @@ const SKILL_CONTENT_TOOLS = new Set(["agent_skill_read", "agent_skill_read_file"
  * result, or a step message's tool-result value) carries project skill content.
  * code_execution outputs are inspected record by record.
  */
-function toolOutputCarriesProjectSkillContent(toolName: unknown, output: unknown): boolean {
+export function toolOutputCarriesProjectSkillContent(toolName: unknown, output: unknown): boolean {
   if (toolName === "agent_skill_read") return outputRetainsProjectSkill(output);
   if (toolName === "agent_skill_read_file") return outputIsProjectSkillFile(output);
   if (toolName === "code_execution") {
-    return nestedSkillContentRecords(output).some((record) =>
-      toolOutputCarriesProjectSkillContent(record.toolName, record.result)
+    // The execution's own provenance stamp (CodeExecutionResult
+    // .carriesProjectSkillContent) covers content the guest copied into the
+    // return value or console and records kernel-mode compaction dropped;
+    // the nested scan covers outputs persisted before the stamp existed.
+    return (
+      outputIsStampedCodeExecution(output) ||
+      nestedSkillContentRecords(output).some((record) =>
+        toolOutputCarriesProjectSkillContent(record.toolName, record.result)
+      )
     );
   }
   return false;
+}
+
+function outputIsStampedCodeExecution(output: unknown): boolean {
+  return (
+    typeof output === "object" &&
+    output !== null &&
+    (output as { carriesProjectSkillContent?: unknown }).carriesProjectSkillContent === true
+  );
 }
 
 /**
@@ -356,23 +371,29 @@ function nestedSkillContentRecords(
   );
 }
 
+/**
+ * A tainted code_execution output is withheld WHOLE: the guest can copy a
+ * nested project skill result into the return value or console output, so
+ * redacting the nested record alone would leave the copies. The replacement
+ * keeps the result's shape (a failed execution) so the call/result pairing
+ * survives, and the stamp so a later scan still classifies it.
+ */
 function redactCodeExecutionOutput(output: unknown): { output: unknown; changed: boolean } {
-  if (typeof output !== "object" || output === null) return { output, changed: false };
-  const toolCalls = (output as { toolCalls?: unknown }).toolCalls;
-  if (!Array.isArray(toolCalls)) return { output, changed: false };
-  let changed = false;
-  const redactedCalls = toolCalls.map((record: unknown) => {
-    if (typeof record !== "object" || record === null) return record;
-    const call = record as { toolName?: unknown; result?: unknown };
-    if (!toolOutputCarriesProjectSkillContent(call.toolName, call.result)) {
-      return record;
-    }
-    changed = true;
-    return { ...call, result: { success: false, error: PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE } };
-  });
-  return changed
-    ? { output: { ...output, toolCalls: redactedCalls }, changed }
-    : { output, changed };
+  if (!toolOutputCarriesProjectSkillContent("code_execution", output)) {
+    return { output, changed: false };
+  }
+  const duration = (output as { duration_ms?: unknown }).duration_ms;
+  return {
+    output: {
+      success: false,
+      error: PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE,
+      toolCalls: [],
+      consoleOutput: [],
+      duration_ms: typeof duration === "number" ? duration : 0,
+      carriesProjectSkillContent: true,
+    },
+    changed: true,
+  };
 }
 
 /**

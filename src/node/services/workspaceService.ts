@@ -4360,6 +4360,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       onPostCompactionStateChange: () => {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
       },
+      onDeferredSendDelivered: (text) => {
+        this.runAutoTitleForDeliveredSend(workspaceId, text);
+      },
       // Codex P1 (PRRT_kwDOPxxmWM6cRJD-): expose service-level send
       // preflights (manual sends counted but not yet queued or busy) to the
       // session's follow-up idle probes so redispatched synthetic turns yield
@@ -7733,6 +7736,29 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
 
     return candidates;
+  }
+
+  /**
+   * Fork auto-title for a send whose delivery was deferred behind an on-send
+   * compaction: sendMessage released its claim at the `{ queued: true }`
+   * answer (the follow-up could still be refused), and the session reports
+   * the actual delivery here.
+   */
+  private runAutoTitleForDeliveredSend(workspaceId: string, text: string): void {
+    if (!this.hasPendingAutoTitle(workspaceId) || this.autoTitlingWorkspaces.has(workspaceId)) {
+      return;
+    }
+    this.autoTitlingWorkspaces.add(workspaceId);
+    this.maybeRunPendingAutoTitleFromMessage(workspaceId, text)
+      .catch((error: unknown) => {
+        log.error("Unexpected rejection while running deferred fork auto-title", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      })
+      .finally(() => {
+        this.autoTitlingWorkspaces.delete(workspaceId);
+      });
   }
 
   private async maybeRunPendingAutoTitleFromMessage(
@@ -11865,11 +11891,17 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return result;
       }
 
-      if (claimedAutoTitle && result.data?.acceptedWithoutStream === true) {
-        // A late consent refusal recorded as a transcript row: nothing
-        // streamed, and the refused text must not reach the title model
-        // either. Release the claim; the pending auto-title stays armed for
-        // the next turn that actually streams.
+      if (
+        claimedAutoTitle &&
+        (result.data?.acceptedWithoutStream === true || result.data?.queued === true)
+      ) {
+        // Nothing streamed yet: a late consent refusal recorded as a
+        // transcript row, or a send deferred behind an on-send compaction
+        // whose follow-up can still be refused. The text must not reach the
+        // title model before the primary request was allowed to leave.
+        // Release the claim; the pending auto-title stays armed — a deferred
+        // send titles on its delivery (onDeferredSendDelivered), a refused
+        // one on the next turn that streams.
         this.autoTitlingWorkspaces.delete(workspaceId);
         claimedAutoTitle = false;
       }
