@@ -237,7 +237,13 @@ export function createRefineSummaryMessage(
         edits: StagedRefineEdit[];
         /** Canonical hash binding /refine apply to the rendered bytes. */
         stagedSetHash: string;
-      }
+      },
+  /**
+   * Provenance of the distilled transcript: a routed request after a trust
+   * revocation withholds this row like any summary (see
+   * MuxMessageMetadata.carriesProjectSkillContent).
+   */
+  carriesProjectSkillContent: boolean
 ): MuxMessage {
   const lines = [REFINE_SUMMARY_LABEL, ""];
   if (mode.mode === "staged") {
@@ -321,6 +327,7 @@ export function createRefineSummaryMessage(
     // request-time injection), uiVisible so users see what was self-applied.
     synthetic: true,
     uiVisible: true,
+    carriesProjectSkillContent,
     muxMetadata: {
       type: "refine-summary",
       ...(mode.mode === "staged" ? { stagedSetHash: mode.stagedSetHash } : {}),
@@ -859,9 +866,14 @@ export class RefineService {
     // even when removal is racing. Removal awaits this promise before
     // deleting the session directory, so the append still precedes teardown.
     if (!record.noOp) {
-      const auditDurable = await this.appendSummaryMessage(workspaceId, record, {
-        mode: "applied",
-      });
+      const auditDurable = await this.appendSummaryMessage(
+        workspaceId,
+        record,
+        { mode: "applied" },
+        // The audit row describes edits derived from the staged transcript;
+        // a set staged before provenance was recorded is unknown → carrying.
+        staged.carriesProjectSkillContent ?? true
+      );
       // The staged set is the only state that can regenerate the audit row
       // (persisted baseline + attempted IDs reproduce it with zero
       // re-mutation). A swallowed append failure here would consume that
@@ -1248,6 +1260,7 @@ export class RefineService {
           createdAt: Date.now(),
           summary,
           edits: stagedEdits,
+          carriesProjectSkillContent: trustedProjectContent,
         });
       } else {
         await clearStagedRefineSet(sessionDir);
@@ -1258,11 +1271,18 @@ export class RefineService {
       // The row renders the exact staged payloads and carries their hash so
       // apply can bind approval to these bytes.
       if (!record.noOp) {
-        const proposalDurable = await this.appendSummaryMessage(workspaceId, record, {
-          mode: "staged",
-          edits: stagedEdits,
-          stagedSetHash: hashStagedRefineSet(stagedEdits),
-        });
+        const proposalDurable = await this.appendSummaryMessage(
+          workspaceId,
+          record,
+          {
+            mode: "staged",
+            edits: stagedEdits,
+            stagedSetHash: hashStagedRefineSet(stagedEdits),
+          },
+          // The pass distilled transcriptRows: project content reached the
+          // model only under trust (a withheld copy carries none).
+          trustedProjectContent
+        );
         // Approval is hash-bound to this rendered row; without it apply fails
         // closed ("no staged refine proposal found"). Reporting staged
         // success here would leave the user a dead end.
@@ -1770,10 +1790,11 @@ export class RefineService {
   private async appendSummaryMessage(
     workspaceId: string,
     record: RefineRecord,
-    mode: Parameters<typeof createRefineSummaryMessage>[1]
+    mode: Parameters<typeof createRefineSummaryMessage>[1],
+    carriesProjectSkillContent: boolean
   ): Promise<boolean> {
     try {
-      const message = createRefineSummaryMessage(record, mode);
+      const message = createRefineSummaryMessage(record, mode, carriesProjectSkillContent);
       const appendResult = await this.historyService.appendToHistory(workspaceId, message);
       if (!appendResult.success) {
         log.warn("[Refine] failed to append summary row", {

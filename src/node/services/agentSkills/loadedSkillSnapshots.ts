@@ -325,11 +325,14 @@ function summaryCarriesProjectSkillContent(message: MuxMessage): boolean {
   if (metadata?.carriesProjectSkillContent === true) return true;
   if (metadata?.carriesProjectSkillContent === false) return false;
   const kind = metadata?.muxMetadata?.type;
+  // Every durable summary row a side channel distills from the transcript:
+  // compaction and branch summaries, and /refine's proposal/audit rows.
   return (
     metadata?.compactionBoundary === true ||
     (metadata?.compacted !== undefined && metadata.compacted !== false) ||
     kind === "compaction-summary" ||
-    kind === "branch-summary"
+    kind === "branch-summary" ||
+    kind === "refine-summary"
   );
 }
 

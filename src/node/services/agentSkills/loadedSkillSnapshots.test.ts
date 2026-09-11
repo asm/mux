@@ -654,10 +654,23 @@ describe("project skill content in persisted tool results", () => {
       carriesProjectSkillContent: false,
       muxMetadata: { type: "branch-summary" },
     });
+    // /refine's proposal and audit rows are summaries of the distilled
+    // transcript too: markerless (legacy) ones are unknown, stamped ones tell.
+    const legacyRefine = createMuxMessage("legacy-refine", "assistant", "Refine summary text", {
+      synthetic: true,
+      muxMetadata: { type: "refine-summary" },
+    });
+    const cleanRefine = createMuxMessage("clean-refine", "assistant", "Refine summary text", {
+      synthetic: true,
+      carriesProjectSkillContent: false,
+      muxMetadata: { type: "refine-summary" },
+    });
     const ordinary = createMuxMessage("ordinary", "assistant", "Just an answer", { timestamp: 1 });
     expect(rowCarriesProjectSkillContent(legacyCompaction)).toBe(true);
     expect(rowCarriesProjectSkillContent(legacyBranch)).toBe(true);
     expect(rowCarriesProjectSkillContent(cleanBranch)).toBe(false);
+    expect(rowCarriesProjectSkillContent(legacyRefine)).toBe(true);
+    expect(rowCarriesProjectSkillContent(cleanRefine)).toBe(false);
     expect(rowCarriesProjectSkillContent(ordinary)).toBe(false);
     const redacted = redactProjectSkillToolResults([legacyCompaction, legacyBranch, cleanBranch]);
     expect(JSON.stringify(redacted[0])).not.toContain("Older summary");

@@ -3131,6 +3131,48 @@ describe("RefineService", () => {
     }
   }
 
+  it("stamps refine summary rows with the provenance of the distilled transcript", async () => {
+    // The proposal and audit rows are durable assistant rows a later routed
+    // request carries: they summarize the distilled transcript, so they take
+    // its provenance — through the staged set into the apply audit row — and
+    // a routed request after a trust revocation withholds them like any
+    // other summary. A clean trajectory stamps FALSE (distinguishable from a
+    // markerless legacy row, which counts as carrying).
+    const stagingModel = () =>
+      toolCallModel(
+        [
+          {
+            toolCallId: "refine-provenance-1",
+            toolName: "memory",
+            input: { command: "create", path: LESSON_PATH, file_text: "A lesson.\n" },
+          },
+        ],
+        `${LESSON_PATH}: a lesson.`
+      );
+    {
+      using fixture = await createFixture({ modelFactory: stagingModel });
+      await fixture.seedTrajectory(["Please run the tests for this repo."]);
+      await seedSettledProjectTurn(fixture);
+      expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+      expect(fixture.emittedMessages).toHaveLength(1);
+      expect(fixture.emittedMessages[0].metadata?.carriesProjectSkillContent).toBe(true);
+      expect((await loadStagedRefineSet(fixture.sessionDir))?.carriesProjectSkillContent).toBe(
+        true
+      );
+      expect((await fixture.applyShown()).success).toBe(true);
+      const chat = await fixture.readChat();
+      const auditRow = chat[chat.length - 1];
+      expect(auditRow.metadata?.muxMetadata?.type).toBe("refine-summary");
+      expect(auditRow.metadata?.carriesProjectSkillContent).toBe(true);
+    }
+    {
+      using fixture = await createFixture({ modelFactory: stagingModel });
+      await fixture.seedTrajectory(["Please run the tests for this repo."]);
+      expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+      expect(fixture.emittedMessages[0]?.metadata?.carriesProjectSkillContent).toBe(false);
+    }
+  });
+
   it("omits the timeline while the segment holds a rejected turn", async () => {
     // A `turn.user` timeline event carries the prompt's digest, recorded
     // before the row was refused; the timeline is selected by time alone, so
