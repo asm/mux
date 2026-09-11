@@ -5,11 +5,7 @@ import assert from "@/common/utils/assert";
 import { MAX_POST_COMPACTION_LOADED_SKILLS } from "@/common/constants/attachments";
 import type { LoadedSkillSnapshot } from "@/common/types/attachment";
 import type { AgentSkillFrontmatter, AgentSkillScope } from "@/common/types/agentSkill";
-import {
-  isTurnSnapshotPrefixRow,
-  type ModelMessage,
-  type MuxMessage,
-} from "@/common/types/message";
+import { isTurnStartingUserRow, type ModelMessage, type MuxMessage } from "@/common/types/message";
 import { AgentSkillPackageSchema, AgentSkillScopeSchema } from "@/common/orpc/schemas/agentSkill";
 import {
   extractAgentSkillBodyFromSnapshotText,
@@ -266,9 +262,7 @@ export function rowCarriesProjectSkillContent(message: MuxMessage): boolean {
   if (message.metadata?.agentSkillSnapshot?.scope === "project") {
     return true;
   }
-  // A compaction summary stamped with the provenance of the rows it replaced:
-  // its text may quote a project skill the summarized turns loaded.
-  if (message.metadata?.carriesProjectSkillContent === true) {
+  if (summaryCarriesProjectSkillContent(message)) {
     return true;
   }
   return message.parts.some((part) => {
@@ -312,12 +306,34 @@ function outputIsStampedCodeExecution(output: unknown): boolean {
 }
 
 /**
- * Replaces the text of a compaction summary that summarized project skill
- * content, in a REQUEST copy for an untrusted workspace (history is untouched).
+ * Replaces the text of a summary row (compaction or abandoned branch) that
+ * summarized — or, lacking a provenance stamp, may have summarized — project
+ * skill content, in a REQUEST copy for an untrusted workspace (history is
+ * untouched).
  */
 export const COMPACTION_SUMMARY_WITHHELD_MESSAGE =
-  "[Compaction summary withheld: it summarized project skill content and this " +
+  "[Summary withheld: it may summarize project skill content and this " +
   "workspace's project is not trusted.]";
+
+/**
+ * Whether a summary row must be treated as project skill content: stamped
+ * TRUE, or a summary row written before provenance was tracked (no stamp) —
+ * its text may quote a project skill, so across the trust boundary it is
+ * unknown and counts as carrying until a newer summary replaces it. Summaries
+ * stamped FALSE were verified clean at summarization.
+ */
+function summaryCarriesProjectSkillContent(message: MuxMessage): boolean {
+  const metadata = message.metadata;
+  if (metadata?.carriesProjectSkillContent === true) return true;
+  if (metadata?.carriesProjectSkillContent === false) return false;
+  const kind = metadata?.muxMetadata?.type;
+  return (
+    metadata?.compactionBoundary === true ||
+    (metadata?.compacted !== undefined && metadata.compacted !== false) ||
+    kind === "compaction-summary" ||
+    kind === "branch-summary"
+  );
+}
 
 /**
  * Replaces an assistant row that replied to a project skill invocation, in a
@@ -345,7 +361,10 @@ export const PROJECT_SKILL_TURN_WITHHELD_MESSAGE =
 export function withholdProjectSkillContentFromRequest(messages: MuxMessage[]): MuxMessage[] {
   const kept: MuxMessage[] = [];
   // A turn persists its snapshot prefix immediately before its user row, so a
-  // project snapshot marks the NEXT non-snapshot user row's turn.
+  // project snapshot marks the NEXT turn-starting user row's turn. Synthetic
+  // user rows that are not turns of their own (a <system-file-update>
+  // notification between the user row and its reply, other snapshot prefixes)
+  // leave the turn tracking untouched.
   let projectPrefixPending = false;
   let inProjectTurn = false;
   for (const message of messages) {
@@ -354,7 +373,7 @@ export function withholdProjectSkillContentFromRequest(messages: MuxMessage[]): 
         projectPrefixPending = true;
         continue;
       }
-      if (!isTurnSnapshotPrefixRow(message)) {
+      if (isTurnStartingUserRow(message)) {
         inProjectTurn = projectPrefixPending;
         projectPrefixPending = false;
       }
@@ -461,11 +480,12 @@ function redactCodeExecutionOutput(output: unknown): { output: unknown; changed:
  */
 export function redactProjectSkillToolResults(messages: MuxMessage[]): MuxMessage[] {
   return messages.map((message) => {
-    // A provenance-stamped compaction summary (see
+    // A summary carrying project skill provenance (stamped, or a legacy
+    // summary whose provenance is unknown — see
     // MuxMessageMetadata.carriesProjectSkillContent) is plain assistant text
     // with no structure to redact around: its text is withheld whole, the row
     // (and the context boundary it marks) kept.
-    if (message.metadata?.carriesProjectSkillContent === true) {
+    if (summaryCarriesProjectSkillContent(message)) {
       return {
         ...message,
         parts: [{ type: "text", text: COMPACTION_SUMMARY_WITHHELD_MESSAGE }],

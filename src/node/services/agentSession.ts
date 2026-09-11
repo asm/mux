@@ -224,6 +224,8 @@ import {
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCompactionCheck";
 import { ROUTED_SEND_COMPACTION_HEADROOM_PERCENT } from "@/common/constants/ui";
+import { MAX_AGENT_SKILL_SNAPSHOT_CHARS } from "@/common/constants/attachments";
+import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
 import { getModelCapabilitiesResolved } from "@/common/utils/ai/modelCapabilities";
 import {
   getExplicitGatewayPrefix,
@@ -4884,8 +4886,32 @@ export class AgentSession {
       // limit. The headroom accounts for the pending turn (new message,
       // attachments, skill snapshot), which the recorded usage doesn't
       // include yet.
+      // The recorded usage excludes the pending turn, and a routed window can
+      // be far smaller than the workspace model's: size what this send adds
+      // — the prompt, the invoked skill's body (bounded like its snapshot)
+      // and text attachments — against the routed window before deciding
+      // compaction is unnecessary, or the routed invocation fails with a
+      // context error instead of taking the compaction path. Inline skill
+      // references materialize after this decision and media attachments are
+      // priced per image/page, not by bytes; both stay under the headroom.
+      const routedPendingPercent =
+        skillModelOverride?.kind === "override"
+          ? this.estimateRoutedPendingSendPercent({
+              message,
+              skillBody: skillModelOverride.resolvedPackage?.package.body,
+              fileParts: effectiveFileParts,
+              model: modelForStream,
+              use1MContext: this.is1MContextEnabledForModel(
+                modelForStream,
+                optionsForStream,
+                providersConfigForCompaction
+              ),
+              providersConfig: providersConfigForCompaction,
+            })
+          : 0;
       const routedSendNearsWindow =
-        compactionResult.usagePercentage >= 100 - ROUTED_SEND_COMPACTION_HEADROOM_PERCENT;
+        compactionResult.usagePercentage + routedPendingPercent >=
+        100 - ROUTED_SEND_COMPACTION_HEADROOM_PERCENT;
       const shouldCompactBeforeSend =
         this.compactionMonitor.getThreshold() < 1 &&
         (continuousContext.enabled
@@ -6332,6 +6358,33 @@ export class AgentSession {
       // built-in model limits. This matches prior behavior without crashing.
       return null;
     }
+  }
+
+  /**
+   * Share of the routed model's window the pending send itself will occupy,
+   * by the budget code's chars-per-token heuristic: the prompt, the invoked
+   * skill's body bounded to what its snapshot row will hold, and text
+   * attachments by size. 0 when the window is unknown (no compaction signal,
+   * as the monitor treats it).
+   */
+  private estimateRoutedPendingSendPercent(args: {
+    message: string;
+    skillBody: string | undefined;
+    fileParts: ReadonlyArray<{ url: string; mediaType: string }> | undefined;
+    model: string;
+    use1MContext: boolean;
+    providersConfig: ProvidersConfigMap | null;
+  }): number {
+    const limit = getEffectiveContextLimit(args.model, args.use1MContext, args.providersConfig);
+    if (limit == null || limit <= 0) return 0;
+    const attachmentChars = (args.fileParts ?? [])
+      .filter((part) => part.mediaType.startsWith("text/"))
+      .reduce((sum, part) => sum + part.url.length, 0);
+    const chars =
+      args.message.length +
+      Math.min(args.skillBody?.length ?? 0, MAX_AGENT_SKILL_SNAPSHOT_CHARS) +
+      attachmentChars;
+    return (chars / APPROX_CHARS_PER_TOKEN / limit) * 100;
   }
 
   private is1MContextEnabledForModel(

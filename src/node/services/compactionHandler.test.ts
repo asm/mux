@@ -293,7 +293,9 @@ describe("CompactionHandler", () => {
       const afterPlain = await historyService.getHistoryFromLatestBoundary(workspaceId);
       if (!afterPlain.success) throw new Error(afterPlain.error);
       const plainSummary = afterPlain.data.filter((m) => m.metadata?.compactionBoundary).at(-1);
-      expect(plainSummary?.metadata?.carriesProjectSkillContent).toBeUndefined();
+      // Verified clean: stamped FALSE, so a routed request after a trust
+      // revocation can tell it from a legacy summary of unknown provenance.
+      expect(plainSummary?.metadata?.carriesProjectSkillContent).toBe(false);
 
       // A project skill snapshot in the summarized range: stamped.
       for (const row of [

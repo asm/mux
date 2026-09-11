@@ -600,6 +600,20 @@ export function isTurnSnapshotPrefixRow(message: MuxMessage): boolean {
 }
 
 /**
+ * A user row that STARTS a turn. A stream appends synthetic user rows around a
+ * turn's own — a <system-file-update> notification after it, a snapshot prefix
+ * before the next — which are part of the turn they sit in, not turns of their
+ * own. Synthetic rows that do start a turn (compaction requests) carry retry
+ * options like any resumable turn.
+ */
+export function isTurnStartingUserRow(message: MuxMessage): boolean {
+  return (
+    message.role === "user" &&
+    (message.metadata?.synthetic !== true || message.metadata.retrySendOptions != null)
+  );
+}
+
+/**
  * The latest user row of `messages` when it starts a ROUTED turn — retry
  * options carrying the consent obligation or the routed compaction context,
  * the same predicate resumeStream gates on — that has no committed assistant
@@ -610,16 +624,7 @@ export function isTurnSnapshotPrefixRow(message: MuxMessage): boolean {
 export function findUnansweredRoutedTurnRow(
   messages: readonly MuxMessage[]
 ): MuxMessage | undefined {
-  // The latest TURN-STARTING user row: a stream appends synthetic user rows
-  // after the turn's own (a <system-file-update> notification, a snapshot
-  // prefix of the next turn), which must not read as a newer, unrouted turn.
-  // Synthetic rows that start a turn (compaction requests) carry retry
-  // options like any resumable turn and still count.
-  const index = messages.findLastIndex(
-    (message) =>
-      message.role === "user" &&
-      (message.metadata?.synthetic !== true || message.metadata.retrySendOptions != null)
-  );
+  const index = messages.findLastIndex(isTurnStartingUserRow);
   if (index === -1) {
     return undefined;
   }
@@ -1261,15 +1266,19 @@ export interface MuxMetadata {
   // Readers should use helper: isCompacted = compacted !== undefined && compacted !== false
   compacted?: "user" | "idle" | "heartbeat" | boolean;
   /**
-   * Provenance stamp on a compaction summary — any form: user/idle summary,
-   * continuous boundary, heartbeat reset boundary — whose summarized rows
-   * carried repository-controlled PROJECT skill content. The summary is
-   * ordinary assistant text that may quote that content, so it inherits the
-   * consent obligation of the rows it replaced: the routed-request scan
-   * treats it like a project snapshot row, and an untrusted workspace's
-   * request copy withholds its text. Sticky across chained compactions.
+   * Provenance stamp on a summary row — a compaction summary of any form
+   * (user/idle summary, continuous boundary, heartbeat reset boundary) or an
+   * abandoned-branch summary. TRUE: the summarized rows carried
+   * repository-controlled PROJECT skill content, and the summary is ordinary
+   * assistant text that may quote it, so it inherits the rows' consent
+   * obligation (the routed-request scan treats it like a project snapshot
+   * row; an untrusted workspace's request copy withholds its text). FALSE:
+   * verified clean at summarization. UNDEFINED on a summary row: written by a
+   * build that did not track provenance — unknown, treated as TRUE across the
+   * trust boundary until a newer summary replaces it. Sticky across chained
+   * summaries.
    */
-  carriesProjectSkillContent?: true;
+  carriesProjectSkillContent?: boolean;
   /**
    * Monotonic compaction epoch identifier.
    *

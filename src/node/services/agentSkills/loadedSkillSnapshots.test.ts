@@ -300,6 +300,7 @@ describe("project skill content in persisted tool results", () => {
     const plain = createMuxMessage("summary-plain", "assistant", "Summary of ordinary chat", {
       compacted: "user",
       compactionBoundary: true,
+      carriesProjectSkillContent: false,
     });
     expect(rowCarriesProjectSkillContent(stamped)).toBe(true);
     expect(rowCarriesProjectSkillContent(plain)).toBe(false);
@@ -448,6 +449,69 @@ describe("project skill content in persisted tool results", () => {
     ]);
     expect(JSON.stringify(globalTurn)).toContain("Applying: GLOBAL BODY");
     expect(globalTurn).toHaveLength(3);
+  });
+
+  it("keeps the project turn's taint across a synthetic notification row", () => {
+    // A <system-file-update> notification (synthetic user row) can sit between
+    // the invoking user row and its reply; it is part of the turn, not a new
+    // one, so the reply stays withheld.
+    const withheld = withholdProjectSkillContentFromRequest([
+      createSyntheticSkillSnapshotMessage({
+        id: "snap-project",
+        skillName: "repo-conventions",
+        body: "PROJECT BODY",
+      }),
+      createMuxMessage("u-invoke", "user", "Use skill repo-conventions", { timestamp: 1 }),
+      createMuxMessage(
+        "sys-file-update",
+        "user",
+        "<system-file-update>x.ts changed</system-file-update>",
+        { timestamp: 2, synthetic: true }
+      ),
+      createMuxMessage("a-reply", "assistant", "Applying: PROJECT BODY", { timestamp: 3 }),
+      createMuxMessage("u-next", "user", "Next", { timestamp: 4 }),
+      createMuxMessage("a-next", "assistant", "Unrelated reply stays", { timestamp: 5 }),
+    ]);
+    const serialized = JSON.stringify(withheld);
+    expect(serialized).not.toContain("PROJECT BODY");
+    expect(serialized).toContain(PROJECT_SKILL_TURN_WITHHELD_MESSAGE);
+    expect(serialized).toContain("Unrelated reply stays");
+    expect(withheld.map((row) => row.id)).toEqual([
+      "u-invoke",
+      "sys-file-update",
+      "a-reply",
+      "u-next",
+      "a-next",
+    ]);
+  });
+
+  it("treats an unstamped legacy summary as project content, a summary stamped clean as clean", () => {
+    // Summaries persisted before provenance was tracked have no stamp; their
+    // text may quote a project skill, so across the trust boundary they are
+    // unknown and withheld like a stamped one. Compaction and branch summaries
+    // alike.
+    const legacyCompaction = createMuxMessage("legacy-compaction", "assistant", "Older summary", {
+      compacted: "user",
+      compactionBoundary: true,
+    });
+    const legacyBranch = createMuxMessage("legacy-branch", "assistant", "Branch summary text", {
+      synthetic: true,
+      muxMetadata: { type: "branch-summary" },
+    });
+    const cleanBranch = createMuxMessage("clean-branch", "assistant", "Branch summary text", {
+      synthetic: true,
+      carriesProjectSkillContent: false,
+      muxMetadata: { type: "branch-summary" },
+    });
+    const ordinary = createMuxMessage("ordinary", "assistant", "Just an answer", { timestamp: 1 });
+    expect(rowCarriesProjectSkillContent(legacyCompaction)).toBe(true);
+    expect(rowCarriesProjectSkillContent(legacyBranch)).toBe(true);
+    expect(rowCarriesProjectSkillContent(cleanBranch)).toBe(false);
+    expect(rowCarriesProjectSkillContent(ordinary)).toBe(false);
+    const redacted = redactProjectSkillToolResults([legacyCompaction, legacyBranch, cleanBranch]);
+    expect(JSON.stringify(redacted[0])).not.toContain("Older summary");
+    expect(JSON.stringify(redacted[1])).not.toContain("Branch summary text");
+    expect(redacted[2]).toBe(cleanBranch);
   });
 
   function skillFileReadMessage(id: string, result: Record<string, unknown>): MuxMessage {

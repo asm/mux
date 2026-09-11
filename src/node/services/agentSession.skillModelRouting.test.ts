@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import { MAX_AGENT_SKILL_SNAPSHOT_CHARS } from "@/common/constants/attachments";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { LoadedSkillSnapshot } from "@/common/types/attachment";
@@ -54,12 +55,16 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     }
   });
 
-  async function createWorkspaceWithSkill(args: { skillName: string; metadataYaml?: string }) {
+  async function createWorkspaceWithSkill(args: {
+    skillName: string;
+    metadataYaml?: string;
+    body?: string;
+  }) {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "mux-skill-routing-"));
     tempDirs.push(tmp);
     const skillDir = path.join(tmp, ".mux", "skills", args.skillName);
     await fs.mkdir(skillDir, { recursive: true });
-    const skillMarkdown = `---\nname: ${args.skillName}\ndescription: Test skill\n${args.metadataYaml ?? ""}---\n\nDo the thing.\n`;
+    const skillMarkdown = `---\nname: ${args.skillName}\ndescription: Test skill\n${args.metadataYaml ?? ""}---\n\n${args.body ?? "Do the thing."}\n`;
     await fs.writeFile(path.join(skillDir, "SKILL.md"), skillMarkdown, "utf-8");
     return tmp;
   }
@@ -149,6 +154,22 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
         return resolved;
       }
     );
+  }
+
+  /** Report a fixed recorded usage (threshold 90%, no force) so the routed pending-payload estimate decides. */
+  function stubCompactionMonitor(session: object, usagePercentage: number): void {
+    (session as { compactionMonitor: unknown }).compactionMonitor = {
+      checkBeforeSend: mock(() => ({
+        shouldShowWarning: false,
+        shouldForceCompact: false,
+        usagePercentage,
+        thresholdPercentage: 90,
+      })),
+      checkMidStream: mock(() => false),
+      resetForNewStream: mock(() => undefined),
+      setThreshold: mock(() => undefined),
+      getThreshold: mock(() => 0.9),
+    };
   }
 
   /** Force the next send onto the on-send compaction path (mirrors the autoCompaction fixtures). */
@@ -1296,6 +1317,39 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     expect(internals.lastAutoRetryResumeRequest?.userMessageId).toBe(compactionRequest.id);
     expect(compactionRequest.metadata?.retrySendOptions?.routedProjectConsent).toBe(true);
     await session.dispose();
+  });
+
+  it("compacts a routed send whose pending skill snapshot would overrun the routed window", async () => {
+    // The recorded usage excludes the pending turn, and the routed window can
+    // be far smaller than the workspace model's: the invoked skill's body
+    // (bounded like its snapshot) counts against the routed window before the
+    // send decides compaction is unnecessary — otherwise the routed
+    // invocation fails with a context error instead of compacting.
+    for (const [body, expectCompaction] of [
+      ["x".repeat(MAX_AGENT_SKILL_SNAPSHOT_CHARS), true],
+      ["Do the thing.", false],
+    ] as const) {
+      const workspacePath = await createWorkspaceWithSkill({
+        skillName: "done",
+        metadataYaml: "metadata:\n  model-class: small\n",
+        body,
+      });
+      const { session, historyService } = await createRoutingHarness({
+        workspacePath,
+        configValues: { modelClasses: { small: "haiku+0" } },
+      });
+      // 86% recorded: under the 90% cutoff on its own; a 50k-char body adds
+      // ~6% of haiku's window, a one-line body next to nothing.
+      stubCompactionMonitor(session, 86);
+      const result = await session.sendMessage("Use skill done", skillSendOptions());
+      expect(result.success).toBe(true);
+      const history = await historyService.getHistoryFromLatestBoundary("ws-skill-routing");
+      if (!history.success) throw new Error(history.error);
+      expect(
+        history.data.some((message) => message.metadata?.muxMetadata?.type === "compaction-request")
+      ).toBe(expectCompaction);
+      await session.dispose();
+    }
   });
 
   it("marks a routed global skill's compaction request as routed-origin for its resume", async () => {

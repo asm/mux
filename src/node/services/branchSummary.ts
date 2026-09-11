@@ -16,6 +16,7 @@
  */
 
 import { streamText } from "ai";
+import { rowCarriesProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
@@ -620,8 +621,17 @@ async function generateAbandonedBranchSummaryText(input: {
   return null;
 }
 
-/** Build the durable labeled summary row appended to the new branch. */
-export function createBranchSummaryMessage(summaryText: string): MuxMessage {
+/**
+ * Build the durable labeled summary row appended to the new branch.
+ * `carriesProjectSkillContent` is the provenance of the abandoned rows the
+ * text distills (see MuxMessageMetadata.carriesProjectSkillContent): a
+ * summary of a trusted project-skill turn may quote the skill, and a routed
+ * request after trust revocation must be able to withhold it.
+ */
+export function createBranchSummaryMessage(
+  summaryText: string,
+  carriesProjectSkillContent: boolean
+): MuxMessage {
   assert(summaryText.trim().length > 0, "branch summary text must be non-empty");
   return createMuxMessage(
     createBranchSummaryMessageId(),
@@ -640,6 +650,7 @@ export function createBranchSummaryMessage(summaryText: string): MuxMessage {
       timestamp: Date.now(),
       synthetic: true,
       uiVisible: true,
+      carriesProjectSkillContent,
       muxMetadata: { type: "branch-summary" },
     }
   );
@@ -816,7 +827,12 @@ export async function maybeAppendAbandonedBranchSummary(
       return null;
     }
 
-    const summaryMessage = createBranchSummaryMessage(summaryText);
+    // Provenance rides with the summary: routed requests after a trust
+    // revocation withhold a summary distilled from project skill content.
+    const summaryMessage = createBranchSummaryMessage(
+      summaryText,
+      input.abandonedMessages.some(rowCarriesProjectSkillContent)
+    );
     if (input.guardTailMessageId !== undefined) {
       const guardedResult = await input.historyService.appendToHistoryIfTailMatches(
         input.workspaceId,

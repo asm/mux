@@ -903,9 +903,7 @@ export class CompactionHandler {
         compacted: "heartbeat",
         // Provenance of the rows this boundary replaces (see
         // MuxMessageMetadata.carriesProjectSkillContent).
-        ...(messages.some(rowCarriesProjectSkillContent)
-          ? { carriesProjectSkillContent: true as const }
-          : {}),
+        carriesProjectSkillContent: messages.some(rowCarriesProjectSkillContent),
         compactionEpoch: nextCompactionEpoch,
         compactionBoundary: true,
         muxMetadata: {
@@ -1299,9 +1297,7 @@ export class CompactionHandler {
         compacted: "user",
         // Provenance of the rows this boundary replaces (see
         // MuxMessageMetadata.carriesProjectSkillContent).
-        ...(params.messages.some(rowCarriesProjectSkillContent)
-          ? { carriesProjectSkillContent: true as const }
-          : {}),
+        carriesProjectSkillContent: params.messages.some(rowCarriesProjectSkillContent),
         compactionBoundary: true,
         compactionEpoch: getNextCompactionEpoch(params.messages),
         model: params.model,
@@ -1504,9 +1500,7 @@ export class CompactionHandler {
         // MuxMessageMetadata.carriesProjectSkillContent): the summary text may
         // quote a project skill a summarized turn loaded, and the consent scan
         // recognizes only tagged rows.
-        ...(messages.some(rowCarriesProjectSkillContent)
-          ? { carriesProjectSkillContent: true as const }
-          : {}),
+        carriesProjectSkillContent: messages.some(rowCarriesProjectSkillContent),
         compactionEpoch: nextCompactionEpoch,
         compactionBoundary: true,
         model: metadata.model,
