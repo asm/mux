@@ -396,6 +396,18 @@ describe("AgentStatusService", () => {
     await getInternals(service).runForWorkspace(workspaceId);
     expect(generateSpy).toHaveBeenCalledTimes(1);
 
+    // An interrupted stream's committed partial (content, flagged partial) is
+    // not a reply either: the whole turn stays out, that row included.
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("a-interrupted", "assistant", "INTERRUPTED ROUTED OUTPUT", {
+        partial: true,
+      })
+    );
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    expect(generateSpy.mock.calls[0][0]).not.toContain("INTERRUPTED ROUTED OUTPUT");
+
     // Settled: with the reply committed the turn can no longer be refused.
     await history.deletePartial(workspaceId);
     await history.appendToHistory(

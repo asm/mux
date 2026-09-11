@@ -356,6 +356,19 @@ export const PROJECT_SKILL_TURN_WITHHELD_MESSAGE =
  *
  * Rows are copied, never mutated.
  */
+/**
+ * Whether a user row's own (client-stamped) skill metadata invokes or
+ * references a project-scope skill. Used only in the withholding direction,
+ * where trusting client metadata can at most over-withhold.
+ */
+function rowInvokesProjectSkill(message: MuxMessage): boolean {
+  const muxMetadata = message.metadata?.muxMetadata;
+  if (muxMetadata == null) return false;
+  if (muxMetadata.type === "agent-skill" && muxMetadata.scope === "project") return true;
+  const refs = muxMetadata.agentSkillRefs;
+  return Array.isArray(refs) && refs.some((ref) => ref.scope === "project");
+}
+
 export function withholdProjectSkillContentFromRequest(messages: MuxMessage[]): MuxMessage[] {
   const kept: MuxMessage[] = [];
   // A turn persists its snapshot prefix immediately before its user row, so a
@@ -372,7 +385,10 @@ export function withholdProjectSkillContentFromRequest(messages: MuxMessage[]): 
         continue;
       }
       if (isTurnStartingUserRow(message)) {
-        inProjectTurn = projectPrefixPending;
+        // A repeated invocation of the same project skill deduplicates its
+        // snapshot (no prefix row), so the invoking row's own skill metadata
+        // marks the turn as well — over-withholding is the safe direction.
+        inProjectTurn = projectPrefixPending || rowInvokesProjectSkill(message);
         projectPrefixPending = false;
       }
       kept.push(message);
@@ -532,17 +548,34 @@ export function redactProjectSkillToolResults(messages: MuxMessage[]): MuxMessag
       return part;
     });
     if (!changed) return message;
-    // The stream persists a tool result and the prose that follows it in ONE
-    // assistant row, and that prose can be the model's copy of the withheld
-    // output. A tainted row therefore loses its text (and reasoning) as well;
-    // the tool parts keep the call/result pairing.
+    // The stream persists a tool result, the prose that follows it and every
+    // later tool call of the same step in ONE assistant row, and any of them
+    // can carry the model's copy of the withheld output — prose, or the
+    // arguments/result of a sibling tool call. A tainted row therefore loses
+    // its text and reasoning, and every other tool part's input and output;
+    // the parts keep their ids so the call/result pairing survives.
     return {
       ...message,
       parts: parts
         .filter((part) => part.type !== "reasoning")
-        .map((part) =>
-          part.type === "text" ? { ...part, text: PROJECT_SKILL_TEXT_WITHHELD_MESSAGE } : part
-        ),
+        .map((part) => {
+          if (part.type === "text") {
+            return { ...part, text: PROJECT_SKILL_TEXT_WITHHELD_MESSAGE };
+          }
+          if (part.type !== "dynamic-tool" || SKILL_CONTENT_TOOLS.has(part.toolName)) {
+            return part;
+          }
+          if (part.toolName === "code_execution") {
+            return part;
+          }
+          return {
+            ...part,
+            input: {},
+            ...(part.state === "output-available"
+              ? { output: { success: false, error: PROJECT_SKILL_TEXT_WITHHELD_MESSAGE } }
+              : {}),
+          };
+        }),
     };
   });
 }

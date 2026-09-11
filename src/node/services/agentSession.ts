@@ -13051,14 +13051,15 @@ export class AgentSession {
    * recorded nowhere else, so they are RECONSTRUCTED conservatively rather
    * than requiring the user to delete the file. A pre-stream refusal never
    * gets an assistant reply, so every retry-eligible user turn in the active
-   * segment without a committed reply is treated as refused, and so is every
-   * ROUTED turn regardless (a Retry of an interrupted routed turn — committed
-   * partial and all — can be the refused turn): their rows (and snapshot
-   * prefixes) are stamped provider-ineligible, a surviving partial is deleted,
-   * and the record is rewritten as a valid document. Turns caught by the rule
-   * become non-resumable and must be re-sent — the price of not knowing, paid
-   * only after external corruption. False when the reconstruction itself
-   * could not be made durable; the caller keeps refusing.
+   * segment without a TERMINAL reply is treated as refused — an interrupted
+   * stream's committed partial or a failed reply does not settle a turn, and a
+   * Retry of such a routed turn can be the refused turn: their rows (and
+   * snapshot prefixes) are stamped provider-ineligible, a surviving partial
+   * is deleted, and the record is rewritten as a valid document. Turns caught
+   * by the rule become non-resumable and must be re-sent — the price of not
+   * knowing, paid only after external corruption; turns that ran to
+   * completion stay valid context. False when the reconstruction itself could
+   * not be made durable; the caller keeps refusing.
    */
   private async recoverFromCorruptRejectedTurnRecord(): Promise<boolean> {
     const corrupt = this.corruptRejectedTurnRecord;
@@ -13074,13 +13075,12 @@ export class AgentSession {
         (message) => message.role === "user" && !isSyntheticSnapshotUserMessage(message)
       );
       const turnRows = rest.slice(0, nextTurn === -1 ? rest.length : nextTurn);
-      // A ROUTED turn is a candidate even with a committed reply: an
-      // interrupted routed turn's committed partial counts as one, yet a
-      // trust-revoked Retry of that turn can be exactly the refused turn the
-      // record named. Unrouted turns are candidates only while unanswered.
-      const retry = row.metadata?.retrySendOptions;
-      const routed = retry?.routedProjectConsent === true || retry?.compactionBaseOptions != null;
-      if (routed || !turnRows.some(isCommittedAssistantReply)) candidates.push(row.id);
+      // Only a TERMINAL reply settles a turn (isCommittedAssistantReply): an
+      // interrupted routed stream's committed partial or a failed reply leaves
+      // it retryable, and a trust-revoked Retry of it can be exactly the
+      // refused turn the record named. A turn that ran to completion is
+      // valid context and must not be stamped and orphaned from its reply.
+      if (!turnRows.some(isCommittedAssistantReply)) candidates.push(row.id);
     });
     // A refused turn's in-flight output may still sit in partial.json.
     const partialDeleted = await this.historyService.deletePartial(this.workspaceId);

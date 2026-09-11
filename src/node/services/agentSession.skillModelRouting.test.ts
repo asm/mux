@@ -2680,8 +2680,8 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
           agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
         }),
         createMuxMessage("u-unanswered", "user", "refused prompt", { timestamp: 4 }),
-        // A routed turn with a committed (interrupted) reply: a trust-revoked
-        // Retry of it can be the refused turn, so it is a candidate too.
+        // A routed turn with a committed INTERRUPTED reply: a trust-revoked
+        // Retry of it can be the refused turn, so it is a candidate too...
         createMuxMessage("snap-routed-answered", "user", "ROUTED SKILL BODY", {
           timestamp: 5,
           synthetic: true,
@@ -2691,7 +2691,21 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
           timestamp: 6,
           retrySendOptions: { model: USER_MODEL, agentId: "exec", routedProjectConsent: true },
         }),
-        createMuxMessage("a-routed-partial", "assistant", "partial reply", { timestamp: 7 }),
+        createMuxMessage("a-routed-partial", "assistant", "partial reply", {
+          timestamp: 7,
+          partial: true,
+        }),
+        // ...while a routed turn that ran to completion is valid context.
+        createMuxMessage("snap-routed-done", "user", "COMPLETED SKILL BODY", {
+          timestamp: 8,
+          synthetic: true,
+          agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "z" },
+        }),
+        createMuxMessage("u-routed-done", "user", "Use skill done again", {
+          timestamp: 9,
+          retrySendOptions: { model: USER_MODEL, agentId: "exec", routedProjectConsent: true },
+        }),
+        createMuxMessage("a-routed-done", "assistant", "Applied the skill", { timestamp: 10 }),
       ]) {
         await historyService.appendToHistory(workspaceId, row);
       }
@@ -2731,9 +2745,12 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
         ]) {
           expect(history.data.find((row) => row.id === id)?.metadata?.preStreamRejected).toBe(true);
         }
-        expect(
-          history.data.find((row) => row.id === "u-answered")?.metadata?.preStreamRejected
-        ).toBeUndefined();
+        for (const id of ["u-answered", "u-routed-done", "snap-routed-done"]) {
+          expect(
+            history.data.find((row) => row.id === id)?.metadata?.preStreamRejected
+          ).toBeUndefined();
+        }
+        expect(requestIds).toContain("u-routed-done");
         // The sidecar is a valid document again (or gone: nothing left to record).
         expect((await readDurableRejectedTurnKeys(preferencePath)).success).toBe(true);
         await session.dispose();

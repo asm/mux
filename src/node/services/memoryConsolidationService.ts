@@ -68,6 +68,11 @@ import { log } from "@/node/services/log";
 import type { HistoryService } from "@/node/services/historyService";
 import { runMemoryHarvest } from "@/node/services/memoryHarvest";
 import { excludeRejectedTurnRows } from "@/common/types/message";
+import {
+  redactProjectSkillToolResults,
+  withholdProjectSkillContentFromRequest,
+} from "@/node/services/agentSkills/loadedSkillSnapshots";
+import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
@@ -359,6 +364,43 @@ export class MemoryConsolidationService extends EventEmitter {
    * the harvest fails closed. Late-bound — WorkspaceService is constructed
    * after core services.
    */
+  /**
+   * Whether project skill content may reach the dream provider for this
+   * workspace: the workspace's project (as registered in config) is trusted.
+   * A scratch workspace's workdir is not a project key, so it reads untrusted
+   * — the conservative side, matching provider-selection consent.
+   */
+  private isHarvestProjectTrusted(workspaceId: string): boolean {
+    const entry = this.config.findWorkspace(workspaceId);
+    return entry != null && isProjectTrusted(this.config, entry.projectPath);
+  }
+
+  /**
+   * Pre-dispatch re-verification of a built harvest input: trust must not
+   * have been revoked since the input was built with it, and every row in the
+   * input must still be provider-eligible under a fresh quarantine read (a
+   * Retry can refuse and stamp a turn meanwhile). False on unreadable state.
+   */
+  private async harvestInputStillCurrent(
+    metadata: CompactionCompletionMetadata,
+    trustedAtBuild: boolean,
+    rowIds: readonly string[]
+  ): Promise<boolean> {
+    if (trustedAtBuild && !this.isHarvestProjectTrusted(metadata.workspaceId)) return false;
+    const epoch = await this.historyService.getMessagesForCompactionEpoch(
+      metadata.workspaceId,
+      metadata
+    );
+    if (!epoch.success) return false;
+    const quarantine =
+      (await this.getQuarantinedRowIds?.(metadata.workspaceId)) ?? Ok(new Set<string>());
+    if (!quarantine.success) return false;
+    const eligible = new Set(
+      excludeRejectedTurnRows(epoch.data.messages, quarantine.data).map((row) => row.id)
+    );
+    return rowIds.every((id) => eligible.has(id));
+  }
+
   private getQuarantinedRowIds?: (
     workspaceId: string
   ) => Result<ReadonlySet<string>, string> | Promise<Result<ReadonlySet<string>, string>>;
@@ -1023,6 +1065,19 @@ export class MemoryConsolidationService extends EventEmitter {
         );
       }
       const harvestMessages = excludeRejectedTurnRows(epoch.data.messages, quarantine.data);
+      // Project skill content may leave for the dream provider (possibly
+      // another provider) only while the workspace's project is trusted — the
+      // routed request's rule. Without trust, snapshot rows, tainted tool
+      // results and summaries carrying (or of unknown) provenance are withheld
+      // from the harvest input, the epoch summary included: compaction stamps
+      // it, and runMemoryHarvest quotes it into every chunk's prompt.
+      const projectTrusted = self.isHarvestProjectTrusted(metadata.workspaceId);
+      const harvestInput = projectTrusted
+        ? { messages: harvestMessages, summary: epoch.data.summary }
+        : {
+            messages: withholdProjectSkillContentFromRequest(harvestMessages),
+            summary: redactProjectSkillToolResults([epoch.data.summary])[0],
+          };
 
       const modelString = resolveDreamModelString(self.config, metadata.workspaceId);
       const modelResult = yield* Effect.tryPromise({
@@ -1048,8 +1103,16 @@ export class MemoryConsolidationService extends EventEmitter {
             memoryService: self.memoryService,
             ctx,
             completionMetadata: metadata,
-            messages: harvestMessages,
-            summary: epoch.data.summary,
+            messages: harvestInput.messages,
+            summary: harvestInput.summary,
+            // Trust and the quarantine were read before the model was built;
+            // re-verify right before each chunk's request.
+            beforeDispatch: () =>
+              self.harvestInputStillCurrent(
+                metadata,
+                projectTrusted,
+                harvestInput.messages.map((message) => message.id)
+              ),
             // Timeout + removal (r60); see the runLockedEffect signal for rationale.
             abortSignal: AbortSignal.any([
               AbortSignal.timeout(MEMORY_CONSOLIDATION_TIMEOUT_MS),

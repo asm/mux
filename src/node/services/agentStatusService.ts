@@ -655,8 +655,12 @@ export class AgentStatusService {
     // withhold its rows and partial until it has one.
     const inFlightRoutedRow = findUnansweredRoutedTurnRow(committedMessages);
     if (inFlightRoutedRow !== undefined) {
+      // The whole turn goes: its snapshot prefix, the user row AND every row
+      // after it (a committed partial of the interrupted stream), which is
+      // the tail of the segment since this is the latest turn-starting row.
       const inFlight = collectRejectedTurnRowIds(committedMessages, [inFlightRoutedRow.id]);
-      committedMessages = committedMessages.filter((m) => !inFlight.has(m.id));
+      const turnStart = committedMessages.findIndex((m) => inFlight.has(m.id));
+      committedMessages = committedMessages.slice(0, turnStart);
       eligiblePartial = null;
     }
     const rowIds = committedMessages.map((m) => m.id);

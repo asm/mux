@@ -508,6 +508,82 @@ describe("project skill content in persisted tool results", () => {
     ]);
   });
 
+  it("withholds the reply of a repeated project skill invocation whose snapshot deduplicated", () => {
+    // A second invocation of the same project skill persists no snapshot row
+    // (recent-snapshot dedupe), so the invoking row's own skill metadata marks
+    // the turn; its reply can quote the reused skill just as well.
+    const withheld = withholdProjectSkillContentFromRequest([
+      createSyntheticSkillSnapshotMessage({
+        id: "snap-first",
+        skillName: "repo-conventions",
+        body: "PROJECT BODY",
+      }),
+      createMuxMessage("u-first", "user", "Use skill repo-conventions", {
+        timestamp: 1,
+        muxMetadata: {
+          type: "agent-skill",
+          rawCommand: "/repo-conventions",
+          skillName: "repo-conventions",
+          scope: "project",
+        },
+      }),
+      createMuxMessage("a-first", "assistant", "Applying: PROJECT BODY", { timestamp: 2 }),
+      createMuxMessage("u-second", "user", "Use skill repo-conventions again", {
+        timestamp: 3,
+        muxMetadata: {
+          type: "agent-skill",
+          rawCommand: "/repo-conventions",
+          skillName: "repo-conventions",
+          scope: "project",
+        },
+      }),
+      createMuxMessage("a-second", "assistant", "Again: PROJECT BODY", { timestamp: 4 }),
+      createMuxMessage("u-plain", "user", "Something else", { timestamp: 5 }),
+      createMuxMessage("a-plain", "assistant", "Unrelated reply stays", { timestamp: 6 }),
+    ]);
+    const serialized = JSON.stringify(withheld);
+    expect(serialized).not.toContain("PROJECT BODY");
+    expect(serialized).toContain("Unrelated reply stays");
+    expect(withheld.map((row) => row.id)).toEqual([
+      "u-first",
+      "a-first",
+      "u-second",
+      "a-second",
+      "u-plain",
+      "a-plain",
+    ]);
+  });
+
+  it("withholds sibling tool calls of a tainted assistant row", () => {
+    // The step that read the project skill can invoke another tool with the
+    // copied content in its arguments (or get it back in the result); both
+    // calls persist in one row. Every non-skill tool part of a tainted row
+    // loses its input and output; ids keep the call/result pairing.
+    const tainted = createAgentSkillReadToolMessage({
+      id: "tainted",
+      skillName: "repo-conventions",
+      body: "PROJECT BODY",
+    });
+    tainted.parts = [
+      ...tainted.parts,
+      {
+        type: "dynamic-tool",
+        toolCallId: "edit-1",
+        toolName: "file_edit_replace_string",
+        state: "output-available",
+        input: { path: "x", new_string: "PROJECT BODY" },
+        output: { success: true, echoed: "PROJECT BODY" },
+      },
+    ];
+    const [redacted] = redactProjectSkillToolResults([tainted]);
+    const serialized = JSON.stringify(redacted);
+    expect(serialized).not.toContain("PROJECT BODY");
+    const sibling = redacted.parts.find(
+      (part) => part.type === "dynamic-tool" && part.toolCallId === "edit-1"
+    );
+    expect(sibling?.type === "dynamic-tool" && sibling.toolName).toBe("file_edit_replace_string");
+  });
+
   it("treats an unstamped legacy summary as project content, a summary stamped clean as clean", () => {
     // Summaries persisted before provenance was tracked have no stamp; their
     // text may quote a project skill, so across the trust boundary they are
