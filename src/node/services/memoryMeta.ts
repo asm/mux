@@ -249,6 +249,20 @@ export class MemoryMetaService {
       }),
 
     /**
+     * Provenance-only marker for a write about to land from a context that
+     * carries project skill content, committed BEFORE the content: the
+     * post-write stats update is best-effort, and a marker that failed to
+     * persist would leave tainted content beside a verified-clean marker.
+     */
+    markCarriesProjectSkillContent: (
+      logicalKey: string
+    ): Effect.Effect<void, MemoryMetaWriteError> =>
+      this.mutate((entries) => {
+        const current = entries[logicalKey] ?? EMPTY_ENTRY;
+        entries[logicalKey] = { ...current, carriesProjectSkillContent: true };
+      }),
+
+    /**
      * Move all entries for a renamed file or directory subtree so pins and
      * stats follow the file. Stale entries at the destination are overwritten.
      */
@@ -372,6 +386,11 @@ export class MemoryMetaService {
     options: { write: boolean; carriesProjectSkillContent?: boolean; replacesContent?: boolean }
   ): Promise<void> {
     await Effect.runPromise(this.effects.recordAccess(logicalKey, options));
+  }
+
+  /** Commit the tainted-provenance marker ahead of the content write (see effects). */
+  async markCarriesProjectSkillContent(logicalKey: string): Promise<void> {
+    await Effect.runPromise(this.effects.markCarriesProjectSkillContent(logicalKey));
   }
 
   /**

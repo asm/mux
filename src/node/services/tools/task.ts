@@ -16,6 +16,7 @@ import {
   type RuntimeMode,
 } from "@/common/types/runtime";
 import type { TaskCreatedEvent } from "@/common/types/stream";
+import { contextProjectSkillContentWithheld } from "@/node/services/tools/projectSkillContentGate";
 import { log } from "@/node/services/log";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 
@@ -367,6 +368,15 @@ function normalizePendingTaskStatuses(params: {
   });
 }
 
+/**
+ * Refusal for a spawn from a turn that must not carry project skill content
+ * while its context holds some: the child's request is outside this turn's
+ * consent gate, so the content would reach a model the routed request withheld
+ * it from.
+ */
+export const TASK_PROJECT_SKILL_CONTENT_WITHHELD_ERROR =
+  "This turn's context holds project skill content that Project Trust does not allow to leave the workspace; a subagent cannot be started from it. Restore Project Trust or start the subagent from a turn that has not read project skills.";
+
 export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
   // Only advertise the `isolation` parameter on runtimes where sharing the parent checkout is
   // supported. On local runtimes the field is omitted from the schema entirely, so it never
@@ -424,6 +434,19 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
 
       const parentRuntimeAiSettings = buildParentRuntimeAiSettings(config);
 
+      // Provenance of the launch (sub-agent or workspace turn): project skill
+      // content in this turn's context (request rows, or a read earlier in
+      // this stream — inside a PTC program too, observed at the tool's return)
+      // reaches the target through its prompt. A turn that must not carry it
+      // refuses; under trust the sub-agent's opening row is stamped so its own
+      // provenance tracking inherits it.
+      const contextCarriesProjectSkillContent =
+        config.memoryWriteCarriesProjectSkillContent === true ||
+        config.projectSkillContentInContext?.() === true;
+      if (await contextProjectSkillContentWithheld(config)) {
+        throw new Error(TASK_PROJECT_SKILL_CONTENT_WITHHELD_ERROR);
+      }
+
       if (config.planFileOnly && kind === "workspace") {
         throw new Error(PLAN_AGENT_EXPLORE_ONLY_ERROR);
       }
@@ -433,6 +456,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           ownerWorkspaceId: workspaceId,
           prompt,
           title,
+          ...(contextCarriesProjectSkillContent ? { carriesProjectSkillContent: true } : {}),
           // Agent mode for the launched turn (e.g. "plan"); createWorkspaceTurn defaults to exec.
           ...(agentId != null ? { agentId } : {}),
           experiments: config.experiments,
@@ -576,6 +600,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           agentType: requestedAgentId,
           prompt: launch.prompt,
           title,
+          ...(contextCarriesProjectSkillContent ? { carriesProjectSkillContent: true } : {}),
           experiments: config.experiments,
           ...(aiOverrides.modelString != null ? { modelString: aiOverrides.modelString } : {}),
           ...(aiOverrides.thinkingLevel != null

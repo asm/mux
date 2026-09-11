@@ -393,7 +393,9 @@ export interface TaskCreateResult {
   thinkingLevel?: ThinkingLevel;
 }
 
-type TaskLaunchStart = { kind: "sendMessage"; prompt: string } | { kind: "resumeStream" };
+type TaskLaunchStart =
+  | { kind: "sendMessage"; prompt: string; carriesProjectSkillContent?: boolean }
+  | { kind: "resumeStream" };
 
 interface TaskLaunchPlan {
   taskId: string;
@@ -3088,7 +3090,11 @@ export class TaskService implements AgentTaskIntegration {
         parentMeta,
         agentId,
         agentType,
-        start: { kind: "sendMessage", prompt },
+        start: {
+          kind: "sendMessage",
+          prompt,
+          ...(args.carriesProjectSkillContent === true ? { carriesProjectSkillContent: true } : {}),
+        },
         title: args.title,
         workspaceName,
         createdAt,
@@ -3655,6 +3661,9 @@ export class TaskService implements AgentTaskIntegration {
         ? await this.workspaceService.sendMessage(plan.taskId, plan.start.prompt, startOptions, {
             allowQueuedAgentTask: true,
             agentInitiated: true,
+            ...(plan.start.carriesProjectSkillContent === true
+              ? { userRowCarriesProjectSkillContent: true }
+              : {}),
           })
         : await this.workspaceService.resumeStream(plan.taskId, startOptions, {
             allowQueuedAgentTask: true,

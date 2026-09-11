@@ -1,4 +1,4 @@
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, spyOn } from "bun:test";
 
 import { MEMORY_MAX_FILES_PER_SCOPE, MEMORY_MAX_FILE_BYTES } from "@/common/constants/memory";
 
@@ -1740,5 +1740,50 @@ describe("MemoryService refinement journal", () => {
     expect(
       await fsPromises.readFile(path.join(fixture.xumHome, "memory", "global", "notes.md"), "utf-8")
     ).toBe("hello");
+  });
+});
+
+describe("MemoryService write provenance persistence", () => {
+  it("fails a tainted write whose provenance marker cannot persist, keeping content and marker paired", async () => {
+    // The post-write stats update is best-effort; the taint marker is not.
+    // A marker that cannot be written must fail the write, or a verified-clean
+    // file would hold tainted content for a later untrusted routed turn.
+    using fixture = await createFixture("ws-provenance-persist");
+    const tainted = {
+      ...fixture.ctx,
+      writeProvenance: { carriesProjectSkillContent: true as const },
+    };
+    await fixture.service.create(fixture.ctx, "/memories/global/notes.md", "clean", "agent");
+    const marker = spyOn(
+      fixture.metaService,
+      "markCarriesProjectSkillContent"
+    ).mockRejectedValueOnce(new Error("sidecar is read-only"));
+    try {
+      const failed = await fixture.service.strReplace(
+        tainted,
+        "/memories/global/notes.md",
+        "clean",
+        "quotes the skill",
+        "agent"
+      );
+      expect(failed.success).toBe(false);
+      if (!failed.success) expect(failed.error).toContain("provenance");
+      const meta = await fixture.metaService.getEntries();
+      expect(meta.get("global:notes.md")?.carriesProjectSkillContent).toBe(false);
+      // The content is untouched: the same edit applies once the marker persists.
+      const retried = await fixture.service.strReplace(
+        tainted,
+        "/memories/global/notes.md",
+        "clean",
+        "quotes the skill",
+        "agent"
+      );
+      expect(retried.success).toBe(true);
+      expect(
+        (await fixture.metaService.getEntries()).get("global:notes.md")?.carriesProjectSkillContent
+      ).toBe(true);
+    } finally {
+      marker.mockRestore();
+    }
   });
 });

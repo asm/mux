@@ -123,6 +123,12 @@ export interface TaskCreateArgs {
    * Defaults to blocking when omitted.
    */
   attentionPolicy?: BackgroundWorkAttentionPolicy;
+  /**
+   * The spawning turn's context carried project skill content (request rows
+   * or a read earlier in its stream): stamped on the child's opening row so
+   * the child's provenance tracking inherits it.
+   */
+  carriesProjectSkillContent?: boolean;
   /** Experiments to inherit to subagent */
   experiments?: {
     programmaticToolCalling?: boolean;
@@ -365,6 +371,8 @@ export interface SendMessageInternalOptions {
   preTurnMessages?: MuxMessage[];
   /** r54: fired once pre-turn rows cross the rollback horizon (see AgentSession). */
   onPreTurnRowsPersisted?: () => void;
+  /** Stamp the turn's user row as carrying project skill content (see AgentSession). */
+  userRowCarriesProjectSkillContent?: boolean;
   /** Return once the user message is accepted; stream startup continues asynchronously. */
   startStreamInBackground?: boolean;
   /** When true, reject instead of queueing if the workspace is busy. */

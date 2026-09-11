@@ -11772,6 +11772,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             onAcceptedPreStreamFailure: continuationSendState.onAcceptedPreStreamFailure,
             preTurnMessages: internal?.preTurnMessages,
             onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,
+            userRowCarriesProjectSkillContent: internal?.userRowCarriesProjectSkillContent,
             // Thread the probe onto the queued entry: a Stop landing after dequeue is
             // invisible to queue clearing, so the session's turn-admission gates must
             // re-check it at dispatch.
@@ -11901,6 +11902,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         onAcceptedPreStreamFailure,
         preTurnMessages: internal?.preTurnMessages,
         onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,
+        userRowCarriesProjectSkillContent: internal?.userRowCarriesProjectSkillContent,
         admissionEpochStale,
         admissionStale: internal?.admissionStale,
       });

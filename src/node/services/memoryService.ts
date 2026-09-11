@@ -668,6 +668,30 @@ export class MemoryService extends EventEmitter {
   }
 
   /**
+   * A write from a context carrying project skill content commits its
+   * provenance marker BEFORE the content lands: recordUsage above is
+   * best-effort, and a marker that failed to persist would leave a
+   * verified-clean file holding tainted content for a later untrusted routed
+   * turn to read. A marker that cannot be written fails the write instead.
+   */
+  private async commitWriteProvenance(
+    ctx: MemoryScopeContext,
+    scope: MemoryScope,
+    relPath: string
+  ): Promise<void> {
+    if (ctx.writeProvenance?.carriesProjectSkillContent !== true) return;
+    const key = this.logicalKeyFor(ctx, scope, relPath);
+    if (key === null) return;
+    try {
+      await this.metaService.markCarriesProjectSkillContent(key);
+    } catch (error) {
+      throw new MemoryCommandError(
+        `Could not record the provenance of ${toVirtualPath(scope, relPath)}; the write was not applied (${getErrorMessage(error)})`
+      );
+    }
+  }
+
+  /**
    * Directory listings for a turn that must not read project skill content:
    * files carrying (or of unknown) provenance are left out, so their
    * repository-influenced names never reach the provider either.
@@ -1139,6 +1163,7 @@ export class MemoryService extends EventEmitter {
           );
         }
         await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+        await this.commitWriteProvenance(ctx, scope, parsed.relPath);
         await store.writeFile(parsed.relPath, fileText);
         // Row is written before the create is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1180,6 +1205,7 @@ export class MemoryService extends EventEmitter {
         const updated = computeStrReplaceUpdate(content, oldStr, newStr, virtualPath);
         assertWithinFileSizeCap(updated);
         await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+        await this.commitWriteProvenance(ctx, scope, parsed.relPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1233,6 +1259,7 @@ export class MemoryService extends EventEmitter {
         const { updated, insertedLineCount } = computeInsertUpdate(content, insertLine, insertText);
         assertWithinFileSizeCap(updated);
         await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+        await this.commitWriteProvenance(ctx, scope, parsed.relPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1328,6 +1355,7 @@ export class MemoryService extends EventEmitter {
                 ).updated;
         assertWithinFileSizeCap(updated, maxFileBytes);
         await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+        await this.commitWriteProvenance(ctx, scope, parsed.relPath);
         await store.writeFile(parsed.relPath, updated);
         const physicalPath = store.physicalPath(parsed.relPath);
         // Row is written before the write is acknowledged (mutation → row → ack).
@@ -1717,6 +1745,7 @@ export class MemoryService extends EventEmitter {
             }
           }
           await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+          await this.commitWriteProvenance(ctx, scope, parsed.relPath);
           await store.writeFile(parsed.relPath, content);
           await this.recordUsage(ctx, scope, parsed.relPath, {
             write: true,

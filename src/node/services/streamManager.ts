@@ -288,6 +288,12 @@ export interface PreDispatchConsentGateContext {
    * its rows are ModelMessages the step scan cannot classify.
    */
   swappedPrefixCarriesProjectSkillContent?: boolean;
+  /**
+   * The request's tool descriptions advertise project-scope skills kept under
+   * trust (agent_skill_read lists each skill's repository-controlled
+   * description): project content no row of the request carries.
+   */
+  toolDescriptionsCarryProjectSkillContent?: boolean;
 }
 export type PreDispatchConsentGate = (
   context?: PreDispatchConsentGateContext

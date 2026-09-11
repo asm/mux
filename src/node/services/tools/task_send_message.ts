@@ -6,6 +6,7 @@ import {
   TOOL_DEFINITIONS,
 } from "@/common/utils/tools/toolDefinitions";
 import type { AgentTreeTargetRelation } from "@/node/services/taskService";
+import { contextProjectSkillContentWithheld } from "@/node/services/tools/projectSkillContentGate";
 
 import { parseToolResult, requireTaskService, requireWorkspaceId } from "./toolUtils";
 
@@ -23,6 +24,10 @@ function targetRelationLabel(
   }
 }
 
+/** Same sink rule as the task tool: the message text can carry the withheld content. */
+export const TASK_MESSAGE_PROJECT_SKILL_CONTENT_WITHHELD_ERROR =
+  "This turn's context holds project skill content that Project Trust does not allow to leave the workspace; it cannot be forwarded to another agent.";
+
 export const createTaskSendMessageTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({
     description: TOOL_DEFINITIONS.task_send_message.description,
@@ -30,6 +35,12 @@ export const createTaskSendMessageTool: ToolFactory = (config: ToolConfiguration
     execute: async (args): Promise<unknown> => {
       const workspaceId = requireWorkspaceId(config, "task_send_message");
       const taskService = requireTaskService(config, "task_send_message");
+
+      // The target's request is outside this turn's consent gate (see
+      // contextProjectSkillContentWithheld).
+      if (await contextProjectSkillContentWithheld(config)) {
+        throw new Error(TASK_MESSAGE_PROJECT_SKILL_CONTENT_WITHHELD_ERROR);
+      }
 
       // The default dispatch mode depends on the target's relation (ancestors default to
       // turn-end), which only the service can compute — pass the raw arg through.

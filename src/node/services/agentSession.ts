@@ -1,3 +1,4 @@
+import { estimatePdfAttachmentTokens } from "@/node/utils/pdfTokenEstimate";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { STARTUP_RECOVERY_PROBE_TIMEOUT_MS } from "@/constants/startupRecovery";
 import type { AIService } from "./aiService";
@@ -19,8 +20,6 @@ import {
   CONTEXT_WARNING_DEDUPE_KEY,
   FLUSH_RESERVE_TOKENS,
   OUTPUT_RESERVE_TOKENS,
-  IMAGE_TOKEN_ESTIMATE,
-  PDF_TOKENS_PER_PAGE_ESTIMATE,
 } from "@/common/constants/contextBudget";
 import {
   evaluateStepBudget,
@@ -549,27 +548,6 @@ function decodedAttachmentChars(url: string): number {
   return estimateBase64DataUrlBytes(url) ?? url.length;
 }
 
-/**
- * Conservative token cost of a PDF attachment. Providers bill a PDF per page
- * (extracted text plus a page image), not as one media unit: count the page
- * objects of the decoded document and price each at the per-page upper bound;
- * a document whose page objects live in compressed object streams (none
- * visible) falls back to its decoded size as text — over-estimating is the
- * safe direction here (it only compacts earlier).
- */
-function estimatePdfAttachmentTokens(url: string): number {
-  if (!url.startsWith("data:")) return IMAGE_TOKEN_ESTIMATE;
-  const commaIndex = url.indexOf(",");
-  if (commaIndex === -1 || !url.slice(0, commaIndex).includes(";base64")) {
-    return IMAGE_TOKEN_ESTIMATE;
-  }
-  const bytes = Buffer.from(url.slice(commaIndex + 1), "base64");
-  const pages = bytes.toString("latin1").match(/\/Type\s*\/Page(?![s])/g)?.length ?? 0;
-  return pages > 0
-    ? pages * PDF_TOKENS_PER_PAGE_ESTIMATE
-    : Math.max(IMAGE_TOKEN_ESTIMATE, Math.ceil(bytes.length / APPROX_CHARS_PER_TOKEN));
-}
-
 function estimateBase64DataUrlBytes(dataUrl: string): number | null {
   if (!dataUrl.startsWith("data:")) return null;
 
@@ -948,7 +926,9 @@ function excludeProjectLoadedSkills(
  * assembly-time request scan: tool results appended by earlier steps of the
  * same stream, and a continuous-compaction prefix swapped in under trust —
  * its rows are ModelMessages by then, so the step scan cannot classify them
- * and the swap carries its own verdict.
+ * and the swap carries its own verdict — and project-scope skill descriptors
+ * advertised in the request's tool descriptions (repository-controlled text
+ * no row carries).
  */
 function gateContextCarriesProjectSkillContent(
   context: PreDispatchConsentGateContext | undefined
@@ -956,7 +936,8 @@ function gateContextCarriesProjectSkillContent(
   if (context == null) return false;
   return (
     (context.stepMessages != null && stepMessagesCarryProjectSkillContent(context.stepMessages)) ||
-    context.swappedPrefixCarriesProjectSkillContent === true
+    context.swappedPrefixCarriesProjectSkillContent === true ||
+    context.toolDescriptionsCarryProjectSkillContent === true
   );
 }
 
@@ -1219,6 +1200,12 @@ interface SendMessageInternalOptions {
    * in-flight request without their trigger (r30).
    */
   preTurnMessages?: MuxMessage[];
+  /**
+   * Stamp the turn's user row as carrying project skill content: a child
+   * task's opening prompt from a parent whose context carried it (see
+   * TaskCreateArgs.carriesProjectSkillContent).
+   */
+  userRowCarriesProjectSkillContent?: boolean;
   /**
    * r54: fired once the pre-turn batch has crossed the rollback horizon —
    * durably committed AND past the last cancellation/rollback gate. From
@@ -4954,6 +4941,12 @@ export class AgentSession {
           routedTurnCarriesProjectContent || inheritsRoutedConsent
         ),
         muxMetadata: stampedMuxMetadata, // Frontend metadata; requestedModel re-stamped when routing applied
+        // A child task's opening prompt from a parent whose context carried
+        // project skill content: the child's provenance tracking (routed
+        // request scan, memory writes, its report) starts tainted.
+        ...(internal?.userRowCarriesProjectSkillContent === true
+          ? { carriesProjectSkillContent: true }
+          : {}),
         ...(acpPromptId != null ? { acpPromptId } : {}),
         ...(goalKind != null ? { kind: goalKind } : {}),
         // Scope goal-loop rows to their goal so a replaced goal's continuation
@@ -11286,6 +11279,8 @@ export class AgentSession {
       onPreTurnRowsPersisted?: () => void;
       /** Caller staleness probe re-checked at this entry's dispatch admission. */
       admissionStale?: () => boolean;
+      /** See SendMessageInternalOptions.userRowCarriesProjectSkillContent. */
+      userRowCarriesProjectSkillContent?: boolean;
     }
   ): "tool-end" | "turn-end" | null {
     this.assertNotDisposed("queueMessage");
@@ -11825,6 +11820,19 @@ export class AgentSession {
               thinkingLevel: result.data?.routedThinkingLevel ?? options?.thinkingLevel,
             });
           }
+        }
+        // A busy-queued send answered { queued: true } at enqueue, so the
+        // service's fork auto-title waits for this delivery (see
+        // onDeferredSendDelivered) — ordinary queue dispatches are not
+        // compaction follow-ups or background startups, which report their
+        // own. Not when this dispatch deferred again (its delivery reports)
+        // or never streamed.
+        if (
+          result.success &&
+          result.data?.queued !== true &&
+          result.data?.acceptedWithoutStream !== true
+        ) {
+          this.onDeferredSendDelivered?.(message);
         }
         return result;
       });

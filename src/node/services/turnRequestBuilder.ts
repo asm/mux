@@ -126,6 +126,10 @@ import {
 } from "@/node/services/mcpServerManager";
 import { type MemoryService, type MemorySessionContext } from "@/node/services/memoryService";
 import type { TaskService } from "@/node/services/taskService";
+import {
+  observeProjectSkillContentInToolOutputs,
+  withToolDescriptionProvenance,
+} from "@/node/services/tools/projectSkillContentGate";
 import { resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import {
@@ -2509,10 +2513,14 @@ export class TurnRequestBuilder {
 
         const applyPolicyStartedAt = Date.now();
         let attemptTools = await applyToolPolicyAndExperiments({
-          allTools: this.dependencies.wrapToolsForDelegation(
-            workspaceId,
-            allTools,
-            delegatedToolNames
+          // Outputs are classified as they return: a project skill read inside
+          // a PTC program taints the live provenance before the evaluation's
+          // later sinks run, not only at onStepMessages.
+          allTools: observeProjectSkillContentInToolOutputs(
+            this.dependencies.wrapToolsForDelegation(workspaceId, allTools, delegatedToolNames),
+            () => {
+              liveProjectTaint.carries = true;
+            }
           ),
           extraTools: this.dependencies.bindings.extraTools,
           effectiveToolPolicy,
@@ -3217,13 +3225,23 @@ export class TurnRequestBuilder {
       const emitPrimaryEnvelope = (): Promise<void> =>
         primaryRequest.emitEnvelopeWith(streamThinkingLevel, streamProviderOptions);
       emitStartupBreadcrumb("starting_stream");
+      // agent_skill_read's description lists each advertised skill's
+      // repository-controlled description: project-scope entries kept under
+      // trust are project content the row scan never sees, so they arm the
+      // gate like a snapshot row (an untrusted routed turn filters them out of
+      // the description instead — see buildSkillReadDescription).
+      const preDispatchConsentGate = withToolDescriptionProvenance(
+        opts.preDispatchConsentGate,
+        excludeProjectSkillContent !== true &&
+          (availableSkills ?? []).some(
+            (skill) => skill.scope === "project" && skill.advertise !== false
+          )
+      );
       const turnExecutionOptions: TurnExecutionOptions = {
         workspaceId,
         // Threaded to the stream-start critical section (see
         // TurnExecutionOptions.preDispatchConsentGate).
-        ...(opts.preDispatchConsentGate != null
-          ? { preDispatchConsentGate: opts.preDispatchConsentGate }
-          : {}),
+        ...(preDispatchConsentGate != null ? { preDispatchConsentGate } : {}),
         messages: streamFinalMessages,
         model: modelResult.data.model,
         modelString,
