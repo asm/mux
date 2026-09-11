@@ -946,7 +946,13 @@ export class RefineService {
     }
     const snapshot = await this.snapshotActiveSegment(workspaceId, snapshotExclusion.data);
     if (!snapshot.success) return snapshot;
-    const { messages, quarantinedRowIds, activeSegment, snapshotRowFingerprints } = snapshot.data;
+    const {
+      messages,
+      quarantinedRowIds,
+      activeSegment,
+      rejectedRowsPresent,
+      snapshotRowFingerprints,
+    } = snapshot.data;
     // Reuse the branch-summary transcript builder: role-labeled,
     // thinking-stripped, char-bounded — exactly the evidence shape a
     // distillation pass needs. The tail cap preserves the prior bound on
@@ -974,8 +980,12 @@ export class RefineService {
       typeof timelineSinceTs === "number" &&
       Number.isFinite(timelineSinceTs) &&
       timelineSinceTs >= 0;
+    // Timeline events are selected by timestamp alone, and a `turn.user` event
+    // carries the prompt's digest recorded before its row was refused. While
+    // the segment holds a rejected (stamped or quarantined) turn, the timeline
+    // is omitted entirely (fail closed) rather than correlated event by event.
     const timelineText =
-      boundaryRow !== undefined && !boundaryTsUsable
+      rejectedRowsPresent || (boundaryRow !== undefined && !boundaryTsUsable)
         ? undefined
         : await this.buildTimelineText(workspaceId, timelineSinceTs);
 
@@ -1594,6 +1604,7 @@ export class RefineService {
         messages: MuxMessage[];
         quarantinedRowIds: ReadonlySet<string>;
         activeSegment: MuxMessage[];
+        rejectedRowsPresent: boolean;
         snapshotRowFingerprints: string[];
       },
       string
@@ -1612,14 +1623,15 @@ export class RefineService {
           "run /refine again once the workspace has been opened"
       );
     }
-    const activeSegment = excludeRejectedTurnRows(
-      sliceMessagesForProviderFromLatestContextBoundary(messagesResult.data),
-      quarantine.data
-    );
+    const segment = sliceMessagesForProviderFromLatestContextBoundary(messagesResult.data);
+    const activeSegment = excludeRejectedTurnRows(segment, quarantine.data);
     return Ok({
       messages: messagesResult.data,
       quarantinedRowIds: quarantine.data,
       activeSegment,
+      // The timeline input is selected by time alone, so the caller omits it
+      // while the segment holds a rejected turn (see runLocked).
+      rejectedRowsPresent: activeSegment.length !== segment.length,
       snapshotRowFingerprints: activeSegment.map(fingerprintHistoryRow),
     });
   }

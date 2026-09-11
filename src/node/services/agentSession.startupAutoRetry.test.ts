@@ -1489,7 +1489,11 @@ describe("AgentSession startup auto-retry recovery", () => {
     const releaseUnlink = Promise.withResolvers<void>();
     const releaseWrite = Promise.withResolvers<void>();
     const macrotask = () => new Promise((resolve) => setTimeout(resolve, 0));
-    const { unlink, mkdir, writeFile } = fsPromises;
+    const { unlink, mkdir, rename, writeFile } = fsPromises;
+    // The preference file is replaced atomically: the payload is written to a
+    // sibling temp path (prefixed by the preference path) and renamed over it.
+    const isPreferenceWrite = (target: unknown): boolean =>
+      typeof target === "string" && target.startsWith(preferencePath);
     const spies = [
       spyOn(fsPromises, "unlink").mockImplementation(async (target) => {
         if (target !== preferencePath) return unlink(target);
@@ -1500,8 +1504,11 @@ describe("AgentSession startup auto-retry recovery", () => {
       spyOn(fsPromises, "mkdir").mockImplementation(async (target, options) => {
         if (target !== path.dirname(preferencePath)) await mkdir(target, options);
       }),
+      spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+        if (to !== preferencePath) return rename(from, to);
+      }),
       spyOn(fsPromises, "writeFile").mockImplementation(async (target, data, options) => {
-        if (target !== preferencePath || typeof data !== "string") {
+        if (!isPreferenceWrite(target) || typeof data !== "string") {
           return writeFile(target, data, options);
         }
         if (holdMarkerWrites) {
@@ -1779,7 +1786,11 @@ describe("AgentSession startup auto-retry recovery", () => {
     const { writeFile } = fsPromises;
     const writeSpy = spyOn(fsPromises, "writeFile").mockImplementation(
       async (target, data, options) => {
-        if (target === preferencePath && failWrites) throw new Error("EIO");
+        // The preference file is replaced through a sibling temp path
+        // (prefixed by the preference path), so fail that write.
+        if (typeof target === "string" && target.startsWith(preferencePath) && failWrites) {
+          throw new Error("EIO");
+        }
         return writeFile(target, data, options);
       }
     );

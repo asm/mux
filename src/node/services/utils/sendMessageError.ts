@@ -61,6 +61,17 @@ export const REJECTED_TURN_RECORD_UNRECORDED_MESSAGE =
   "The refused turn could not be recorded on disk; its content is withheld for this " +
   "session only, and new messages are refused until the record can be written.";
 
+/**
+ * The durable rejected-turn record (or the preference document carrying it)
+ * exists but cannot be parsed, so WHICH earlier turns a refusal still protects
+ * is unknown and nobody can recover the keys. The path is in the message
+ * because removing the file by hand is the only remedy.
+ */
+export const rejectedTurnRecordCorruptMessage = (recordPath: string): string =>
+  `The record of refused turns (${recordPath}) is unreadable, so this message was ` +
+  "not sent: which earlier turns must stay withheld from providers is unknown. " +
+  "Remove that file and reopen the workspace to continue.";
+
 export const createUnknownSendMessageError = (raw: string): SendMessageError => {
   assert(typeof raw === "string", "Expected raw error to be a string");
   const trimmed = stripNoisyErrorPrefix(raw.trim());

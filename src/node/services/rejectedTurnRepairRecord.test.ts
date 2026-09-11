@@ -5,7 +5,6 @@ import * as path from "node:path";
 
 import {
   AUTO_RETRY_PREFERENCE_FILE,
-  parsePendingRejectedTurnRepairKeys,
   readDurableRejectedTurnKeys,
 } from "./rejectedTurnRepairRecord";
 
@@ -46,10 +45,6 @@ describe("rejected-turn repair record", () => {
     );
     const keys = await readDurableRejectedTurnKeys(preferencePath);
     expect(keys.success && [...keys.data]).toEqual(["u-legacy"]);
-    expect(parsePendingRejectedTurnRepairKeys({ userMessageIds: ["a", "", 3, "a"] })).toEqual([
-      "a",
-    ]);
-    expect(parsePendingRejectedTurnRepairKeys(null)).toEqual([]);
   });
 
   it("yields no keys for a missing file but an unknown state for an unreadable or malformed one", async () => {
@@ -80,15 +75,17 @@ describe("rejected-turn repair record", () => {
       { startupAutoRetryAbandon: { reason: "pre_stream_rejected", userMessageId: 7 } },
       { startupAutoRetryAbandon: { reason: "" } },
       { startupAutoRetryAbandon: "pre_stream_rejected" },
+      // A key-less rejected marker (a refused resume that could not read its
+      // row key) names a refused turn the session has not identified yet:
+      // unknown, not empty, until startup recovery keys or stamps it.
+      { startupAutoRetryAbandon: { reason: "pre_stream_rejected" } },
     ];
     for (const record of malformed) {
       await fs.writeFile(preferencePath, JSON.stringify(record));
       expect((await readDurableRejectedTurnKeys(preferencePath)).success).toBe(false);
     }
-    // Valid shapes still read: a key-less rejected marker (nothing to add), an
-    // empty key list, and an unrelated marker reason.
+    // Valid shapes still read: an empty key list and an unrelated marker reason.
     for (const record of [
-      { startupAutoRetryAbandon: { reason: "pre_stream_rejected" } },
       { pendingRejectedTurnRepair: { userMessageIds: [] } },
       { startupAutoRetryAbandon: { reason: "aborted", userMessageId: "u-aborted" } },
     ]) {

@@ -16,7 +16,7 @@ import {
   AGENT_STATUS_TICK_INTERVAL_MS,
 } from "@/constants/agentStatus";
 import type { Config } from "@/node/config";
-import type { MuxMessage } from "@/common/types/message";
+import { excludeRejectedTurnRows, type MuxMessage } from "@/common/types/message";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { AIService } from "./aiService";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
@@ -262,6 +262,9 @@ export class AgentStatusService {
   ): Promise<void> {
     try {
       const transcript = await this.buildTrailingTranscript(workspaceId);
+      // Unknown rejected-turn quarantine: nothing is generated this tick, and
+      // the recency signal stays unconsumed so the next tick retries.
+      if (transcript === null) return;
       // Two hashes, two purposes:
       //
       //   transcriptHash — keyed only on transcript bytes. Used by the
@@ -550,23 +553,46 @@ export class AgentStatusService {
    * AGENT_STATUS_MAX_TRANSCRIPT_TOKENS. Includes the in-flight partial
    * assistant message (HistoryService.readPartial) so the hash refreshes
    * mid-stream — exactly when "what is the agent doing now" matters most.
+   *
+   * Rows of consent-refused turns — stamped provider-ineligible, or
+   * quarantined while their stamp is outstanding — are excluded first, the
+   * in-flight partial included: the status model may live on another
+   * provider, and the refused prompt, its project-skill snapshot and any
+   * surviving output were withheld from the routed dispatch itself. Returns
+   * null when the quarantine cannot be read, so the tick is skipped (fail
+   * closed) instead of generated from an unfiltered transcript.
    */
-  private async buildTrailingTranscript(workspaceId: string): Promise<string> {
+  private async buildTrailingTranscript(workspaceId: string): Promise<string | null> {
     const result = await this.historyService.getLastMessages(
       workspaceId,
       AGENT_STATUS_MAX_TRAILING_MESSAGES
     );
     if (!result.success) return "";
 
-    const committedMessages: MuxMessage[] = [...result.data];
     const partial = await this.historyService.readPartial(workspaceId);
+    const quarantine = await this.workspaceService.getQuarantinedRejectedRowIds(workspaceId);
+    if (!quarantine.success) {
+      log.warn("AgentStatusService: rejected-turn quarantine unreadable; skipping status", {
+        workspaceId,
+        error: quarantine.error,
+      });
+      return null;
+    }
+    const committedMessages: MuxMessage[] = excludeRejectedTurnRows(result.data, quarantine.data);
+    // The partial is the in-flight reply to the latest user turn; a refused
+    // turn's surviving output (its deletion failed) goes with that turn.
+    const latestUserRow = result.data.findLast((m) => m.role === "user");
+    const eligiblePartial =
+      partial != null && (latestUserRow === undefined || committedMessages.includes(latestUserRow))
+        ? partial
+        : null;
 
     // Partial messages get an "(in progress)" role suffix so the model sees
     // they aren't finalized; committed messages render with their normal
     // role label. Doing this here keeps formatMessageForTranscript pure.
     const formattedParts = [
       ...committedMessages.map((m) => formatMessageForTranscript(m, { partial: false })),
-      ...(partial ? [formatMessageForTranscript(partial, { partial: true })] : []),
+      ...(eligiblePartial ? [formatMessageForTranscript(eligiblePartial, { partial: true })] : []),
     ];
     const formatted = formattedParts.filter((s) => s.length > 0);
     if (formatted.length === 0) return "";

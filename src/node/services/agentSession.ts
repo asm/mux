@@ -51,7 +51,7 @@ import {
   type StartupRecoveryState,
 } from "./startupRecovery";
 import { hasErrorCode } from "./tools/skillFileUtils";
-import { mkdir, readdir, readFile, unlink, writeFile } from "fs/promises";
+import { mkdir, readdir, readFile, rename, unlink, writeFile } from "fs/promises";
 import type { Dirent } from "fs";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { PlatformPaths } from "@/common/utils/paths";
@@ -118,6 +118,7 @@ import {
   createUnknownSendMessageError,
   REJECTED_TURN_RECORD_UNRECORDED_MESSAGE,
   REJECTED_TURN_REPAIR_PENDING_MESSAGE,
+  rejectedTurnRecordCorruptMessage,
   ROUTED_SKILL_TRUST_REVOKED_MESSAGE,
   type StreamErrorPayload,
 } from "@/node/services/utils/sendMessageError";
@@ -286,7 +287,7 @@ import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelo
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   AUTO_RETRY_PREFERENCE_FILE,
-  parsePendingRejectedTurnRepairKeys,
+  parseStrictPendingRejectedTurnRepairKeys,
 } from "@/node/services/rejectedTurnRepairRecord";
 import { CompactionMonitor, type CompactionStatusEvent } from "./compactionMonitor";
 import { injectPostCompactionAttachments } from "@/browser/utils/messages/modelMessageTransform";
@@ -654,6 +655,24 @@ function isCompactionRequestMetadata(meta: unknown): meta is CompactionRequestMe
 }
 
 /**
+ * Replace the auto-retry preference file atomically (temp file + rename): a
+ * crash mid-write must not leave a torn document, which reads as an UNKNOWN
+ * rejected-turn quarantine and refuses sends until removed by hand. Built on
+ * the fs/promises primitives (not write-file-atomic) so the temp write stays
+ * orderable and failable through the same seams as the plain write it replaces.
+ */
+async function replacePreferenceFile(preferencePath: string, payload: string): Promise<void> {
+  const tempPath = `${preferencePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tempPath, payload, "utf-8");
+    await rename(tempPath, preferencePath);
+  } catch (error) {
+    await unlink(tempPath).catch(() => undefined);
+    throw error;
+  }
+}
+
+/**
  * Clear provider-config-fixable startup abandon markers persisted by workspaces
  * WITHOUT a live AgentSession (closed chats). Live sessions clear their own
  * marker via handleProviderConfigChanged(); this sweep covers the rest so that
@@ -682,7 +701,11 @@ export async function clearProviderConfigFixableAbandonMarkers(
       }
 
       const preferencePath = path.join(sessionsDir, entry.name, AUTO_RETRY_PREFERENCE_FILE);
-      let parsed: { enabled?: unknown; startupAutoRetryAbandon?: unknown };
+      let parsed: {
+        enabled?: unknown;
+        startupAutoRetryAbandon?: unknown;
+        pendingRejectedTurnRepair?: unknown;
+      };
       try {
         parsed = JSON.parse(await readFile(preferencePath, "utf-8")) as typeof parsed;
       } catch {
@@ -700,10 +723,19 @@ export async function clearProviderConfigFixableAbandonMarkers(
         return;
       }
 
-      // Mirror persistAutoRetryState(): the file only exists to carry an
-      // opt-out or an abandon marker, so dropping the last field deletes it.
-      if (parsed.enabled === false) {
-        await writeFile(preferencePath, JSON.stringify({ enabled: false }) + "\n", "utf-8");
+      // Mirror persistAutoRetryState(): the file carries an opt-out, an abandon
+      // marker or the rejected-turn repair record, so dropping the last field
+      // deletes it. This sweep retires only the marker; the record (keys of
+      // refused turns whose stamp is outstanding) is carried over verbatim.
+      const repairRecord = parsed.pendingRejectedTurnRepair;
+      if (parsed.enabled === false || repairRecord != null) {
+        await replacePreferenceFile(
+          preferencePath,
+          JSON.stringify({
+            ...(parsed.enabled === false ? { enabled: false } : {}),
+            ...(repairRecord != null ? { pendingRejectedTurnRepair: repairRecord } : {}),
+          }) + "\n"
+        );
       } else {
         await unlink(preferencePath);
       }
@@ -2077,10 +2109,18 @@ export class AgentSession {
       pendingRejectedTurnRepair?: unknown;
     } = {};
     try {
-      parsed = (JSON.parse(raw ?? "{}") as typeof parsed | null) ?? {};
+      const document: unknown = JSON.parse(raw ?? "{}");
+      if (document !== null && (typeof document !== "object" || Array.isArray(document))) {
+        throw new Error("preference document is not a JSON object");
+      }
+      parsed = (document as typeof parsed | null) ?? {};
     } catch (error) {
-      log.warn("Failed to load auto-retry preference; defaulting to enabled", {
+      // FAIL CLOSED: the document may have carried the rejected-turn repair
+      // record, whose keys nothing else knows (see corruptRejectedTurnRecord).
+      this.corruptRejectedTurnRecord = { kind: "document", raw: raw ?? "" };
+      log.error("Auto-retry preference is malformed; refusing sends until it is removed", {
         workspaceId: this.workspaceId,
+        preferencePath: this.getAutoRetryPreferencePath(),
         error: getErrorMessage(error),
       });
     }
@@ -2096,13 +2136,26 @@ export class AgentSession {
     // The durable repair record rides in the same file. Union, not replace: a
     // key recorded in memory before this load settled must survive it, and so
     // must every key on disk.
-    const persistedRepair = this.parsePendingRejectedTurnRepair(parsed.pendingRejectedTurnRepair);
-    if (persistedRepair != null) {
-      const keys = new Set([
-        ...(this.pendingRejectedTurnRepair?.userMessageIds ?? []),
-        ...persistedRepair.userMessageIds,
-      ]);
-      this.pendingRejectedTurnRepair = { userMessageIds: [...keys] };
+    const persistedRepairRecord = parsed.pendingRejectedTurnRepair;
+    if (persistedRepairRecord != null) {
+      const persistedKeys = parseStrictPendingRejectedTurnRepairKeys(persistedRepairRecord);
+      if (persistedKeys === null) {
+        // FAIL CLOSED: a present record that cannot be parsed hides the keys
+        // of refused turns whose row stamp failed, and nothing else knows
+        // them; read as "no keys", the next request build would include
+        // those rows. The value is held as an unknown quarantine instead.
+        this.corruptRejectedTurnRecord = { kind: "record", value: persistedRepairRecord };
+        log.error("Rejected-turn repair record is malformed; refusing sends until it is removed", {
+          workspaceId: this.workspaceId,
+          preferencePath: this.getAutoRetryPreferencePath(),
+        });
+      } else if (persistedKeys.length > 0) {
+        const keys = new Set([
+          ...(this.pendingRejectedTurnRepair?.userMessageIds ?? []),
+          ...persistedKeys,
+        ]);
+        this.pendingRejectedTurnRepair = { userMessageIds: [...keys] };
+      }
     }
     this.retryManager.setEnabled(enabled);
     if (raw == null && !enabled) {
@@ -2112,6 +2165,20 @@ export class AgentSession {
       await this.persistAutoRetryState();
     }
   }
+
+  /**
+   * The rejected-turn repair record — or the whole preference document that
+   * carries it — as found on disk when it could not be parsed. Non-null means
+   * the quarantine is UNKNOWN: the keys of refused turns whose stamp failed
+   * are recorded nowhere else, so request builds are refused and the
+   * malformed content is written back verbatim (side channels keep failing
+   * closed across restarts) until the file is removed by hand. The file is
+   * written atomically, so reaching this state takes external corruption.
+   */
+  private corruptRejectedTurnRecord:
+    | { kind: "document"; raw: string }
+    | { kind: "record"; value: unknown }
+    | null = null;
 
   private autoRetryPersistence: Promise<void> = Promise.resolve();
 
@@ -2129,20 +2196,32 @@ export class AgentSession {
     // (accepted sends clear the marker, never the record), so the file is the
     // default state only when BOTH are absent.
     const pendingRepair = this.pendingRejectedTurnRepair;
+    const corrupt = this.corruptRejectedTurnRecord;
     // Capture the admitted update, then serialize every writer (including success policy
     // and public opt-out). Generation checks cannot cancel an already-issued unlink: it
     // must settle before a newer preference commits, or it can erase the user's opt-out.
     // Once memory reflects this admitted snapshot it must commit even if its generation
     // retires while queued; a later clear may already see null and have nothing to enqueue.
     // Callers admit against the retry generation synchronously, before the load await.
+    //
+    // A malformed record (or document) is written back VERBATIM: it must keep
+    // reading as an unknown quarantine, never as "no keys", until removed by
+    // hand. Sends are refused meanwhile, so no new key can need the slot; a
+    // key recorded in memory before the load settled stays in memory.
     const payload =
-      enabled && !abandon && !pendingRepair
-        ? undefined
-        : JSON.stringify({
-            ...(!enabled ? { enabled: false } : {}),
-            ...(abandon ? { startupAutoRetryAbandon: abandon } : {}),
-            ...(pendingRepair ? { pendingRejectedTurnRepair: pendingRepair } : {}),
-          }) + "\n";
+      corrupt?.kind === "document"
+        ? corrupt.raw
+        : enabled && !abandon && !pendingRepair && corrupt === null
+          ? undefined
+          : JSON.stringify({
+              ...(!enabled ? { enabled: false } : {}),
+              ...(abandon ? { startupAutoRetryAbandon: abandon } : {}),
+              ...(corrupt !== null
+                ? { pendingRejectedTurnRepair: corrupt.value }
+                : pendingRepair
+                  ? { pendingRejectedTurnRepair: pendingRepair }
+                  : {}),
+            }) + "\n";
     const execution = this.coordinator.enterExecution();
     const persisted = this.autoRetryPersistence
       .then(async () => {
@@ -2151,7 +2230,7 @@ export class AgentSession {
             await unlink(preferencePath);
           } else {
             await mkdir(path.dirname(preferencePath), { recursive: true });
-            await writeFile(preferencePath, payload, "utf-8");
+            await replacePreferenceFile(preferencePath, payload);
           }
         } catch (error) {
           if (payload !== undefined || !isErrnoWithCode(error, "ENOENT")) {
@@ -2227,11 +2306,6 @@ export class AgentSession {
 
     this.startupAutoRetryAbandon = null;
     await this.persistAutoRetryState();
-  }
-
-  private parsePendingRejectedTurnRepair(value: unknown): { userMessageIds: string[] } | null {
-    const userMessageIds = parsePendingRejectedTurnRepairKeys(value);
-    return userMessageIds.length > 0 ? { userMessageIds } : null;
   }
 
   /** Persist (or retire) the durable repair record; best-effort like the abandon marker. */
@@ -2597,20 +2671,34 @@ export class AgentSession {
    * recovery derives. An unreadable tail yields nothing; the request build's
    * own history read then fails the resume.
    */
-  private async deriveResumeConsentFromTail(): Promise<{
-    routedProjectConsent?: boolean;
-    compactionBaseOptions?: SendMessageOptions;
-    userMessageId?: string;
-  }> {
+  private async deriveResumeConsentFromTail(): Promise<
+    Result<
+      {
+        routedProjectConsent?: boolean;
+        compactionBaseOptions?: SendMessageOptions;
+        userMessageId?: string;
+      },
+      SendMessageError
+    >
+  > {
     const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
-    if (!history.success) return {};
+    // FAIL CLOSED: the persisted row is the only record of a routed turn's
+    // consent obligation, so an unreadable tail refuses the resume instead of
+    // replaying the row as an unrouted send.
+    if (!history.success) {
+      return Err(
+        createUnknownSendMessageError(
+          `Cannot resume: the workspace history could not be read (${history.error}). Retry.`
+        )
+      );
+    }
     const row = this.findLastRetryUserMessage(history.data);
     const retry = row?.metadata?.retrySendOptions;
-    return {
+    return Ok({
       routedProjectConsent: retry?.routedProjectConsent === true ? true : undefined,
       compactionBaseOptions: sanitizePersistedCompactionBaseOptions(retry?.compactionBaseOptions),
       userMessageId: row?.id,
-    };
+    });
   }
 
   private findLastRetryUserMessage(messages: MuxMessage[]): MuxMessage | undefined {
@@ -5909,16 +5997,18 @@ export class AgentSession {
     // request on the class model. Derive the obligation, the routed compaction
     // policy and the row key from the durable tail then, as startup recovery
     // does; internal callers (auto-retry, recovery) pass their own.
-    const routedResume =
+    const routedResumeResult =
       internal?.routedProjectConsent != null ||
       internal?.compactionBaseOptions != null ||
       internal?.userMessageId != null
-        ? {
+        ? Ok({
             routedProjectConsent: internal?.routedProjectConsent,
             compactionBaseOptions: internal?.compactionBaseOptions,
             userMessageId: internal?.userMessageId,
-          }
+          })
         : await this.deriveResumeConsentFromTail();
+    if (!routedResumeResult.success) return Err(routedResumeResult.error);
+    const routedResume = routedResumeResult.data;
     if (this.coordinator.closing || startupController?.signal.aborted) {
       return Ok({ started: false });
     }
@@ -8447,6 +8537,16 @@ export class AgentSession {
       // assistant into an unmarked history row the repair no longer finds.
       // Marker-gated — a no-op in the common case.
       await this.loadAutoRetryEnabledPreference();
+      if (this.corruptRejectedTurnRecord !== null) {
+        // FAIL CLOSED: which earlier turns a refusal still protects is unknown
+        // (see corruptRejectedTurnRecord), so no request leaves until the
+        // record is removed by hand.
+        return await fail(
+          createUnknownSendMessageError(
+            rejectedTurnRecordCorruptMessage(this.getAutoRetryPreferencePath())
+          )
+        );
+      }
       const repair = await this.repairUnstampedRejectedTurn();
       if (isStreamStartAborted()) {
         return Ok(undefined);

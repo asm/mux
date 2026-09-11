@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import type { ProjectsConfig, ProjectConfig, Workspace } from "@/common/types/project";
-import { Ok, Err } from "@/common/types/result";
+import { Ok, Err, type Result } from "@/common/types/result";
 import { createMuxMessage } from "@/common/types/message";
 import {
   AGENT_STATUS_PROVIDER_FAILURE_IDLE_COOLDOWN_MS,
@@ -70,6 +70,9 @@ describe("AgentStatusService", () => {
     typeof mock<(workspaceId: string, snapshot: unknown) => void>
   >;
   let getCandidatesMock: ReturnType<typeof mock<(workspaceId: string) => Promise<string[]>>>;
+  let getQuarantineMock: ReturnType<
+    typeof mock<(workspaceId: string) => Promise<Result<ReadonlySet<string>, string>>>
+  >;
   let generateSpy: ReturnType<
     typeof spyOn<typeof workspaceStatusGenerator, "generateWorkspaceStatus">
   >;
@@ -123,9 +126,13 @@ describe("AgentStatusService", () => {
 
     emitWorkspaceActivityMock = mock(() => undefined);
     getCandidatesMock = mock((_id: string) => Promise.resolve(["anthropic:claude-haiku-4-5"]));
+    getQuarantineMock = mock((_workspaceId: string) =>
+      Promise.resolve<Result<ReadonlySet<string>, string>>(Ok(new Set<string>()))
+    );
     mockWorkspaceService = {
       getWorkspaceTitleModelCandidates: getCandidatesMock,
       emitWorkspaceActivity: emitWorkspaceActivityMock,
+      getQuarantinedRejectedRowIds: getQuarantineMock,
     } as unknown as WorkspaceService;
 
     // Stateful fake for the shared status slot: mirrors the real service,
@@ -249,6 +256,93 @@ describe("AgentStatusService", () => {
     await getInternals(service).runForWorkspace(workspaceId);
     expect(generateSpy).toHaveBeenCalledTimes(2);
     expect(generateSpy.mock.calls[1][0]).toContain("Assistant (in progress): Reading config files");
+  });
+
+  test("withholds rejected turns, their snapshots and surviving output from the transcript", async () => {
+    // SECURITY: the status model may live on another provider. A
+    // consent-refused turn's prompt, its project-skill snapshot and any
+    // output whose deletion failed were withheld from the routed dispatch
+    // itself; a stamped row and a row quarantined while its stamp is
+    // outstanding must both stay out of the status prompt.
+    const history = historyHandle.historyService;
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please run the test suite")
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("a1", "assistant", "Running tests now")
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("snap-stamped", "user", "STAMPED SKILL BODY", {
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
+        preStreamRejected: true,
+      })
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u-stamped", "user", "STAMPED REFUSED PROMPT", { preStreamRejected: true })
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("snap-quarantined", "user", "QUARANTINED SKILL BODY", {
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "y" },
+      })
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u-quarantined", "user", "QUARANTINED REFUSED PROMPT")
+    );
+    await history.writePartial(
+      workspaceId,
+      createMuxMessage("a-partial", "assistant", "SURVIVING REFUSED OUTPUT")
+    );
+    getQuarantineMock.mockImplementation(() =>
+      Promise.resolve<Result<ReadonlySet<string>, string>>(Ok(new Set(["u-quarantined"])))
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const prompt = generateSpy.mock.calls[0][0];
+    expect(prompt).toContain("User: Please run the test suite");
+    expect(prompt).toContain("Assistant: Running tests now");
+    for (const withheld of [
+      "STAMPED SKILL BODY",
+      "STAMPED REFUSED PROMPT",
+      "QUARANTINED SKILL BODY",
+      "QUARANTINED REFUSED PROMPT",
+      "SURVIVING REFUSED OUTPUT",
+    ]) {
+      expect(prompt).not.toContain(withheld);
+    }
+  });
+
+  test("skips status generation while the rejected-turn quarantine is unreadable", async () => {
+    // Unknown quarantine: no prompt is built from an unfiltered transcript,
+    // and the tick is not settled, so a later readable state generates.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please run the test suite")
+    );
+    getQuarantineMock.mockImplementation(() =>
+      Promise.resolve<Result<ReadonlySet<string>, string>>(Err("record unreadable"))
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).not.toHaveBeenCalled();
+    expect(setSidebarStatusMock).not.toHaveBeenCalled();
+
+    getQuarantineMock.mockImplementation(() =>
+      Promise.resolve<Result<ReadonlySet<string>, string>>(Ok(new Set<string>()))
+    );
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
   });
 
   test("transcript tags in-flight tool calls 'running' and completed ones 'done'", async () => {

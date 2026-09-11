@@ -2951,6 +2951,35 @@ describe("RefineService", () => {
     expect(prompt).not.toContain("PROJECT SKILL BODY");
   });
 
+  it("omits the timeline while the segment holds a rejected turn", async () => {
+    // A `turn.user` timeline event carries the prompt's digest, recorded
+    // before the row was refused; the timeline is selected by time alone, so
+    // it is omitted entirely while a rejected turn is in the segment.
+    const prompts: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
+      timelineEvents: [{ kind: "turn.user", description: "REFUSED ROUTED PROMPT (digest)" }],
+      enabledExperiments: [
+        EXPERIMENT_IDS.RLM,
+        EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
+        EXPERIMENT_IDS.TIMELINE,
+      ],
+    });
+    await fixture.seedTrajectory(["Please run the tests for this repo."]);
+    await fixture.historyService.appendToHistory(
+      WORKSPACE_ID,
+      createMuxMessage("user-refused", "user", "REFUSED ROUTED PROMPT", {
+        timestamp: Date.now(),
+        preStreamRejected: true,
+      })
+    );
+
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    const prompt = prompts.at(-1) ?? "";
+    expect(prompt).toContain("Please run the tests for this repo.");
+    expect(prompt).not.toContain("REFUSED ROUTED PROMPT");
+  });
+
   it("fails closed when the rejected-turn quarantine record cannot be read", async () => {
     // Without the record's keys the pass cannot tell which unstamped rows a
     // refusal still protects: no model call, an explicit error to retry.

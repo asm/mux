@@ -2142,6 +2142,91 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     await session.dispose();
   });
 
+  it("refuses a manual resume while the tail's consent record cannot be read", async () => {
+    // FAIL CLOSED: an unreadable tail is not "no consent obligation". The
+    // replayed row may be a routed project-skill turn whose trust has since
+    // been revoked; resuming it unrouted would dispatch the project content
+    // without the gate.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const { session, streamed, historyService } = await createRoutingHarness({ workspacePath });
+    await historyService.appendToHistory(
+      "ws-skill-routing",
+      createMuxMessage("u-routed", "user", "Use skill done", {
+        timestamp: 1,
+        retrySendOptions: { model: USER_MODEL, agentId: "exec", routedProjectConsent: true },
+      })
+    );
+
+    const readSpy = spyOn(historyService, "getHistoryFromLatestBoundary").mockResolvedValue(
+      Err("disk error")
+    );
+    try {
+      const resumed = await session.resumeStream({ model: USER_MODEL, agentId: "exec" });
+      expect(resumed.success).toBe(false);
+      expect(JSON.stringify(resumed)).toMatch(/could not be read/);
+    } finally {
+      readSpy.mockRestore();
+    }
+    expect(streamed).toHaveLength(0);
+    await session.dispose();
+  });
+
+  it("refuses sends while the durable repair record is malformed instead of reading it as empty", async () => {
+    // The record names the refused turns whose row stamp failed, and nothing
+    // else knows them: a record that cannot be parsed is an UNKNOWN
+    // quarantine, so no request leaves, and the malformed value is written
+    // back verbatim so side channels keep failing closed after a restart.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const probe = await createRoutingHarness({ workspacePath });
+    const internals = (session: object) =>
+      session as unknown as {
+        getAutoRetryPreferencePath(): string;
+        persistAutoRetryState(): Promise<void>;
+      };
+    const preferencePath = internals(probe.session).getAutoRetryPreferencePath();
+    await probe.session.dispose();
+    const malformedRecord = { userMessageIds: 42 };
+    try {
+      await fs.mkdir(path.dirname(preferencePath), { recursive: true });
+      await fs.writeFile(
+        preferencePath,
+        JSON.stringify({ pendingRejectedTurnRepair: malformedRecord }) + "\n"
+      );
+      const { session, streamed } = await createRoutingHarness({ workspacePath });
+      const refused = await session.sendMessage("next prompt", {
+        model: USER_MODEL,
+        agentId: "exec",
+      });
+      expect(refused.success).toBe(false);
+      expect(JSON.stringify(refused)).toMatch(/record of refused turns/);
+      expect(streamed).toHaveLength(0);
+
+      // A state write preserves the malformed record rather than healing it
+      // into "no keys".
+      await internals(session).persistAutoRetryState();
+      expect(JSON.parse(await fs.readFile(preferencePath, "utf-8"))).toEqual({
+        pendingRejectedTurnRepair: malformedRecord,
+      });
+      await session.dispose();
+
+      // A torn document (the file exists but is not JSON) is the same unknown.
+      await fs.writeFile(preferencePath, "{ not json");
+      const torn = await createRoutingHarness({ workspacePath });
+      const refusedAgain = await torn.session.sendMessage("next prompt", {
+        model: USER_MODEL,
+        agentId: "exec",
+      });
+      expect(refusedAgain.success).toBe(false);
+      expect(JSON.stringify(refusedAgain)).toMatch(/record of refused turns/);
+      expect(torn.streamed).toHaveLength(0);
+      await internals(torn.session).persistAutoRetryState();
+      expect(await fs.readFile(preferencePath, "utf-8")).toBe("{ not json");
+      await torn.session.dispose();
+    } finally {
+      await fs.rm(preferencePath, { force: true });
+    }
+  });
+
   it("refuses a manual resume of a routed row once trust is revoked and stamps it", async () => {
     const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
     const harnessArgs: Parameters<typeof createRoutingHarness>[0] = { workspacePath };
