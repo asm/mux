@@ -827,6 +827,10 @@ export class MemoryConsolidationService extends EventEmitter {
       const ctx: MemoryScopeContext = scopeCarriesProjectSkillContent
         ? { ...scopeCtx, writeProvenance: { carriesProjectSkillContent: true } }
         : scopeCtx;
+      // The dream provider may differ from the workspace's: without Project
+      // Trust the sweep cannot read memories carrying project skill provenance,
+      // and trust granted at setup is re-verified right before its request.
+      const sweepTrusted = self.isHarvestProjectTrusted(workspaceId);
 
       const result = yield* Effect.promise(async () =>
         runMemoryConsolidation({
@@ -836,6 +840,9 @@ export class MemoryConsolidationService extends EventEmitter {
           metaService: self.metaService,
           ctx,
           dryRun: false,
+          memoryReadsExcludeProjectSkillContent: !sweepTrusted,
+          beforeDispatch: () =>
+            Promise.resolve(!sweepTrusted || self.isHarvestProjectTrusted(workspaceId)),
           finalPass: trigger === "archive",
           // Hard timeout: a wedged provider stream must not hold the in-flight
           // lock forever (and stall the sequential launch sweep behind it).

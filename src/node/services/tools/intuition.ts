@@ -59,6 +59,7 @@ export const createIntuitionTool: ToolFactory = (config: ToolConfiguration) => {
           ctx,
           cue,
           abortSignal: signal,
+          excludeProjectSkillContent: config.memoryReadsExcludeProjectSkillContent === true,
           recordUsage: (usage, providerMetadata, metadataModel) =>
             Promise.resolve(
               config.reportModelUsage?.({
@@ -83,7 +84,15 @@ export const createIntuitionTool: ToolFactory = (config: ToolConfiguration) => {
             message: sanitizeErrorMessageForDisplay(result.message),
           };
         }
-        const fields = { cue, model, stats: result.stats };
+        const fields = {
+          cue,
+          model,
+          stats: result.stats,
+          // Stamped so the per-step consent scan and request redaction classify it.
+          ...(result.kind === "report" && result.carriesProjectSkillContent
+            ? { carriesProjectSkillContent: true as const }
+            : {}),
+        };
         if (result.kind === "report") {
           if (result.memories.length > 0) {
             // Commit point: cancellation was checked above. Once recall metadata

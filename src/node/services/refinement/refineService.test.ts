@@ -3048,10 +3048,14 @@ describe("RefineService", () => {
   it("withholds settled project skill content from the distillation transcript without Project Trust", async () => {
     // A settled routed project-skill turn is past every consent gate, but the
     // refinement model is configured apart from the workspace's model: without
-    // Project Trust its snapshot and reply stay out of the transcript copy.
+    // Project Trust its snapshot and reply stay out of the transcript copy —
+    // and so do the timeline digests, model-authored over the same context.
     const prompts: string[] = [];
     using fixture = await createFixture({
       modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
+      timelineEvents: [
+        { kind: "note", description: "TIMELINE DIGEST QUOTING THE SKILL", ts: Date.now() },
+      ],
     });
     await fixture.seedTrajectory(["Please run the tests for this repo."]);
     await seedSettledProjectTurn(fixture);
@@ -3065,7 +3069,11 @@ describe("RefineService", () => {
     const prompt = prompts.at(-1) ?? "";
     expect(prompt).toContain("Please run the tests for this repo.");
     expect(prompt).toContain(PROJECT_SKILL_TURN_WITHHELD_MESSAGE);
-    for (const withheld of ["SETTLED SKILL BODY", "Applied the settled skill"]) {
+    for (const withheld of [
+      "SETTLED SKILL BODY",
+      "Applied the settled skill",
+      "TIMELINE DIGEST QUOTING THE SKILL",
+    ]) {
       expect(prompt).not.toContain(withheld);
     }
   });

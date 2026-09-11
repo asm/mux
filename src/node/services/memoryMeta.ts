@@ -17,6 +17,7 @@ import { Effect, Schema, Semaphore } from "effect";
 import type { MemoryScope } from "@/common/constants/memory";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 /**
  * Escape the ':' separator (and the escape character itself) inside a key
@@ -162,6 +163,9 @@ export class MemoryMetaWriteError extends Schema.TaggedError<MemoryMetaWriteErro
   }
 ) {}
 
+/** Cross-process sidecar lock wait; the critical section is one small read + atomic write. */
+const MEMORY_META_LOCK_TIMEOUT_MS = 5_000;
+
 export class MemoryMetaService {
   private readonly metaPath: string;
   /**
@@ -171,7 +175,6 @@ export class MemoryMetaService {
    * waiting for the permit never runs its critical section.
    */
   private readonly writeLock = Semaphore.makeUnsafe(1);
-  private cache: MemoryMetaFile | null = null;
 
   /**
    * Effect-native API. The Promise methods below are thin `Effect.runPromise`
@@ -278,38 +281,36 @@ export class MemoryMetaService {
   }
 
   /**
-   * Load + cache the sidecar. The error channel is `never` by design, not an
-   * oversight: per the self-healing rule, a missing or unreadable sidecar must
-   * never brick memory routes, so read failures degrade to "no metadata"
-   * (logged for diagnosis) and only writes can fail.
+   * Read the sidecar from disk. Never cached: several backends can share one
+   * Xum home, and a cached copy would let this process treat a file another
+   * process marked as carrying project skill content as clean. The error
+   * channel is `never` by design: per the self-healing rule, a missing or
+   * unreadable sidecar must never brick memory routes, so read failures
+   * degrade to "no metadata" (logged for diagnosis) and only writes can fail.
    */
   private load(): Effect.Effect<MemoryMetaFile> {
-    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
-    const self = this;
-    return Effect.gen(function* () {
-      if (self.cache !== null) return self.cache;
-      const parsed = yield* Effect.tryPromise({
-        try: async (): Promise<unknown> =>
-          JSON.parse(await fsPromises.readFile(self.metaPath, "utf-8")),
-        catch: (error) => error,
-      }).pipe(
-        Effect.catch((error) => {
-          // Missing file is the normal first-run case; anything else is healed to empty.
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-            log.debug("[MemoryMetaService] healing unreadable sidecar", { error });
-          }
-          return Effect.succeed<unknown>(null);
-        })
-      );
-      self.cache = sanitizeMetaFile(parsed);
-      return self.cache;
-    });
+    return Effect.promise(() => this.loadFromDisk());
+  }
+
+  private async loadFromDisk(): Promise<MemoryMetaFile> {
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(await fsPromises.readFile(this.metaPath, "utf-8"));
+    } catch (error) {
+      // Missing file is the normal first-run case; anything else is healed to empty.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        log.debug("[MemoryMetaService] healing unreadable sidecar", { error });
+      }
+    }
+    return sanitizeMetaFile(parsed);
   }
 
   /**
-   * Read-modify-write cycle under the sidecar semaphore. Persists before
-   * updating the in-memory cache so observers never see state that didn't make
-   * it to disk. Entries that end up entirely default are dropped.
+   * Read-modify-write cycle under the in-process semaphore AND the
+   * cross-process sidecar lock: the current file is re-read inside the lock,
+   * so a marker another backend persisted meanwhile (a file stamped as
+   * carrying project skill content) is folded in, never overwritten from a
+   * stale copy. Entries that end up entirely default are dropped.
    */
   private mutate(
     update: (entries: Record<string, MemoryMetaEntry>) => void
@@ -317,37 +318,34 @@ export class MemoryMetaService {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return this.writeLock.withPermit(
-      Effect.gen(function* () {
-        const meta = yield* self.load();
-        const entries = { ...meta.entries };
-        update(entries);
-        for (const [key, entry] of Object.entries(entries)) {
-          if (isEmptyEntry(entry)) delete entries[key];
-        }
-        const next: MemoryMetaFile = { entries };
-        // The atomic write cannot be cancelled once started, so the write and
-        // the cache update form one uninterruptible unit: a fiber interrupted
-        // mid-write (e.g. client abort) must still reconcile the in-memory
-        // cache with what landed on disk. Otherwise the next mutation would
-        // rebuild disk state from a stale cache and silently lose this write.
-        yield* Effect.uninterruptible(
-          Effect.gen(function* () {
-            yield* Effect.tryPromise({
-              try: () =>
-                writeFileAtomic(self.metaPath, JSON.stringify(next, null, 2), {
-                  encoding: "utf-8",
-                }),
-              catch: (cause) =>
-                new MemoryMetaWriteError({
-                  metaPath: self.metaPath,
-                  reason: getErrorMessage(cause),
-                }),
-            });
-            self.cache = next;
-          })
-        );
+      Effect.tryPromise({
+        try: () => self.mutateLocked(update),
+        catch: (cause) =>
+          cause instanceof MemoryMetaWriteError
+            ? cause
+            : new MemoryMetaWriteError({ metaPath: self.metaPath, reason: getErrorMessage(cause) }),
       })
     );
+  }
+
+  private async mutateLocked(update: (entries: Record<string, MemoryMetaEntry>) => void) {
+    await using _lock = await acquireProcessFileLock({
+      lockPath: `${this.metaPath}.lock`,
+      timeoutMs: MEMORY_META_LOCK_TIMEOUT_MS,
+      label: "memory sidecar lock",
+    });
+    const meta = await this.loadFromDisk();
+    const entries = { ...meta.entries };
+    update(entries);
+    for (const [key, entry] of Object.entries(entries)) {
+      if (isEmptyEntry(entry)) delete entries[key];
+    }
+    const next: MemoryMetaFile = { entries };
+    try {
+      await writeFileAtomic(this.metaPath, JSON.stringify(next, null, 2), { encoding: "utf-8" });
+    } catch (cause) {
+      throw new MemoryMetaWriteError({ metaPath: this.metaPath, reason: getErrorMessage(cause) });
+    }
   }
 
   // Legacy Promise facade — signatures unchanged for pre-Effect callers.

@@ -974,6 +974,8 @@ export class RefineService {
       activeSegment,
       transcriptRows,
       trustedProjectContent,
+      projectContentWithheld,
+      projectTrusted,
       takenAt,
       rejectedRowsPresent,
       snapshotRowFingerprints,
@@ -1012,8 +1014,12 @@ export class RefineService {
     // and it is capped at the snapshot instant, so a turn that starts after
     // the exclusion is released (and may still be refused) contributes nothing
     // even though the prefix verification cannot see its event.
+    // Timeline descriptions are model-authored over the same context: when the
+    // transcript copy withholds project skill content, they go with it.
     const timelineText =
-      rejectedRowsPresent || (boundaryRow !== undefined && !boundaryTsUsable)
+      rejectedRowsPresent ||
+      projectContentWithheld ||
+      (boundaryRow !== undefined && !boundaryTsUsable)
         ? undefined
         : await this.buildTimelineText(workspaceId, timelineSinceTs, takenAt);
 
@@ -1098,6 +1104,7 @@ export class RefineService {
         memoryService: this.memoryService,
         metaService: this.metaService,
         ctx,
+        memoryReadsExcludeProjectSkillContent: !projectTrusted,
         transcript,
         timelineText,
         skillWriteAvailable,
@@ -1643,6 +1650,10 @@ export class RefineService {
         /** Provider-facing copy of activeSegment (project content withheld without trust). */
         transcriptRows: MuxMessage[];
         trustedProjectContent: boolean;
+        /** Project content was withheld from the copy: the timeline (model-authored digests) goes with it. */
+        projectContentWithheld: boolean;
+        /** The workspace's project is trusted (the tools of the pass may read tainted memories). */
+        projectTrusted: boolean;
         takenAt: number;
         rejectedRowsPresent: boolean;
         snapshotRowFingerprints: string[];
@@ -1694,6 +1705,8 @@ export class RefineService {
         ? activeSegment
         : withholdProjectSkillContentFromRequest(activeSegment),
       trustedProjectContent: trusted && messagesCarryProjectSkillContent(activeSegment),
+      projectContentWithheld: !trusted && messagesCarryProjectSkillContent(activeSegment),
+      projectTrusted: trusted,
       takenAt,
       // The timeline input is selected by time alone, so the caller omits it
       // while the segment holds a withheld turn — rejected, quarantined or

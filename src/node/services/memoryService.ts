@@ -667,6 +667,25 @@ export class MemoryService extends EventEmitter {
     }
   }
 
+  /**
+   * Directory listings for a turn that must not read project skill content:
+   * files carrying (or of unknown) provenance are left out, so their
+   * repository-influenced names never reach the provider either.
+   */
+  private async filterFilesByProvenance(
+    ctx: MemoryScopeContext,
+    scope: MemoryScope,
+    files: string[],
+    excludeProjectSkillContent: boolean
+  ): Promise<string[]> {
+    if (!excludeProjectSkillContent) return files;
+    const meta = await this.metaService.getEntries();
+    return files.filter((relPath) => {
+      const key = this.logicalKeyFor(ctx, scope, relPath);
+      return !memoryEntryCarriesProjectSkillContent(key === null ? undefined : meta.get(key));
+    });
+  }
+
   /** Recognition, unlike scanning or UI browsing, is an actual agent recall. */
   async recordRecall(ctx: MemoryScopeContext, virtualPath: string): Promise<void> {
     const parsed = parseMemoryPath(virtualPath);
@@ -1009,7 +1028,12 @@ export class MemoryService extends EventEmitter {
             const store = this.getStore(ctx, scope);
             // Read-only: never create roots just to list (missing ⇒ empty).
             await store.assertRootSafe();
-            const files = await store.listFiles();
+            const files = await this.filterFilesByProvenance(
+              ctx,
+              scope,
+              await store.listFiles(),
+              options?.excludeProjectSkillContent === true
+            );
             sections.push(...renderTree(files, MEMORY_VIEW_MAX_DEPTH - 1, "  "));
           } catch (error) {
             // Self-healing: an unavailable scope must not break the whole view.
@@ -1025,7 +1049,12 @@ export class MemoryService extends EventEmitter {
       // create roots, so clean checkouts have no physical dir until the first
       // write — but the scope itself always exists in the protocol.
       if (kind === "dir" || (kind === null && parsed.relPath === "")) {
-        const files = await store.listFiles();
+        const files = await this.filterFilesByProvenance(
+          ctx,
+          parsed.scope,
+          await store.listFiles(),
+          options?.excludeProjectSkillContent === true
+        );
         const prefix = parsed.relPath === "" ? "" : `${parsed.relPath}/`;
         const scopedFiles = files
           .filter((file) => file.startsWith(prefix))

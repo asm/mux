@@ -14,6 +14,7 @@ import {
   rowCarriesProjectSkillContent,
   messagesCarryProjectSkillContent,
   toolOutputCarriesProjectSkillContent,
+  PROJECT_SKILL_SYNTHETIC_ROW_WITHHELD_MESSAGE,
 } from "./loadedSkillSnapshots";
 
 function createAgentSkillReadToolMessage(args: {
@@ -681,6 +682,92 @@ describe("project skill content in persisted tool results", () => {
     expect(messagesCarryProjectSkillContent([invocation("u-global", "global", 3), reply])).toBe(
       false
     );
+  });
+
+  it("withholds server-generated user rows produced while project content was in context", () => {
+    // A background task's report lands as a synthetic user row; its subagent
+    // ran with the project skill in context and can repeat it. The user's own
+    // prompts stay, as do synthetic rows that start turns of their own.
+    const rows: MuxMessage[] = [
+      createMuxMessage("report-before", "user", "Earlier report stays", {
+        timestamp: 0,
+        synthetic: true,
+      }),
+      createSyntheticSkillSnapshotMessage({
+        id: "snap-project",
+        skillName: "repo-conventions",
+        body: "PROJECT BODY",
+      }),
+      createMuxMessage("u-invoke", "user", "Use skill repo-conventions", { timestamp: 1 }),
+      createMuxMessage("a-reply", "assistant", "Delegating: PROJECT BODY", { timestamp: 2 }),
+      createMuxMessage("report-after", "user", "Task report: PROJECT BODY", {
+        timestamp: 3,
+        synthetic: true,
+      }),
+      createMuxMessage("u-next", "user", "My own follow-up stays", { timestamp: 4 }),
+      createMuxMessage("compact-request", "user", "Compact now", {
+        timestamp: 5,
+        synthetic: true,
+        retrySendOptions: { model: "anthropic:claude-haiku-4-5", agentId: "exec" },
+      }),
+    ];
+    const withheld = withholdProjectSkillContentFromRequest(rows);
+    const serialized = JSON.stringify(withheld);
+    expect(serialized).not.toContain("PROJECT BODY");
+    expect(serialized).toContain("Earlier report stays");
+    expect(serialized).toContain("My own follow-up stays");
+    expect(serialized).toContain("Compact now");
+    expect(serialized).toContain(PROJECT_SKILL_SYNTHETIC_ROW_WITHHELD_MESSAGE);
+    expect(withheld.map((row) => row.id)).toEqual([
+      "report-before",
+      "u-invoke",
+      "a-reply",
+      "report-after",
+      "u-next",
+      "compact-request",
+    ]);
+  });
+
+  it("treats a stamped intuition report as project skill content and redacts it in its own shape", () => {
+    const stamped = {
+      kind: "recognized",
+      cue: "conventions",
+      model: "m",
+      stats: {},
+      candidates: [],
+      memories: [{ path: "/memories/global/from-skill.md", relevance: 1, excerpt: "quotes it" }],
+      carriesProjectSkillContent: true,
+    };
+    expect(toolOutputCarriesProjectSkillContent("intuition", stamped)).toBe(true);
+    expect(
+      toolOutputCarriesProjectSkillContent("intuition", {
+        ...stamped,
+        carriesProjectSkillContent: undefined,
+      })
+    ).toBe(false);
+    const row: MuxMessage = {
+      id: "a-intuition",
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "intuition-1",
+          toolName: "intuition",
+          state: "output-available",
+          input: { cue: "conventions" },
+          output: stamped,
+        },
+      ],
+    };
+    const [redacted] = redactProjectSkillToolResults([row]);
+    expect(JSON.stringify(redacted)).not.toContain("quotes it");
+    const part = redacted.parts[0];
+    expect(
+      part.type === "dynamic-tool" && part.state === "output-available" && part.output
+    ).toMatchObject({
+      kind: "error",
+      isError: true,
+    });
   });
 
   it("treats a stamped memory view as project skill content and redacts it", () => {

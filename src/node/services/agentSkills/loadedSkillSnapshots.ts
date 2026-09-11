@@ -5,7 +5,7 @@ import assert from "@/common/utils/assert";
 import { MAX_POST_COMPACTION_LOADED_SKILLS } from "@/common/constants/attachments";
 import type { LoadedSkillSnapshot } from "@/common/types/attachment";
 import type { AgentSkillFrontmatter, AgentSkillScope } from "@/common/types/agentSkill";
-import { type ModelMessage, type MuxMessage } from "@/common/types/message";
+import { isTurnStartingUserRow, type ModelMessage, type MuxMessage } from "@/common/types/message";
 import { AgentSkillPackageSchema, AgentSkillScopeSchema } from "@/common/orpc/schemas/agentSkill";
 import {
   extractAgentSkillBodyFromSnapshotText,
@@ -283,8 +283,11 @@ export function toolOutputCarriesProjectSkillContent(toolName: unknown, output: 
   if (toolName === "agent_skill_read") return outputRetainsProjectSkill(output);
   if (toolName === "agent_skill_read_file") return outputIsProjectSkillFile(output);
   // A memory view of a file carrying project skill provenance is stamped by
-  // MemoryService.view (harvested or written from such content).
-  if (toolName === "memory") return outputIsStampedCodeExecution(output);
+  // MemoryService.view (harvested or written from such content); an intuition
+  // report whose recognized memories or leads carry it is stamped the same way.
+  if (toolName === "memory" || toolName === "intuition") {
+    return outputIsStampedCodeExecution(output);
+  }
   if (toolName === "code_execution") {
     // The execution's own provenance stamp (CodeExecutionResult
     // .carriesProjectSkillContent) covers content the guest copied into the
@@ -349,6 +352,16 @@ export const PROJECT_SKILL_TURN_WITHHELD_MESSAGE =
   "workspace's project is not trusted.]";
 
 /**
+ * Replaces a server-generated user row (a background task's report, a
+ * file-change notification, a prompt snapshot) produced while project skill
+ * content was in context, in a REQUEST copy for an untrusted workspace: a
+ * subagent's report can repeat that content as readily as a reply can.
+ */
+export const PROJECT_SKILL_SYNTHETIC_ROW_WITHHELD_MESSAGE =
+  "[System-generated message withheld: project skill content was in its context and " +
+  "this workspace's project is not trusted.]";
+
+/**
  * Request-copy withholding for an UNTRUSTED workspace's routed request — every
  * channel repository-controlled project skill content takes into a request:
  *
@@ -407,6 +420,21 @@ export function withholdProjectSkillContentFromRequest(
         continue;
       }
       if (rowInvokesProjectSkill(message)) projectContentInContext = true;
+      // Server-generated user rows (background task reports, file-change
+      // notifications, prompt snapshots) were produced while the content was
+      // in context too; only the user's own prompts and turn-starting
+      // synthetic requests stay verbatim.
+      if (
+        projectContentInContext &&
+        message.metadata?.synthetic === true &&
+        !isTurnStartingUserRow(message)
+      ) {
+        kept.push({
+          ...message,
+          parts: [{ type: "text", text: PROJECT_SKILL_SYNTHETIC_ROW_WITHHELD_MESSAGE }],
+        });
+        continue;
+      }
       kept.push(message);
       continue;
     }
@@ -565,13 +593,15 @@ export function redactProjectSkillToolResults(messages: MuxMessage[]): MuxMessag
     const parts = message.parts.map((part) => {
       if (part.type !== "dynamic-tool" || part.state !== "output-available") return part;
       if (
-        (SKILL_CONTENT_TOOLS.has(part.toolName) || part.toolName === "memory") &&
+        (SKILL_CONTENT_TOOLS.has(part.toolName) ||
+          part.toolName === "memory" ||
+          part.toolName === "intuition") &&
         toolOutputCarriesProjectSkillContent(part.toolName, part.output)
       ) {
         changed = true;
         return {
           ...part,
-          output: { success: false, error: PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE },
+          output: withheldToolOutput(part.toolName, PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE),
         };
       }
       if (part.toolName === "code_execution") {
@@ -620,12 +650,22 @@ export function redactProjectSkillToolResults(messages: MuxMessage[]): MuxMessag
             ...part,
             input: {},
             ...(part.state === "output-available"
-              ? { output: { success: false, error: PROJECT_SKILL_TEXT_WITHHELD_MESSAGE } }
+              ? { output: withheldToolOutput(part.toolName, PROJECT_SKILL_TEXT_WITHHELD_MESSAGE) }
               : {}),
           };
         }),
     };
   });
+}
+
+/**
+ * A withheld tool output in the tool's own failure shape, so the provider's
+ * view of the call stays well-formed (and the replacement is idempotent).
+ */
+function withheldToolOutput(toolName: string, message: string): Record<string, unknown> {
+  return toolName === "intuition"
+    ? { kind: "error", isError: true, message }
+    : { success: false, error: message };
 }
 
 /**

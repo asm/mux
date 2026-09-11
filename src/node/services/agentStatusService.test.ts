@@ -525,6 +525,20 @@ describe("AgentStatusService", () => {
     expect(prompt).not.toContain("Answer 89 restates the skill");
     expect(prompt).not.toContain("PROJECT SKILL BODY");
     expect(prompt).toContain(PROJECT_SKILL_TURN_WITHHELD_MESSAGE);
+
+    // Next tick: the inherited taint is memoized (sticky for the segment), so
+    // the bounded slice read alone classifies the new rows.
+    const segmentReads = spyOn(historyHandle.historyService, "getHistoryFromLatestBoundary");
+    await history.appendToHistory(workspaceId, createMuxMessage("u-90", "user", "Question 90"));
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("a-90", "assistant", "Answer 90 restates the skill")
+    );
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(2);
+    expect(generateSpy.mock.calls[1][0]).not.toContain("Answer 90 restates the skill");
+    expect(segmentReads).not.toHaveBeenCalled();
+    segmentReads.mockRestore();
   });
 
   test("correlates the partial with the history read instead of an older snapshot", async () => {

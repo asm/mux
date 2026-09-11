@@ -96,6 +96,41 @@ async function execute(tool: Tool, input: Record<string, unknown>): Promise<Memo
 }
 
 describe("consolidation memory tool rails", () => {
+  it("refuses views of memories carrying project skill provenance when the run excludes them", async () => {
+    // The dream provider may differ from the workspace's: a sweep without
+    // Project Trust must not read files harvested or written from project
+    // skill content, while a trusted run still can.
+    using fixture = await createFixture();
+    await fixture.memoryService.create(
+      { ...fixture.ctx, writeProvenance: { carriesProjectSkillContent: true as const } },
+      "/memories/global/from-skill.md",
+      "quotes the skill",
+      "agent"
+    );
+    await fixture.memoryService.create(fixture.ctx, "/memories/global/clean.md", "clean", "agent");
+    const { tool: excluding } = createConsolidationMemoryTool({
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+      journal: [],
+      memoryReadsExcludeProjectSkillContent: true,
+    });
+    const refused = await execute(excluding, {
+      command: "view",
+      path: "/memories/global/from-skill.md",
+    });
+    expect(refused.success).toBe(false);
+    if (!refused.success) expect(refused.error).toContain("withheld");
+    expect(
+      (await execute(excluding, { command: "view", path: "/memories/global/clean.md" })).success
+    ).toBe(true);
+    expect(
+      (await execute(fixture.tool, { command: "view", path: "/memories/global/from-skill.md" }))
+        .success
+    ).toBe(true);
+  });
+
   it("a mutation wedged before commit refuses once the pass is cancelled (r59)", async () => {
     // Tool executions receive no hard cancellation: a live run wedged in
     // pre-commit I/O is detached by the caller's bounded drain, and once

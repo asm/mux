@@ -186,7 +186,12 @@ export async function classifyIntuitionReport(args: {
 }
 
 export type MemoryIntuitionResult =
-  | ({ kind: "report"; stats: IntuitionStats } & ClassifiedMemories)
+  | ({
+      kind: "report";
+      stats: IntuitionStats;
+      /** A recognized memory or lead carries project skill provenance (sidecar). */
+      carriesProjectSkillContent: boolean;
+    } & ClassifiedMemories)
   | { kind: "no_report"; stats: IntuitionStats }
   | { kind: "error"; message: string; stats: IntuitionStats };
 
@@ -309,6 +314,12 @@ export async function runMemoryIntuition(args: {
   ctx: MemoryScopeContext;
   cue: string;
   abortSignal?: AbortSignal;
+  /**
+   * Routed turn without Project Trust: memories carrying (or of unknown)
+   * project skill provenance stay out of the index the intuition model sees
+   * and therefore out of its reads (reads are bound to the selected index).
+   */
+  excludeProjectSkillContent?: boolean;
   recordUsage?: (
     usage: LanguageModelV2Usage,
     providerMetadata?: Record<string, unknown>,
@@ -347,7 +358,9 @@ export async function runMemoryIntuition(args: {
       .replace(/<\/cue\s*>/gi, "&lt;/cue&gt;")
       .slice(0, MEMORY_INTUITION_MAX_CUE_CHARS);
     let selection = selectIndexForCue(
-      await untilAborted(signal, () => args.memoryService.listIndexEntries(args.ctx)),
+      (await untilAborted(signal, () => args.memoryService.listIndexEntries(args.ctx))).filter(
+        (entry) => args.excludeProjectSkillContent !== true || !entry.carriesProjectSkillContent
+      ),
       cue
     );
     stats.indexEntriesConsidered = selection.indexEntriesConsidered;
@@ -584,7 +597,15 @@ export async function runMemoryIntuition(args: {
             entries: selection.entries,
             readFile: readMemoryView,
           });
-    if (classified) return { kind: "report", ...classified, stats };
+    if (classified) {
+      // Provenance of what the report carries (excerpts and leads alike): the
+      // routed turn's consent gate arms on it.
+      const entryByPath = new Map(selection.entries.map((entry) => [entry.path, entry]));
+      const carriesProjectSkillContent = [...classified.memories, ...classified.candidates].some(
+        (item) => entryByPath.get(item.path)?.carriesProjectSkillContent === true
+      );
+      return { kind: "report", ...classified, carriesProjectSkillContent, stats };
+    }
     if (errors.length > 0 && !signal.aborted) return { kind: "error", message: errors[0], stats };
     return { kind: "no_report", stats };
   } catch (error) {

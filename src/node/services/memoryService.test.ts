@@ -1214,6 +1214,34 @@ describe("MemoryService", () => {
       expect(withheld.some((item) => item.path === "/memories/global/from-skill.md")).toBe(false);
     });
 
+    it("leaves tainted files out of directory views for a turn that excludes project content", async () => {
+      // A directory view lists file names — repository-influenced for a file
+      // harvested from project skill content — so the exclusion applies to the
+      // virtual root, the scope root and subdirectories alike.
+      using fixture = await createFixture("ws-listing");
+      const tainted = {
+        ...fixture.ctx,
+        writeProvenance: { carriesProjectSkillContent: true as const },
+      };
+      await fixture.service.create(tainted, "/memories/global/from-skill.md", "x", "agent");
+      await fixture.service.create(fixture.ctx, "/memories/global/clean.md", "y", "agent");
+      await fixture.service.create(tainted, "/memories/global/notes/from-skill-2.md", "x", "agent");
+      await fixture.service.create(fixture.ctx, "/memories/global/notes/clean-2.md", "y", "agent");
+      const excluded = { excludeProjectSkillContent: true };
+      // The virtual root lists one level per scope; deeper views list files.
+      for (const [virtualPath, taintedName, cleanName] of [
+        ["/memories", "from-skill.md", "clean.md"],
+        ["/memories/global", "from-skill.md", "clean.md"],
+        ["/memories/global/notes", "from-skill-2.md", "clean-2.md"],
+      ] as const) {
+        const full = await fixture.service.view(fixture.ctx, virtualPath);
+        expect(full.success && full.output).toContain(taintedName);
+        const filtered = await fixture.service.view(fixture.ctx, virtualPath, excluded);
+        expect(filtered.success && filtered.output).toContain(cleanName);
+        expect(filtered.success && filtered.output).not.toContain(taintedName);
+      }
+    });
+
     it("records edits (str_replace, insert) as writes", async () => {
       using fixture = await createFixture();
       await fixture.service.create(fixture.ctx, "/memories/global/a.md", "one two", "agent");

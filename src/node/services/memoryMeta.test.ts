@@ -13,6 +13,28 @@ import {
 import { TestTempDir } from "./tools/testHelpers";
 
 describe("memoryLogicalKey", () => {
+  it("folds another process's provenance marker in instead of overwriting it from a stale view", async () => {
+    // Two backends over one Xum home each hold a MemoryMetaService. A: clean
+    // create; B: tainted write; A: a later read. A's update must re-read the
+    // sidecar under the cross-process lock, so B's marker survives.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "memory-meta-cross-process-"));
+    try {
+      const a = new MemoryMetaService(home);
+      const b = new MemoryMetaService(home);
+      await a.recordAccess("global:shared.md", { write: true, replacesContent: true });
+      expect((await a.getEntries()).get("global:shared.md")?.carriesProjectSkillContent).toBe(
+        false
+      );
+      await b.recordAccess("global:shared.md", { write: true, carriesProjectSkillContent: true });
+      await a.recordAccess("global:shared.md", { write: false });
+      const fresh = await new MemoryMetaService(home).getEntries();
+      expect(fresh.get("global:shared.md")?.carriesProjectSkillContent).toBe(true);
+      expect(fresh.get("global:shared.md")?.accessCount).toBe(3);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("records project skill provenance on tainted writes and keeps it across clean uses", async () => {
     // A write made with project skill content in the writer's context marks
     // the file for good — later reads, clean edits and even a clean full

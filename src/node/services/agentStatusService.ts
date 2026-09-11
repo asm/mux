@@ -30,6 +30,7 @@ import {
   type MuxMessage,
 } from "@/common/types/message";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { isDurableContextBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
 import type { AIService } from "./aiService";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { HistoryService } from "./historyService";
@@ -621,16 +622,11 @@ export class AgentStatusService {
     // cannot attach a newer turn's in-flight text to an older turn whose rows
     // are the only ones verified.
     const partial = await this.historyService.readPartial(workspaceId);
-    // The whole active segment is read (not just the trailing slice): rows
-    // before the slice are still in the model's context, so a project skill
-    // among them taints every later reply the slice does contain.
-    const segmentResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
-    if (!segmentResult.success) return { transcript: "", rowIds: [], trustedProjectContent: false };
-    const trailingStart = Math.max(
-      0,
-      segmentResult.data.length - AGENT_STATUS_MAX_TRAILING_MESSAGES
+    const result = await this.historyService.getLastMessages(
+      workspaceId,
+      AGENT_STATUS_MAX_TRAILING_MESSAGES
     );
-    const result = { data: segmentResult.data.slice(trailingStart) };
+    if (!result.success) return { transcript: "", rowIds: [], trustedProjectContent: false };
 
     const quarantine = await this.workspaceService.getQuarantinedRejectedRowIds(workspaceId);
     if (!quarantine.success) {
@@ -640,8 +636,12 @@ export class AgentStatusService {
       });
       return null;
     }
-    const inheritedProjectContext = messagesCarryProjectSkillContent(
-      excludeRejectedTurnRows(segmentResult.data.slice(0, trailingStart), quarantine.data)
+    // Rows before the bounded slice are still in the model's context: a
+    // project skill among them taints every later reply the slice contains.
+    const inheritedProjectContext = await this.inheritedProjectContextBeforeSlice(
+      workspaceId,
+      result.data,
+      quarantine.data
     );
     let committedMessages: MuxMessage[] = excludeRejectedTurnRows(result.data, quarantine.data);
     // A turn persists its snapshot prefix before its user row: trailing prefix
@@ -734,6 +734,65 @@ export class AgentStatusService {
    * (also on an unreadable quarantine) means the snapshot is stale: a row was
    * stamped rejected, quarantined or truncated since it was taken.
    */
+  /**
+   * Per-workspace memo of the inherited project provenance: the first row of
+   * the last slice, whether the rows before it carried project content, and
+   * which rows of that slice carry it (so the rows leaving the window on the
+   * next tick are classified without another read).
+   */
+  private readonly inheritedProjectContext = new Map<
+    string,
+    { firstRowId: string; inherited: boolean; carryingRowIds: string[] }
+  >();
+
+  /**
+   * Whether the active-segment rows BEFORE the bounded trailing slice carry
+   * project skill content. The slice itself is the only history read per tick
+   * (getLastMessages, bounded); the segment is scanned in full only on the
+   * first look at a workspace or after a burst that pushed more rows through
+   * the window than it holds — otherwise every row that left the window since
+   * the last tick sat in that tick's slice, whose carrying rows are memoized.
+   * Inherited taint is sticky for the segment; a context boundary inside the
+   * slice resets it (the boundary row carries its own provenance).
+   */
+  private async inheritedProjectContextBeforeSlice(
+    workspaceId: string,
+    slice: MuxMessage[],
+    quarantine: ReadonlySet<string>
+  ): Promise<boolean> {
+    const first = slice[0];
+    if (first === undefined || slice.some(isDurableContextBoundaryMarker)) {
+      this.inheritedProjectContext.delete(workspaceId);
+      return false;
+    }
+    const memo = this.inheritedProjectContext.get(workspaceId);
+    const sliceIds = new Set(slice.map((row) => row.id));
+    let inherited: boolean;
+    if (memo?.inherited === true) {
+      inherited = true;
+    } else if (memo !== undefined && sliceIds.has(memo.firstRowId)) {
+      inherited = memo.carryingRowIds.some((id) => !sliceIds.has(id));
+    } else {
+      const segment = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!segment.success) return true;
+      const sliceStart = segment.data.findIndex((row) => row.id === first.id);
+      // A slice whose first row is not in the active segment is unclassifiable: tainted.
+      inherited =
+        sliceStart === -1 ||
+        messagesCarryProjectSkillContent(
+          excludeRejectedTurnRows(segment.data.slice(0, sliceStart), quarantine)
+        );
+    }
+    this.inheritedProjectContext.set(workspaceId, {
+      firstRowId: first.id,
+      inherited,
+      carryingRowIds: slice
+        .filter((row) => messagesCarryProjectSkillContent([row]))
+        .map((row) => row.id),
+    });
+    return inherited;
+  }
+
   /**
    * Provider-selection trust for a workspace's project (fail closed): the
    * status model is not the workspace's own model, so repository-controlled

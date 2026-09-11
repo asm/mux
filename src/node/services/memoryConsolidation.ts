@@ -192,6 +192,10 @@ async function validateMutationForStaging(
  * Build the guarded memory tool for one consolidation run. Exported separately
  * from runMemoryConsolidation so the rails are testable without a model.
  */
+/** Retryable consolidation failure: Project Trust changed under the run before its request. */
+export const CONSOLIDATION_INPUT_STALE_MESSAGE =
+  "consolidation input changed before dispatch (Project Trust); retry";
+
 export function createConsolidationMemoryTool(args: {
   memoryService: MemoryService;
   metaService: MemoryMetaService;
@@ -226,6 +230,8 @@ export function createConsolidationMemoryTool(args: {
    * immediately before the first durable write.
    */
   abortSignal?: AbortSignal;
+  /** Untrusted project: views of memories carrying project skill provenance are refused. */
+  memoryReadsExcludeProjectSkillContent?: boolean;
 }): { tool: Tool; getMutationCount: () => number } {
   const { memoryService, metaService, ctx, dryRun, journal } = args;
   const budget = args.budget ?? createMutationBudget(MEMORY_CONSOLIDATION_OP_BUDGET);
@@ -282,8 +288,11 @@ export function createConsolidationMemoryTool(args: {
       }
       const target = classifyMutation(input);
       if (target === null) {
-        // Reads (and malformed inputs, which fail validation inside) pass through.
-        return executeMemoryCommand(memoryService, ctx, input, () => null, toolCallId);
+        // Reads (and malformed inputs, which fail validation inside) pass through,
+        // under the run's provenance exclusion.
+        return executeMemoryCommand(memoryService, ctx, input, () => null, toolCallId, {
+          memoryReadsExcludeProjectSkillContent: args.memoryReadsExcludeProjectSkillContent,
+        });
       }
 
       let rejection: string | null;
@@ -371,6 +380,14 @@ export async function runMemoryConsolidation(args: {
     usage: LanguageModelV2Usage,
     providerMetadata?: Record<string, unknown>
   ) => Promise<void>;
+  /** See createConsolidationMemoryTool. */
+  memoryReadsExcludeProjectSkillContent?: boolean;
+  /**
+   * Re-verification immediately before the provider call (model creation
+   * and tool setup are trust-revocation windows): false ends the run with a
+   * retryable stream error and no request.
+   */
+  beforeDispatch?: () => Promise<boolean>;
 }): Promise<MemoryConsolidationResult> {
   assert(args.agentBody.trim().length > 0, "dream agent body must not be empty");
   const journal: MemoryConsolidationOp[] = [];
@@ -380,6 +397,7 @@ export async function runMemoryConsolidation(args: {
     ctx: args.ctx,
     dryRun: args.dryRun,
     journal,
+    memoryReadsExcludeProjectSkillContent: args.memoryReadsExcludeProjectSkillContent,
     // r59: workspace removal aborts this signal — a tool execution wedged in
     // filesystem I/O must not commit durable memory (or recreate the deleted
     // session directory via its journal row) once the I/O unblocks.
@@ -393,6 +411,15 @@ export async function runMemoryConsolidation(args: {
         ? " This is the FINAL pass for an archived workspace: preserve only cross-project user preferences or environment facts in /memories/global/... before workspace memory is deleted. Project memory is unavailable for this run; do not promote project-specific lessons to global memory."
         : " This is the FINAL pass for an archived workspace: promote durable workspace lessons before workspace memory is deleted. Move repo-specific lessons to /memories/project/... and only cross-project user preferences or environment facts to /memories/global/....";
 
+  if (args.beforeDispatch !== undefined && !(await args.beforeDispatch())) {
+    return {
+      ops: journal,
+      summary: `stream error: ${CONSOLIDATION_INPUT_STALE_MESSAGE}`,
+      budgetExhausted: false,
+      usage: undefined,
+      streamError: CONSOLIDATION_INPUT_STALE_MESSAGE,
+    };
+  }
   const stream = streamText({
     model: args.model,
     system: args.agentBody,

@@ -296,6 +296,8 @@ const IntuitionResultFields = {
   candidates: z.array(IntuitionCandidateSchema).max(MEMORY_INTUITION_MAX_RESULTS),
   model: z.string(),
   stats: IntuitionStatsSchema,
+  /** A recognized memory or lead carries project skill provenance. */
+  carriesProjectSkillContent: z.literal(true).optional(),
 };
 export const IntuitionToolResultSchema = z.discriminatedUnion("kind", [
   z.object({

@@ -279,6 +279,41 @@ describe("runMemoryIntuition", () => {
     expect(createModel).not.toHaveBeenCalled();
   });
 
+  it("leaves memories carrying project skill provenance out of the index it considers when excluded", async () => {
+    // A routed turn without Project Trust: the intuition model must not see
+    // (or read — reads are bound to the selected index) memories harvested or
+    // written from project skill content; a trusted turn considers them all.
+    // Both files go through the service so the sidecar classifies them: a
+    // file with no entry (written straight to disk) is unknown and reads as
+    // carrying, by design.
+    using f = await fixture();
+    await f.memoryService.create(
+      f.ctx,
+      "/memories/global/locks.md",
+      "Use explicit locks.",
+      "agent"
+    );
+    await f.memoryService.create(
+      { ...f.ctx, writeProvenance: { carriesProjectSkillContent: true as const } },
+      "/memories/global/from-skill.md",
+      "Locks per the project skill.",
+      "agent"
+    );
+    const considered = async (excludeProjectSkillContent: boolean) =>
+      (
+        await runMemoryIntuition({
+          ...f,
+          cue: "locks",
+          modelString: "mock:test",
+          createModel: () => Promise.resolve(pinned(scriptedModel([]))),
+          resolveAgentBody: body,
+          excludeProjectSkillContent,
+        })
+      ).stats.indexEntriesConsidered;
+    expect(await considered(false)).toBe(2);
+    expect(await considered(true)).toBe(1);
+  });
+
   it("does not create a model, resolve a body, or record usage for an empty index", async () => {
     using f = await fixture();
     const createModel = mock(() => Promise.resolve(pinned(scriptedModel([]))));
