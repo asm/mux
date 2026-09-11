@@ -231,6 +231,29 @@ describe("isModelServableWithProvidersConfig", () => {
       ).toBe(false);
     });
 
+    test("a request-level chatCompletions wire format gates an OAuth-only direct route too", () => {
+      // With no stored wire format the factory honors the request's own
+      // (providerOptions.openai.wireFormat) and rejects OAuth-only credentials
+      // for it; the class verdict must judge the same request, while an API
+      // key still serves the Chat Completions send.
+      expect(
+        isModelServableWithProvidersConfig({
+          canonicalModel: "openai:gpt-5.5",
+          routePriority: ["direct"],
+          providersConfig: openaiProviders({ codexOauthSet: true }),
+          openaiWireFormat: "chatCompletions",
+        })
+      ).toBe(false);
+      expect(
+        isModelServableWithProvidersConfig({
+          canonicalModel: "openai:gpt-5.5",
+          routePriority: ["direct"],
+          providersConfig: openaiProviders({ apiKeySet: true }),
+          openaiWireFormat: "chatCompletions",
+        })
+      ).toBe(true);
+    });
+
     test("an API key serves OAuth-ineligible models directly", () => {
       expect(
         isModelServableWithProvidersConfig({

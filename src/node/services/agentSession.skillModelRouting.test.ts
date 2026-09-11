@@ -18,6 +18,7 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
 import type { ResolvedAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
 import * as agentSkillsModule from "@/node/services/agentSkills/agentSkillsService";
+import * as continuousCompactionSummaryModule from "@/node/services/continuousCompactionSummary";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
 import {
   COMPACTION_SUMMARY_WITHHELD_MESSAGE,
@@ -2705,7 +2706,19 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
           timestamp: 9,
           retrySendOptions: { model: USER_MODEL, agentId: "exec", routedProjectConsent: true },
         }),
-        createMuxMessage("a-routed-done", "assistant", "Applied the skill", { timestamp: 10 }),
+        // A file-change notification INSIDE the completed turn (synthetic, no
+        // retrySendOptions) is not a turn boundary: the reply after it still
+        // settles the turn.
+        createMuxMessage(
+          "notify-routed-done",
+          "user",
+          "<system-file-update>x</system-file-update>",
+          {
+            timestamp: 10,
+            synthetic: true,
+          }
+        ),
+        createMuxMessage("a-routed-done", "assistant", "Applied the skill", { timestamp: 11 }),
       ]) {
         await historyService.appendToHistory(workspaceId, row);
       }
@@ -2757,6 +2770,88 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       } finally {
         await fs.rm(preferencePath, { force: true });
       }
+    }
+  });
+
+  it("filters rejected rows and withholds untrusted project content from the continuous compaction summarizer", async () => {
+    // The continuous compactor reads RAW history and hands the rolling head to
+    // its summarizer — a provider request: stamped/quarantined rows never ride
+    // it, and during a ROUTED turn the project skill content an untrusted
+    // workspace's routed request withholds is withheld here too, with trust
+    // re-verified right before the summarizer's provider call. An unrouted
+    // turn keeps its history (only rejected rows go), like its own request.
+    const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
+    const harnessArgs: Parameters<typeof createRoutingHarness>[0] = { workspacePath };
+    const { session } = await createRoutingHarness(harnessArgs);
+    const summarize = spyOn(
+      continuousCompactionSummaryModule,
+      "summarizeContinuousCompaction"
+    ).mockResolvedValue({ text: "summary", model: USER_MODEL });
+    type Row = ReturnType<typeof createMuxMessage>;
+    const deps = Reflect.get(
+      (session as unknown as { continuousCompactor: object }).continuousCompactor,
+      "deps"
+    ) as {
+      summarize(
+        head: Row[],
+        signal: AbortSignal,
+        context: Record<string, unknown>
+      ): Promise<unknown>;
+    };
+    const head: Row[] = [
+      createMuxMessage("u-rejected", "user", "REFUSED PROMPT", {
+        timestamp: 1,
+        preStreamRejected: true,
+      }),
+      createMuxMessage("snap-project", "user", "PROJECT SKILL BODY", {
+        timestamp: 2,
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
+      }),
+      createMuxMessage("u-project", "user", "Use skill done", { timestamp: 3 }),
+      createMuxMessage("a-project", "assistant", "QUOTING THE SKILL", { timestamp: 4 }),
+    ];
+    const context = {
+      enabled: true,
+      model: USER_MODEL,
+      contextWindowTokens: 100_000,
+      thresholdPercent: 70,
+      sendOptions: { model: USER_MODEL, agentId: "exec" },
+    };
+    const lastCall = () =>
+      summarize.mock.calls.at(-1)?.[0] as {
+        head: Row[];
+        beforeDispatch?: () => Promise<boolean>;
+      };
+    try {
+      // Routed + trusted: the rejected row is gone, project content stays,
+      // and the dispatch recheck tracks trust.
+      await deps.summarize(head, new AbortController().signal, { ...context, routedTurn: true });
+      const trusted = lastCall();
+      expect(trusted.head.map((row) => row.id)).toEqual(["snap-project", "u-project", "a-project"]);
+      expect(await trusted.beforeDispatch?.()).toBe(true);
+      harnessArgs.projectTrusted = false;
+      expect(await trusted.beforeDispatch?.()).toBe(false);
+
+      // Routed + untrusted: the snapshot row drops, the turn's reply is withheld.
+      await deps.summarize(head, new AbortController().signal, { ...context, routedTurn: true });
+      const withheld = JSON.stringify(lastCall().head);
+      expect(withheld).not.toContain("REFUSED PROMPT");
+      expect(withheld).not.toContain("PROJECT SKILL BODY");
+      expect(withheld).not.toContain("QUOTING THE SKILL");
+      expect(withheld).toContain(PROJECT_SKILL_TURN_WITHHELD_MESSAGE);
+
+      // Unrouted + untrusted: the workspace's own model keeps its history.
+      await deps.summarize(head, new AbortController().signal, { ...context, routedTurn: false });
+      expect(lastCall().head.map((row) => row.id)).toEqual([
+        "snap-project",
+        "u-project",
+        "a-project",
+      ]);
+      expect(JSON.stringify(lastCall().head)).toContain("QUOTING THE SKILL");
+    } finally {
+      summarize.mockRestore();
+      await session.dispose();
     }
   });
 

@@ -12,6 +12,7 @@ import {
   withholdProjectSkillContentFromRequest,
   redactProjectSkillToolResults,
   rowCarriesProjectSkillContent,
+  messagesCarryProjectSkillContent,
 } from "./loadedSkillSnapshots";
 
 function createAgentSkillReadToolMessage(args: {
@@ -574,6 +575,22 @@ describe("project skill content in persisted tool results", () => {
         input: { path: "x", new_string: "PROJECT BODY" },
         output: { success: true, echoed: "PROJECT BODY" },
       },
+      // A sibling code_execution with NO nested skill read of its own: the
+      // guest code, return value and console can all hold the copy.
+      {
+        type: "dynamic-tool",
+        toolCallId: "exec-1",
+        toolName: "code_execution",
+        state: "output-available",
+        input: { code: "print('PROJECT BODY')" },
+        output: {
+          success: true,
+          result: "PROJECT BODY",
+          toolCalls: [],
+          consoleOutput: ["PROJECT BODY"],
+          duration_ms: 3,
+        },
+      },
     ];
     const [redacted] = redactProjectSkillToolResults([tainted]);
     const serialized = JSON.stringify(redacted);
@@ -582,6 +599,41 @@ describe("project skill content in persisted tool results", () => {
       (part) => part.type === "dynamic-tool" && part.toolCallId === "edit-1"
     );
     expect(sibling?.type === "dynamic-tool" && sibling.toolName).toBe("file_edit_replace_string");
+    const execution = redacted.parts.find(
+      (part) => part.type === "dynamic-tool" && part.toolCallId === "exec-1"
+    );
+    expect(execution?.type === "dynamic-tool" && execution.toolName).toBe("code_execution");
+    expect(
+      execution?.type === "dynamic-tool" &&
+        execution.state === "output-available" &&
+        (execution.output as { success?: unknown }).success
+    ).toBe(false);
+  });
+
+  it("counts a deduplicated project skill invocation as project provenance", () => {
+    // The repeated invocation persisted no snapshot row of its own, yet its
+    // reply can quote the skill: summaries distilled from the turn (and the
+    // routed request scan) must classify it like the withholding tracker does.
+    const invocation = (id: string, scope: "project" | "global", timestamp: number) =>
+      createMuxMessage(id, "user", "Using skill repo-conventions", {
+        timestamp,
+        muxMetadata: {
+          type: "agent-skill",
+          rawCommand: "/repo-conventions",
+          skillName: "repo-conventions",
+          scope,
+        },
+      });
+    const reply = createMuxMessage("a-dedup", "assistant", "Applying the conventions", {
+      timestamp: 2,
+    });
+    expect(rowCarriesProjectSkillContent(invocation("u-project", "project", 1))).toBe(false);
+    expect(messagesCarryProjectSkillContent([invocation("u-project", "project", 1), reply])).toBe(
+      true
+    );
+    expect(messagesCarryProjectSkillContent([invocation("u-global", "global", 3), reply])).toBe(
+      false
+    );
   });
 
   it("treats an unstamped legacy summary as project content, a summary stamped clean as clean", () => {

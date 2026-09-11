@@ -16,6 +16,7 @@ import {
   type ContinuousCompactionJournal,
 } from "@/common/orpc/schemas/continuousCompaction";
 import { prepareMessagesForProvider } from "./messagePipeline";
+import type { MuxMessage } from "@/common/types/message";
 import { log } from "./log";
 
 // JSON.stringify otherwise silently drops functions/symbols and coerces binary/URL options.
@@ -61,10 +62,14 @@ export function stripMessageCacheControl(messages: ModelMessage[]): ModelMessage
 
 export async function rebuildContinuousPrefix(
   journal: ContinuousCompactionJournal,
-  workspaceId: string
+  workspaceId: string,
+  // Provider-copy transform of the durable sources (rejected-row exclusion,
+  // untrusted project skill withholding for a routed turn); the journal itself
+  // keeps the unfiltered rows.
+  prefixRows: (rows: MuxMessage[]) => MuxMessage[] = (rows) => rows
 ): Promise<ModelMessage[]> {
   const prepared = prepareProviderRequestMessages(
-    journal.prefixSourceRows,
+    prefixRows(journal.prefixSourceRows),
     journal.preparation.providerForMessages,
     journal.preparation.effectiveThinkingLevel
   );

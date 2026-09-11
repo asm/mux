@@ -456,6 +456,29 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         experiments: RLM_ON,
       });
       expect(tainted?.metadata?.carriesProjectSkillContent).toBe(true);
+
+      // A repeated project skill invocation whose snapshot deduplicated
+      // leaves no snapshot row in the abandoned branch; its reply can still
+      // quote the skill, so the invocation itself carries the provenance.
+      const deduplicated = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        aiService: fakeAiService(summaryModel("Summary quoting the skill.")),
+        workspaceId: "ws-provenance-dedup",
+        abandonedMessages: [
+          createMuxMessage("u-dedup", "user", "Using skill done", {
+            timestamp: 1,
+            muxMetadata: {
+              type: "agent-skill",
+              rawCommand: "/done",
+              skillName: "done",
+              scope: "project",
+            },
+          }),
+          ...meatyExchange("dedup"),
+        ],
+        experiments: RLM_ON,
+      });
+      expect(deduplicated?.metadata?.carriesProjectSkillContent).toBe(true);
     } finally {
       await cleanup();
     }

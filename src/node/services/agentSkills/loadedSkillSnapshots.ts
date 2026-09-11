@@ -361,7 +361,7 @@ export const PROJECT_SKILL_TURN_WITHHELD_MESSAGE =
  * references a project-scope skill. Used only in the withholding direction,
  * where trusting client metadata can at most over-withhold.
  */
-function rowInvokesProjectSkill(message: MuxMessage): boolean {
+export function rowInvokesProjectSkill(message: MuxMessage): boolean {
   const muxMetadata = message.metadata?.muxMetadata;
   if (muxMetadata == null) return false;
   if (muxMetadata.type === "agent-skill" && muxMetadata.scope === "project") return true;
@@ -401,6 +401,19 @@ export function withholdProjectSkillContentFromRequest(messages: MuxMessage[]): 
     );
   }
   return redactProjectSkillToolResults(kept);
+}
+
+/**
+ * Provenance of a row set as a whole (a summary's input, a request's rows): a
+ * row carrying project skill content, or a project skill INVOCATION whose
+ * repeated snapshot deduplicated away — its reply can quote the skill while no
+ * row of the set carries the body itself. Feeds the summary stamps and the
+ * routed request scan, so both agree with the withholding turn tracker above.
+ */
+export function messagesCarryProjectSkillContent(messages: readonly MuxMessage[]): boolean {
+  return messages.some(
+    (message) => rowCarriesProjectSkillContent(message) || rowInvokesProjectSkill(message)
+  );
 }
 
 /**
@@ -490,17 +503,22 @@ function redactCodeExecutionOutput(output: unknown): { output: unknown; changed:
   if (!toolOutputCarriesProjectSkillContent("code_execution", output)) {
     return { output, changed: false };
   }
-  const duration = (output as { duration_ms?: unknown }).duration_ms;
+  return { output: withheldCodeExecutionOutput(output), changed: true };
+}
+
+/** The withheld replacement shape itself (idempotent over an already withheld output). */
+function withheldCodeExecutionOutput(output: unknown): Record<string, unknown> {
+  const duration =
+    typeof output === "object" && output !== null
+      ? (output as { duration_ms?: unknown }).duration_ms
+      : undefined;
   return {
-    output: {
-      success: false,
-      error: PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE,
-      toolCalls: [],
-      consoleOutput: [],
-      duration_ms: typeof duration === "number" ? duration : 0,
-      carriesProjectSkillContent: true,
-    },
-    changed: true,
+    success: false,
+    error: PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE,
+    toolCalls: [],
+    consoleOutput: [],
+    duration_ms: typeof duration === "number" ? duration : 0,
+    carriesProjectSkillContent: true,
   };
 }
 
@@ -565,8 +583,20 @@ export function redactProjectSkillToolResults(messages: MuxMessage[]): MuxMessag
           if (part.type !== "dynamic-tool" || SKILL_CONTENT_TOOLS.has(part.toolName)) {
             return part;
           }
+          // A sibling code_execution can hold the copy in its code (input),
+          // return value or console without a nested skill read of its own,
+          // so it is withheld whole like every other sibling — in the
+          // execution's own failed shape (the first pass replaced only the
+          // executions that read a skill themselves; this is idempotent over
+          // that replacement).
           if (part.toolName === "code_execution") {
-            return part;
+            return {
+              ...part,
+              input: {},
+              ...(part.state === "output-available"
+                ? { output: withheldCodeExecutionOutput(part.output) }
+                : {}),
+            };
           }
           return {
             ...part,

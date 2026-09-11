@@ -1,4 +1,5 @@
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { OpenAIWireFormat } from "@/common/types/providerOptions";
 import { isModelAvailable, resolveRoute } from "@/common/routing";
 import { isGatewayModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
 import { canDirectOpenAIServeModel } from "@/common/utils/providers/codexOauthRouting";
@@ -63,6 +64,11 @@ export function isRouteGatewayModelAccessible(
  * test mocks) must skip the check rather than pass an empty map:
  * "cannot determine" is not "unavailable".
  *
+ * `openaiWireFormat` is the request's own OpenAI wire format
+ * (providerOptions.openai.wireFormat): with no stored format the factory
+ * honors it, and Codex-OAuth-only credentials cannot serve a Chat Completions
+ * request — send-path callers pass it so the verdict matches model creation.
+ *
  * Known one-directional gap: enforced-policy model gating (policyService
  * isModelAllowed, applied inside the node-side gateway checker) is not
  * consulted here, so this can over-report availability for policy-blocked
@@ -74,6 +80,7 @@ export function isModelServableWithProvidersConfig(args: {
   routePriority?: string[];
   routeOverrides?: Record<string, string>;
   providersConfig: ProvidersConfigMap;
+  openaiWireFormat?: OpenAIWireFormat | null;
 }): boolean {
   const providersConfig = args.providersConfig;
   // The OAuth gate judges the CANONICAL identity, matching createModel's
@@ -90,7 +97,9 @@ export function isModelServableWithProvidersConfig(args: {
     // would reject (api_key_not_found) must not win over a later gateway or
     // suppress the actionable class error.
     if (provider === "openai") {
-      return canDirectOpenAIServeModel(canonicalForDirect, providersConfig);
+      return canDirectOpenAIServeModel(canonicalForDirect, providersConfig, {
+        openaiWireFormat: args.openaiWireFormat,
+      });
     }
     return true;
   };

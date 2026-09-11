@@ -83,21 +83,23 @@ export function buildFollowUpFromSource(
   const oneShotModel = oneShot?.modelString;
   const rawThinking = oneShot?.thinkingLevel;
 
-  // Numeric thinking is model-relative. With an explicit model it resolves
-  // right here; without one the send may get class-routed, so the raw index
-  // rides along for the backend to resolve against whatever model streams
-  // (the resolved fallback below applies only if routing doesn't happen).
+  // Numeric thinking is model-relative, and the model that streams is decided
+  // at dispatch: class routing can pick another model, and even an explicit
+  // one-shot model can map to a different provider model by the time a long
+  // compaction finishes. The RAW index therefore always rides along for the
+  // backend to resolve against the model that actually streams; the level
+  // resolved here (against the explicit model, else the current one) is only
+  // the fallback for a send the backend does not re-resolve.
   let thinkingLevel: CompactionFollowUpInput["thinkingLevel"];
   let oneShotThinkingIndex: number | undefined;
   if (rawThinking != null) {
     if (typeof rawThinking !== "number") {
       thinkingLevel = rawThinking;
-    } else if (oneShotModel != null) {
-      thinkingLevel = resolveThinkingInput(rawThinking, oneShotModel, ctx.providersConfig);
     } else {
       oneShotThinkingIndex = rawThinking;
-      thinkingLevel = ctx.currentModel
-        ? resolveThinkingInput(rawThinking, ctx.currentModel, ctx.providersConfig)
+      const referenceModel = oneShotModel ?? ctx.currentModel;
+      thinkingLevel = referenceModel
+        ? resolveThinkingInput(rawThinking, referenceModel, ctx.providersConfig)
         : undefined;
     }
   }

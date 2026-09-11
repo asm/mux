@@ -16,7 +16,7 @@
  */
 
 import { streamText } from "ai";
-import { rowCarriesProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
+import { messagesCarryProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
@@ -828,10 +828,12 @@ export async function maybeAppendAbandonedBranchSummary(
     }
 
     // Provenance rides with the summary: routed requests after a trust
-    // revocation withhold a summary distilled from project skill content.
+    // revocation withhold a summary distilled from project skill content. The
+    // row-set detector also counts a project skill invocation whose repeated
+    // snapshot deduplicated (no snapshot row, a reply that can quote it).
     const summaryMessage = createBranchSummaryMessage(
       summaryText,
-      input.abandonedMessages.some(rowCarriesProjectSkillContent)
+      messagesCarryProjectSkillContent(input.abandonedMessages)
     );
     if (input.guardTailMessageId !== undefined) {
       const guardedResult = await input.historyService.appendToHistoryIfTailMatches(

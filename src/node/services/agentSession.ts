@@ -171,6 +171,7 @@ import {
   prepareUserMessageForSend,
   type AgentSkillReference,
   isSyntheticSnapshotUserMessage,
+  isTurnStartingUserRow,
   type CompactionFollowUpRequest,
   type MuxMessageMetadata,
   type MuxFilePart,
@@ -258,7 +259,7 @@ import {
   createLoadedSkillSnapshot,
   extractLoadedSkillSnapshotsFromMessages,
   mergeLoadedSkillSnapshots,
-  rowCarriesProjectSkillContent,
+  messagesCarryProjectSkillContent,
   withholdProjectSkillContentFromRequest,
   stepMessagesCarryProjectSkillContent,
   stringifyAgentSkillFrontmatter,
@@ -307,6 +308,12 @@ import { summarizeContinuousCompaction } from "./continuousCompactionSummary";
 
 type SessionCompactionContext = ContinuousCompactionContext & {
   sendOptions?: SendMessageOptions;
+  /**
+   * The observed turn is skill-routed (resumeStream's routed predicate:
+   * compactionBaseOptions set): its summaries and swapped prefixes leave for
+   * the routed/compact provider under the routed request's consent rules.
+   */
+  routedTurn?: boolean;
 };
 
 /**
@@ -1594,26 +1601,55 @@ export class AgentSession {
         if (!this.activeStreamContext?.options) return null;
         const prepared = this.streamManager.getPrefixSwapPreparation?.(this.workspaceId);
         if (!prepared) return null;
-        const attachments = await this.buildContinuousCompactionAttachments(head);
-        return { ...prepared, attachments };
+        // The swapped prefix is rebuilt from history copies and ships to the
+        // live (possibly routed) provider mid-stream: the same provider-copy
+        // rules as the summarizer head, applied at rebuild time so the durable
+        // journal keeps the unfiltered sources. Post-compaction loaded-skill
+        // attachments are a second channel for the same content.
+        const eligible = await this.prepareContinuousCompactionRows(
+          head,
+          this.activeStreamContext.compactionBaseOptions != null
+        );
+        if (eligible === null) return null;
+        const attachments = await this.buildContinuousCompactionAttachments(eligible.rows);
+        return {
+          ...prepared,
+          attachments: eligible.projectContentWithheld
+            ? (excludeProjectLoadedSkills(attachments) ?? [])
+            : attachments,
+          prefixRows: (rows: MuxMessage[]) => {
+            const filtered = this.excludeRejectedRows(rows);
+            return eligible.projectContentWithheld
+              ? withholdProjectSkillContentFromRequest(filtered)
+              : filtered;
+          },
+        };
       },
-      summarize: (head, signal, context: SessionCompactionContext) => {
+      summarize: async (head, signal, context: SessionCompactionContext) => {
         const baseOptions = context.sendOptions ?? { model: context.model, agentId: "exec" };
         const request = this.buildAutoCompactionRequest({
           baseOptions,
           followUpContent: { text: "Continue", model: context.model, agentId: "exec" },
           reason: "on-send",
         });
+        // The compactor reads RAW history; what its summarizer sends is a
+        // provider request like any other (see prepareContinuousCompactionRows).
+        const eligible = await this.prepareContinuousCompactionRows(
+          head,
+          context.routedTurn === true
+        );
+        if (eligible === null || eligible.rows.length === 0) return null;
         return summarizeContinuousCompaction({
           workspaceId: this.workspaceId,
           config: this.config,
           aiService: this.aiService,
           sessionUsageService: this.sessionUsageService,
-          head,
+          head: eligible.rows,
           signal,
           context,
           baseOptions,
           compactOptions: request.sendOptions,
+          beforeDispatch: () => this.continuousCompactionRowsStillEligible(eligible),
         });
       },
       fastApply: (apply) => this.interruptForContinuousCompaction(apply),
@@ -4888,7 +4924,8 @@ export class AgentSession {
 
       const continuousContext = this.getContinuousCompactionContext(
         modelForStream,
-        optionsForStream
+        optionsForStream,
+        compactionBaseOptionsForRoutedTurn != null
       );
       if (!continuousContext.enabled) this.continuousCompactor.reset("disabled");
       const continuousResult = continuousContext.enabled
@@ -6972,7 +7009,7 @@ export class AgentSession {
     rows: MuxMessage[]
   ): StreamMessageOptions["preDispatchConsentGate"] {
     if (routedConsentRejection == null) return undefined;
-    const carriesProjectContent = rows.some(rowCarriesProjectSkillContent);
+    const carriesProjectContent = messagesCarryProjectSkillContent(rows);
     return (context) =>
       routedConsentRejection(
         carriesProjectContent ||
@@ -8106,7 +8143,8 @@ export class AgentSession {
 
   private getContinuousCompactionContext(
     model: string,
-    options?: SendMessageOptions
+    options?: SendMessageOptions,
+    routedTurn = false
   ): SessionCompactionContext {
     const providersConfig = this.getProvidersConfigSafe();
     const enabled =
@@ -8135,12 +8173,14 @@ export class AgentSession {
         this.streamManager.getStreamInfo(this.workspaceId)?.initialMetadata?.systemMessageTokens ??
         this.lastSystemMessageTokens,
       sendOptions: options,
+      routedTurn,
     };
   }
 
   private async observeContinuousCompactionAtStreamEnd(
     model: string,
-    options?: SendMessageOptions
+    options?: SendMessageOptions,
+    routedTurn = false
   ): Promise<void> {
     // fastApply waits for this handler to reach IDLE; waiting on its latch here
     // (or re-entering it from the generated Continue send) would deadlock.
@@ -8151,7 +8191,7 @@ export class AgentSession {
     )
       return;
     try {
-      const context = this.getContinuousCompactionContext(model, options);
+      const context = this.getContinuousCompactionContext(model, options, routedTurn);
       if (!context.enabled && !this.continuousCompactor.hasConsumedSwap()) {
         this.continuousCompactor.reset("disabled");
         return;
@@ -9098,7 +9138,7 @@ export class AgentSession {
         // a request: synthetic snapshot rows AND agent_skill_read results — a
         // project skill the model read through the tool in an earlier turn
         // persists inside an assistant tool-result row, not in row metadata.
-        let requestCarriesProjectContent = requestMessages.some(rowCarriesProjectSkillContent);
+        let requestCarriesProjectContent = messagesCarryProjectSkillContent(requestMessages);
         // Post-compaction loaded-skill attachments carry the same repository-
         // controlled content by a different channel: once the original snapshot
         // row sits behind the boundary, the history scan above no longer sees
@@ -10127,6 +10167,7 @@ export class AgentSession {
       // A configured fallback can bill a different model than the requested one.
       const activeModelForAbort = payload.metadata?.model ?? this.activeStreamContext?.modelString;
       const activeOptionsForAbort = this.activeStreamContext?.options;
+      const activeRoutedForAbort = this.activeStreamContext?.compactionBaseOptions != null;
       this.lastSystemMessageTokens = systemMessageTokens ?? this.lastSystemMessageTokens;
       if (activeModelForAbort) {
         this.updateUsageStateFromModelUsage({
@@ -10189,7 +10230,8 @@ export class AgentSession {
       if (!hadCompactionRequest && activeModelForAbort && !this.continuousCompactionAbandoned) {
         await this.observeContinuousCompactionAtStreamEnd(
           activeModelForAbort,
-          activeOptionsForAbort
+          activeOptionsForAbort,
+          activeRoutedForAbort
         );
         if (
           !this.coordinator.isCurrentTurn(turn) ||
@@ -10264,6 +10306,7 @@ export class AgentSession {
     const streamEndPayload = payload;
     const activeStreamGoalKind = this.activeStreamContext?.goalKind;
     const activeStreamOptions = this.activeStreamContext?.options;
+    const activeStreamRouted = this.activeStreamContext?.compactionBaseOptions != null;
     // A final-flush turn is housekeeping, not the goal's work: its text-only finish must never
     // count as an implicit complete_goal.
     const activeStreamWasContextBudgetFlush =
@@ -10358,7 +10401,8 @@ export class AgentSession {
       if (!handled && !completedCompactionRequest) {
         await this.observeContinuousCompactionAtStreamEnd(
           streamEndPayload.metadata.model,
-          activeStreamOptions
+          activeStreamOptions,
+          activeStreamRouted
         );
         if (
           !this.coordinator.isCurrentTurn(turn) ||
@@ -10617,7 +10661,11 @@ export class AgentSession {
           return;
         await this.runContinuousCompactionObservation(async (token) => {
           const result = await this.continuousCompactor.observe(0, {
-            ...this.getContinuousCompactionContext(context.modelString, context.options),
+            ...this.getContinuousCompactionContext(
+              context.modelString,
+              context.options,
+              context.compactionBaseOptions != null
+            ),
             phase: "mid-stream",
           });
           // The observation's finally settles the pending window only after this dispatches the
@@ -10674,7 +10722,11 @@ export class AgentSession {
       const streamContext = this.activeStreamContext;
       const streamOptions = streamContext?.options;
       if (streamContext?.modelString !== modelForUsage) return;
-      const continuousContext = this.getContinuousCompactionContext(modelForUsage, streamOptions);
+      const continuousContext = this.getContinuousCompactionContext(
+        modelForUsage,
+        streamOptions,
+        streamContext?.compactionBaseOptions != null
+      );
       const usagePercent =
         continuousContext.contextWindowTokens > 0
           ? ((payload.usage.inputTokens ?? payload.usage.cachedInputTokens ?? 0) /
@@ -12870,6 +12922,9 @@ export class AgentSession {
               routePriority: cfg?.routePriority,
               routeOverrides: cfg?.routeOverrides,
               providersConfig,
+              // The factory honors the request's own OpenAI wire format when
+              // none is stored; the verdict must judge the same request.
+              openaiWireFormat: options.providerOptions?.openai?.wireFormat,
             })
           ) {
             return {
@@ -13013,6 +13068,62 @@ export class AgentSession {
   }
 
   /**
+   * Provider-facing copy of continuous-compaction rows (the summarizer's head,
+   * the swapped prefix's sources). The compactor reads RAW history, but what it
+   * sends is a provider request like any other: durably stamped and quarantined
+   * rejected rows never ride it, and during a ROUTED turn — the summary or the
+   * prefix leaves for the routed/compact provider — an untrusted workspace's
+   * project skill content is withheld exactly as the routed request's own
+   * assembly withholds it (withholdProjectSkillContentFromRequest). Content
+   * kept under trust is flagged so the dispatch-time recheck can catch a
+   * revocation in the model-creation window. Null: the rejected-turn record is
+   * corrupt (its recovery deletes the partial and cannot run under a live
+   * stream) or unreadable — the compactor stands down and the legacy
+   * compaction request, which recovers first, stays in charge.
+   */
+  private async prepareContinuousCompactionRows(
+    rows: MuxMessage[],
+    routedTurn: boolean
+  ): Promise<{
+    rows: MuxMessage[];
+    trustedProjectContent: boolean;
+    projectContentWithheld: boolean;
+  } | null> {
+    try {
+      await this.loadAutoRetryState();
+    } catch {
+      return null;
+    }
+    if (this.corruptRejectedTurnRecord !== null) return null;
+    const eligible = this.excludeRejectedRows(rows);
+    if (!routedTurn) {
+      return { rows: eligible, trustedProjectContent: false, projectContentWithheld: false };
+    }
+    if (await this.isRoutedProjectSkillTurnStillTrusted()) {
+      return {
+        rows: eligible,
+        trustedProjectContent: messagesCarryProjectSkillContent(eligible),
+        projectContentWithheld: false,
+      };
+    }
+    return {
+      rows: withholdProjectSkillContentFromRequest(eligible),
+      trustedProjectContent: false,
+      projectContentWithheld: true,
+    };
+  }
+
+  /** Dispatch-time recheck of prepareContinuousCompactionRows' verdict, right before the provider call. */
+  private async continuousCompactionRowsStillEligible(prepared: {
+    rows: MuxMessage[];
+    trustedProjectContent: boolean;
+  }): Promise<boolean> {
+    if (this.corruptRejectedTurnRecord !== null) return false;
+    if (this.excludeRejectedRows(prepared.rows).length !== prepared.rows.length) return false;
+    return !prepared.trustedProjectContent || (await this.isRoutedProjectSkillTurnStillTrusted());
+  }
+
+  /**
    * Self-healing for a late-gate rejection whose durable row stamp FAILED
    * (transient rewrite error; the in-memory quarantine died with the
    * process): the abandon marker and the durable repair record name the
@@ -13071,9 +13182,11 @@ export class AgentSession {
     rows.forEach((row, index) => {
       if (!this.shouldUseUserMessageForRetry(row)) return;
       const rest = rows.slice(index + 1);
-      const nextTurn = rest.findIndex(
-        (message) => message.role === "user" && !isSyntheticSnapshotUserMessage(message)
-      );
+      // Turn boundaries are TURN-STARTING user rows (isTurnStartingUserRow):
+      // a synthetic <system-file-update> notification between a user row and
+      // its reply belongs to that turn — read as a boundary it would make a
+      // completed turn look unanswered and stamp it away from its reply.
+      const nextTurn = rest.findIndex(isTurnStartingUserRow);
       const turnRows = rest.slice(0, nextTurn === -1 ? rest.length : nextTurn);
       // Only a TERMINAL reply settles a turn (isCommittedAssistantReply): an
       // interrupted routed stream's committed partial or a failed reply leaves

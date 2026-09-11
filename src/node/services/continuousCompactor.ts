@@ -64,6 +64,8 @@ interface Dependencies {
     requestProviderOptions?: Record<string, unknown>;
     attachments: PostCompactionAttachment[];
     cacheEnabled: boolean;
+    /** Provider-copy filter for the rebuilt prefix's source rows (see rebuildContinuousPrefix). */
+    prefixRows?: (rows: MuxMessage[]) => MuxMessage[];
   } | null>;
   // Includes usage recording: the generation fence must be AFTER the last await.
   summarize(
@@ -555,7 +557,11 @@ export class ContinuousCompactor {
         stepNumber: 0,
         firstTailToolCallId: tool.toolCallId,
       };
-      const prefix = await rebuildContinuousPrefix(journal, this.deps.workspaceId);
+      const prefix = await rebuildContinuousPrefix(
+        journal,
+        this.deps.workspaceId,
+        prepared.prefixRows
+      );
       if (!this.isValid(staged, rows)) return false;
       const swap: ContinuousPrefixSwap = { prefix, firstTailToolCallId: tool.toolCallId, journal };
       if (!this.deps.streamManager.setPrefixSwap(this.deps.workspaceId, swap)) return false;

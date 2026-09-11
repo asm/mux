@@ -107,6 +107,11 @@ describe("buildFollowUpFromSource", () => {
     // parseCommand canonicalizes the "haiku" alias.
     expect(followUp.model).toBe("anthropic:claude-haiku-4-5");
     expect(followUp.skipSkillModelRouting).toBe(true);
+    // The raw numeric index rides along even with an explicit model: dispatch
+    // resolves it against the model that actually streams (a provider mapping
+    // can change during a long compaction); the level here is the fallback.
+    expect(followUp.oneShotThinkingIndex).toBe(0);
+    expect(followUp.thinkingLevel).toBe("off");
     expect(followUp.muxMetadata?.type).toBe("agent-skill");
     if (followUp.muxMetadata?.type === "agent-skill") {
       expect(followUp.muxMetadata.rawCommand).toBe("/haiku+0 /done finish");

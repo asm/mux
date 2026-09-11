@@ -90,7 +90,8 @@ export function hasOpenAIApiKey(config: unknown): boolean {
  */
 export function canDirectOpenAIServeModel(
   model: string,
-  providersConfig: ProvidersConfigMap | null | undefined
+  providersConfig: ProvidersConfigMap | null | undefined,
+  options?: CodexOauthRoutingOptions
 ): boolean {
   const openAIConfig = providersConfig?.openai;
   // A custom provider (any wire type) shadowing the built-in "openai" id is
@@ -105,8 +106,12 @@ export function canDirectOpenAIServeModel(
   // Codex OAuth speaks only the Responses endpoint: a provider pinned to the
   // Chat Completions wire format cannot be served by OAuth-only credentials —
   // createModel rejects that combination with api_key_not_found — so direct
-  // routing must not win over a configured gateway for it.
-  if (asRecord(openAIConfig)?.wireFormat === "chatCompletions") {
+  // routing must not win over a configured gateway for it. The REQUEST's own
+  // wire format counts the same way: with no stored format the factory honors
+  // providerOptions.openai.wireFormat, so a chatCompletions send is judged as
+  // the factory will judge it.
+  const wireFormat = asRecord(openAIConfig)?.wireFormat ?? options?.openaiWireFormat;
+  if (wireFormat === "chatCompletions") {
     return false;
   }
   return (
