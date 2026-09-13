@@ -86,6 +86,33 @@ describe("estimatePdfAttachmentTokens", () => {
     expect(estimatePdfAttachmentTokens(pdfDataUrl(pdf))).toBe(60 * PDF_TOKENS_PER_PAGE_ESTIMATE);
   });
 
+  it("ignores page-like text inside content streams", () => {
+    // A content stream can spell out page dictionaries as DATA (a document
+    // about PDF syntax): only dictionaries outside stream payloads count, or a
+    // two-page document would be priced as fifty and compacted for nothing.
+    const pages = Array.from(
+      { length: 2 },
+      (_, index) => `${index + 1} 0 obj\n<< /Type /Page /Parent 9 0 R >>\nendobj`
+    ).join("\n");
+    const payload = "BT (/Type /Page and /Type /Pages /Count 40) Tj ET\n".repeat(50);
+    const pdf =
+      `%PDF-1.4\n${pages}\n9 0 obj\n<< /Type /Pages /Kids [1 0 R 2 0 R] /Count 2 >>\nendobj\n` +
+      `10 0 obj\n<< /Length ${payload.length} >>\nstream\n${payload}endstream\nendobj\n`;
+    expect(estimatePdfAttachmentTokens(pdfDataUrl(pdf))).toBe(2 * PDF_TOKENS_PER_PAGE_ESTIMATE);
+  });
+
+  it("caps the recovered page count at the provider limit", () => {
+    // Providers reject longer documents anyway, so a larger count (real or a
+    // false positive) cannot price a request beyond the cap.
+    const pages = Array.from(
+      { length: PDF_MAX_PAGES_ESTIMATE + 50 },
+      (_, index) => `${index + 1} 0 obj\n<< /Type /Page >>\nendobj`
+    ).join("\n");
+    expect(estimatePdfAttachmentTokens(pdfDataUrl(`%PDF-1.4\n${pages}\n`))).toBe(
+      PDF_MAX_PAGES_ESTIMATE * PDF_TOKENS_PER_PAGE_ESTIMATE
+    );
+  });
+
   it("uses the page tree count when the page objects themselves are not visible", () => {
     const pdf = "%PDF-1.5\n1 0 obj\n<< /Type /Pages /Kids [2 0 R] /Count 12 >>\nendobj\n";
     expect(estimatePdfAttachmentTokens(pdfDataUrl(pdf))).toBe(12 * PDF_TOKENS_PER_PAGE_ESTIMATE);

@@ -1431,6 +1431,38 @@ describe("task tool project skill content sink", () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  it("stops a grouped launch when trust is revoked between members", async () => {
+    // The gate is re-read before EVERY create: a revocation while the first
+    // member's create awaited must not let the rest of the group ship the
+    // project-derived prompt.
+    using tempDir = new TestTempDir("test-task-tool-group-revocation");
+    let trusted = true;
+    let launched = 0;
+    const create = mock(() => {
+      trusted = false;
+      launched += 1;
+      return Ok({
+        taskId: `child-${launched}`,
+        kind: "agent" as const,
+        status: "running" as const,
+      });
+    });
+    const tool = createTaskTool({
+      ...createTestToolConfig(tempDir.path),
+      taskService: { create } as unknown as TaskService,
+      projectSkillContentInContext: () => true,
+      projectSkillContentStillReadable: () => Promise.resolve(trusted),
+    });
+    const result = (await tool.execute!({ ...spawnArgs, n: 3 }, mockToolCallOptions)) as {
+      taskIds?: string[];
+      note?: string;
+    };
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(result.taskIds).toEqual(["child-1"]);
+    expect(result.note).toContain("stopped after spawning 1 of 3");
+    expect(result.note).toContain(TASK_PROJECT_SKILL_CONTENT_WITHHELD_ERROR);
+  });
+
   it("stamps the spawn with the context's project skill provenance under trust", async () => {
     using tempDir = new TestTempDir("test-task-tool-project-content-stamp");
     const create = mock((_args: { carriesProjectSkillContent?: boolean }) =>

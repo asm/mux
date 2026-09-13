@@ -23,7 +23,8 @@ export interface ModelClassesState {
    * The backend's message for the most recent write that failed (config.json
    * read-only or full, the RPC rejecting). The map reverts to backend truth on
    * the failure's refetch, so without this the selection would silently snap
-   * back; consumers must show it. Cleared when the next write is attempted.
+   * back; consumers must show it. Cleared when the next write is attempted and
+   * again when a write issued after the failure is acknowledged.
    */
   writeError: string | null;
   // Arrow-function property type so consumers can destructure without
@@ -76,6 +77,14 @@ export function useModelClasses(): ModelClassesState {
   const latestFetchRef = useRef<Promise<void> | null>(null);
   // Serializes writes so rapid edits persist in order and the last one wins.
   const writeChainRef = useRef<Promise<void>>(Promise.resolve());
+  // Write ordering for the error message: every write takes a sequence number
+  // and a failure records its own, so a LATER write's acknowledgment clears the
+  // stale message while an older completion can never erase a newer failure.
+  // Two rows edited while the first write is pending both clear the message at
+  // dispatch; if the first RPC then fails and the second succeeds, only this
+  // ordering lets the success retire the first's error.
+  const writeSequenceRef = useRef(0);
+  const failedWriteSequenceRef = useRef(0);
   // Per-class in-flight write counts; consumers disable pending rows.
   const [pendingWrites, setPendingWrites] = useState<Record<string, number>>({});
 
@@ -233,6 +242,7 @@ export function useModelClasses(): ModelClassesState {
     const trimmed = value?.trim() ?? "";
     setPendingWrites((current) => ({ ...current, [key]: (current[key] ?? 0) + 1 }));
     setWriteError(null);
+    const writeSequence = ++writeSequenceRef.current;
 
     // Await whichever fetch currently owns the latest version, not just the
     // one this chain started: a peer notification can supersede our refetch
@@ -270,6 +280,11 @@ export function useModelClasses(): ModelClassesState {
         await updateModelClass({ className: key, model: trimmed ? trimmed : null });
         if (clientGenerationRef.current !== writeGeneration) {
           return;
+        }
+        // The freshest completed write is this one: a message left by an
+        // earlier failure no longer describes the entry's state.
+        if (failedWriteSequenceRef.current < writeSequence) {
+          setWriteError(null);
         }
         // The ack is the freshest truth for this entry. Invalidate in-flight
         // fetches whose snapshot may predate this write, patch the entry
@@ -312,6 +327,7 @@ export function useModelClasses(): ModelClassesState {
         }
         // The revert alone would look like the selection silently snapping
         // back; surface the backend's actionable message with it.
+        failedWriteSequenceRef.current = Math.max(failedWriteSequenceRef.current, writeSequence);
         setWriteError(getErrorMessage(error));
         await refetchRef.current();
         await awaitLatestFetch();

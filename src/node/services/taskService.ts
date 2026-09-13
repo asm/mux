@@ -8417,7 +8417,11 @@ export class TaskService implements AgentTaskIntegration {
   async sendMessageToParentFromAgentTask(
     childWorkspaceId: string,
     message: string,
-    queueDispatchMode: TaskMessageQueueDispatchMode
+    queueDispatchMode: TaskMessageQueueDispatchMode,
+    options?: {
+      /** The sender's context carried project skill content: stamped on the target rows. */
+      carriesProjectSkillContent?: boolean;
+    }
   ): Promise<Result<SendParentAgentMessageResult, SendParentAgentMessageError>> {
     assert(
       childWorkspaceId.length > 0,
@@ -8428,6 +8432,7 @@ export class TaskService implements AgentTaskIntegration {
       senderWorkspaceId: childWorkspaceId,
       message,
       queueDispatchMode,
+      ...(options?.carriesProjectSkillContent === true ? { carriesProjectSkillContent: true } : {}),
     });
   }
 
@@ -8444,7 +8449,11 @@ export class TaskService implements AgentTaskIntegration {
     senderWorkspaceId: string,
     targetTaskId: string,
     message: string,
-    queueDispatchMode: TaskMessageQueueDispatchMode
+    queueDispatchMode: TaskMessageQueueDispatchMode,
+    options?: {
+      /** The sender's context carried project skill content: stamped on the target rows. */
+      carriesProjectSkillContent?: boolean;
+    }
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     assert(
       senderWorkspaceId.length > 0,
@@ -8460,6 +8469,7 @@ export class TaskService implements AgentTaskIntegration {
       targetId: targetTaskId,
       message,
       queueDispatchMode,
+      ...(options?.carriesProjectSkillContent === true ? { carriesProjectSkillContent: true } : {}),
     });
   }
 

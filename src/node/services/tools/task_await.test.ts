@@ -1,14 +1,16 @@
-import type { HistoryService } from "@/node/services/historyService";
 import * as fs from "fs";
 
-import { describe, it, expect, mock, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, it, expect, mock, spyOn } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { COMPLETED_REPORT_REFETCH_NOTE } from "@/common/utils/tools/toolDefinitions";
 import type { WorkflowRunRecord, WorkflowRunStatus } from "@/common/types/workflow";
+import { createMuxMessage } from "@/common/types/message";
 import { createTaskAwaitTool } from "./task_await";
+import { TASK_REPORT_WITHHELD_MESSAGE } from "./taskReportProvenance";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
+import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { getSubagentGitPatchArtifactsFilePath } from "@/node/services/subagentGitPatchArtifacts";
 import { ForegroundWaitBackgroundedError, type TaskService } from "@/node/services/taskService";
@@ -41,18 +43,24 @@ function createWorkflowRun(
   };
 }
 
-// Workspace-turn reports are classified from the target workspace's history;
-// these tests' targets are clean.
-const cleanHistoryService = {
-  getHistoryFromLatestBoundary: () => Promise.resolve({ success: true as const, data: [] }),
-} as unknown as HistoryService;
-
 describe("task_await tool", () => {
+  // Workspace-turn reports are classified from the target workspace's history
+  // (a real HistoryService, per the repository's testing contract): a target
+  // with no rows is clean, and a test that needs a carrying target appends
+  // the row through appendToHistory.
+  let history: Awaited<ReturnType<typeof createTestHistoryService>>;
+  beforeEach(async () => {
+    history = await createTestHistoryService();
+  });
+  afterEach(async () => {
+    await history.cleanup();
+  });
+
   it("returns completed workspace-turn results without raw part duplication", async () => {
     using tempDir = new TestTempDir("test-task-await-workspace-turn");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const markWorkspaceTurnTerminalAttentionConsumed = mock(() => Promise.resolve());
@@ -121,7 +129,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-workspace-turn-interrupted");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const taskService = {
@@ -167,7 +175,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-nested-continuation-owner");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
     const continuation = {
       kind: "workspace_turn",
@@ -250,11 +258,85 @@ describe("task_await tool", () => {
     });
   });
 
+  it("classifies a workspace-turn report from the target's history after the wait settles", async () => {
+    // The target reads a project skill WHILE this call awaits it: a verdict
+    // taken before the wait would return the report unstamped (and, under an
+    // excluding turn, unwithheld).
+    using tempDir = new TestTempDir("test-task-await-late-provenance");
+    const run = async (excludeProjectSkillContent: boolean) => {
+      const targetWorkspaceId = excludeProjectSkillContent
+        ? "child-task-excluded"
+        : "child-task-trusted";
+      const continuation = {
+        kind: "workspace_turn",
+        handleId: `wst_${targetWorkspaceId}`,
+        ownerWorkspaceId: "parent-task",
+        workspaceId: targetWorkspaceId,
+        turnId: "turn-late",
+        status: "running",
+        createdAt: "2026-08-10T00:00:00.000Z",
+        updatedAt: "2026-08-10T00:00:01.000Z",
+        createdWorkspace: false,
+        disposableWorkspace: false,
+      } as const;
+      const taskService = {
+        listActiveDescendantAgentTaskIds: mock(() => []),
+        isDescendantAgentTask: mock(() => Promise.resolve(true)),
+        getAgentTaskExecutionId: mock(() => continuation.handleId),
+        getDescendantAgentTaskExecutionSnapshot: mock(() =>
+          Promise.resolve({ ownerWorkspaceId: "parent-task", record: continuation })
+        ),
+        getWorkspaceTurnSnapshot: mock(() => {
+          throw new Error("requester-owned snapshot lookup should not be used");
+        }),
+        waitForWorkspaceTurn: mock(async () => {
+          // The skill read lands in the target's history during the wait.
+          await history.historyService.appendToHistory(
+            targetWorkspaceId,
+            createMuxMessage("snap-project", "user", "PROJECT SKILL BODY", {
+              timestamp: Date.now(),
+              synthetic: true,
+              agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "s" },
+            })
+          );
+          return {
+            workspaceId: targetWorkspaceId,
+            updatedAt: "2026-08-10T00:00:02.000Z",
+            reportMarkdown: "Applied the conventions",
+          };
+        }),
+        markWorkspaceTurnTerminalAttentionConsumed: mock(() => Promise.resolve()),
+      } as unknown as TaskService;
+      const tool = createTaskAwaitTool({
+        ...createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" }),
+        historyService: history.historyService,
+        taskService,
+        ...(excludeProjectSkillContent ? { excludeProjectSkillContent: true } : {}),
+      });
+      return (await Promise.resolve(
+        tool.execute!({ task_ids: [targetWorkspaceId] }, mockToolCallOptions)
+      )) as { results: Array<Record<string, unknown>> };
+    };
+
+    const trusted = await run(false);
+    expect(trusted.results[0]).toMatchObject({
+      status: "completed",
+      reportMarkdown: "Applied the conventions",
+      carriesProjectSkillContent: true,
+    });
+    const excluded = await run(true);
+    expect(excluded.results[0]).toMatchObject({
+      status: "completed",
+      reportMarkdown: TASK_REPORT_WITHHELD_MESSAGE,
+    });
+    expect(excluded.results[0]).not.toHaveProperty("carriesProjectSkillContent");
+  });
+
   it("does not mark active workspace-turn awaits consumed", async () => {
     using tempDir = new TestTempDir("test-task-await-active-workspace-turn-consumption");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
     const markWorkspaceTurnTerminalAttentionConsumed = mock(() => Promise.resolve());
     const runningSnapshot = {
@@ -299,7 +381,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-workspace-turn-detached");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
     const completedSnapshot = {
       kind: "workspace_turn",
@@ -382,7 +464,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-workspace-turn-default-timeout");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
     const runningSnapshot = {
       kind: "workspace_turn",
@@ -435,7 +517,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-workspace-turn-timeout-terminal");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
     const runningSnapshot = {
       kind: "workspace_turn",
@@ -500,7 +582,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-workspace-turn-generic-terminal");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
     const runningSnapshot = {
       kind: "workspace_turn",
@@ -557,7 +639,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-artifacts");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const workspaceSessionDir = baseConfig.workspaceSessionDir;
@@ -632,7 +714,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-v1-artifacts");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const workspaceSessionDir = baseConfig.workspaceSessionDir;
@@ -696,7 +778,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock((taskId: string) =>
@@ -750,7 +832,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-report-settings");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock(() =>
@@ -790,7 +872,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-agent-elapsed-completed");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const taskService = {
@@ -827,7 +909,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-agent-elapsed-active");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
     const nowMs = Date.parse("2026-01-01T00:00:05.000Z");
     const dateNowSpy = spyOn(Date, "now").mockReturnValue(nowMs);
@@ -865,7 +947,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-explicit-valid-agent-with-bash-manager");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock(() => Promise.resolve({ reportMarkdown: "ok" }));
@@ -912,7 +994,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-explicit-workflow-owned-agent");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock(() => Promise.resolve({ reportMarkdown: "leaked" }));
@@ -955,7 +1037,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-suggestion-fallback-on-list-error");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock(() => {
@@ -1000,7 +1082,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-this-binding");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock(() => Promise.resolve({ reportMarkdown: "ok" }));
@@ -1043,7 +1125,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-hallucinated-descendant-suggestions");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock(() => {
@@ -1087,7 +1169,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-hallucinated-bash-suggestions");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock(() => {
@@ -1146,7 +1228,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-mixed-results");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock(() => Promise.resolve({ reportMarkdown: "ok" }));
@@ -1207,7 +1289,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-hallucinated-not-found-no-suggestions");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock(() => {
@@ -1247,7 +1329,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-workflow-completed");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
     const completedRun = createWorkflowRun("completed", [
       {
@@ -1322,7 +1404,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-workflow-retryable-failed");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
     const failedRun = createWorkflowRun("failed", [
       {
@@ -1382,7 +1464,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-workflow-ordinary-failed");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
     const failedRun = {
       ...createWorkflowRun("failed", [
@@ -1469,7 +1551,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-workflow-progress");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
     const runningRun = {
       ...createWorkflowRun("running", [
@@ -1567,7 +1649,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-workflow-agent-reservation-progress");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
     const reservingRun = {
       ...createWorkflowRun("running", [
@@ -1627,7 +1709,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-workflow-discovery");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
     const backgroundedRun = {
       ...createWorkflowRun("backgrounded", [
@@ -1689,7 +1771,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-workflow-poll");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
     const backgroundedRun = {
       ...createWorkflowRun("backgrounded"),
@@ -1755,7 +1837,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-workflow-interrupted");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
     const interruptedRun = createWorkflowRun("interrupted", [
       {
@@ -1807,7 +1889,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-descendants");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const listActiveDescendantAgentTaskIds = mock(() => ["t1"]);
@@ -1844,7 +1926,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-reactivated-descendant");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
     const continuation = {
       kind: "workspace_turn",
@@ -1895,7 +1977,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-backgrounded");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock(() => Promise.reject(new ForegroundWaitBackgroundedError()));
@@ -1929,7 +2011,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-errors");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock((taskId: string) => {
@@ -1968,7 +2050,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-timeout-zero");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock(() => {
@@ -1998,7 +2080,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-reactivated-child");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
     const taskService = {
       listActiveDescendantAgentTaskIds: mock(() => ["child-agent"]),
@@ -2040,7 +2122,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-timeout-zero-cached");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const getAgentTaskStatus = mock(() => null);
@@ -2086,7 +2168,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-min-completed-default");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     let t1Signal: AbortSignal | undefined;
@@ -2141,7 +2223,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-min-completed-total");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock((taskId: string) => {
@@ -2191,7 +2273,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-min-completed-k");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock((taskId: string, opts: { abortSignal?: AbortSignal }) => {
@@ -2243,7 +2325,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-min-completed-clamp");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock((taskId: string) =>
@@ -2286,7 +2368,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-min-completed-unreachable");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock((taskId: string) => {
@@ -2329,7 +2411,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-min-completed-reawait");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     let t2Ready = false;
@@ -2394,7 +2476,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-min-completed-timeout-zero");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock(() => {
@@ -2431,7 +2513,7 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-min-completed-reject");
     const baseConfig = {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
-      historyService: cleanHistoryService,
+      historyService: history.historyService,
     };
 
     const waitForAgentReport = mock(() =>

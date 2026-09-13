@@ -601,11 +601,16 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           // paths cannot drift on the reported fields or fallback copy.
           // Report provenance: the turn ran in the target workspace, whose active
           // segment is the report's context (see taskReportProvenance).
-          const workspaceTurnReportProvenance = {
-            carries: await workspaceHistoryCarriesProjectSkillContent(config, snapshot.workspaceId),
+          // Classified when a completed result is BUILT, never ahead of a wait:
+          // the turn can read a project skill while this call awaits it, and a
+          // verdict cached before the wait would miss that read. Workspace-turn
+          // handles persist no report provenance, so the target's history is
+          // the source each time.
+          const classifyWorkspaceTurnReport = async (targetWorkspaceId: string) => ({
+            carries: await workspaceHistoryCarriesProjectSkillContent(config, targetWorkspaceId),
             excludes: await toolExcludesProjectSkillContent(config),
-          };
-          const completedWorkspaceTurnResult = (record: WorkspaceTurnTaskHandleRecord) => ({
+          });
+          const completedWorkspaceTurnResult = async (record: WorkspaceTurnTaskHandleRecord) => ({
             status: "completed" as const,
             taskId,
             ...workspaceTurnIdentityFields(record.workspaceId),
@@ -615,7 +620,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
                   record.reportMarkdown ?? "Workspace turn completed without final text output.",
                 title: record.title,
               },
-              workspaceTurnReportProvenance
+              await classifyWorkspaceTurnReport(record.workspaceId)
             ),
             messageId: record.messageId,
             finalMessageRef: record.finalMessageRef,
@@ -636,7 +641,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           if (timeoutMs === 0 || !isActiveWorkspaceTurnTaskStatus(snapshot.status)) {
             if (snapshot.status === "completed") {
               await markWorkspaceTurnTerminalAttentionConsumed(snapshot);
-              return completedWorkspaceTurnResult(snapshot);
+              return await completedWorkspaceTurnResult(snapshot);
             }
             if (snapshot.status === "interrupted") {
               await markWorkspaceTurnTerminalAttentionConsumed(snapshot);
@@ -677,7 +682,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               ...workspaceTurnIdentityFields(report.workspaceId),
               ...applyTaskReportProvenance(
                 { reportMarkdown: report.reportMarkdown, title: report.title },
-                workspaceTurnReportProvenance
+                await classifyWorkspaceTurnReport(report.workspaceId)
               ),
               messageId: report.messageId,
               finalMessageRef: report.finalMessageRef,
@@ -708,7 +713,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               if (latest == null) return { status: "not_found" as const, taskId };
               if (latest.status === "completed") {
                 await markWorkspaceTurnTerminalAttentionConsumed(latest);
-                return completedWorkspaceTurnResult(latest);
+                return await completedWorkspaceTurnResult(latest);
               }
               if (latest.status === "error") {
                 await markWorkspaceTurnTerminalAttentionConsumed(latest);
@@ -734,7 +739,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               if (latest == null) return { status: "not_found" as const, taskId };
               if (latest.status === "completed") {
                 await markWorkspaceTurnTerminalAttentionConsumed(latest);
-                return completedWorkspaceTurnResult(latest);
+                return await completedWorkspaceTurnResult(latest);
               }
               if (latest.status === "error") {
                 await markWorkspaceTurnTerminalAttentionConsumed(latest);
@@ -760,7 +765,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             const latest = await getWorkspaceTurnSnapshotForAwait().catch(() => null);
             if (latest?.status === "completed") {
               await markWorkspaceTurnTerminalAttentionConsumed(latest);
-              return completedWorkspaceTurnResult(latest);
+              return await completedWorkspaceTurnResult(latest);
             }
             if (latest?.status === "error") {
               await markWorkspaceTurnTerminalAttentionConsumed(latest);

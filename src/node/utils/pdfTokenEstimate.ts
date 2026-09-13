@@ -30,6 +30,47 @@ function maxPageTreeCount(text: string): number {
 }
 
 /**
+ * Every stream payload (`stream … endstream`) with the dictionary window that
+ * precedes it. The raw scans skip the payloads — page-like text inside a
+ * content stream (a document about PDF syntax) is data, not a dictionary —
+ * and the inflater picks the object streams among them.
+ */
+function* streamPayloads(
+  text: string
+): Generator<{ dictionary: string; dataStart: number; endAt: number }> {
+  let cursor = 0;
+  for (;;) {
+    const keywordAt = text.indexOf("stream", cursor);
+    if (keywordAt === -1) return;
+    const endAt = text.indexOf("endstream", keywordAt + "stream".length);
+    if (endAt === -1) return;
+    cursor = endAt + "endstream".length;
+    // "endstream" contains "stream": skip the closing keyword's own match.
+    if (text.slice(Math.max(0, keywordAt - 3), keywordAt) === "end") continue;
+    let dataStart = keywordAt + "stream".length;
+    if (text[dataStart] === "\r") dataStart++;
+    if (text[dataStart] === "\n") dataStart++;
+    yield {
+      dictionary: text.slice(Math.max(0, keywordAt - STREAM_DICTIONARY_WINDOW_CHARS), keywordAt),
+      dataStart,
+      endAt,
+    };
+  }
+}
+
+/** The raw bytes without their stream payloads: only object dictionaries remain to scan. */
+function withoutStreamPayloads(text: string): string {
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const { dataStart, endAt } of streamPayloads(text)) {
+    parts.push(text.slice(cursor, dataStart));
+    cursor = endAt;
+  }
+  parts.push(text.slice(cursor));
+  return parts.join("");
+}
+
+/**
  * Decoded contents of the document's FlateDecode object streams (`/Type
  * /ObjStm`): modern writers keep page dictionaries there, where a raw scan
  * sees none. Only object streams can hold page dictionaries — content and
@@ -40,23 +81,9 @@ function maxPageTreeCount(text: string): number {
 function inflatedStreams(bytes: Buffer, text: string): string[] {
   const inflated: string[] = [];
   let total = 0;
-  let cursor = 0;
-  while (total < MAX_INFLATED_TOTAL_BYTES) {
-    const keywordAt = text.indexOf("stream", cursor);
-    if (keywordAt === -1) break;
-    const endAt = text.indexOf("endstream", keywordAt + "stream".length);
-    if (endAt === -1) break;
-    cursor = endAt + "endstream".length;
-    // "endstream" contains "stream": skip the closing keyword's own match.
-    if (text.slice(Math.max(0, keywordAt - 3), keywordAt) === "end") continue;
-    const dictionary = text.slice(
-      Math.max(0, keywordAt - STREAM_DICTIONARY_WINDOW_CHARS),
-      keywordAt
-    );
+  for (const { dictionary, dataStart, endAt } of streamPayloads(text)) {
+    if (total >= MAX_INFLATED_TOTAL_BYTES) break;
     if (!dictionary.includes("/ObjStm") || !dictionary.includes("/FlateDecode")) continue;
-    let dataStart = keywordAt + "stream".length;
-    if (text[dataStart] === "\r") dataStart++;
-    if (text[dataStart] === "\n") dataStart++;
     try {
       const data = inflateSync(bytes.subarray(dataStart, endAt), {
         maxOutputLength: MAX_INFLATED_STREAM_BYTES,
@@ -73,12 +100,13 @@ function inflatedStreams(bytes: Buffer, text: string): string[] {
 /**
  * Conservative token cost of a PDF attachment. Providers bill a PDF per page
  * (extracted text plus a page image), so pages are priced at the per-page
- * upper bound. Page objects are counted in the raw bytes together with the
- * page tree's `/Count`, and the FlateDecode object streams (which hold the
- * page dictionaries of most modern PDFs) are inflated and scanned the same
- * way whether or not a raw source is visible. When no source recovers a page
- * count, the provider's page cap is assumed: a compressed byte size cannot
- * bound a page count, and under-estimating lets the pre-send check skip
+ * upper bound. Page objects are counted in the raw object dictionaries
+ * (stream payloads excluded) together with the page tree's `/Count`, and the
+ * FlateDecode object streams (which hold the page dictionaries of most modern
+ * PDFs) are inflated and scanned the same way whether or not a raw source is
+ * visible. The recovered count is capped at the provider's page limit, and
+ * when no source recovers one that limit is assumed: a compressed byte size
+ * cannot bound a page count, and under-estimating lets the pre-send check skip
  * compaction only to fail at dispatch.
  */
 export function estimatePdfAttachmentTokens(url: string): number {
@@ -89,8 +117,9 @@ export function estimatePdfAttachmentTokens(url: string): number {
   }
   const bytes = Buffer.from(url.slice(commaIndex + 1), "base64");
   const text = bytes.toString("latin1");
-  let pageObjects = countPageObjects(text);
-  let treeCount = maxPageTreeCount(text);
+  const dictionaries = withoutStreamPayloads(text);
+  let pageObjects = countPageObjects(dictionaries);
+  let treeCount = maxPageTreeCount(dictionaries);
   // A hybrid or incrementally saved document keeps some page dictionaries raw
   // and the rest — or the active page tree — in object streams, so a visible
   // raw source does not make the streams redundant: they are always scanned.
@@ -102,6 +131,9 @@ export function estimatePdfAttachmentTokens(url: string): number {
     pageObjects += countPageObjects(decoded);
     treeCount = Math.max(treeCount, maxPageTreeCount(decoded));
   }
-  const pages = Math.max(pageObjects, treeCount);
+  // Providers reject documents over their page cap, so a count above it prices
+  // the same request the cap does — a page-like false positive cannot force an
+  // irreversible compaction out of a short document.
+  const pages = Math.min(Math.max(pageObjects, treeCount), PDF_MAX_PAGES_ESTIMATE);
   return (pages > 0 ? pages : PDF_MAX_PAGES_ESTIMATE) * PDF_TOKENS_PER_PAGE_ESTIMATE;
 }

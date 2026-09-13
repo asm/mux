@@ -617,6 +617,26 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         if (abortSignal?.aborted) {
           throw new Error("Interrupted");
         }
+        // Trust is re-read before EVERY launch: a revocation while an earlier
+        // create awaited must not let the remaining members of the group ship
+        // the project-derived prompt (possibly to another provider). Members
+        // already launched keep running on their stamped opening rows.
+        if (await contextProjectSkillContentWithheld(config)) {
+          if (createdTasks.length > 0) {
+            return parseToolResult(
+              TaskToolResultSchema,
+              buildPendingTaskResult({
+                tasks: createdTasks,
+                note:
+                  `Grouped task creation stopped after spawning ${createdTasks.length} of ${taskGroupCount} task(s): ${TASK_PROJECT_SKILL_CONTENT_WITHHELD_ERROR} ` +
+                  "Use task_await on the returned task metadata before retrying, or you may duplicate work.",
+                forceGrouped: taskGroupCount > 1,
+              }),
+              "task"
+            );
+          }
+          throw new Error(TASK_PROJECT_SKILL_CONTENT_WITHHELD_ERROR);
+        }
 
         const created = await taskService.create({
           parentWorkspaceId: workspaceId,
