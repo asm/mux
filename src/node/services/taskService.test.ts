@@ -505,6 +505,43 @@ describe("TaskService", () => {
     );
   });
 
+  test("an immediate launch stamps its opening row and entry with the launch context's provenance", async () => {
+    // A routed parent passing project-skill-derived text to a child: the
+    // child's first row must be classified like a group launch's, and the
+    // entry records that its title came from the same context (task_list).
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    stubStableIds(config, ["derived-child", "clean-child"]);
+    const workspaceMocks = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const derived = await createAgentTask(taskService, parentId, "Apply the conventions", {
+      carriesProjectSkillContent: true,
+    });
+    expect(derived.success).toBe(true);
+    expect(workspaceMocks.sendMessage).toHaveBeenLastCalledWith(
+      "derived-child",
+      "Apply the conventions",
+      expect.any(Object),
+      expect.objectContaining({ userRowCarriesProjectSkillContent: true })
+    );
+    expect(findWorkspaceInConfig(config, "derived-child")?.taskCarriesProjectSkillContent).toBe(
+      true
+    );
+
+    const clean = await createAgentTask(taskService, parentId, "Map the tooling");
+    expect(clean.success).toBe(true);
+    const cleanSend = (
+      workspaceMocks.sendMessage as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls.at(-1);
+    expect(cleanSend?.[3]).not.toHaveProperty("userRowCarriesProjectSkillContent");
+    expect(findWorkspaceInConfig(config, "clean-child")).not.toHaveProperty(
+      "taskCarriesProjectSkillContent"
+    );
+  });
+
   test("does not consume a terminal report from a request that never included it", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
@@ -5716,6 +5753,61 @@ describe("TaskService", () => {
     expect(started?.taskStatus).toBe("running");
   }, 20_000);
 
+  test("a queued launch keeps the launch context's provenance for its deferred start", async () => {
+    // The prompt waits in the config entry until a slot frees: the deferred
+    // sendMessage must stamp the opening row the way an immediate one does.
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.taskSettings = testTaskSettings(1, 3);
+      return cfg;
+    });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const running = await createAgentTask(taskService, parentId, "task 1");
+    expect(running.success).toBe(true);
+    if (!running.success) return;
+    const queued = await createAgentTask(taskService, parentId, "Apply the conventions", {
+      carriesProjectSkillContent: true,
+    });
+    expect(queued.success).toBe(true);
+    if (!queued.success) return;
+    expect(queued.data.status).toBe("queued");
+    const queuedEntry = findWorkspaceInConfig(config, queued.data.taskId);
+    expect(queuedEntry?.taskPrompt).toBe("Apply the conventions");
+    expect(queuedEntry?.taskCarriesProjectSkillContent).toBe(true);
+
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        const ws = project.workspaces.find((w) => w.id === running.data.taskId);
+        if (ws) ws.taskStatus = "reported";
+      }
+      return cfg;
+    });
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
+    );
+    try {
+      await taskService.initialize();
+      expect(sendMessage).toHaveBeenCalledWith(
+        queued.data.taskId,
+        "Apply the conventions",
+        expect.any(Object),
+        expect.objectContaining({
+          allowQueuedAgentTask: true,
+          userRowCarriesProjectSkillContent: true,
+        })
+      );
+    } finally {
+      runBackgroundInitSpy.mockRestore();
+    }
+    // The stamp outlives the consumed prompt: task_list still withholds the title.
+    expect(findWorkspaceInConfig(config, queued.data.taskId)?.taskCarriesProjectSkillContent).toBe(
+      true
+    );
+  }, 20_000);
+
   test("resumes accepted queued starts instead of replaying prompts", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = await createTestProject(rootDir);
@@ -10678,6 +10770,33 @@ describe("TaskService", () => {
       )
     ).toEqual(Ok({ title: "Simplicity Auditor" }));
     expect(updateTitle).toHaveBeenCalledWith(childTaskId, "Simplicity Auditor");
+    expect(
+      findWorkspaceInConfig(config, childTaskId)?.taskCarriesProjectSkillContent
+    ).toBeUndefined();
+
+    // A title authored from project skill content stamps the task, and the
+    // stamp is sticky: a later clean retitle cannot launder the earlier one
+    // (task_list reads the flag, not the current title's origin).
+    expect(
+      await taskService.retitleDescendantAgentTask(
+        parentWorkspaceId,
+        childTaskId,
+        "Convention Auditor",
+        {
+          carriesProjectSkillContent: true,
+        }
+      )
+    ).toEqual(Ok({ title: "Convention Auditor" }));
+    expect(findWorkspaceInConfig(config, childTaskId)?.taskCarriesProjectSkillContent).toBe(true);
+    expect(
+      await taskService.retitleDescendantAgentTask(parentWorkspaceId, childTaskId, "Auditor")
+    ).toEqual(Ok({ title: "Auditor" }));
+    expect(findWorkspaceInConfig(config, childTaskId)?.taskCarriesProjectSkillContent).toBe(true);
+    expect(
+      taskService
+        .listDescendantAgentTasks(parentWorkspaceId)
+        .find((task) => task.taskId === childTaskId)?.carriesProjectSkillContent
+    ).toBe(true);
   });
 
   test("retitleDescendantAgentTask rejects missing, foreign, self, and workflow-owned targets", async () => {

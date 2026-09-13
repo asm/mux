@@ -129,6 +129,10 @@ import {
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
 import {
+  attachmentsCarryProjectSkillContent,
+  excludeProjectSkillContentFromAttachments,
+} from "@/node/services/postCompactionAttachmentProvenance";
+import {
   buildStreamErrorEventData,
   createStreamErrorMessage,
   createUnknownSendMessageError,
@@ -906,37 +910,6 @@ interface RejectedTurnRepairOutcome {
 
 // ROUTED_SKILL_TRUST_REVOKED_MESSAGE moved to utils/sendMessageError.ts so
 // StreamManager's per-step consent gate can share it without an import cycle.
-
-/**
- * Loaded-skills attachments re-inject the scope AND body of every skill read
- * before the compaction boundary — a second channel for repository-controlled
- * content, independent of the snapshot rows the request scan sees.
- */
-function carriesProjectLoadedSkills(attachments: PostCompactionAttachment[] | null): boolean {
-  return (
-    attachments?.some(
-      (attachment) =>
-        attachment.type === "loaded_skills_snapshot" &&
-        attachment.skills.some((skill) => skill.scope === "project")
-    ) === true
-  );
-}
-
-/** Least-privilege counterpart: drop project-scope skills (and an emptied attachment). */
-function excludeProjectLoadedSkills(
-  attachments: PostCompactionAttachment[] | null
-): PostCompactionAttachment[] | null {
-  if (attachments === null) {
-    return null;
-  }
-  return attachments.flatMap((attachment): PostCompactionAttachment[] => {
-    if (attachment.type !== "loaded_skills_snapshot") {
-      return [attachment];
-    }
-    const skills = attachment.skills.filter((skill) => skill.scope !== "project");
-    return skills.length > 0 ? [{ ...attachment, skills }] : [];
-  });
-}
 
 /**
  * Project skill content a per-step consent gate context carries BEYOND the
@@ -1773,7 +1746,7 @@ export class AgentSession {
         if (eligible === null) return null;
         const attachments = await this.buildContinuousCompactionAttachments(eligible.rows);
         const swapAttachments = eligible.projectContentWithheld
-          ? (excludeProjectLoadedSkills(attachments) ?? [])
+          ? (excludeProjectSkillContentFromAttachments(attachments) ?? [])
           : attachments;
         return {
           ...prepared,
@@ -1792,7 +1765,7 @@ export class AgentSession {
             ? () => false
             : (rows: MuxMessage[]) =>
                 messagesCarryProjectSkillContent(rows) ||
-                carriesProjectLoadedSkills(swapAttachments),
+                attachmentsCarryProjectSkillContent(swapAttachments),
         };
       },
       summarize: async (head, signal, context: SessionCompactionContext) => {
@@ -10119,11 +10092,13 @@ export class AgentSession {
         // project skill the model read through the tool in an earlier turn
         // persists inside an assistant tool-result row, not in row metadata.
         let requestCarriesProjectContent = messagesCarryProjectSkillContent(requestMessages);
-        // Post-compaction loaded-skill attachments carry the same repository-
-        // controlled content by a different channel: once the original snapshot
-        // row sits behind the boundary, the history scan above no longer sees
-        // it, but the attachment still ships the project skill's body.
-        let attachmentsCarryProjectSkills = carriesProjectLoadedSkills(postCompactionAttachments);
+        // Post-compaction attachments carry the same repository-controlled
+        // content by a different channel: once the original snapshot row sits
+        // behind the boundary, the history scan above no longer sees it, but
+        // a loaded-skills attachment still ships the project skill's body and
+        // the completed-reports index the title of a report distilled from it.
+        let attachmentsCarryProjectSkills =
+          attachmentsCarryProjectSkillContent(postCompactionAttachments);
         if (
           (requestCarriesProjectContent || attachmentsCarryProjectSkills) &&
           memoryConsent?.excludeProjectSkillContent === true
@@ -10136,7 +10111,8 @@ export class AgentSession {
           // later routed send deterministically. Snapshot rows drop out; tool
           // results are redacted in place so the call/result pairing survives.
           requestMessages = withholdProjectSkillContentFromRequest(requestMessages);
-          postCompactionAttachments = excludeProjectLoadedSkills(postCompactionAttachments);
+          postCompactionAttachments =
+            excludeProjectSkillContentFromAttachments(postCompactionAttachments);
           log.warn("Excluding historical project skill content from routed request", {
             workspaceId: this.workspaceId,
           });
@@ -10162,7 +10138,7 @@ export class AgentSession {
       // request already withheld it above, so this scans the FINAL rows.
       const memoryWritesCarryProjectSkillContent =
         messagesCarryProjectSkillContent(requestMessages) ||
-        carriesProjectLoadedSkills(postCompactionAttachments);
+        attachmentsCarryProjectSkillContent(postCompactionAttachments);
 
       this.activeStreamHadPostCompactionInjection =
         postCompactionAttachments !== null && postCompactionAttachments.length > 0;

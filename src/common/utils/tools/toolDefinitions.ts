@@ -1634,6 +1634,8 @@ export const TaskListToolResultSchema = z
   .object({
     tasks: z.array(TaskListToolTaskSchema),
     note: z.string().optional(),
+    /** A listed title was authored from project skill content (kept under trust). */
+    carriesProjectSkillContent: z.boolean().optional(),
   })
   .strict();
 

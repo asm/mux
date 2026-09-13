@@ -750,6 +750,15 @@ describe("project skill content in persisted tool results", () => {
     expect(
       toolOutputCarriesProjectSkillContent("session_history", { success: true, items: [] })
     ).toBe(false);
+    // A task list is stamped when a listed title was authored from project
+    // skill content; a plain list (titles withheld or clean) is not.
+    expect(
+      toolOutputCarriesProjectSkillContent("task_list", {
+        tasks: [{ taskId: "t", status: "running", title: "Derived", depth: 1 }],
+        carriesProjectSkillContent: true,
+      })
+    ).toBe(true);
+    expect(toolOutputCarriesProjectSkillContent("task_list", { tasks: [] })).toBe(false);
     expect(
       toolOutputCarriesProjectSkillContent("intuition", {
         ...stamped,

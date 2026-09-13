@@ -581,6 +581,13 @@ export interface DescendantAgentTaskInfo {
   modelString?: string;
   thinkingLevel?: ThinkingLevel;
   bestOf?: WorkspaceMetadata["bestOf"];
+  /**
+   * The task's prompt or title was authored from a context carrying project
+   * skill content (WorkspaceConfigEntry.taskCarriesProjectSkillContent):
+   * task_list withholds the title from a turn that excludes such content and
+   * stamps its result otherwise.
+   */
+  carriesProjectSkillContent?: boolean;
   depth: number;
 }
 
@@ -3207,6 +3214,10 @@ export class TaskService implements AgentTaskIntegration {
                 bestOf: plan.bestOf,
                 taskStatus: plan.status,
                 taskPrompt: plan.start.kind === "sendMessage" ? plan.start.prompt : undefined,
+                ...(plan.start.kind === "sendMessage" &&
+                plan.start.carriesProjectSkillContent === true
+                  ? { taskCarriesProjectSkillContent: true }
+                  : {}),
                 taskTrunkBranch: trunkBranch,
                 taskModelString: plan.taskModelString,
                 taskThinkingLevel: plan.effectiveThinkingLevel,
@@ -4076,6 +4087,11 @@ export class TaskService implements AgentTaskIntegration {
               bestOf: normalizedBestOf,
               taskStatus: "queued",
               taskPrompt: prompt,
+              // The launch context's provenance survives the queue with the
+              // prompt: the deferred start stamps the opening row from it.
+              ...(args.carriesProjectSkillContent === true
+                ? { taskCarriesProjectSkillContent: true }
+                : {}),
               taskTrunkBranch: trunkBranch,
               taskModelString,
               taskThinkingLevel: effectiveThinkingLevel,
@@ -4257,6 +4273,11 @@ export class TaskService implements AgentTaskIntegration {
           workflowTask: args.workflowTask,
           bestOf: normalizedBestOf,
           taskStatus: "running",
+          // The launch context's provenance covers the title too (authored
+          // alongside the prompt): task_list withholds or stamps it.
+          ...(args.carriesProjectSkillContent === true
+            ? { taskCarriesProjectSkillContent: true }
+            : {}),
           taskTrunkBranch: trunkBranch,
           taskBaseCommitSha: taskBaseCommitSha ?? undefined,
           taskBaseCommitShaByProjectPath,
@@ -4365,7 +4386,8 @@ export class TaskService implements AgentTaskIntegration {
       );
     }
 
-    // Start immediately (counts towards parallel limit).
+    // Start immediately (counts towards parallel limit). The opening row
+    // carries the launch context's provenance like a group launch's does.
     const sendResult = await this.workspaceService
       .sendMessage(
         taskId,
@@ -4380,6 +4402,9 @@ export class TaskService implements AgentTaskIntegration {
         {
           acceptanceOrigin: "automatic",
           agentInitiated: true,
+          ...(args.carriesProjectSkillContent === true
+            ? { userRowCarriesProjectSkillContent: true }
+            : {}),
         }
       )
       .catch((error: unknown) => Err(getErrorMessage(error)));
@@ -4411,7 +4436,14 @@ export class TaskService implements AgentTaskIntegration {
   async retitleDescendantAgentTask(
     ancestorWorkspaceId: string,
     taskId: string,
-    title: string
+    title: string,
+    options?: {
+      /**
+       * The retitling context carried project skill content: the title is
+       * repository-derived text, so the task is stamped (sticky) for task_list.
+       */
+      carriesProjectSkillContent?: boolean;
+    }
   ): Promise<Result<RetitleAgentTaskResult, RetitleAgentTaskError>> {
     assert(ancestorWorkspaceId.length > 0, "retitleDescendantAgentTask: ancestor ID is required");
     assert(taskId.length > 0, "retitleDescendantAgentTask: task ID is required");
@@ -4436,6 +4468,11 @@ export class TaskService implements AgentTaskIntegration {
       const result = await this.workspaceService.updateTitle(taskId, trimmedTitle);
       if (!result.success) {
         return Err({ code: "update_failed" as const, message: result.error });
+      }
+      if (options?.carriesProjectSkillContent === true) {
+        await this.editWorkspaceEntry(taskId, (workspace) => {
+          workspace.taskCarriesProjectSkillContent = true;
+        });
       }
       return Ok({ title: trimmedTitle });
     });
@@ -9538,6 +9575,9 @@ export class TaskService implements AgentTaskIntegration {
           modelString: entry.aiSettings?.model,
           thinkingLevel: entry.aiSettings?.thinkingLevel,
           ...(entry.bestOf != null ? { bestOf: { ...entry.bestOf } } : {}),
+          ...(entry.taskCarriesProjectSkillContent === true
+            ? { carriesProjectSkillContent: true }
+            : {}),
           depth: next.depth,
         });
       }
@@ -10506,7 +10546,13 @@ export class TaskService implements AgentTaskIntegration {
 
         const queuedPrompt = coerceNonEmptyString(task.taskPrompt);
         const start: TaskLaunchStart = queuedPrompt
-          ? { kind: "sendMessage", prompt: queuedPrompt }
+          ? {
+              kind: "sendMessage",
+              prompt: queuedPrompt,
+              ...(task.taskCarriesProjectSkillContent === true
+                ? { carriesProjectSkillContent: true }
+                : {}),
+            }
           : { kind: "resumeStream" };
         if (start.kind === "resumeStream") {
           // Older queued task records stored the initial prompt only in chat history.

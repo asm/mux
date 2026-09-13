@@ -5,6 +5,7 @@ import { readSubagentGitPatchArtifact } from "@/node/services/subagentGitPatchAr
 import { toolExcludesProjectSkillContent } from "@/node/services/tools/projectSkillContentGate";
 import {
   applyTaskReportProvenance,
+  taskReportWithheld,
   workspaceHistoryCarriesProjectSkillContent,
 } from "@/node/services/tools/taskReportProvenance";
 import { WorkflowRunRecordSchema } from "@/common/orpc/schemas";
@@ -828,6 +829,10 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             });
 
             const gitFormatPatch = await readGitFormatPatchArtifact(taskId);
+            const provenance = {
+              carries: report.carriesProjectSkillContent === true,
+              excludes: await toolExcludesProjectSkillContent(config),
+            };
             return {
               status: "completed" as const,
               taskId,
@@ -837,15 +842,16 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
                   structuredOutput: report.structuredOutput,
                   title: report.title,
                 },
-                {
-                  carries: report.carriesProjectSkillContent === true,
-                  excludes: await toolExcludesProjectSkillContent(config),
-                }
+                provenance
               ),
               ...(report.model != null ? { modelString: report.model } : {}),
               ...(report.thinkingLevel != null ? { thinkingLevel: report.thinkingLevel } : {}),
               ...getAgentTaskElapsedField(taskId),
-              ...(gitFormatPatch ? { artifacts: { gitFormatPatch } } : {}),
+              // The patch can embed the same derived text (a commit message, a
+              // file the child wrote): withheld together with the report.
+              ...(gitFormatPatch && !taskReportWithheld(provenance)
+                ? { artifacts: { gitFormatPatch } }
+                : {}),
               note: COMPLETED_REPORT_REFETCH_NOTE,
             };
           } catch (error: unknown) {
@@ -866,27 +872,32 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           });
 
           const gitFormatPatch = await readGitFormatPatchArtifact(taskId);
+          // Provenance persisted with the report (TaskService reads a legacy
+          // report as carrying): withheld when this turn excludes project
+          // skill content, stamped otherwise.
+          const provenance = {
+            carries: report.carriesProjectSkillContent === true,
+            excludes: await toolExcludesProjectSkillContent(config),
+          };
           return {
             status: "completed" as const,
             taskId,
-            // Provenance persisted with the report (TaskService reads a legacy
-            // report as carrying): withheld when this turn excludes project
-            // skill content, stamped otherwise.
             ...applyTaskReportProvenance(
               {
                 reportMarkdown: report.reportMarkdown,
                 structuredOutput: report.structuredOutput,
                 title: report.title,
               },
-              {
-                carries: report.carriesProjectSkillContent === true,
-                excludes: await toolExcludesProjectSkillContent(config),
-              }
+              provenance
             ),
             ...(report.model != null ? { modelString: report.model } : {}),
             ...(report.thinkingLevel != null ? { thinkingLevel: report.thinkingLevel } : {}),
             ...getAgentTaskElapsedField(taskId),
-            ...(gitFormatPatch ? { artifacts: { gitFormatPatch } } : {}),
+            // The patch can embed the same derived text (a commit message, a
+            // file the child wrote): withheld together with the report.
+            ...(gitFormatPatch && !taskReportWithheld(provenance)
+              ? { artifacts: { gitFormatPatch } }
+              : {}),
             note: COMPLETED_REPORT_REFETCH_NOTE,
           };
         } catch (error: unknown) {

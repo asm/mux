@@ -710,6 +710,66 @@ describe("task_await tool", () => {
     });
   });
 
+  it("withholds the gitFormatPatch artifact together with a withheld report", async () => {
+    // The patch can embed the same derived text as the report (a commit
+    // message, a file the child wrote): a turn that excludes project skill
+    // content gets neither, while a trusted turn gets both, stamped.
+    const run = async (excludeProjectSkillContent: boolean) => {
+      using tempDir = new TestTempDir("test-task-await-tool-withheld-artifacts");
+      const baseConfig = {
+        ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
+        historyService: history.historyService,
+      };
+      const artifactsPath = getSubagentGitPatchArtifactsFilePath(baseConfig.workspaceSessionDir!);
+      const gitFormatPatch = {
+        childTaskId: "t1",
+        parentWorkspaceId: "parent-workspace",
+        createdAtMs: 123,
+        status: "ready",
+        projectArtifacts: [],
+        readyProjectCount: 0,
+        failedProjectCount: 0,
+        skippedProjectCount: 0,
+        totalCommitCount: 0,
+      };
+      const taskService = {
+        listActiveDescendantAgentTaskIds: mock(() => []),
+        isDescendantAgentTask: mock(() => Promise.resolve(true)),
+        waitForAgentReport: mock(async (taskId: string) => {
+          await fs.promises.writeFile(
+            artifactsPath,
+            JSON.stringify({ version: 2, artifactsByChildTaskId: { [taskId]: gitFormatPatch } }),
+            "utf-8"
+          );
+          return { reportMarkdown: "Applied the conventions", carriesProjectSkillContent: true };
+        }),
+      } as unknown as TaskService;
+      const tool = createTaskAwaitTool({
+        ...baseConfig,
+        taskService,
+        ...(excludeProjectSkillContent ? { excludeProjectSkillContent: true } : {}),
+      });
+      return (await Promise.resolve(tool.execute!({ task_ids: ["t1"] }, mockToolCallOptions))) as {
+        results: Array<Record<string, unknown>>;
+      };
+    };
+
+    const trusted = await run(false);
+    expect(trusted.results[0]).toMatchObject({
+      status: "completed",
+      reportMarkdown: "Applied the conventions",
+      carriesProjectSkillContent: true,
+    });
+    expect(trusted.results[0]).toHaveProperty("artifacts");
+    const excluded = await run(true);
+    expect(excluded.results[0]).toMatchObject({
+      status: "completed",
+      reportMarkdown: TASK_REPORT_WITHHELD_MESSAGE,
+    });
+    expect(excluded.results[0]).not.toHaveProperty("artifacts");
+    expect(excluded.results[0]).not.toHaveProperty("carriesProjectSkillContent");
+  });
+
   it("normalizes version 1 gitFormatPatch artifacts into a one-project patch set", async () => {
     using tempDir = new TestTempDir("test-task-await-tool-v1-artifacts");
     const baseConfig = {

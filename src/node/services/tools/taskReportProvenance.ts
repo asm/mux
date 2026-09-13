@@ -28,6 +28,15 @@ export async function workspaceHistoryCarriesProjectSkillContent(
 }
 
 /**
+ * Whether a report is withheld from the turn: its context carried project
+ * skill content the turn must not carry. Artifacts distilled from the same
+ * context (a git patch whose commits embed the derived text) share the verdict.
+ */
+export function taskReportWithheld(provenance: { carries: boolean; excludes: boolean }): boolean {
+  return provenance.carries && provenance.excludes;
+}
+
+/**
  * A completed report in a tool result: withheld (text, title and structured
  * output replaced) when the turn excludes project skill content the report's
  * context carried, stamped `carriesProjectSkillContent` otherwise so the
