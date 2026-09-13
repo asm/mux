@@ -68,6 +68,24 @@ describe("estimatePdfAttachmentTokens", () => {
     expect(estimatePdfAttachmentTokens(url)).toBe(40 * PDF_TOKENS_PER_PAGE_ESTIMATE);
   });
 
+  it("scans the object streams even when a raw page object is visible", () => {
+    // A hybrid or incrementally saved document: one page dictionary sits raw
+    // while the page tree and the other pages live in object streams. The raw
+    // source alone would price a 60-page document as one page and let the
+    // pre-send check skip a compaction the provider then demands.
+    const compressedPages = Array.from(
+      { length: 59 },
+      (_, index) => `${index + 3} 0 << /Type /Page /Parent 1 0 R >>`
+    ).join("\n");
+    const pdf = Buffer.concat([
+      Buffer.from("%PDF-1.5\n2 0 obj\n<< /Type /Page /Parent 1 0 R >>\nendobj\n", "latin1"),
+      flateObjectStream(100, "1 0 << /Type /Pages /Kids [] /Count 60 >>"),
+      flateObjectStream(101, compressedPages),
+      Buffer.from("%%EOF\n", "latin1"),
+    ]);
+    expect(estimatePdfAttachmentTokens(pdfDataUrl(pdf))).toBe(60 * PDF_TOKENS_PER_PAGE_ESTIMATE);
+  });
+
   it("uses the page tree count when the page objects themselves are not visible", () => {
     const pdf = "%PDF-1.5\n1 0 obj\n<< /Type /Pages /Kids [2 0 R] /Count 12 >>\nendobj\n";
     expect(estimatePdfAttachmentTokens(pdfDataUrl(pdf))).toBe(12 * PDF_TOKENS_PER_PAGE_ESTIMATE);

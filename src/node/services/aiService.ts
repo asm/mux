@@ -304,6 +304,7 @@ export class AIService extends EventEmitter {
       // Hot preloading is a sub-experiment: without it, memories stay
       // pull-based like skills (index only, contents fetched on demand).
       let hotMemoriesBlock: string | null = null;
+      let hotMemoriesCarryProjectSkillContent = false;
       if (
         options?.includeHotMemories !== false &&
         this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET) === true
@@ -332,6 +333,9 @@ export class AIService extends EventEmitter {
               : formatHotMemoriesBlock(items, {
                   flushPreload: options?.onlyContextNotes === true,
                 });
+          hotMemoriesCarryProjectSkillContent = items.some(
+            (item) => item.carriesProjectSkillContent === true
+          );
         } catch (error) {
           // Hot preloading is best-effort context. Preserve the pull-based
           // memory index when tokenizer setup or ranked selection fails.
@@ -344,9 +348,12 @@ export class AIService extends EventEmitter {
       return {
         indexEntries,
         hotMemoriesBlock,
-        // Preloaded files are a subset of the index, so the index provenance
-        // covers both channels.
-        carriesProjectSkillContent: indexEntries.some((entry) => entry.carriesProjectSkillContent),
+        // Preloaded files are a subset of the index, but a file's provenance is
+        // re-checked at its preload read (it can turn tainted after the index
+        // snapshot), so both channels contribute.
+        carriesProjectSkillContent:
+          indexEntries.some((entry) => entry.carriesProjectSkillContent) ||
+          hotMemoriesCarryProjectSkillContent,
       };
     } catch (error) {
       // Self-healing: memory context is best-effort, never a stream blocker.

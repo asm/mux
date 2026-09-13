@@ -1169,6 +1169,108 @@ describe("MemoryService", () => {
       }
     });
 
+    it("reads index provenance and descriptions under the store lock, so a tainted rewrite cannot pair new content with the old clean marker", async () => {
+      using fixture = await createFixture("ws-index-race");
+      await fixture.service.create(
+        fixture.ctx,
+        "/memories/global/racy.md",
+        "---\ndescription: clean facts\n---\nclean",
+        "agent"
+      );
+      const realGetEntries = fixture.metaService.getEntries.bind(fixture.metaService);
+      let releaseSnapshot!: () => void;
+      const snapshotHeld = new Promise<void>((resolve) => {
+        releaseSnapshot = resolve;
+      });
+      let snapshotTaken!: () => void;
+      const snapshotReached = new Promise<void>((resolve) => {
+        snapshotTaken = resolve;
+      });
+      const spy = spyOn(fixture.metaService, "getEntries").mockImplementationOnce(async () => {
+        const snapshot = await realGetEntries();
+        snapshotTaken();
+        await snapshotHeld;
+        return snapshot;
+      });
+      try {
+        const listing = fixture.service.listIndexEntries(fixture.ctx);
+        await snapshotReached;
+        // Requested while the listing holds the lock: the rewrite (stamp, then
+        // content) lands only after the descriptions were read.
+        const tainted = {
+          ...fixture.ctx,
+          writeProvenance: { carriesProjectSkillContent: true as const },
+        };
+        const rewrite = fixture.service.strReplace(
+          tainted,
+          "/memories/global/racy.md",
+          "clean facts",
+          "from a skill",
+          "agent"
+        );
+        releaseSnapshot();
+        const entries = await listing;
+        expect(entries.find((entry) => entry.path === "/memories/global/racy.md")).toMatchObject({
+          description: "clean facts",
+          carriesProjectSkillContent: false,
+        });
+        expect((await rewrite).success).toBe(true);
+        expect(
+          (await fixture.service.listIndexEntries(fixture.ctx)).find(
+            (entry) => entry.path === "/memories/global/racy.md"
+          )
+        ).toMatchObject({ description: "from a skill", carriesProjectSkillContent: true });
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("re-checks a preloaded file's provenance at its read, so a file that turned tainted after the index snapshot is withheld or flagged", async () => {
+      using fixture = await createFixture("ws-hot-race");
+      for (const name of ["a.md", "b.md"]) {
+        await fixture.service.create(
+          fixture.ctx,
+          `/memories/global/${name}`,
+          "clean facts",
+          "agent"
+        );
+        await fixture.metaService.setPinned(`global:${name}`, true);
+      }
+      const taintAfterSnapshot = ["a.md", "b.md"];
+      const realList = fixture.service.listIndexEntries.bind(fixture.service);
+      const spy = spyOn(fixture.service, "listIndexEntries").mockImplementation(async (ctx) => {
+        const entries = await realList(ctx);
+        // Another writer stamps and replaces a file between the index snapshot
+        // and the preload reads.
+        const name = taintAfterSnapshot.shift();
+        if (name !== undefined) {
+          await fixture.metaService.markCarriesProjectSkillContent(`global:${name}`);
+          await fsPromises.writeFile(
+            path.join(fixture.xumHome, "memory", "global", name),
+            "quotes a skill"
+          );
+        }
+        return entries;
+      });
+      try {
+        const countTokens = () => Promise.resolve(1);
+        // a.md turns tainted after the excluding turn's snapshot: withheld at its read.
+        const excluding = await fixture.service.listHotMemories(fixture.ctx, {
+          countTokens,
+          excludeProjectSkillContent: true,
+        });
+        expect(excluding.map((item) => item.path)).toEqual(["/memories/global/b.md"]);
+        // b.md turns tainted after the trusted turn's snapshot: preloaded, flagged.
+        const trusted = await fixture.service.listHotMemories(fixture.ctx, { countTokens });
+        expect(trusted.find((item) => item.path === "/memories/global/b.md")).toMatchObject({
+          content: "quotes a skill",
+          carriesProjectSkillContent: true,
+        });
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
     it("records project skill provenance for tainted writes and exposes it to the index and hot set", async () => {
       // Provenance rides the scope context of the writer (harvest of a trusted
       // project-skill epoch, sweep over such an inbox, tainted chat turn): the

@@ -30,10 +30,12 @@ function maxPageTreeCount(text: string): number {
 }
 
 /**
- * Decoded contents of the document's FlateDecode streams: modern writers keep
- * page dictionaries in compressed object streams, where a raw scan sees none.
- * Bounded; streams that do not inflate (encrypted, other filters, corrupt)
- * are skipped.
+ * Decoded contents of the document's FlateDecode object streams (`/Type
+ * /ObjStm`): modern writers keep page dictionaries there, where a raw scan
+ * sees none. Only object streams can hold page dictionaries — content and
+ * image streams never do — so they are the only streams inflated, which keeps
+ * the always-on scan cheap. Bounded; streams that do not inflate (encrypted,
+ * other filters, corrupt) are skipped.
  */
 function inflatedStreams(bytes: Buffer, text: string): string[] {
   const inflated: string[] = [];
@@ -51,7 +53,7 @@ function inflatedStreams(bytes: Buffer, text: string): string[] {
       Math.max(0, keywordAt - STREAM_DICTIONARY_WINDOW_CHARS),
       keywordAt
     );
-    if (!dictionary.includes("/FlateDecode")) continue;
+    if (!dictionary.includes("/ObjStm") || !dictionary.includes("/FlateDecode")) continue;
     let dataStart = keywordAt + "stream".length;
     if (text[dataStart] === "\r") dataStart++;
     if (text[dataStart] === "\n") dataStart++;
@@ -72,12 +74,12 @@ function inflatedStreams(bytes: Buffer, text: string): string[] {
  * Conservative token cost of a PDF attachment. Providers bill a PDF per page
  * (extracted text plus a page image), so pages are priced at the per-page
  * upper bound. Page objects are counted in the raw bytes together with the
- * page tree's `/Count`; when neither is visible the FlateDecode streams are
- * inflated (object streams hold the page dictionaries of most modern PDFs)
- * and scanned the same way. When no source recovers a page count, the
- * provider's page cap is assumed: a compressed byte size cannot bound a page
- * count, and under-estimating lets the pre-send check skip compaction only to
- * fail at dispatch.
+ * page tree's `/Count`, and the FlateDecode object streams (which hold the
+ * page dictionaries of most modern PDFs) are inflated and scanned the same
+ * way whether or not a raw source is visible. When no source recovers a page
+ * count, the provider's page cap is assumed: a compressed byte size cannot
+ * bound a page count, and under-estimating lets the pre-send check skip
+ * compaction only to fail at dispatch.
  */
 export function estimatePdfAttachmentTokens(url: string): number {
   if (!url.startsWith("data:")) return IMAGE_TOKEN_ESTIMATE;
@@ -89,14 +91,16 @@ export function estimatePdfAttachmentTokens(url: string): number {
   const text = bytes.toString("latin1");
   let pageObjects = countPageObjects(text);
   let treeCount = maxPageTreeCount(text);
-  if (pageObjects === 0 && treeCount === 0) {
-    for (const decoded of inflatedStreams(bytes, text)) {
-      // Page objects are summed across streams (each dictionary lives in
-      // exactly one); the tree count is a maximum. The two sources are
-      // compared once below, never added to each other.
-      pageObjects += countPageObjects(decoded);
-      treeCount = Math.max(treeCount, maxPageTreeCount(decoded));
-    }
+  // A hybrid or incrementally saved document keeps some page dictionaries raw
+  // and the rest — or the active page tree — in object streams, so a visible
+  // raw source does not make the streams redundant: they are always scanned.
+  // Page objects are summed across the raw bytes and every stream (each
+  // dictionary lives in one place; an incremental update that rewrote a page
+  // counts it twice, which only over-estimates); the tree count is a maximum.
+  // The two sources are compared once below, never added to each other.
+  for (const decoded of inflatedStreams(bytes, text)) {
+    pageObjects += countPageObjects(decoded);
+    treeCount = Math.max(treeCount, maxPageTreeCount(decoded));
   }
   const pages = Math.max(pageObjects, treeCount);
   return (pages > 0 ? pages : PDF_MAX_PAGES_ESTIMATE) * PDF_TOKENS_PER_PAGE_ESTIMATE;

@@ -8111,7 +8111,14 @@ export class TaskService implements AgentTaskIntegration {
   async reportAgentProgress(
     childWorkspaceId: string,
     toolCallId: string,
-    report: { reportMarkdown: string; title?: string; structuredOutput?: unknown }
+    report: { reportMarkdown: string; title?: string; structuredOutput?: unknown },
+    options?: {
+      /**
+       * The child's live per-stream provenance at the call: a project skill
+       * read earlier in the SAME stream is not in its committed history yet.
+       */
+      carriesProjectSkillContent?: boolean;
+    }
   ): Promise<void> {
     assert(childWorkspaceId.length > 0, "reportAgentProgress requires childWorkspaceId");
     assert(toolCallId.length > 0, "reportAgentProgress requires toolCallId");
@@ -8229,9 +8236,11 @@ export class TaskService implements AgentTaskIntegration {
         parentEntry,
         content: reportContent,
         // The update is distilled from the child's context: the wake row carries
-        // its provenance like the terminal report row does.
+        // its provenance like the terminal report row does. The caller's live
+        // verdict covers the current stream; the scan, the child's history.
         userRowCarriesProjectSkillContent:
-          await this.reportCarriesProjectSkillContent(childWorkspaceId),
+          options?.carriesProjectSkillContent === true ||
+          (await this.reportCarriesProjectSkillContent(childWorkspaceId)),
         queueDedupeKey: `${dedupePrefix}${toolCallId}`,
         // Only the queue head's dispatch mode can cut the parent's stream. A child's earlier
         // ancestor-bound peer message (turn-end by default) at the head would otherwise hold this
@@ -12730,11 +12739,13 @@ export class TaskService implements AgentTaskIntegration {
       reportArgs
     );
 
+    // Same classification the persisted artifact received (the child's
+    // history still exists at this point); the kernel event below shares it.
+    const reportCarriesProjectSkillContent =
+      await this.reportCarriesProjectSkillContent(childWorkspaceId);
     const hadForegroundWaiters = this.resolveWaiters(childWorkspaceId, {
       ...reportArgs,
-      // Same classification the persisted artifact received (the child's
-      // history still exists at this point).
-      carriesProjectSkillContent: await this.reportCarriesProjectSkillContent(childWorkspaceId),
+      carriesProjectSkillContent: reportCarriesProjectSkillContent,
       model: latestChildEntry?.workspace.taskModelString,
       thinkingLevel: latestChildEntry?.workspace.taskThinkingLevel,
     });
@@ -12753,6 +12764,10 @@ export class TaskService implements AgentTaskIntegration {
           taskId: childWorkspaceId,
           status: "completed",
           reportMarkdown: reportArgs.reportMarkdown,
+          // The queue is another channel for the report: the verdict rides the
+          // event so a drain by a turn that excludes project skill content is
+          // withheld and a trusted drain taints the kernel (SandboxMount).
+          carriesProjectSkillContent: reportCarriesProjectSkillContent,
         })
         .catch((error: unknown) => {
           log.warn("Failed to post task terminal event to sandbox mount", {
@@ -13723,11 +13738,22 @@ export class TaskService implements AgentTaskIntegration {
   /**
    * Provenance of a child's report: its whole active context is what the
    * report distills, so any project skill content there taints the report;
-   * an unreadable child history reads as carrying (fail closed).
+   * an unreadable child history reads as carrying (fail closed). The child's
+   * open partial counts too: a progress update is sent while its row is still
+   * open, and stream-end settlement runs concurrently with the session's
+   * commit of the ended stream's row.
    */
   private async reportCarriesProjectSkillContent(childWorkspaceId: string): Promise<boolean> {
     const childHistory = await this.historyService.getHistoryFromLatestBoundary(childWorkspaceId);
-    return !childHistory.success || messagesCarryProjectSkillContent(childHistory.data);
+    if (!childHistory.success || messagesCarryProjectSkillContent(childHistory.data)) return true;
+    try {
+      const partial = await this.historyService.readPartial(childWorkspaceId, {
+        throwOnError: true,
+      });
+      return partial !== null && messagesCarryProjectSkillContent([partial]);
+    } catch {
+      return true;
+    }
   }
 
   private async tryFinalizePendingTaskToolCallInPartial(

@@ -1832,74 +1832,93 @@ export class MemoryService extends EventEmitter {
    */
   async listIndexEntries(ctx: MemoryScopeContext): Promise<MemoryIndexEntry[]> {
     const entries: MemoryIndexEntry[] = [];
-    // Sidecar provenance rides the index so prompt injection and hot-set
-    // selection can withhold tainted files without a second enumeration.
-    const meta = await this.metaService.getEntries();
     for (const scope of MEMORY_SCOPES) {
       try {
         const store = this.getStore(ctx, scope);
         // Read-only enumeration (stream startup, Memory tab) must not create
         // scope roots unnecessarily. Missing roots list as empty.
         await store.assertRootSafe();
-        const files = await store.listFiles();
-        if (files.length > MEMORY_MAX_FILES_PER_SCOPE) {
-          // Files can be edited outside MemoryService; honor the cap at
-          // enumeration so a degenerate directory cannot force thousands of
-          // per-file reads on stream startup. The context-notes slot is exempt
-          // from the cap on write (writePinnedFile), so it must survive the cut
-          // too or the flush handoff would vanish from the next window's index.
-          log.debug("[MemoryService] truncating memory index to the per-scope cap", { scope });
-          // The bounded walk may have stopped before reaching the notes: probe them
-          // directly. lstat (not store.kind, which follows symlinks) so the probe
-          // admits exactly what the walk's dirent filter would: a regular file. A
-          // symlinked notes slot must not smuggle an out-of-root file into the index.
-          const keepNotes =
-            scope === CONTEXT_NOTES.scope &&
-            (await fsPromises
-              .lstat(store.physicalPath(CONTEXT_NOTES.relPath))
-              .then((stat) => stat.isFile())
-              .catch(() => false));
-          files.length = MEMORY_MAX_FILES_PER_SCOPE - (keepNotes ? 1 : 0);
-          if (keepNotes && !files.includes(CONTEXT_NOTES.relPath))
-            files.push(CONTEXT_NOTES.relPath);
-        }
-        for (const relPath of files) {
-          // Filenames are attacker-controlled: only index paths the memory tool
-          // itself would accept (rejects control chars, traversal,
-          // etc.), so a hostile name can never break out of its index line.
-          try {
-            parseMemoryPath(toVirtualPath(scope, relPath));
-          } catch {
-            log.debug("[MemoryService] skipping unaddressable file in memory index", {
-              scope,
-            });
-            continue;
-          }
-          let description = "";
-          try {
-            // Bounded prefix read: files can bypass service write caps when
-            // edited outside Xum, and this runs on every memory-enabled stream startup.
-            description = extractMemoryDescription(
-              await store.readFilePrefix(relPath, MEMORY_INDEX_DESCRIPTION_PREFIX_BYTES)
-            );
-          } catch {
-            // Unreadable file: list it without a description.
-          }
-          const key = this.logicalKeyFor(ctx, scope, relPath);
-          entries.push({
-            path: toVirtualPath(scope, relPath),
-            scope,
-            relPath,
-            description,
-            // Unknown provenance (legacy entry, never-classified file) is tainted.
-            carriesProjectSkillContent: memoryEntryCarriesProjectSkillContent(
-              key === null ? undefined : meta.get(key)
-            ),
-          });
-        }
+        // Enumeration, descriptions and the sidecar snapshot are read under the
+        // store's mutation lock: writers stamp the sidecar and replace the file
+        // inside it, so an index line can never pair the description of freshly
+        // tainted content with the verified-clean marker of the content it
+        // replaced (a routed turn without trust would preload it).
+        entries.push(
+          ...(await withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), () =>
+            this.listScopeIndexEntries(ctx, scope, store)
+          ))
+        );
       } catch (error) {
         log.debug("[MemoryService] skipping scope in memory index", { scope, error });
       }
+    }
+    return entries;
+  }
+
+  /** One scope's index lines; the caller holds the store's mutation lock. */
+  private async listScopeIndexEntries(
+    ctx: MemoryScopeContext,
+    scope: MemoryScope,
+    store: MemoryStore
+  ): Promise<MemoryIndexEntry[]> {
+    const entries: MemoryIndexEntry[] = [];
+    // Sidecar provenance rides the index so prompt injection and hot-set
+    // selection can withhold tainted files without a second enumeration.
+    const meta = await this.metaService.getEntries();
+    const files = await store.listFiles();
+    if (files.length > MEMORY_MAX_FILES_PER_SCOPE) {
+      // Files can be edited outside MemoryService; honor the cap at
+      // enumeration so a degenerate directory cannot force thousands of
+      // per-file reads on stream startup. The context-notes slot is exempt
+      // from the cap on write (writePinnedFile), so it must survive the cut
+      // too or the flush handoff would vanish from the next window's index.
+      log.debug("[MemoryService] truncating memory index to the per-scope cap", { scope });
+      // The bounded walk may have stopped before reaching the notes: probe them
+      // directly. lstat (not store.kind, which follows symlinks) so the probe
+      // admits exactly what the walk's dirent filter would: a regular file. A
+      // symlinked notes slot must not smuggle an out-of-root file into the index.
+      const keepNotes =
+        scope === CONTEXT_NOTES.scope &&
+        (await fsPromises
+          .lstat(store.physicalPath(CONTEXT_NOTES.relPath))
+          .then((stat) => stat.isFile())
+          .catch(() => false));
+      files.length = MEMORY_MAX_FILES_PER_SCOPE - (keepNotes ? 1 : 0);
+      if (keepNotes && !files.includes(CONTEXT_NOTES.relPath)) files.push(CONTEXT_NOTES.relPath);
+    }
+    for (const relPath of files) {
+      // Filenames are attacker-controlled: only index paths the memory tool
+      // itself would accept (rejects control chars, traversal,
+      // etc.), so a hostile name can never break out of its index line.
+      try {
+        parseMemoryPath(toVirtualPath(scope, relPath));
+      } catch {
+        log.debug("[MemoryService] skipping unaddressable file in memory index", {
+          scope,
+        });
+        continue;
+      }
+      let description = "";
+      try {
+        // Bounded prefix read: files can bypass service write caps when
+        // edited outside Xum, and this runs on every memory-enabled stream startup.
+        description = extractMemoryDescription(
+          await store.readFilePrefix(relPath, MEMORY_INDEX_DESCRIPTION_PREFIX_BYTES)
+        );
+      } catch {
+        // Unreadable file: list it without a description.
+      }
+      const key = this.logicalKeyFor(ctx, scope, relPath);
+      entries.push({
+        path: toVirtualPath(scope, relPath),
+        scope,
+        relPath,
+        description,
+        // Unknown provenance (legacy entry, never-classified file) is tainted.
+        carriesProjectSkillContent: memoryEntryCarriesProjectSkillContent(
+          key === null ? undefined : meta.get(key)
+        ),
+      });
     }
     return entries;
   }
@@ -1944,7 +1963,8 @@ export class MemoryService extends EventEmitter {
         carriesProjectSkillContent: entry.carriesProjectSkillContent,
       };
     });
-    return selectHotMemories({
+    const taintedPaths = new Set<string>();
+    const items = await selectHotMemories({
       candidates,
       countTokens: options.countTokens,
       tokenBudgetActive: options.tokenBudgetActive,
@@ -1952,16 +1972,37 @@ export class MemoryService extends EventEmitter {
       readFile: (virtualPath) => {
         const parsed = parseMemoryPath(virtualPath);
         const scope = this.requireFilePath(parsed, virtualPath);
-        // Paths come from listIndexEntries (already enumerated under the scope
-        // roots), so no extra containment walk is needed for these reads.
-        // Bounded prefix: selection truncates to MEMORY_HOT_SET_MAX_ITEM_BYTES
-        // anyway; +1 byte preserves its over-budget (truncation marker) check.
-        return this.getStore(ctx, scope).readFilePrefix(
-          parsed.relPath,
-          MEMORY_HOT_SET_MAX_ITEM_BYTES + 1
-        );
+        const store = this.getStore(ctx, scope);
+        // The index snapshot above is stale by the time a candidate is read: a
+        // tainted write landing in between would preload the new content under
+        // the old verified-clean classification. Marker check and read run
+        // under the store's mutation lock (writers stamp and replace inside
+        // it): a turn that excludes project skill content skips a file that
+        // turned tainted, a trusted turn flags the item. Paths come from
+        // listIndexEntries (already enumerated under the scope roots), so no
+        // extra containment walk is needed for these reads.
+        return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
+          const key = this.logicalKeyFor(ctx, scope, parsed.relPath);
+          const carries = memoryEntryCarriesProjectSkillContent(
+            key === null ? undefined : (await this.metaService.getEntries()).get(key)
+          );
+          if (carries) {
+            if (options.excludeProjectSkillContent === true) {
+              throw new MemoryCommandError(MEMORY_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE);
+            }
+            taintedPaths.add(virtualPath);
+          }
+          // Bounded prefix: selection truncates to MEMORY_HOT_SET_MAX_ITEM_BYTES
+          // anyway; +1 byte preserves its over-budget (truncation marker) check.
+          return store.readFilePrefix(parsed.relPath, MEMORY_HOT_SET_MAX_ITEM_BYTES + 1);
+        });
       },
     });
+    return items.map((item) =>
+      taintedPaths.has(item.path) && item.carriesProjectSkillContent !== true
+        ? { ...item, carriesProjectSkillContent: true }
+        : item
+    );
   }
 }
 

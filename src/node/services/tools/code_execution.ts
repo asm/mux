@@ -83,6 +83,8 @@ interface DispatchState {
   withMount: MountRunner | undefined;
   /** Host file loader backing mux.load (kernel mode only); see KernelBridgeOptions. */
   loadFile: KernelFileLoader | undefined;
+  /** See CodeExecutionToolOptions.excludesProjectSkillContent. */
+  excludesProjectSkillContent: (() => Promise<boolean>) | undefined;
 }
 
 /** Model-visible replacement for an offloaded oversized value. */
@@ -492,6 +494,13 @@ export interface CodeExecutionToolOptions {
    * API" rule as kernelFirst.
    */
   loadFile?: KernelFileLoader;
+  /**
+   * Whether the calling turn must leave project skill content out of what the
+   * kernel returns (see toolExcludesProjectSkillContent): a queued child
+   * report distilled from it is then withheld at drain. Re-read at each call
+   * so a trust revocation between assembly and the call is honored.
+   */
+  excludesProjectSkillContent?: () => Promise<boolean>;
 }
 
 export async function createCodeExecutionTool(
@@ -502,7 +511,12 @@ export async function createCodeExecutionTool(
   options?: CodeExecutionToolOptions
 ): Promise<Tool> {
   const bridgeableTools = toolBridge.getBridgeableTools();
-  const state: DispatchState = { toolBridge, withMount, loadFile: options?.loadFile };
+  const state: DispatchState = {
+    toolBridge,
+    withMount,
+    loadFile: options?.loadFile,
+    excludesProjectSkillContent: options?.excludesProjectSkillContent,
+  };
 
   // Kernel mode = persistent mount available (RLM experiment, or the
   // XUM_SANDBOX_PERSISTENT_MOUNTS dev override that rides the same path).
@@ -597,7 +611,12 @@ ${xumTypes}
     ): Promise<PTCExecutionResult> => {
       const execStartTime = Date.now();
 
-      const { toolBridge: activeBridge, withMount: activeMount, loadFile: activeLoadFile } = state;
+      const {
+        toolBridge: activeBridge,
+        withMount: activeMount,
+        loadFile: activeLoadFile,
+        excludesProjectSkillContent,
+      } = state;
 
       // Mirrors the creation-time loadEnabled gate.
       const loadActive =
@@ -655,6 +674,14 @@ ${xumTypes}
           // are a finite per-context budget; see QuickJSRuntime), so this is
           // cheap and idempotent. Persistent mounts get the kernel extras
           // (xum.task_spawn / xum.events) bound to this mount's event queue.
+          if (mount?.lifetime === "persistent") {
+            // Drain policy for THIS call (mux.events() and the raw guest drain
+            // both go through the mount): a queued child report distilled from
+            // project skill content is withheld when the turn excludes it and
+            // taints the mount otherwise (see SandboxMount.drainHostEvents).
+            mount.hostEventsExcludeProjectSkillContent =
+              excludesProjectSkillContent !== undefined && (await excludesProjectSkillContent());
+          }
           activeBridge.register(
             runtime,
             mount?.lifetime === "persistent"

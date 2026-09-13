@@ -128,6 +128,7 @@ import { type MemoryService, type MemorySessionContext } from "@/node/services/m
 import type { TaskService } from "@/node/services/taskService";
 import {
   observeProjectSkillContentInToolOutputs,
+  toolExcludesProjectSkillContent,
   withToolDescriptionProvenance,
 } from "@/node/services/tools/projectSkillContentGate";
 import { resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
@@ -2531,6 +2532,10 @@ export class TurnRequestBuilder {
             sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             kernelFileLoader,
           },
+          // A queued child report distilled from project skill content is
+          // withheld when the kernel drains it for a turn that excludes such
+          // content; re-read at the call, like the tools' own gates.
+          excludesProjectSkillContent: () => toolExcludesProjectSkillContent(toolsForModelConfig),
         });
         if (options.recordTimings) {
           recordStartupPhaseTiming("applyToolPolicyAndExperimentsMs", applyPolicyStartedAt);
