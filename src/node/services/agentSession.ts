@@ -1606,6 +1606,13 @@ export class AgentSession {
      * trust the way StreamManager's own fallback/retry recreations do.
      */
     routedConsentRejection?: RoutedConsentRejection;
+    /**
+     * The send's options before skill routing replaced the model (routed
+     * streams only). The class model is one send only: an autonomous follow-up
+     * spawned off this stream — the goal continuation — carries neither the
+     * skill invocation nor its consent obligation, so it runs on these.
+     */
+    preRoutingOptions?: SendMessageOptions;
   };
 
   private activeCompactionRequest?: {
@@ -6477,7 +6484,8 @@ export class AgentSession {
         undefined,
         undefined,
         compactionBaseOptionsForRoutedTurn,
-        streamConsentRejection
+        streamConsentRejection,
+        skillModelOverride != null ? preRoutingOptions : undefined
       );
       // The provider-boundary consent gate inside streamWithHistory surfaces
       // here: same accepted-pre-stream conversion as above.
@@ -9610,7 +9618,10 @@ export class AgentSession {
     // project content. Performs rejection bookkeeping and returns the error
     // to surface; absent on unrouted internal paths (resumeStream supplies
     // its own for resumed routed turns).
-    routedConsentRejection?: RoutedConsentRejection
+    routedConsentRejection?: RoutedConsentRejection,
+    // The options the send carried before skill routing (routed turns only);
+    // see activeStreamContext.preRoutingOptions.
+    preRoutingOptions?: SendMessageOptions
   ): Promise<AgentSessionResult<void>> {
     const preparedRequest = admittedRequest ?? preparation?.preparedRequest;
     const previousCompactionRequest = this.activeCompactionRequest;
@@ -9695,6 +9706,7 @@ export class AgentSession {
         providersConfig,
         ...(compactionBaseOptions != null ? { compactionBaseOptions } : {}),
         ...(routedConsentRejection != null ? { routedConsentRejection } : {}),
+        ...(preRoutingOptions != null ? { preRoutingOptions } : {}),
       };
       this.activeStreamUserMessageId = undefined;
 
@@ -10325,7 +10337,8 @@ export class AgentSession {
               rolled.data.request,
               undefined,
               compactionBaseOptions,
-              routedConsentRejection
+              routedConsentRejection,
+              preRoutingOptions
             );
           }
           // This row passed send-time admission but never fit the final request.
@@ -10801,7 +10814,8 @@ export class AgentSession {
         // consent gate: the rebuilt history still carries the project-skill
         // snapshot, and trust may have been revoked since the failed attempt.
         context.compactionBaseOptions,
-        context.routedConsentRejection
+        context.routedConsentRejection,
+        context.preRoutingOptions
       );
     } finally {
       if (this.coordinator.isCurrentTurn(preparedTurn)) {
@@ -11023,7 +11037,8 @@ export class AgentSession {
             rolled.data.request,
             context.admissionCapture,
             context.compactionBaseOptions,
-            context.routedConsentRejection
+            context.routedConsentRejection,
+            context.preRoutingOptions
           );
         } finally {
           if (this.coordinator.isCurrentTurn(preparedTurn)) {
@@ -11320,6 +11335,30 @@ export class AgentSession {
     }
   }
 
+  /**
+   * Options for an autonomous follow-up of a routed stream: the pre-routing
+   * options when the stream still knows them, else — a resumed routed turn,
+   * whose durable row keeps only the routed options — the workspace's own
+   * persisted AI settings for the turn's agent. The routed options stay the
+   * last resort when neither is available.
+   */
+  private async continuationOptionsAfterRoutedStream(
+    routed: SendMessageOptions,
+    preRouting: SendMessageOptions | undefined
+  ): Promise<SendMessageOptions> {
+    if (preRouting != null) return preRouting;
+    const metadata = await this.aiService.getWorkspaceMetadata(this.workspaceId);
+    if (!metadata.success) return routed;
+    const agentId = routed.agentId ?? WORKSPACE_DEFAULTS.agentId;
+    const settings = metadata.data.aiSettingsByAgent?.[agentId] ?? metadata.data.aiSettings;
+    if (settings?.model == null) return routed;
+    return {
+      ...routed,
+      model: settings.model,
+      ...(settings.thinkingLevel != null ? { thinkingLevel: settings.thinkingLevel } : {}),
+    };
+  }
+
   private async handleTurnSuccess(
     payload: StreamEndEvent,
     operation = this.coordinator.operationId
@@ -11338,6 +11377,7 @@ export class AgentSession {
     const activeStreamGoalKind = this.activeStreamContext?.goalKind;
     const activeStreamOptions = this.activeStreamContext?.options;
     const activeStreamRouted = this.activeStreamContext?.compactionBaseOptions != null;
+    const activeStreamPreRoutingOptions = this.activeStreamContext?.preRoutingOptions;
     // A final-flush turn is housekeeping, not the goal's work: its text-only finish must never
     // count as an implicit complete_goal.
     const activeStreamWasContextBudgetFlush =
@@ -11482,10 +11522,21 @@ export class AgentSession {
         !continuousApplyPending &&
         !hadQueuedMessages
       ) {
-        const sendOptions = activeStreamOptions ?? {
-          model: streamEndPayload.metadata.model,
-          agentId: WORKSPACE_DEFAULTS.agentId,
-        };
+        // A routed stream's class model is one send only: the goal
+        // continuation is a fresh synthetic send with neither the skill
+        // invocation nor its consent obligation, so it runs on the
+        // workspace's own model — on the class provider it would keep
+        // receiving history that withholding protects after a revocation.
+        const sendOptions =
+          activeStreamRouted && activeStreamOptions != null
+            ? await this.continuationOptionsAfterRoutedStream(
+                activeStreamOptions,
+                activeStreamPreRoutingOptions
+              )
+            : (activeStreamOptions ?? {
+                model: streamEndPayload.metadata.model,
+                agentId: WORKSPACE_DEFAULTS.agentId,
+              });
         if (sendOptions.agentId !== "plan" && sendOptions.agentId !== "compact") {
           // If a `goal_continuation` turn ended without any tool calls,
           // interpret the text-only finish as an implicit `complete_goal`.

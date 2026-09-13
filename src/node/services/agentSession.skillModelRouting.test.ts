@@ -33,6 +33,11 @@ import {
 } from "@/node/services/utils/sendMessageError";
 
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
+import type { TurnStreamHandle } from "./streamManager";
+import type { StreamEndEvent } from "@/common/types/stream";
+import type { EventEmitter } from "events";
+import { waitForCondition } from "./testDispatchHelpers";
+import type { WorkspaceGoalService } from "./workspaceGoalService";
 
 const USER_MODEL = "anthropic:claude-fable-5";
 
@@ -84,6 +89,10 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     };
     /** When provided, getProvidersConfigSafe sees this map (enables the availability check). */
     providersConfig?: Record<string, { isConfigured: boolean; isEnabled?: boolean }>;
+    /** Goal service seam (a mock suffices for the stream-end continuation request). */
+    workspaceGoalService?: WorkspaceGoalService;
+    /** Turn handle for each streamed request; defaults to a handle that never completes. */
+    streamHandle?: (opts: StreamMessageOptions) => TurnStreamHandle;
   }) {
     const workspaceId = "ws-skill-routing";
     const workspaceMeta = {
@@ -99,7 +108,9 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     const streamed: StreamMessageOptions[] = [];
     const streamMessage = mock((opts: StreamMessageOptions) => {
       streamed.push(opts);
-      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
+      return Promise.resolve(
+        Ok(args.streamHandle?.(opts) ?? createStartedTurnHandle(session.closingSignal))
+      );
     });
 
     const config = {
@@ -116,21 +127,24 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       })),
     } as unknown as Config;
 
-    const { session, cleanup, historyService, events } = await createAgentSessionHarness({
-      workspaceId,
-      config,
-      aiServiceOverrides: {
-        getWorkspaceMetadata: mock((_id: string) => Promise.resolve(Ok(workspaceMeta))),
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
-        ...(args.providersConfig != null
-          ? { getProvidersConfig: mock(() => args.providersConfig) }
-          : {}),
-      } as unknown as Partial<AIService>,
-      captureEvents: true,
-    });
+    const { session, cleanup, historyService, events, aiService } = await createAgentSessionHarness(
+      {
+        workspaceId,
+        config,
+        workspaceGoalService: args.workspaceGoalService,
+        aiServiceOverrides: {
+          getWorkspaceMetadata: mock((_id: string) => Promise.resolve(Ok(workspaceMeta))),
+          streamMessage: streamMessage as unknown as AIService["streamMessage"],
+          ...(args.providersConfig != null
+            ? { getProvidersConfig: mock(() => args.providersConfig) }
+            : {}),
+        } as unknown as Partial<AIService>,
+        captureEvents: true,
+      }
+    );
     historyCleanup = cleanup;
     sessions.push(session);
-    return { session, streamed, historyService, events };
+    return { session, streamed, historyService, events, aiService };
   }
 
   /**
@@ -875,6 +889,84 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     harnessArgs.projectTrusted = false;
     const rejection = await streamed[0].preDispatchConsentGate?.();
     expect(JSON.stringify(rejection)).toMatch(/trust was revoked/i);
+    await session.dispose();
+  });
+
+  it("runs the goal continuation of a routed turn on the pre-routing options, not the class model", async () => {
+    // The class model is one send only: the automatic goal continuation is a
+    // fresh synthetic send with neither the skill invocation nor its consent
+    // obligation, so it returns to the workspace's model — the class provider
+    // would otherwise keep receiving history that withholding protects after
+    // a revocation.
+    const workspacePath = await createWorkspaceWithSkill({
+      skillName: "done",
+      metadataYaml: "metadata:\n  model-class: small\n",
+    });
+    const requestContinuationAfterStreamEnd = mock(
+      (_input: { workspaceId: string; sendOptions: { model?: string } }) => Promise.resolve()
+    );
+    const goalService = {
+      assertPricedModelForBudgetedGoal: () => Promise.resolve(Ok(undefined)),
+      recordStreamStarted: () => undefined,
+      previewStreamAccounting: () => Promise.resolve(),
+      recordStreamAccounting: () => Promise.resolve(),
+      restoreGoalAccountingSnapshot: () => Promise.resolve(),
+      applyPendingAfterStreamEnd: () => Promise.resolve(),
+      syncGoalModeWithChatTail: () => Promise.resolve(),
+      getGoal: () => Promise.resolve(null),
+      takePendingContinuationCandidateForManualUserMessage: () => null,
+      restorePendingContinuationCandidate: () => undefined,
+      clearPendingContinuationForManualUserMessage: () => Promise.resolve(),
+      suppressBudgetWrapupForManualUserMessage: () => Promise.resolve(),
+      acknowledgeUser: () => Promise.resolve(Ok(undefined)),
+      requestContinuationAfterStreamEnd,
+    } as unknown as WorkspaceGoalService;
+    // The harness's emitter exists only after creation; the handle factory runs later.
+    const emitter: { current?: EventEmitter } = {};
+    const { session, streamed, aiService } = await createRoutingHarness({
+      workspacePath,
+      configValues: { modelClasses: { small: "haiku+0" } },
+      workspaceGoalService: goalService,
+      streamHandle: () => {
+        // The routed stream ends with a plain text reply on the class model.
+        const payload: StreamEndEvent = {
+          type: "stream-end",
+          workspaceId: "ws-skill-routing",
+          messageId: "assistant-routed",
+          parts: [{ type: "text", text: "Applied the skill." }],
+          metadata: {
+            model: KNOWN_MODELS.HAIKU.id,
+            contextUsage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+            providerMetadata: {},
+            finishReason: "stop",
+          },
+        };
+        emitter.current?.emit("stream-start", {
+          type: "stream-start",
+          workspaceId: "ws-skill-routing",
+          messageId: "assistant-routed",
+          model: KNOWN_MODELS.HAIKU.id,
+          startTime: Date.now(),
+        });
+        emitter.current?.emit("stream-end", payload);
+        return {
+          messageId: "assistant-routed",
+          completion: Promise.resolve({ status: "completed" as const, streamEnd: payload }),
+        };
+      },
+    });
+    emitter.current = aiService as unknown as EventEmitter;
+
+    const result = await session.sendMessage("Use skill done", skillSendOptions());
+    expect(result.success).toBe(true);
+    expect(streamed[0].modelString).toBe(KNOWN_MODELS.HAIKU.id);
+
+    await waitForCondition(() => requestContinuationAfterStreamEnd.mock.calls.length > 0, {
+      timeoutMs: 1_000,
+    });
+    expect(requestContinuationAfterStreamEnd.mock.calls[0]?.[0].sendOptions).toMatchObject({
+      model: USER_MODEL,
+    });
     await session.dispose();
   });
 

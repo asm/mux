@@ -139,7 +139,22 @@ export interface MemoryIndexEntry {
 }
 
 export type MemoryReadFileResult =
-  | { success: true; data: { content: string; sha256: string } }
+  | {
+      success: true;
+      data: {
+        content: string;
+        sha256: string;
+        /**
+         * Present when the read asked for provenance (readFileWithSha's
+         * withProvenance): the file's marker at the moment of THIS read, taken
+         * under the store lock together with the content, so a caller holding
+         * an index snapshot re-checks a file that can have been replaced with
+         * project-derived content after the snapshot. Unknown provenance reads
+         * as carrying.
+         */
+        carriesProjectSkillContent?: boolean;
+      };
+    }
   | { success: false; error: string };
 
 /**
@@ -1726,18 +1741,50 @@ export class MemoryService extends EventEmitter {
 
   async readFileWithSha(
     ctx: MemoryScopeContext,
-    virtualPath: string
+    virtualPath: string,
+    options?: {
+      /**
+       * Also report the file's provenance, read under the store's mutation
+       * lock together with the content (writers stamp the sidecar and replace
+       * the file inside it), so the marker describes the content returned —
+       * never a clean marker beside freshly project-derived bytes. Intuition
+       * gates its provider reads on this verdict rather than on its earlier
+       * index snapshot.
+       */
+      withProvenance?: boolean;
+    }
   ): Promise<MemoryReadFileResult> {
     try {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
       const store = await this.resolveStore(ctx, scope, parsed.relPath);
-      const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
+      const read = async () => this.readTextFileForEdit(store, parsed.relPath, virtualPath);
+      const { content, carriesProjectSkillContent } =
+        options?.withProvenance === true
+          ? await withTargetMutationLock(
+              this.config.rootDir,
+              this.storeLockKey(store),
+              async () => {
+                const key = this.logicalKeyFor(ctx, scope, parsed.relPath);
+                const carries = memoryEntryCarriesProjectSkillContent(
+                  key === null ? undefined : (await this.metaService.getEntries()).get(key)
+                );
+                return { content: await read(), carriesProjectSkillContent: carries };
+              }
+            )
+          : { content: await read(), carriesProjectSkillContent: undefined };
       // Deliberately NOT recorded as a use: this is a human browsing the
       // Memory tab/settings, and usage stats must reflect agent reads only so
       // UI browsing never inflates hot-set ranking. (UI saves still count —
       // an edit is an explicit signal the file matters, like pinning.)
-      return { success: true, data: { content, sha256: sha256Hex(content) } };
+      return {
+        success: true,
+        data: {
+          content,
+          sha256: sha256Hex(content),
+          ...(carriesProjectSkillContent !== undefined ? { carriesProjectSkillContent } : {}),
+        },
+      };
     } catch (error) {
       if (error instanceof MemoryCommandError) {
         return { success: false, error: error.message };

@@ -1316,6 +1316,37 @@ describe("MemoryService", () => {
       expect(withheld.some((item) => item.path === "/memories/global/from-skill.md")).toBe(false);
     });
 
+    it("reports a file's provenance with its content when a read asks for it", async () => {
+      // Read together under the store lock: the marker describes the bytes
+      // returned. A plain UI read keeps its exact shape.
+      using fixture = await createFixture("ws-read-provenance");
+      const tainted = {
+        ...fixture.ctx,
+        writeProvenance: { carriesProjectSkillContent: true as const },
+      };
+      await fixture.service.create(tainted, "/memories/global/from-skill.md", "quotes it", "agent");
+      await fixture.service.create(fixture.ctx, "/memories/global/clean.md", "clean", "agent");
+      const carrying = await fixture.service.readFileWithSha(
+        fixture.ctx,
+        "/memories/global/from-skill.md",
+        { withProvenance: true }
+      );
+      expect(carrying.success && carrying.data.carriesProjectSkillContent).toBe(true);
+      const clean = await fixture.service.readFileWithSha(
+        fixture.ctx,
+        "/memories/global/clean.md",
+        {
+          withProvenance: true,
+        }
+      );
+      expect(clean.success && clean.data.carriesProjectSkillContent).toBe(false);
+      const plain = await fixture.service.readFileWithSha(fixture.ctx, "/memories/global/clean.md");
+      expect(plain.success && plain.data).toEqual({
+        content: "clean",
+        sha256: createHash("sha256").update("clean").digest("hex"),
+      });
+    });
+
     it("leaves tainted files out of directory views for a turn that excludes project content", async () => {
       // A directory view lists file names — repository-influenced for a file
       // harvested from project skill content — so the exclusion applies to the

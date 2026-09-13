@@ -12,6 +12,12 @@ const PAGE_OBJECT_PATTERN = /\/Type\s*\/Page(?![s])/g;
 const PAGE_TREE_COUNT_PATTERN = /\/Type\s*\/Pages\b[^>]*?\/Count\s+(\d+)/g;
 /** Stream dictionaries sit right before the `stream` keyword; this window covers them. */
 const STREAM_DICTIONARY_WINDOW_CHARS = 512;
+/**
+ * A direct `/Length N` in a stream dictionary. An indirect reference
+ * (`/Length 12 0 R`) is left alone: resolving it needs the object table.
+ */
+const DIRECT_STREAM_LENGTH_PATTERN = /\/Length\s+(\d+)(?!\s+\d+\s+R)/;
+const END_STREAM_KEYWORD = "endstream";
 /** Inflation bounds: a hostile stream must not expand without limit. */
 const MAX_INFLATED_STREAM_BYTES = 16 * 1024 * 1024;
 const MAX_INFLATED_TOTAL_BYTES = 64 * 1024 * 1024;
@@ -30,6 +36,24 @@ function maxPageTreeCount(text: string): number {
 }
 
 /**
+ * Where a payload's `endstream` keyword starts when its dictionary declares a
+ * direct length that lands on one (an EOL may precede the keyword). Binary
+ * payloads — a stored DEFLATE block, an image — can contain the literal
+ * `endstream`, so the declared length wins over the first occurrence; without
+ * a usable length the first occurrence is the only delimiter available.
+ */
+function declaredPayloadEnd(dictionary: string, text: string, dataStart: number): number | null {
+  const match = DIRECT_STREAM_LENGTH_PATTERN.exec(dictionary);
+  if (match === null) return null;
+  const end = dataStart + Number.parseInt(match[1], 10);
+  if (end > text.length) return null;
+  for (const eol of ["", "\n", "\r\n", "\r"]) {
+    if (text.startsWith(END_STREAM_KEYWORD, end + eol.length)) return end;
+  }
+  return null;
+}
+
+/**
  * Every stream payload (`stream … endstream`) with the dictionary window that
  * precedes it. The raw scans skip the payloads — page-like text inside a
  * content stream (a document about PDF syntax) is data, not a dictionary —
@@ -42,19 +66,24 @@ function* streamPayloads(
   for (;;) {
     const keywordAt = text.indexOf("stream", cursor);
     if (keywordAt === -1) return;
-    const endAt = text.indexOf("endstream", keywordAt + "stream".length);
-    if (endAt === -1) return;
-    cursor = endAt + "endstream".length;
     // "endstream" contains "stream": skip the closing keyword's own match.
-    if (text.slice(Math.max(0, keywordAt - 3), keywordAt) === "end") continue;
+    if (text.slice(Math.max(0, keywordAt - 3), keywordAt) === "end") {
+      cursor = keywordAt + "stream".length;
+      continue;
+    }
     let dataStart = keywordAt + "stream".length;
     if (text[dataStart] === "\r") dataStart++;
     if (text[dataStart] === "\n") dataStart++;
-    yield {
-      dictionary: text.slice(Math.max(0, keywordAt - STREAM_DICTIONARY_WINDOW_CHARS), keywordAt),
-      dataStart,
-      endAt,
-    };
+    const dictionary = text.slice(
+      Math.max(0, keywordAt - STREAM_DICTIONARY_WINDOW_CHARS),
+      keywordAt
+    );
+    const endAt =
+      declaredPayloadEnd(dictionary, text, dataStart) ??
+      text.indexOf(END_STREAM_KEYWORD, dataStart);
+    if (endAt === -1) return;
+    cursor = text.indexOf(END_STREAM_KEYWORD, endAt) + END_STREAM_KEYWORD.length;
+    yield { dictionary, dataStart, endAt };
   }
 }
 
@@ -75,26 +104,31 @@ function withoutStreamPayloads(text: string): string {
  * /ObjStm`): modern writers keep page dictionaries there, where a raw scan
  * sees none. Only object streams can hold page dictionaries — content and
  * image streams never do — so they are the only streams inflated, which keeps
- * the always-on scan cheap. Bounded; streams that do not inflate (encrypted,
- * other filters, corrupt) are skipped.
+ * the always-on scan cheap. Bounded. An object stream that does not decode
+ * (encrypted, another filter, corrupt, past the inflation budget) makes the
+ * page count UNKNOWN: its dictionaries may be pages no other source counts.
  */
-function inflatedStreams(bytes: Buffer, text: string): string[] {
-  const inflated: string[] = [];
+function inflatedStreams(bytes: Buffer, text: string): { decoded: string[]; complete: boolean } {
+  const decoded: string[] = [];
   let total = 0;
+  let complete = true;
   for (const { dictionary, dataStart, endAt } of streamPayloads(text)) {
-    if (total >= MAX_INFLATED_TOTAL_BYTES) break;
     if (!dictionary.includes("/ObjStm") || !dictionary.includes("/FlateDecode")) continue;
+    if (total >= MAX_INFLATED_TOTAL_BYTES) {
+      complete = false;
+      break;
+    }
     try {
       const data = inflateSync(bytes.subarray(dataStart, endAt), {
         maxOutputLength: MAX_INFLATED_STREAM_BYTES,
       });
       total += data.length;
-      inflated.push(data.toString("latin1"));
+      decoded.push(data.toString("latin1"));
     } catch {
-      // Not an inflatable stream; the caller falls back to the page cap.
+      complete = false;
     }
   }
-  return inflated;
+  return { decoded, complete };
 }
 
 /**
@@ -105,9 +139,10 @@ function inflatedStreams(bytes: Buffer, text: string): string[] {
  * FlateDecode object streams (which hold the page dictionaries of most modern
  * PDFs) are inflated and scanned the same way whether or not a raw source is
  * visible. The recovered count is capped at the provider's page limit, and
- * when no source recovers one that limit is assumed: a compressed byte size
- * cannot bound a page count, and under-estimating lets the pre-send check skip
- * compaction only to fail at dispatch.
+ * that limit is assumed when no source recovers a count or an object stream
+ * could not be decoded: a compressed byte size cannot bound a page count, a
+ * partial count is no bound either, and under-estimating lets the pre-send
+ * check skip compaction only to fail at dispatch.
  */
 export function estimatePdfAttachmentTokens(url: string): number {
   if (!url.startsWith("data:")) return IMAGE_TOKEN_ESTIMATE;
@@ -127,7 +162,9 @@ export function estimatePdfAttachmentTokens(url: string): number {
   // dictionary lives in one place; an incremental update that rewrote a page
   // counts it twice, which only over-estimates); the tree count is a maximum.
   // The two sources are compared once below, never added to each other.
-  for (const decoded of inflatedStreams(bytes, text)) {
+  const streams = inflatedStreams(bytes, text);
+  if (!streams.complete) return PDF_MAX_PAGES_ESTIMATE * PDF_TOKENS_PER_PAGE_ESTIMATE;
+  for (const decoded of streams.decoded) {
     pageObjects += countPageObjects(decoded);
     treeCount = Math.max(treeCount, maxPageTreeCount(decoded));
   }

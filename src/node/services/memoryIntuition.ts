@@ -41,11 +41,12 @@ import {
   normalizeUsage,
 } from "@/common/utils/tokens/usageHelpers";
 import { MemoryToolResultSchema, TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
-import type {
-  MemoryIndexEntry,
-  MemoryReadFileResult,
-  MemoryScopeContext,
-  MemoryService,
+import {
+  MEMORY_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE,
+  type MemoryIndexEntry,
+  type MemoryReadFileResult,
+  type MemoryScopeContext,
+  type MemoryService,
 } from "./memoryService";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
@@ -422,6 +423,12 @@ export async function runMemoryIntuition(args: {
       if (selection.entries.length === 0) return { kind: "no_report", stats };
     }
     const allowed = new Set(selection.entries.map((entry) => entry.path));
+    // Paths whose LIVE provenance carried project skill content when their
+    // content was delivered to the provider: the index snapshot above is stale
+    // by then (another workspace can replace a selected clean memory with
+    // project-derived content), so the read's own verdict gates the provider
+    // and classifies the report, not the snapshot.
+    const taintedPaths = new Set<string>();
     const physicalReads = new Map<string, Promise<MemoryReadFileResult>>();
     let reservedBytes = 0;
     let returnedBytes = 0;
@@ -452,7 +459,9 @@ export async function runMemoryIntuition(args: {
             read = Promise.resolve()
               .then(async (): Promise<MemoryReadFileResult> => {
                 if (signal.aborted) return { success: false, error: "Intuition aborted" };
-                const result = await args.memoryService.readFileWithSha(args.ctx, currentPath);
+                const result = await args.memoryService.readFileWithSha(args.ctx, currentPath, {
+                  withProvenance: true,
+                });
                 stats.bytesRead += result.success
                   ? Buffer.byteLength(result.data.content)
                   : reservation;
@@ -466,6 +475,15 @@ export async function runMemoryIntuition(args: {
           }
           const result = await read;
           if (!result.success) return result;
+          if (result.data.carriesProjectSkillContent === true) {
+            // Refused under exclusion — nothing of it reaches the provider, so
+            // the loop continues on the other memories. Delivered under trust,
+            // the path is tainted: a later revocation aborts the loop before
+            // the next step and the report inherits the provenance.
+            if (await excludeAtDispatch())
+              return { success: false, error: MEMORY_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE };
+            taintedPaths.add(currentPath);
+          }
           const content = result.data.content;
           rawContent = content;
           const start = (current.offset ?? 1) - 1;
@@ -593,7 +611,8 @@ export async function runMemoryIntuition(args: {
       prepareStep: async () => {
         if (
           !stale &&
-          selection.entries.some((entry) => entry.carriesProjectSkillContent) &&
+          (selection.entries.some((entry) => entry.carriesProjectSkillContent) ||
+            taintedPaths.size > 0) &&
           (await excludeAtDispatch())
         ) {
           stale = true;
@@ -645,7 +664,9 @@ export async function runMemoryIntuition(args: {
       // routed turn's consent gate arms on it.
       const entryByPath = new Map(selection.entries.map((entry) => [entry.path, entry]));
       const carriesProjectSkillContent = [...classified.memories, ...classified.candidates].some(
-        (item) => entryByPath.get(item.path)?.carriesProjectSkillContent === true
+        (item) =>
+          entryByPath.get(item.path)?.carriesProjectSkillContent === true ||
+          taintedPaths.has(item.path)
       );
       return { kind: "report", ...classified, carriesProjectSkillContent, stats };
     }

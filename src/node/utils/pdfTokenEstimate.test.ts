@@ -14,8 +14,8 @@ function pdfDataUrl(body: string | Buffer): string {
   return `data:application/pdf;base64,${bytes.toString("base64")}`;
 }
 
-function flateObjectStream(objectNumber: number, content: string): Buffer {
-  const compressed = deflateSync(Buffer.from(content, "latin1"));
+function flateObjectStream(objectNumber: number, content: string, level?: number): Buffer {
+  const compressed = deflateSync(Buffer.from(content, "latin1"), level == null ? {} : { level });
   return Buffer.concat([
     Buffer.from(
       `${objectNumber} 0 obj\n<< /Type /ObjStm /First 0 /Filter /FlateDecode /Length ${compressed.length} >>\nstream\r\n`,
@@ -109,6 +109,34 @@ describe("estimatePdfAttachmentTokens", () => {
       (_, index) => `${index + 1} 0 obj\n<< /Type /Page >>\nendobj`
     ).join("\n");
     expect(estimatePdfAttachmentTokens(pdfDataUrl(`%PDF-1.4\n${pages}\n`))).toBe(
+      PDF_MAX_PAGES_ESTIMATE * PDF_TOKENS_PER_PAGE_ESTIMATE
+    );
+  });
+
+  it("delimits a stream by its declared length when its bytes spell out endstream", () => {
+    // A stored (level 0) DEFLATE block keeps the page dictionaries verbatim, so
+    // a dictionary string containing "endstream" appears inside the encoded
+    // bytes. Cutting at the first occurrence would truncate the stream, fail
+    // the inflation and — with one raw page visible — price 1 page for 31.
+    const objects = [
+      "2 0 << /Type /Page /Parent 1 0 R /Title (mentions endstream) >>",
+      ...Array.from({ length: 29 }, (_, index) => `${index + 3} 0 << /Type /Page /Parent 1 0 R >>`),
+    ].join("\n");
+    const pdf = Buffer.concat([
+      Buffer.from("%PDF-1.5\n40 0 obj\n<< /Type /Page /Parent 1 0 R >>\nendobj\n", "latin1"),
+      flateObjectStream(101, objects, 0),
+      Buffer.from("%%EOF\n", "latin1"),
+    ]);
+    expect(estimatePdfAttachmentTokens(pdfDataUrl(pdf))).toBe(31 * PDF_TOKENS_PER_PAGE_ESTIMATE);
+  });
+
+  it("treats an object stream that does not decode as an unknown page count", () => {
+    // One page is visible raw, the rest sit in an object stream that fails to
+    // inflate: the partial count is no bound, so the provider cap applies.
+    const pdf =
+      "%PDF-1.5\n2 0 obj\n<< /Type /Page /Parent 1 0 R >>\nendobj\n" +
+      "3 0 obj\n<< /Type /ObjStm /Filter /FlateDecode /Length 8 >>\nstream\r\nnotzlib!\r\nendstream\nendobj\n";
+    expect(estimatePdfAttachmentTokens(pdfDataUrl(pdf))).toBe(
       PDF_MAX_PAGES_ESTIMATE * PDF_TOKENS_PER_PAGE_ESTIMATE
     );
   });

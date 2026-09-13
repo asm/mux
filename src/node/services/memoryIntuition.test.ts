@@ -21,7 +21,12 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { eventSpine } from "./events/eventSpine";
 import { attachLanguageModelCleanup } from "./languageModelCleanup";
 import { MemoryMetaService } from "./memoryMeta";
-import { MemoryService, type MemoryIndexEntry, type MemoryScopeContext } from "./memoryService";
+import {
+  MEMORY_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE,
+  MemoryService,
+  type MemoryIndexEntry,
+  type MemoryScopeContext,
+} from "./memoryService";
 import { classifyIntuitionReport, runMemoryIntuition, selectIndexForCue } from "./memoryIntuition";
 import { TestTempDir } from "./tools/testHelpers";
 
@@ -312,6 +317,70 @@ describe("runMemoryIntuition", () => {
       ).stats.indexEntriesConsidered;
     expect(await considered(false)).toBe(2);
     expect(await considered(true)).toBe(1);
+  });
+
+  it("gates a memory read on the provenance it finds at the read, not on the index snapshot", async () => {
+    // Another workspace replaces a selected clean memory with project-derived
+    // content after listIndexEntries() returned: the excluding turn's read is
+    // withheld (and the loop goes on), a trusted turn's report carries the
+    // provenance. Each run gets its own still-clean file, so both exercise the
+    // read-time check rather than the index filter.
+    using f = await fixture();
+    for (const name of ["locks.md", "mutex.md"])
+      await f.memoryService.create(
+        f.ctx,
+        `/memories/global/${name}`,
+        "Use explicit locks.",
+        "agent"
+      );
+    let taintAfterSnapshot: string | null = null;
+    const realList = f.memoryService.listIndexEntries.bind(f.memoryService);
+    const listSpy = spyOn(f.memoryService, "listIndexEntries").mockImplementation(async (ctx) => {
+      const entries = await realList(ctx);
+      if (taintAfterSnapshot !== null) {
+        await f.meta.markCarriesProjectSkillContent(`global:${taintAfterSnapshot}`);
+        await fs.writeFile(
+          path.join(f.root, "memory/global", taintAfterSnapshot),
+          "Locks per the skill."
+        );
+      }
+      return entries;
+    });
+    try {
+      const run = async (name: string, excludeProjectSkillContent: boolean) => {
+        taintAfterSnapshot = name;
+        const calls: LanguageModelV3CallOptions[] = [];
+        const model = scriptedModel(
+          [[read(name)], [report([item(name, 0.9, "Locks per the skill.")])]],
+          (options) => calls.push(options)
+        );
+        const result = await runMemoryIntuition({
+          ...f,
+          cue: "locks",
+          modelString: "mock:test",
+          createModel: () => Promise.resolve(pinned(model)),
+          resolveAgentBody: body,
+          excludeProjectSkillContent,
+        });
+        return { result, calls };
+      };
+
+      const excluded = await run("locks.md", true);
+      expect(excluded.calls).toHaveLength(2);
+      expect(memoryReadResults(excluded.calls[1])).toEqual([
+        { success: false, error: MEMORY_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE },
+      ]);
+
+      const trusted = await run("mutex.md", false);
+      expect(trusted.result.kind).toBe("report");
+      if (trusted.result.kind !== "report") throw new Error("expected report");
+      expect(trusted.result.carriesProjectSkillContent).toBe(true);
+      expect(memoryReadResults(trusted.calls[1])).toMatchObject([
+        { success: true, output: "Locks per the skill." },
+      ]);
+    } finally {
+      listSpy.mockRestore();
+    }
   });
 
   it("re-reads trust before dispatch and drops tainted memories the initial verdict admitted", async () => {
