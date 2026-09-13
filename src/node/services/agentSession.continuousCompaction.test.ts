@@ -27,6 +27,8 @@ import type { ContinuousCompactor } from "./continuousCompactor";
 import type { CompactionToken, TurnCoordinator } from "./turnCoordinator";
 import * as fileLock from "@/node/utils/concurrency/fileLock";
 import { historyWriteLockPath } from "./workspaceRemoval";
+import { HistoryService } from "./historyService";
+import { CompactionCancellation } from "./compactionCancellation";
 
 const workspaceId = "continuous-session";
 const model = "openai:gpt-4o";
@@ -37,6 +39,7 @@ const sendOptions: SendMessageOptions = {
 };
 
 interface SessionInternals {
+  interruptForCompaction(): Promise<void>;
   coordinator: TurnCoordinator;
   runContinuousCompactionObservation<T>(
     observe: (token: CompactionToken) => Promise<T>
@@ -456,9 +459,18 @@ describe("AgentSession continuous compaction wiring", () => {
     const retained = createMuxMessage("retained-user", "user", "Earlier task");
     await h.historyService.appendToHistory(workspaceId, retained);
     const handler = Reflect.get(h.session, "compactionHandler") as CompactionHandler;
+    const preparation = handler.beginPreparation(() => true);
+    const source = await rows(h);
     expect(
       await handler.persistContinuousCompaction({
-        messages: await rows(h),
+        preparation,
+        publication: {
+          generation: await h.historyService
+            .getContinuousCompactionJournal(workspaceId)
+            .captureGeneration(),
+        },
+        attachmentMessages: source,
+        messages: source,
         text: "Continuous summary",
         model,
         tail: [retained],
@@ -826,8 +838,16 @@ describe("AgentSession continuous compaction wiring", () => {
           if (context.phase !== "mid-stream") return "none";
           const applied = await internals(h.session).interruptForContinuousCompaction(
             async (followUp) => {
+              const preparation = handler.beginPreparation(() => true);
               const history = await rows(h);
               const applied = await handler.persistContinuousCompaction({
+                preparation,
+                publication: {
+                  generation: await h.historyService
+                    .getContinuousCompactionJournal(workspaceId)
+                    .captureGeneration(),
+                },
+                attachmentMessages: history,
                 messages: history,
                 text: "Recovered summary",
                 model,
@@ -1048,6 +1068,38 @@ describe("AgentSession continuous compaction wiring", () => {
     }
   );
 
+  test.each(["legacy", "continuous resume", "continuous compact"] as const)(
+    "%s cannot adopt a foreign settled Stop while stopping its source stream",
+    async (route) => {
+      const h = await setup(route === "continuous resume" ? 72 : 76);
+      const state = internals(h.session);
+      spyOn(state.continuousCompactor, "observe").mockResolvedValue("none");
+      const starts = mockAbortableStream(h);
+      expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
+      const before = await rows(h);
+      const foreignHistory = new HistoryService(h.config);
+      const storage = foreignHistory.getCompactionCancellationStorage(workspaceId);
+      const foreign = new CompactionCancellation(storage);
+      assert(h.aiService.stopStream != null, "Expected the installed abortable stream");
+      const stopStream = h.aiService.stopStream.bind(h.aiService);
+      let stopped: Awaited<ReturnType<typeof storage.read>> | undefined;
+      spyOn(h.aiService, "stopStream").mockImplementationOnce(async (...args) => {
+        const result = await stopStream(...args);
+        await foreign.cancel({ settled: Promise.resolve(true) });
+        stopped = await storage.read();
+        return result;
+      });
+      if (route === "legacy") await state.interruptForCompaction();
+      else expect(await applyThenFinish(h.session, () => Promise.resolve(false))).toBe(false);
+      assert(stopped, "Expected the foreign Stop to settle before continuation");
+      expect(stopped.version).toBe(2);
+      expect(await storage.read()).toEqual(stopped);
+      expect(starts).toHaveBeenCalledTimes(1);
+      expect(await rows(h)).toEqual(before);
+      mock.restore();
+    }
+  );
+
   // These callbacks interrupt an already-started turn, so model the engine's
   // completion handle rather than invoking terminal policy without settling it.
   function mockAbortableStream(h: AgentSessionHarness) {
@@ -1098,14 +1150,18 @@ describe("AgentSession continuous compaction wiring", () => {
             return read(...args);
           });
         } else {
-          const update = h.historyService.cleanupCompactionFollowUp.bind(h.historyService);
-          spyOn(h.historyService, "cleanupCompactionFollowUp").mockImplementationOnce(
-            async (...args) => {
-              entered.resolve();
-              await release.promise;
-              return update(...args);
-            }
+          // Hard Stop now owns the durable follow-up clear before completion dispatch.
+          const update = h.historyService.neutralizeCompactionRecoveryUnderHistoryLock.bind(
+            h.historyService
           );
+          spyOn(
+            h.historyService,
+            "neutralizeCompactionRecoveryUnderHistoryLock"
+          ).mockImplementationOnce(async (...args) => {
+            entered.resolve();
+            await release.promise;
+            return update(...args);
+          });
           await h.session.interruptStream({ abandonPartial: true });
         }
         return true;

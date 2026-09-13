@@ -1,3 +1,4 @@
+import { SUBAGENT_FAILURE_FOOTER } from "@/common/utils/subagentFailureEnvelope";
 import type { StartupRecoveryState } from "./startupRecovery";
 import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
@@ -198,7 +199,8 @@ export function formatSubagentFailureUserMessage(params: {
     "<error_message>",
     params.errorMessage,
     "</error_message>",
-    "This sub-agent task failed terminally and will not produce a report. Do not re-await it.",
+    // Older clients require this exact terminator to render persisted failures.
+    SUBAGENT_FAILURE_FOOTER,
     "</mux_subagent_failure>",
   ].join("\n");
 }
@@ -326,6 +328,9 @@ export interface WorkspaceLiveActivity {
   desktopViewers: boolean;
 }
 
+/** Who requested acceptance, independent of transcript visibility and provider billing. */
+export type TurnAcceptanceOrigin = "manual" | "automatic";
+
 export interface SendMessageInternalOptions {
   /**
    * True when this send is a QUEUE-DISPATCHED entry (sendQueuedMessages):
@@ -335,6 +340,7 @@ export interface SendMessageInternalOptions {
    * draft; preserving would double-record the prompt.
    */
   dequeued?: boolean;
+  acceptanceOrigin?: TurnAcceptanceOrigin;
   allowQueuedAgentTask?: boolean;
   skipAutoResumeReset?: boolean;
   synthetic?: boolean;
@@ -411,7 +417,11 @@ export interface WorkspaceTurnHost {
   resumeStream(
     workspaceId: string,
     options: SendMessageOptions,
-    internal?: { allowQueuedAgentTask?: boolean; agentInitiated?: boolean }
+    internal?: {
+      acceptanceOrigin?: TurnAcceptanceOrigin;
+      allowQueuedAgentTask?: boolean;
+      agentInitiated?: boolean;
+    }
   ): Promise<Result<{ started: boolean }, SendMessageError>>;
   clearQueue(workspaceId: string, options?: { cancelReason?: string }): Result<void>;
   replaceHistory(
@@ -434,6 +444,7 @@ export interface WorkspaceTurnHost {
 }
 
 export interface TurnAdmissionHost {
+  acquireIdleTurnExclusion(workspaceId: string): Result<Disposable>;
   getStartupRecoveryState(workspaceId: string): Promise<StartupRecoveryState>;
   dispatchPendingCompactionFollowUp(workspaceId: string): Promise<Result<boolean>>;
   isBusyForMessage(workspaceId: string): boolean;
@@ -520,7 +531,8 @@ export interface WorkspaceProvisioningHost {
     runtimeConfig?: RuntimeConfig,
     subProjectPath?: string,
     pendingAutoTitle?: boolean,
-    tags?: Record<string, string>
+    tags?: Record<string, string>,
+    options?: { awaitMaterialization?: boolean }
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>>;
   sanitizeMaterializedTaskWorkspace(
     workspaceId: string,

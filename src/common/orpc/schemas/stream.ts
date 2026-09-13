@@ -1,3 +1,4 @@
+import { StreamStopCauseSchema } from "@/common/types/streamStopCause";
 import { z } from "zod";
 import { AgentDefinitionScopeSchema, AgentIdSchema } from "./agentDefinition";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
@@ -273,6 +274,7 @@ export const StreamEndEventSchema = z.object({
       // Last step's provider metadata (for context window cache display)
       contextProviderMetadata: z.record(z.string(), z.unknown()).optional(),
       finishReason: z.string().optional(),
+      stopCause: StreamStopCauseSchema.optional(),
       duration: z.number().optional(),
       ttftMs: z.number().optional(),
       systemMessageTokens: z.number().optional(),
@@ -584,11 +586,20 @@ export const InitStartEventSchema = z.object({
     .boolean()
     .optional()
     .meta({ description: "True when this event is emitted during init replay" }),
+  // Replay of an already finished init carries its terminal result up front so the
+  // client never has to publish a "running" snapshot before the replayed init-end lands.
+  completed: z
+    .object({
+      exitCode: z.number(),
+      endTime: z.number(),
+    })
+    .optional(),
 });
 
 export const InitOutputEventSchema = z.object({
   type: z.literal("init-output"),
   line: z.string(),
+  step: z.boolean().optional(),
   timestamp: z.number(),
   isError: z.boolean().optional(),
   lineNumber: z
@@ -601,6 +612,13 @@ export const InitOutputEventSchema = z.object({
     .boolean()
     .optional()
     .meta({ description: "True when this event is emitted during init replay" }),
+});
+
+export const InitProgressEventSchema = z.object({
+  type: z.literal("init-progress"),
+  label: z.string(),
+  percent: z.number().int().min(0).max(100),
+  timestamp: z.number(),
 });
 
 export const InitEndEventSchema = z.object({
@@ -619,6 +637,7 @@ export const InitEndEventSchema = z.object({
 export const WorkspaceInitEventSchema = z.discriminatedUnion("type", [
   InitStartEventSchema,
   InitOutputEventSchema,
+  InitProgressEventSchema,
   InitEndEventSchema,
 ]);
 

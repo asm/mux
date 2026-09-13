@@ -1,3 +1,4 @@
+import type { QueuedInputStopCause, StreamStopCause } from "@/common/types/streamStopCause";
 import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget";
 import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./contextBudgetError";
 import {
@@ -17,7 +18,7 @@ import { PlatformPaths } from "@/common/utils/paths";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import {
   streamText,
-  stepCountIs,
+  type stepCountIs,
   type ModelMessage,
   type SystemModelMessage,
   type LanguageModel,
@@ -319,6 +320,7 @@ interface StreamRequestOptions {
   callSettingsOverrides?: ResolvedCallSettingsOverrides;
   toolPolicy?: ToolPolicy;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
   headers?: Record<string, string | undefined>;
   onChunk?: StreamTextOnChunk;
   onStepMessages?: (messages: ModelMessage[]) => void;
@@ -346,6 +348,8 @@ export interface TurnExecutionOptions extends StreamRequestOptions {
   providedRuntimeTempDir?: string;
   modelFallback?: ModelFallbackOptions;
   onStreamConstructed?: () => Promise<void>;
+  assertAdmissionCurrent?: () => Promise<void>;
+  withAdmissionCurrent?: (construct: () => void) => Promise<void>;
 }
 
 type StreamRequestInput = StreamRequestOptions & {
@@ -361,6 +365,7 @@ interface StepMessageTracker {
   latestMessages?: ModelMessage[];
 }
 interface StreamRequestConfig {
+  stopCause?: StreamStopCause;
   cacheEnabled?: boolean;
   budgetMetadataModel?: string;
   model: LanguageModel;
@@ -377,6 +382,7 @@ interface StreamRequestConfig {
   maxOutputTokens?: number;
   streamCallSettings?: Omit<ResolvedCallSettingsOverrides, "maxOutputTokens">;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
   /** Optional hook for callers that need chunk-level visibility during streaming. */
   onChunk?: StreamTextOnChunk;
   /** Optional hook for callers that need the live prepared step transcript. */
@@ -2334,6 +2340,7 @@ export class StreamManager {
       callSettingsOverrides,
       toolPolicy,
       hasQueuedMessages,
+      getQueuedInputStopCause,
       headers,
       onChunk,
       onStepMessages,
@@ -2392,6 +2399,7 @@ export class StreamManager {
       streamCallSettings:
         Object.keys(streamCallSettings).length > 0 ? streamCallSettings : undefined,
       hasQueuedMessages,
+      getQueuedInputStopCause,
       onChunk,
       onStepMessages,
       onStepSettled,
@@ -2410,6 +2418,8 @@ export class StreamManager {
     request: Pick<
       StreamRequestConfig,
       | "hasQueuedMessages"
+      | "getQueuedInputStopCause"
+      | "stopCause"
       | "toolPolicy"
       | "onStepSettled"
       | "modelString"
@@ -2443,7 +2453,9 @@ export class StreamManager {
 
     const requiredPatterns = buildRequiredToolPatterns(request.toolPolicy);
 
-    const hasSuccessfulRequiredToolResult: ReturnType<typeof stepCountIs> = ({ steps }) => {
+    const hasSuccessfulRequiredToolResult = ({
+      steps,
+    }: Parameters<ReturnType<typeof stepCountIs>>[0]): boolean => {
       if (requiredPatterns.length === 0) {
         return false;
       }
@@ -2462,13 +2474,17 @@ export class StreamManager {
     };
 
     return [
-      stepCountIs(100000),
+      ({ steps }) => {
+        if (steps.length < 100000) return false;
+        request.stopCause ??= { kind: "step-limit" };
+        return true;
+      },
       // The SDK evaluates stop conditions only after every sibling tool result in the
       // model's current step settles. Do not move this to individual tool-call-end events:
       // that would abort the remaining calls the model emitted in the same batch.
       async ({ steps }) => {
         const step = steps.at(-1);
-        if (request.onStepSettled && step && !(await hasSuccessfulRequiredToolResult({ steps }))) {
+        if (request.onStepSettled && step && !hasSuccessfulRequiredToolResult({ steps })) {
           const outputs = step.toolResults.map((result) => result.output);
           const size = estimateToolResultSize(outputs);
           const toolResultTokens = await estimateToolResultTokensForModel(outputs, {
@@ -2488,6 +2504,9 @@ export class StreamManager {
             ),
           });
           // All siblings have settled: stop before another provider step without discarding results.
+          if (decision !== "continue") {
+            request.stopCause ??= { kind: "context-budget", decision };
+          }
           if (decision === "block")
             throw new ContextBudgetBlockedError(
               "The settled tool results exceed the context budget. Use /compact or start a new context before continuing."
@@ -2495,9 +2514,19 @@ export class StreamManager {
           // Budget stops are authoritative even when only a turn-end message is queued.
           if (decision !== "continue") return true;
         }
+        if (hasSuccessfulRequiredToolResult({ steps })) return false;
+        const queuedInput = request.getQueuedInputStopCause?.();
+        if (queuedInput != null) {
+          request.stopCause ??= queuedInput;
+          return true;
+        }
         return request.hasQueuedMessages?.("tool-end") ?? false;
       },
-      hasSuccessfulRequiredToolResult,
+      (options) => {
+        if (!hasSuccessfulRequiredToolResult(options)) return false;
+        request.stopCause ??= { kind: "required-tool" };
+        return true;
+      },
     ];
   }
 
@@ -2631,6 +2660,8 @@ export class StreamManager {
     abortController: AbortController,
     stepTracker?: StepMessageTracker
   ): Awaited<ReturnType<typeof streamText>> {
+    // Retries can reuse the request, but each stream makes its own stop decision.
+    delete request.stopCause;
     // Explicit <ToolSet> pins RUNTIME_CONTEXT to its default: mux tools use
     // Tool's `any` context, which would otherwise infect the inferred result
     // type (no-unsafe-return).
@@ -3657,6 +3688,7 @@ export class StreamManager {
       callSettingsOverrides: prepared.data.callSettingsOverrides,
       toolPolicy: streamInfo.request.toolPolicy,
       hasQueuedMessages: streamInfo.request.hasQueuedMessages,
+      getQueuedInputStopCause: streamInfo.request.getQueuedInputStopCause,
       headers: prepared.data.headers,
       onChunk: streamInfo.request.onChunk,
       onStepMessages: streamInfo.request.onStepMessages,
@@ -4493,7 +4525,18 @@ export class StreamManager {
             const contextUsage = streamMeta.contextUsage ?? streamInfo.lastStepUsage;
             const contextProviderMetadata =
               streamMeta.contextProviderMetadata ?? streamInfo.lastStepProviderMetadata;
-            const finishReason = streamInfo.terminalFinishReason ?? streamMeta.finishReason;
+            // Required-tool completion must remain successful after downgrade or crash recovery.
+            // Keep the internal stop cause, but persist the legacy-compatible terminal signal.
+            const finishReason =
+              streamInfo.request.stopCause?.kind === "required-tool"
+                ? "stop"
+                : (streamInfo.terminalFinishReason ?? streamMeta.finishReason);
+            if (finishReason === "tool-calls" && streamInfo.request.stopCause == null) {
+              workspaceLog.warn("Tool-calls stream ended without a recorded stop cause", {
+                messageId: streamInfo.messageId,
+                muxMetadata: streamInfo.initialMetadata?.muxMetadata,
+              });
+            }
             const duration = streamMeta.duration;
             const ttftMs = this.resolveTtftMsForStreamEnd(streamInfo);
             // Aggregated provider metadata across all steps (for cost calculation with cache tokens)
@@ -4532,6 +4575,9 @@ export class StreamManager {
                 contextProviderMetadata, // Last step (for context window display)
                 ...(toolModelUsages != null ? { toolModelUsages } : {}),
                 ...(finishReason !== undefined && { finishReason }),
+                ...(streamInfo.request.stopCause != null && {
+                  stopCause: streamInfo.request.stopCause,
+                }),
                 historySequence: streamInfo.historySequence,
                 duration,
                 ...(ttftMs !== undefined && { ttftMs }),
@@ -5365,17 +5411,11 @@ export class StreamManager {
       });
     }
 
-    // Get or create mutex for this workspace
-    if (!this.streamLocks.has(typedWorkspaceId)) {
-      this.streamLocks.set(typedWorkspaceId, new AsyncMutex());
-    }
-    const mutex = this.streamLocks.get(typedWorkspaceId)!;
-
     let registeredStream: WorkspaceStreamInfo | undefined;
     try {
       // Acquire lock - guarantees only one startStream per workspace
       // Lock is automatically released when scope exits via Symbol.asyncDispose
-      await using _lock = await mutex.acquire();
+      await using _lock = await this.acquireStreamStartLock(workspaceId);
 
       // DEBUG: Log stream start
       log.debug(
@@ -5391,6 +5431,10 @@ export class StreamManager {
       const resourceScope = Scope.makeUnsafe();
       let processingStarted = false;
       const cleanupStartup = async (): Promise<void> => {
+        // streamText may already have invoked the provider while the envelope awaited I/O.
+        // A refused startup must cancel that request before releasing its owned resources.
+        if (!streamAbortController.signal.aborted)
+          streamAbortController.abort(new Error("Stream startup did not complete"));
         if (registeredStream) return this.closeStreamResources(registeredStream);
         runLanguageModelCleanup(model);
         unlinkAbortSignal();
@@ -5453,10 +5497,15 @@ export class StreamManager {
           return settleStartupAbort();
         }
 
+        // Construction invokes the provider: validate after every startup resource await.
+        await options.assertAdmissionCurrent?.();
+        if (streamAbortController.signal.aborted) return settleStartupAbort();
+
         // Routed project-skill turns: final consent verdict inside the
-        // critical section — the mutex wait, ensureStreamSafety, and
-        // temp-dir creation above were the last revocation windows. Nothing
-        // awaitable remains between this check and provider dispatch.
+        // critical section — the mutex wait, ensureStreamSafety, temp-dir
+        // creation and the admission check above were the last revocation
+        // windows before the provider stream is constructed below; the gate
+        // runs again per step.
         if (options.preDispatchConsentGate) {
           const consentError = await options.preDispatchConsentGate();
           if (consentError) {
@@ -5467,17 +5516,25 @@ export class StreamManager {
           }
         }
 
-        // Step 4: Atomic stream creation and registration
-        const streamInfo = this.createStreamAtomically(options, {
-          streamToken,
-          runtimeTempDir,
-          resourceScope,
-          abortController: streamAbortController,
-          completionController,
-        });
-
-        registeredStream = streamInfo;
-        streamInfo.unlinkAbortSignal = unlinkAbortSignal;
+        // The persisted comparison and synchronous provider registration share one lock.
+        // Record cleanup ownership inside the callback, even if releasing the lock fails.
+        const construct = () => {
+          if (streamAbortController.signal.aborted) return;
+          registeredStream = this.createStreamAtomically(options, {
+            streamToken,
+            runtimeTempDir,
+            resourceScope,
+            abortController: streamAbortController,
+            completionController,
+          });
+          registeredStream.unlinkAbortSignal = unlinkAbortSignal;
+          // Scope close must own STARTING streams before the fence's release can await.
+          this.superviseEngine(typedWorkspaceId, registeredStream);
+        };
+        if (options.withAdmissionCurrent) await options.withAdmissionCurrent(construct);
+        else construct();
+        const streamInfo = registeredStream;
+        if (!streamInfo) return settleStartupAbort();
 
         // Guard against a narrow race:
         // - stopStream() may abort while we're between the last aborted-check and stream registration.
@@ -5491,15 +5548,16 @@ export class StreamManager {
           return settleStartupAbort();
         }
 
-        // Supervise from registration on: a shutdown landing during the envelope
-        // write below must find this STARTING stream and cancel it inside the
-        // scope close (the hard-interrupt path documented after the await),
-        // not after teardown has moved past the bridges.
-        this.superviseEngine(typedWorkspaceId, streamInfo);
-
         // Stream constructed + registered: durable request-describing side
         // effects (turn envelope) may be recorded now.
         await onStreamConstructed?.();
+        // The envelope may wait on storage after construction; do not begin processing a
+        // superseded request. Existing failure cleanup owns its registered stream and handle.
+        if (
+          !streamAbortController.signal.aborted &&
+          this.workspaceStreams.get(typedWorkspaceId) === streamInfo
+        )
+          await options.assertAdmissionCurrent?.();
 
         // A hard interrupt during the awaited envelope write finds the
         // registered STARTING stream, aborts it, awaits its placeholder
@@ -5860,10 +5918,20 @@ export class StreamManager {
     return Array.from(this.workspaceStreams.keys()).map((id) => id as string);
   }
 
+  /** Serialize idle recovery with stream startup, including terminal persistence. */
+  async acquireStreamStartLock(workspaceId: string) {
+    const id = workspaceId as WorkspaceId;
+    let mutex = this.streamLocks.get(id);
+    if (mutex == null) {
+      mutex = new AsyncMutex();
+      this.streamLocks.set(id, mutex);
+    }
+    return mutex.acquire();
+  }
+
   /**
-   * Gets the current stream info for a workspace if actively streaming
-   * Returns undefined if no active stream exists
-   * Used to re-establish streaming context on frontend reconnection
+   * Gets the current stream info for a workspace if actively streaming.
+   * Include finalizing streams when checking whether recovery can proceed.
    */
   getStreamInfo(
     workspaceId: string,

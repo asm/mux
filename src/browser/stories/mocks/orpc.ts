@@ -1156,6 +1156,16 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     agentPlugins: {
       list: () => Promise.resolve({ success: true, data: agentPluginsMock?.items ?? [] }),
       containerLocation: () => Promise.resolve("~/.mux/plugins"),
+      getComponents: () =>
+        Promise.resolve({
+          success: false,
+          error: "No component inventory configured in this story",
+        }),
+      setComponents: () =>
+        Promise.resolve({
+          success: false,
+          error: "No component selection configured in this story",
+        }),
       checkUpdates: () =>
         Promise.resolve({ success: true, data: agentPluginsMock?.updateChecks ?? [] }),
       preview: () =>
@@ -1652,6 +1662,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             projectName: input.projectPath.split("/").pop() ?? "project",
             namedWorkspacePath: `/mock/workspace/${input.branchName}`,
             runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+            // The frontend rejects created workspaces without createdAt as a contract violation.
+            createdAt: new Date(Date.now()).toISOString(),
           },
         });
       },

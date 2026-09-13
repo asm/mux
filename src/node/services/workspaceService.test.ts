@@ -1,4 +1,10 @@
 import type { TurnCompletion } from "./streamManager";
+import {
+  FileCompactionCancellationStorage,
+  type CompactionCancellation,
+} from "./compactionCancellation";
+import { CompactionPendingState } from "./compactionPendingState";
+import * as historyScanner from "./historyScanner";
 import type { TurnCoordinator } from "./turnCoordinator";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
@@ -17,7 +23,7 @@ import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCom
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { askUserQuestionManager } from "./askUserQuestionManager";
 import { WorkspaceLifecycleHooks } from "./workspaceLifecycleHooks";
-import { EventEmitter } from "events";
+import { EventEmitter, once } from "events";
 import { existsSync } from "fs";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
@@ -27,7 +33,7 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import type { SendMessageError } from "@/common/types/errors";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { Config, SecretsStore } from "@/node/config";
-import type { HistoryService } from "./historyService";
+import { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import type { SessionTimingService } from "./sessionTimingService";
@@ -104,6 +110,17 @@ import type {
   BashMonitorWakeReconcilerRegistry,
   BashMonitorWakeDispatch,
 } from "./bashMonitorWakeReconciler";
+
+// Policy fixtures do not run a session; runtime cancellation races use real session fixtures.
+function createCompactionAdmissionMocks() {
+  return {
+    captureCompactionAdmission: mock(() => () => false),
+    beginResumeIntent: mock(() => ({
+      signal: new AbortController().signal,
+      [Symbol.dispose]: () => undefined,
+    })),
+  };
+}
 
 // Helper to access private renamingWorkspaces set
 function addToRenamingWorkspaces(service: WorkspaceService, workspaceId: string): void {
@@ -752,6 +769,170 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("output after retirement wakes when fast Stop settlement completes", async () => {
+    const h = await createActiveWakeHarness();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let stopping: ReturnType<WorkspaceService["interruptStream"]> | undefined;
+    try {
+      h.service.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({
+          terminateAllDescendantAgentTasks: async () => {
+            entered.resolve();
+            await release.promise;
+            return [];
+          },
+        })
+      );
+      stopping = h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true });
+      await entered.promise;
+      await h.addAttention(20);
+      expect(h.requests).toHaveLength(0);
+      expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(2);
+      const launched = once(h.launched, "start");
+      release.resolve();
+      expect(await stopping).toEqual(Ok(undefined));
+      await launched;
+      expect(h.requests).toHaveLength(1);
+      expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
+    } finally {
+      release.resolve();
+      await stopping;
+      await h.finish();
+    }
+  });
+
+  test("outer Stop preserves physical completion through exact cleanup retry", async () => {
+    const h = await createActiveWakeHarness();
+    try {
+      spyOn(h.historyService, "neutralizeCompactionRecoveryUnderHistoryLock").mockRejectedValueOnce(
+        new Error("cleanup unavailable")
+      );
+      expect(await h.service.interruptStream(h.workspaceId)).toEqual(Err(STOP_UNRECORDED_MESSAGE));
+      const storage = h.historyService.getCompactionCancellationStorage(h.workspaceId);
+      const cancellation = (
+        h.session as unknown as { compactionCancellation: CompactionCancellation }
+      ).compactionCancellation;
+      // Downgrade cleanup fails before publication; the local Stop still owns its exact retry.
+      expect(await storage.read()).toBeNull();
+      const failed = await cancellation.read();
+      expect(failed).toMatchObject({ version: 1 });
+      expect(cancellation.needsPersistence).toBe(true);
+      expect(await cancellation.retry()).toBe("applied");
+      expect(await storage.read()).toMatchObject({ version: 2, nonce: failed?.nonce });
+      expect(await h.session.isAutomaticSendBlocked()).toBe(false);
+    } finally {
+      await h.finish();
+    }
+  });
+
+  test("failed descendant Stop cleanup stays V1 across restart", async () => {
+    const h = await createActiveWakeHarness();
+    h.service.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        terminateAllDescendantAgentTasks: () => Promise.reject(new Error("descendant unavailable")),
+      })
+    );
+    const foreign = await createAgentSessionHarness({
+      workspaceId: h.workspaceId,
+      config: h.config,
+      historyService: new HistoryService(h.config),
+    });
+    try {
+      // Preserve the existing API result; swallowed cleanup errors confer no settlement proof.
+      expect(await h.service.interruptStream(h.workspaceId)).toEqual(Ok(undefined));
+      expect(
+        await h.historyService.getCompactionCancellationStorage(h.workspaceId).read()
+      ).toMatchObject({ version: 1 });
+      expect(await foreign.session.isAutomaticSendBlocked()).toBe(true);
+    } finally {
+      await foreign.session.dispose();
+      await foreign.cleanup();
+      await h.finish();
+    }
+  });
+
+  test.each(
+    (["retirement", "descendants"] as const).flatMap((phase) =>
+      [false, true].map((superseded) => ({ phase, superseded }))
+    )
+  )(
+    "hard Stop remains V1 until outer $phase finishes across instances (superseded=$superseded)",
+    async ({ phase, superseded }) => {
+      const h = await createActiveWakeHarness();
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      if (phase === "retirement") {
+        const consume = h.reconciler.consumeCurrent.bind(h.reconciler);
+        spyOn(h.reconciler, "consumeCurrent").mockImplementationOnce(async (...args) => {
+          const result = await consume(...args);
+          entered.resolve();
+          await release.promise;
+          return result;
+        });
+      } else {
+        h.service.setAgentTaskIntegration(
+          makeAgentTaskIntegrationFake({
+            terminateAllDescendantAgentTasks: async () => {
+              entered.resolve();
+              await release.promise;
+              return [];
+            },
+          })
+        );
+      }
+      const foreign = await createAgentSessionHarness({
+        workspaceId: h.workspaceId,
+        config: h.config,
+        historyService: new HistoryService(h.config),
+      });
+      let stopping: Promise<unknown> | undefined;
+      try {
+        stopping = h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true });
+        await entered.promise;
+        expect(
+          await h.historyService.getCompactionCancellationStorage(h.workspaceId).read()
+        ).toMatchObject({ version: 1, scope: { kind: "unresolved" } });
+        expect(await foreign.session.isAutomaticSendBlocked()).toBe(true);
+        expect(
+          (
+            await foreign.session.sendMessage(
+              "too early",
+              { model: h.model, agentId: "exec" },
+              { acceptanceOrigin: "automatic" }
+            )
+          ).success
+        ).toBe(false);
+        if (superseded) expect(await foreign.session.cancelCompaction()).toEqual(Ok(undefined));
+        const successor = superseded
+          ? await h.historyService.getCompactionCancellationStorage(h.workspaceId).read()
+          : null;
+        release.resolve();
+        expect(await stopping).toEqual(Ok(undefined));
+        const completed = await h.historyService
+          .getCompactionCancellationStorage(h.workspaceId)
+          .read();
+        if (superseded) expect(completed).toEqual(successor);
+        else expect(completed).toMatchObject({ version: 2 });
+        expect(
+          (
+            await foreign.session.sendMessage(
+              "fresh after cleanup",
+              { model: h.model, agentId: "exec" },
+              { acceptanceOrigin: "automatic" }
+            )
+          ).success
+        ).toBe(!superseded);
+      } finally {
+        release.resolve();
+        await stopping;
+        await foreign.session.dispose();
+        await foreign.cleanup();
+        await h.finish();
+      }
+    }
+  );
+
   test("hard Stop retires owed attention without disarming future idle wakes", async () => {
     const h = await createActiveWakeHarness();
     try {
@@ -774,6 +955,108 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       await h.addAttention(20);
       expect(h.requests).toHaveLength(2);
     } finally {
+      await h.finish();
+    }
+  });
+
+  test.each(["retained", "generation mismatch"] as const)(
+    "%s Stop leaves fresh monitor attention owed without spinning and manual replacement re-arms it",
+    async (kind) => {
+      const h = await createActiveWakeHarness();
+      const internal = h.internal as typeof h.internal & {
+        scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId: string): void;
+      };
+      // Suppress a broken immediate retry so the refusal is a bounded assertion, not a timeout.
+      const idleRetry = spyOn(
+        internal,
+        "scheduleBashMonitorWakeReconcileAfterIdle"
+      ).mockImplementation(() => undefined);
+      try {
+        if (kind === "retained") await h.session.cancelCompaction(true);
+        else {
+          expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+          await h.historyService.getContinuousCompactionJournal(h.workspaceId).advanceGeneration();
+        }
+        const storage = h.historyService.getCompactionCancellationStorage(h.workspaceId);
+        const stop = await storage.read();
+        await h.addAttention(20);
+        expect(idleRetry).not.toHaveBeenCalled();
+        expect(h.requests).toHaveLength(0);
+        expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(2);
+        expect((await storage.read())?.nonce).toBe(stop?.nonce);
+        const history = await h.historyService.getHistoryFromLatestBoundary(h.workspaceId);
+        expect(history).toEqual(Ok([]));
+        idleRetry.mockRestore();
+        await h.session.sendMessage("manual replacement", { model: h.model, agentId: "exec" });
+        await h.complete();
+        await h.reconciler.reconcile(h.workspaceId);
+        expect(h.requests).toHaveLength(2);
+        expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
+      } finally {
+        await h.finish();
+      }
+    }
+  );
+
+  test("a cancellation write failure still completes successful hard-Stop cleanup", async () => {
+    const h = await createActiveWakeHarness();
+    const descendants = mock(() => Promise.resolve(["child"]));
+    h.service.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({ terminateAllDescendantAgentTasks: descendants })
+    );
+    const partialDeleted = spyOn(h.historyService, "deletePartial");
+    const queueRestored = spyOn(h.session, "restoreQueueToInput");
+    const accountingEntered = Promise.withResolvers<void>();
+    const releaseAccounting = Promise.withResolvers<void>();
+    const policy = h.session as unknown as {
+      recordGoalAccountingFromUsage(input: unknown): Promise<void>;
+    };
+    spyOn(policy, "recordGoalAccountingFromUsage").mockImplementation(async () => {
+      accountingEntered.resolve();
+      await releaseAccounting.promise;
+    });
+    const stopSession = h.session.interruptStream.bind(h.session);
+    let sessionResult: Awaited<ReturnType<AgentSession["interruptStream"]>> | undefined;
+    spyOn(h.session, "interruptStream").mockImplementation(async (...args) => {
+      sessionResult = await stopSession(...args);
+      return sessionResult;
+    });
+    let interrupt: Promise<Result<void>> | undefined;
+    try {
+      await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
+      await h.addAttention(10);
+      spyOn(h.aiService, "stopStream").mockImplementation(() => {
+        h.abort("user");
+        return Promise.resolve(Ok(undefined));
+      });
+      spyOn(h.aiService, "isStreaming").mockReturnValue(false);
+      spyOn(FileCompactionCancellationStorage.prototype, "mutate").mockImplementationOnce(() =>
+        Promise.reject(new Error("cancellation write failed"))
+      );
+      let returned = false;
+      interrupt = h.service.interruptStream(h.workspaceId, {
+        abandonPartial: true,
+        retireBashMonitorAttention: true,
+      });
+      const settled = interrupt.then(() => {
+        returned = true;
+      });
+      await accountingEntered.promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(returned).toBe(false);
+      releaseAccounting.resolve();
+      expect(await interrupt).toEqual(Err(STOP_UNRECORDED_MESSAGE));
+      await settled;
+      expect(sessionResult).toMatchObject({ success: false, error: "cancellation write failed" });
+      expect(partialDeleted).toHaveBeenCalledWith(h.workspaceId);
+      expect(descendants).toHaveBeenCalledWith(h.workspaceId);
+      expect(queueRestored).toHaveBeenCalledTimes(1);
+      expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
+      expect(h.session.isBusy()).toBe(false);
+    } finally {
+      releaseAccounting.resolve();
+      await interrupt;
+      await h.session.cancelCompaction();
       await h.finish();
     }
   });
@@ -840,7 +1123,9 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       // The stop's idle reconcile retried the retirement instead of re-dispatching the output.
       expect(h.requests).toHaveLength(1);
       expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
+      const woke = new Promise<void>((resolve) => h.launched.once("start", resolve));
       await h.addAttention(20);
+      await woke;
       expect(h.requests).toHaveLength(2);
     } finally {
       await h.finish();
@@ -858,11 +1143,157 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
           .success
       ).toBe(false);
       expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(2);
+      const woke = new Promise<void>((resolve) => h.launched.once("start", resolve));
       await h.complete();
+      await woke;
       await h.internal.pendingBashMonitorWakeIdleWaitsByOwner.get(h.workspaceId);
       await h.reconciler.reconcile(h.workspaceId);
       expect(h.requests).toHaveLength(2);
     } finally {
+      await h.finish();
+    }
+  });
+
+  test.each([
+    "success",
+    "failure",
+    "partial failure",
+    "superseded",
+    "local supersession",
+    "closing",
+  ] as const)(
+    "failed physical Stop waits for its outer cleanup before natural completion qualifies (%s)",
+    async (outcome) => {
+      const h = await createActiveWakeHarness();
+      const release = Promise.withResolvers<void>();
+      const terminate = mock(async () => {
+        await release.promise;
+        if (outcome === "failure") throw new Error("descendant cleanup failed");
+        return [];
+      });
+      if (outcome === "partial failure") {
+        spyOn(h.historyService, "deletePartial").mockImplementationOnce(async () => {
+          await release.promise;
+          throw new Error("partial cleanup failed");
+        });
+      }
+      const releaseLatch = mock(() => undefined);
+      const restoreQueue = spyOn(h.session, "restoreQueueToInput");
+      h.service.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({
+          terminateAllDescendantAgentTasks: terminate,
+          latchHardInterruptCascade: () => releaseLatch,
+        })
+      );
+      const foreign = await createAgentSessionHarness({
+        workspaceId: h.workspaceId,
+        config: h.config,
+        historyService: new HistoryService(h.config),
+      });
+      try {
+        await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
+        await h.addAttention(10);
+        h.stopStream.mockResolvedValueOnce(Err("stop failed"));
+        // The original physical error returns while descendant cleanup is still held.
+        expect(
+          await h.service.interruptStream(h.workspaceId, {
+            retireBashMonitorAttention: true,
+            abandonPartial: outcome === "partial failure",
+          })
+        ).toEqual(Err("stop failed"));
+        expect(terminate).toHaveBeenCalledTimes(outcome === "partial failure" ? 0 : 1);
+        expect(releaseLatch).not.toHaveBeenCalled();
+        expect(restoreQueue).not.toHaveBeenCalled();
+        const cleanup = [
+          ...(h.service as unknown as { pendingWorkspaceCleanup: Set<Promise<void>> })
+            .pendingWorkspaceCleanup,
+        ];
+        expect(cleanup).toHaveLength(1);
+        await h.complete();
+        const storage = h.historyService.getCompactionCancellationStorage(h.workspaceId);
+        const stopped = await storage.read();
+        expect(stopped).toMatchObject({ version: 1 });
+        expect(await foreign.session.isAutomaticSendBlocked()).toBe(true);
+        expect(h.requests).toHaveLength(1);
+        expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(2);
+        if (outcome === "superseded") {
+          expect(await foreign.session.cancelCompaction()).toEqual(Ok(undefined));
+        }
+        if (outcome === "local supersession") {
+          expect(await h.session.cancelCompaction()).toEqual(Ok(undefined));
+        }
+        if (outcome === "closing") h.session.beginShutdown();
+        const successor = await storage.read();
+        const woke = outcome === "success" ? once(h.launched, "start") : undefined;
+        release.resolve();
+        await Promise.all(cleanup);
+        expect(releaseLatch).toHaveBeenCalledTimes(1);
+        expect(restoreQueue).toHaveBeenCalledTimes(
+          outcome === "partial failure" || outcome === "local supersession" || outcome === "closing"
+            ? 0
+            : 1
+        );
+        if (woke) {
+          await woke;
+          expect(h.requests).toHaveLength(2);
+          expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
+        } else {
+          expect(await storage.read()).toEqual(
+            outcome === "superseded" || outcome === "local supersession" ? successor : stopped
+          );
+          expect(await foreign.session.isAutomaticSendBlocked()).toBe(true);
+          expect(h.requests).toHaveLength(1);
+        }
+      } finally {
+        release.resolve();
+        await foreign.session.dispose();
+        await foreign.cleanup();
+        await h.finish();
+      }
+    }
+  );
+
+  test("failed Stop monitor retirement debt does not hold workspace cleanup during shutdown", async () => {
+    const h = await createActiveWakeHarness();
+    const release = Promise.withResolvers<void>();
+    const releaseLatch = mock(() => undefined);
+    h.service.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        latchHardInterruptCascade: () => releaseLatch,
+        terminateAllDescendantAgentTasks: async () => {
+          await release.promise;
+          return [];
+        },
+      })
+    );
+    try {
+      await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
+      // A persistence failure has no retirement receipt. Only the finalizer may await its retry.
+      spyOn(h.reconciler, "consumeCurrent").mockRejectedValueOnce(new Error("retirement failed"));
+      h.stopStream.mockResolvedValueOnce(Err("stop failed"));
+      expect(
+        await h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true })
+      ).toEqual(Err("stop failed"));
+      const cleanup = [
+        ...(h.service as unknown as { pendingWorkspaceCleanup: Set<Promise<void>> })
+          .pendingWorkspaceCleanup,
+      ];
+      expect(cleanup).toHaveLength(1);
+      release.resolve();
+      await h.complete();
+      h.service.beginShutdown();
+      await h.session.finishShutdown();
+      await Promise.all(cleanup);
+      expect(releaseLatch).toHaveBeenCalledTimes(1);
+      expect(
+        (h.service as unknown as { pendingWorkspaceCleanup: Set<Promise<void>> })
+          .pendingWorkspaceCleanup.size
+      ).toBe(0);
+      expect(
+        await h.historyService.getCompactionCancellationStorage(h.workspaceId).read()
+      ).toMatchObject({ version: 1 });
+    } finally {
+      release.resolve();
       await h.finish();
     }
   });
@@ -1913,12 +2344,14 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     const h = await createActiveWakeHarness();
     const entered = createDeferred<void>();
     const release = createDeferred<void>();
-    const append = h.historyService.appendToHistory.bind(h.historyService);
-    spyOn(h.historyService, "appendToHistory").mockImplementationOnce(async (...args) => {
-      entered.resolve();
-      await release.promise;
-      return append(...args);
-    });
+    const append = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
+      async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return append(...args);
+      }
+    );
     const controller = new AbortController();
     const accepted = mock(() => Promise.resolve());
     const deferred = mock(() => Promise.resolve());
@@ -7383,6 +7816,255 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     return { aiService, config, historyService, workspaceService, goalService, cleanup };
   }
 
+  test.each(["send", "resume", "resume-replaced"] as const)(
+    "service %s pricing cannot adopt a later Stop or replacement intent",
+    async (kind) => {
+      const { config, historyService, workspaceService, goalService, cleanup } =
+        await createServices();
+      const workspaceId = `pricing-cancellation-${kind}`;
+      await config.addWorkspace("/tmp/pricing-cancellation-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "pricing-cancellation-project",
+        projectPath: "/tmp/pricing-cancellation-project",
+        runtimeConfig: { type: "local" },
+      });
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        config,
+        historyService,
+        workspaceGoalService: goalService,
+      });
+      workspaceService.registerSession(workspaceId, h.session);
+      const stream = spyOn(h.aiService, "streamMessage");
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("prior", "user", "old request")
+      );
+      await h.session.cancelCompaction(true);
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const pricing = goalService.assertPricedModelForBudgetedGoal.bind(goalService);
+      spyOn(goalService, "assertPricedModelForBudgetedGoal").mockImplementationOnce(
+        async (...args) => {
+          entered.resolve();
+          await release.promise;
+          return pricing(...args);
+        }
+      );
+      const dispatch =
+        kind === "send"
+          ? workspaceService.sendMessage(workspaceId, "stale input", {
+              model: "openai:gpt-4o",
+              agentId: "exec",
+            })
+          : workspaceService.resumeStream(workspaceId, { model: "openai:gpt-4o", agentId: "exec" });
+      try {
+        await entered.promise;
+        if (kind === "resume-replaced")
+          h.session.queueMessage("new input", { model: "openai:gpt-4o", agentId: "exec" });
+        else expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+        release.resolve();
+        const result = await dispatch;
+        if (kind === "send") expect(result.success).toBe(false);
+        else expect(result).toEqual(Ok({ started: false }));
+        const persisted = await historyService.getLastMessages(workspaceId, 10);
+        expect(persisted.success && persisted.data.map((row) => row.id)).toEqual(["prior"]);
+        expect(
+          await historyService.getCompactionCancellationStorage(workspaceId).read()
+        ).not.toBeNull();
+        expect(stream).not.toHaveBeenCalled();
+      } finally {
+        release.resolve();
+        await dispatch;
+        await workspaceService.disposeSession(workspaceId);
+        await cleanup();
+      }
+    }
+  );
+
+  test.each(["send", "resume"] as const)(
+    "service %s pricing preserves the frontier against a foreign backend Stop",
+    async (kind) => {
+      const { config, historyService, workspaceService, goalService, cleanup } =
+        await createServices();
+      const workspaceId = `foreign-pricing-cancellation-${kind}`;
+      await config.addWorkspace("/tmp/pricing-cancellation-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "pricing-cancellation-project",
+        projectPath: "/tmp/pricing-cancellation-project",
+        runtimeConfig: { type: "local" },
+      });
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        config,
+        historyService,
+        workspaceGoalService: goalService,
+      });
+      workspaceService.registerSession(workspaceId, h.session);
+      const stream = spyOn(h.aiService, "streamMessage");
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("prior", "user", "old request")
+      );
+      const foreign = await createAgentSessionHarness({
+        workspaceId,
+        config,
+        historyService: new HistoryService(config),
+      });
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const pricing = goalService.assertPricedModelForBudgetedGoal.bind(goalService);
+      spyOn(goalService, "assertPricedModelForBudgetedGoal").mockImplementationOnce(
+        async (...args) => {
+          entered.resolve();
+          await release.promise;
+          return pricing(...args);
+        }
+      );
+      const dispatch =
+        kind === "send"
+          ? workspaceService.sendMessage(workspaceId, "stale input", {
+              model: "openai:gpt-4o",
+              agentId: "exec",
+            })
+          : workspaceService.resumeStream(workspaceId, { model: "openai:gpt-4o", agentId: "exec" });
+      try {
+        await entered.promise;
+        expect(await foreign.session.interruptStream()).toEqual(Ok(undefined));
+        const stopped = await historyService.getCompactionCancellationStorage(workspaceId).read();
+        expect(stopped).not.toBeNull();
+        release.resolve();
+        const result = await dispatch;
+        if (kind === "send") expect(result.success).toBe(false);
+        else
+          expect(
+            result.success && result.data != null && "started" in result.data && result.data.started
+          ).toBe(false);
+        const persisted = await historyService.getLastMessages(workspaceId, 10);
+        expect(persisted.success && persisted.data.map((row) => row.id)).toEqual(["prior"]);
+        expect(
+          await historyService.getCompactionCancellationStorage(workspaceId).read()
+        ).not.toBeNull();
+        expect(stream).not.toHaveBeenCalled();
+        expect(await historyService.getCompactionCancellationStorage(workspaceId).read()).toEqual(
+          stopped
+        );
+      } finally {
+        release.resolve();
+        await dispatch;
+        await workspaceService.disposeSession(workspaceId);
+        await foreign.session.dispose();
+        await cleanup();
+      }
+    }
+  );
+
+  test.each(["pricing", "queue"] as const)(
+    "automatic family work admitted before a foreign Stop stays fenced through %s",
+    async (stage) => {
+      const { config, historyService, workspaceService, goalService, cleanup } =
+        await createServices();
+      const workspaceId = `foreign-family-${stage}`;
+      await config.addWorkspace("/tmp/foreign-family-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "foreign-family-project",
+        projectPath: "/tmp/foreign-family-project",
+        runtimeConfig: { type: "local" },
+      });
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        config,
+        historyService,
+        workspaceGoalService: goalService,
+      });
+      const foreign = await createAgentSessionHarness({
+        workspaceId,
+        config,
+        historyService: new HistoryService(config),
+      });
+      workspaceService.registerSession(workspaceId, h.session);
+      const streamStarted = Promise.withResolvers<void>();
+      const stream = spyOn(h.aiService, "streamMessage").mockImplementation(() => {
+        streamStarted.resolve();
+        return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("prior", "user", "old request")
+      );
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const failed = Promise.withResolvers<void>();
+      const price = goalService.assertPricedModelForBudgetedGoal.bind(goalService);
+      const busy = stage === "queue" ? spyOn(h.session, "isBusy").mockReturnValue(true) : undefined;
+      if (stage === "pricing")
+        spyOn(goalService, "assertPricedModelForBudgetedGoal").mockImplementationOnce(
+          async (...args) => {
+            entered.resolve();
+            await release.promise;
+            return price(...args);
+          }
+        );
+      const options = { model: "openai:gpt-4o", agentId: "exec" };
+      const dispatched = workspaceService.sendMessage(workspaceId, "stale child trigger", options, {
+        acceptanceOrigin: "automatic",
+        synthetic: true,
+        agentInitiated: true,
+        preTurnMessages: [
+          createMuxMessage("child-payload", "assistant", "stale child payload", {
+            synthetic: true,
+          }),
+        ],
+        onAcceptedPreStreamFailure: () => {
+          failed.resolve();
+        },
+      });
+      try {
+        if (stage === "pricing") await entered.promise;
+        else {
+          expect(await dispatched).toEqual(Ok({ queued: true }));
+          expect(h.session.hasQueuedMessages()).toBe(true);
+        }
+        expect(await foreign.session.interruptStream()).toEqual(Ok(undefined));
+        const stopped = await historyService.getCompactionCancellationStorage(workspaceId).read();
+        expect(stopped?.version).toBe(2);
+        release.resolve();
+        busy?.mockRestore();
+        if (stage === "queue") {
+          h.session.drainQueuedMessagesIfIdle();
+          await Promise.race([failed.promise, streamStarted.promise]);
+          expect(stream).not.toHaveBeenCalled();
+          await h.session.waitForIdle();
+        } else expect((await dispatched).success).toBe(false);
+        const rows = await historyService.getLastMessages(workspaceId, 10);
+        expect(rows.success && rows.data.map((row) => row.id)).toEqual(["prior"]);
+        expect(stream).not.toHaveBeenCalled();
+        expect(await historyService.getCompactionCancellationStorage(workspaceId).read()).toEqual(
+          stopped
+        );
+        // The fence belongs to the old admission, not to the automatic origin itself.
+        expect(
+          await workspaceService.sendMessage(workspaceId, "fresh child trigger", options, {
+            acceptanceOrigin: "automatic",
+            synthetic: true,
+            agentInitiated: true,
+          })
+        ).toEqual(Ok(undefined));
+        expect(stream).toHaveBeenCalledTimes(1);
+      } finally {
+        release.resolve();
+        busy?.mockRestore();
+        await dispatched;
+        await workspaceService.disposeSession(workspaceId);
+        await foreign.session.dispose();
+        await cleanup();
+      }
+    }
+  );
+
   test("requireIdle sends carry a live idle-admission probe re-evaluated at session gates", async () => {
     // Codex P1 (PRRT_kwDOPxxmWM6cJ6NI): the preflight count check at
     // sendMessage entry is a one-shot snapshot — a manual send can enter
@@ -7407,6 +8089,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       });
       let capturedProbe: (() => boolean) | undefined;
       const fakeSession = {
+        ...createCompactionAdmissionMocks(),
         isBusy: mock(() => false),
         emitMetadata: mock(() => undefined),
         drainQueuedMessagesIfIdle: mock(() => undefined),
@@ -7539,7 +8222,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       bashMonitorRecoveryPromise: Promise<void>;
     };
     internal.bashMonitorRecoveryPromise = recovery.promise;
-    const truncateSpy = spyOn(historyService, "truncateHistory").mockResolvedValue(Ok([]));
+    const truncateSpy = spyOn(historyService, "clearCompactionHistoryUnderHistoryLock");
 
     try {
       const clearPromise = workspaceService.truncateHistory(workspaceId, 1.0);
@@ -7555,6 +8238,170 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       await cleanup();
     }
   });
+
+  test.each(
+    (["clear", "replace"] as const).flatMap((kind) =>
+      (["barrier", "post-deletion"] as const).map((failure) => ({ kind, failure }))
+    )
+  )("full $kind accounts for actual deletion when $failure fails", async ({ kind, failure }) => {
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const id = `clear-receipt-${kind}-${failure}`;
+    const h = await createAgentSessionHarness({ workspaceId: id, config, historyService });
+    workspaceService.registerSession(id, h.session);
+    try {
+      await config.addWorkspace("/tmp/clear-receipt-project", {
+        id,
+        name: id,
+        projectName: "clear-receipt-project",
+        projectPath: "/tmp/clear-receipt-project",
+        runtimeConfig: { type: "local" },
+      });
+      expect(
+        (await historyService.appendToHistory(id, createMuxMessage("old", "user", "old"))).success
+      ).toBe(true);
+      const storage = historyService.getCompactionCancellationStorage(id);
+      const internal = workspaceService as unknown as {
+        bashMonitorRecoveryPromise: Promise<void>;
+        bashMonitorWakeReconciler: BashMonitorWakeReconciler;
+        contextMutationEpochs: Map<string, number>;
+      };
+      await internal.bashMonitorRecoveryPromise;
+      const priorEpoch = internal.contextMutationEpochs.get(id) ?? 0;
+      const finish = spyOn(internal.bashMonitorWakeReconciler, "finishFullHistoryClear");
+      const emit = spyOn(h.session, "emitChatEvent");
+      if (failure === "barrier") {
+        spyOn(internal.bashMonitorWakeReconciler, "beginFullHistoryClear").mockRejectedValueOnce(
+          new Error("barrier unavailable")
+        );
+      } else {
+        const clear = historyService.clearCompactionHistoryUnderHistoryLock.bind(historyService);
+        spyOn(historyService, "clearCompactionHistoryUnderHistoryLock").mockImplementationOnce(
+          async (...args) => {
+            await clear(...args);
+            throw new Error("post-deletion unavailable");
+          }
+        );
+      }
+      const result = await (
+        kind === "clear"
+          ? workspaceService.truncateHistory(id)
+          : workspaceService.replaceHistory(id, createMuxMessage("new", "user", "new"))
+      ).catch((error: unknown) => Err(String(error)));
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain(`${failure} unavailable`);
+      const history = await historyService.getHistoryFromLatestBoundary(id);
+      expect(history.success && history.data.map((row) => row.id)).toEqual(
+        failure === "barrier" ? ["old"] : []
+      );
+      expect(await storage.read()).toBeNull();
+      expect(internal.contextMutationEpochs.get(id) ?? 0).toBe(
+        priorEpoch + (failure === "post-deletion" ? 1 : 0)
+      );
+      if (failure === "post-deletion") {
+        expect(finish).toHaveBeenCalledTimes(1);
+        expect(emit).toHaveBeenCalledWith({ type: "delete", historySequences: [0] });
+      } else {
+        expect(finish).not.toHaveBeenCalled();
+        expect(emit.mock.calls.some(([event]) => event.type === "delete")).toBe(false);
+      }
+    } finally {
+      mock.restore();
+      await h.session.dispose();
+      await h.cleanup();
+      await cleanup();
+    }
+  });
+
+  test.each([
+    ["clear", false],
+    ["clear", true],
+    ["replace", false],
+    ["replace", true],
+  ] as const)(
+    "full %s deletes malformed summaries and recovers failed cancellation (delete failure=%s)",
+    async (kind, failDeletion) => {
+      const { config, historyService, workspaceService, cleanup } = await createServices();
+      const workspaceId = `clear-malformed-summary-${kind}-${failDeletion}`;
+      const h = await createAgentSessionHarness({ workspaceId, config, historyService });
+      workspaceService.registerSession(workspaceId, h.session);
+      try {
+        await config.addWorkspace("/tmp/clear-malformed-summary-project", {
+          id: workspaceId,
+          name: workspaceId,
+          projectName: "clear-malformed-summary-project",
+          projectPath: "/tmp/clear-malformed-summary-project",
+          runtimeConfig: { type: "local" },
+        });
+        const summary = createMuxMessage("damaged-summary", "assistant", "summary", {
+          compactionBoundary: true,
+          muxMetadata: {
+            type: "compaction-summary",
+            pendingFollowUp: { text: "obsolete input", model: "openai:gpt-4o", agentId: "exec" },
+          },
+        });
+        expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
+        const chatPath = path.join(config.sessionsDir, workspaceId, "chat.jsonl");
+        const damaged = JSON.stringify({ ...summary, parts: null }) + "\n";
+        await fsPromises.writeFile(chatPath, damaged);
+        // Ordinary Stop still refuses unsafe row-wise repair; explicit full deletion can
+        // recover a workspace already left with that failed cancellation's blocking debt.
+        expect((await h.session.cancelCompaction(true)).success).toBe(false);
+        const foreign = new HistoryService(config);
+        const generation = await foreign
+          .getContinuousCompactionJournal(workspaceId)
+          .captureGeneration();
+        const storage = foreign.getCompactionCancellationStorage(workspaceId);
+        const clear = () =>
+          kind === "clear"
+            ? workspaceService.truncateHistory(workspaceId)
+            : workspaceService.replaceHistory(
+                workspaceId,
+                createMuxMessage("replacement", "assistant", "new context")
+              );
+        if (failDeletion) {
+          const failing = spyOn(
+            historyService,
+            "clearCompactionHistoryUnderHistoryLock"
+          ).mockRejectedValueOnce(new Error("deletion unavailable"));
+          expect((await clear()).success).toBe(false);
+          failing.mockRestore();
+          expect(await fsPromises.readFile(chatPath, "utf8")).toBe(damaged);
+          expect(await storage.read()).toBeNull();
+        }
+        expect(await clear()).toEqual(Ok(undefined));
+        const remaining = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(remaining.success && remaining.data.map((row) => row.id)).toEqual(
+          kind === "clear" ? [] : ["replacement"]
+        );
+        expect(await storage.read()).toMatchObject({ retainUntilReplacement: true });
+        // A producer captured by another HistoryService before deletion cannot re-publish
+        // its old boundary into the new epoch, even though the malformed row is now gone.
+        const committed = mock(() => undefined);
+        expect(
+          await foreign.persistBoundaryWithTailCopies(workspaceId, summary, [], false, undefined, {
+            publication: { generation },
+            onCommitted: committed,
+          })
+        ).toEqual(Err("Compaction publication changed"));
+        expect(committed).not.toHaveBeenCalled();
+        expect(
+          (
+            await h.session.sendMessage("manual input after clear", {
+              model: "openai:gpt-4o",
+              agentId: "exec",
+            })
+          ).success
+        ).toBe(true);
+        expect(await storage.read()).toBeNull();
+        const sent = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(sent.success && sent.data.filter((row) => row.role === "user")).toHaveLength(1);
+      } finally {
+        await h.session.dispose();
+        await h.cleanup();
+        await cleanup();
+      }
+    }
+  );
 
   test("full chat clear preserves the goal and requires user acknowledgment", async () => {
     const { config, historyService, workspaceService, goalService, cleanup } =
@@ -7597,7 +8444,8 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
   });
 
   test("full chat clear without a goal does not create goal state", async () => {
-    const { config, workspaceService, goalService, cleanup } = await createServices();
+    const { config, historyService, workspaceService, goalService, cleanup } =
+      await createServices();
     const workspaceId = "clear-without-goal-workspace";
     try {
       await config.addWorkspace("/tmp/clear-without-goal-project", {
@@ -7612,6 +8460,9 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
 
       expect(result.success).toBe(true);
       expect(await goalService.getGoal(workspaceId)).toBeNull();
+      expect(
+        await historyService.getCompactionCancellationStorage(workspaceId).read()
+      ).toMatchObject({ retainUntilReplacement: true });
     } finally {
       await cleanup();
     }
@@ -7820,16 +8671,28 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       const sessionDir = path.join(config.sessionsDir, workspaceId);
       await fsPromises.mkdir(sessionDir, { recursive: true });
       const pendingStatePath = path.join(sessionDir, "post-compaction.json");
-      await fsPromises.writeFile(
+      const pending = new CompactionPendingState(
         pendingStatePath,
-        JSON.stringify({
-          version: 1,
-          createdAt: Date.now(),
-          diffs: [],
-          loadedSkills: [],
-          readFiles: ["/tmp/pre-reset-read.ts"],
-        })
+        historyService.getCompactionPendingHistory(workspaceId)
       );
+      expect(
+        (
+          await pending.publishBoundary({
+            summaryMessage: createMuxMessage("summary", "assistant", "Summary", {
+              compacted: "user",
+              compactionBoundary: true,
+              compactionEpoch: 1,
+            }),
+            tailCopies: [],
+            updateExisting: false,
+            publication: { generation: undefined },
+            attachments: { diffs: [], loadedSkills: [], readFiles: ["/tmp/pre-reset-read.ts"] },
+            isCurrent: () => true,
+            shouldPersist: () => true,
+            onCommitted: () => undefined,
+          })
+        ).success
+      ).toBe(true);
 
       expect(await workspaceService.resetContext(workspaceId)).toEqual({
         success: true,
@@ -7846,11 +8709,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     }
   });
 
-  test("context reset fails when the post-compaction carryover discard is not durable", async () => {
-    // Best-effort deletion of post-compaction.json swallowed unlink failures
-    // while resetContext still reported success — after a restart the stale
-    // file re-injects PRE-reset read paths/skills/diffs. The discard must be
-    // durable-or-fail, matching the sandbox invalidation posture.
+  test("context reset repairs an empty directory at the pending-state path", async () => {
     const { config, historyService, workspaceService, cleanup } = await createServices();
     const workspaceId = "context-reset-carryover-not-durable";
     try {
@@ -7865,19 +8724,362 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         workspaceId,
         createMuxMessage("pre-reset-user", "user", "before reset", {})
       );
-      // Deterministic unlink failure: a DIRECTORY at the pending-state path
-      // fails unlink with EISDIR (read errors are swallowed at load, so this
-      // models exactly the stale-undeletable-file case).
+      // Invalid optional state should heal without blocking a durable history reset.
       const pendingStatePath = path.join(config.sessionsDir, workspaceId, "post-compaction.json");
       await fsPromises.mkdir(pendingStatePath, { recursive: true });
 
       const result = await workspaceService.resetContext(workspaceId);
-      expect(result.success).toBe(false);
-      expect(result.success ? "" : result.error).toContain("post-compaction carryover");
+      expect(result.success).toBe(true);
+      expect(
+        await fsPromises.stat(pendingStatePath).catch((error: unknown) => error)
+      ).toMatchObject({ code: "ENOENT" });
     } finally {
       await cleanup();
     }
   });
+
+  test.each(
+    (["reset", "clear", "replace"] as const).flatMap((operation) =>
+      (["legacy", "future", "current"] as const).map((format) => ({ operation, format }))
+    )
+  )(
+    "empty-history $operation durably fences initial $format carryover",
+    async ({ operation, format }) => {
+      const { config, historyService, workspaceService, cleanup } = await createServices();
+      const workspaceId = "empty-history-carryover";
+      try {
+        await config.addWorkspace("/tmp/empty-history-carryover", {
+          id: workspaceId,
+          name: workspaceId,
+          projectName: "empty-history-carryover",
+          projectPath: "/tmp/empty-history-carryover",
+          runtimeConfig: { type: "local" },
+        });
+        const pendingPath = path.join(config.sessionsDir, workspaceId, "post-compaction.json");
+        let original = JSON.stringify({
+          version: format === "future" ? 9 : 1,
+          createdAt: 1,
+          diffs: [],
+          loadedSkills: [],
+          readFiles: ["/tmp/discarded.ts"],
+        });
+        await fsPromises.mkdir(path.dirname(pendingPath), { recursive: true });
+        await fsPromises.writeFile(pendingPath, original);
+        const pending = new CompactionPendingState(
+          pendingPath,
+          historyService.getCompactionPendingHistory(workspaceId)
+        );
+        const journal = historyService.getContinuousCompactionJournal(workspaceId);
+        if (format === "current") {
+          await journal.advanceGeneration();
+          expect(
+            (
+              await pending.publishBoundary({
+                summaryMessage: createMuxMessage("A", "assistant", "", {
+                  compacted: "user",
+                  compactionBoundary: true,
+                  compactionEpoch: 1,
+                }),
+                tailCopies: [],
+                updateExisting: false,
+                publication: { generation: await journal.captureGeneration() },
+                attachments: { diffs: [], loadedSkills: [], readFiles: ["/tmp/discarded.ts"] },
+                isCurrent: () => true,
+                shouldPersist: () => true,
+                onCommitted: () => undefined,
+              })
+            ).success
+          ).toBe(true);
+          original = await fsPromises.readFile(pendingPath, "utf8");
+        }
+        expect((await pending.load(() => true))?.attachments.readFiles).toEqual(
+          format === "future" ? undefined : ["/tmp/discarded.ts"]
+        );
+        if (format !== "current") expect(await journal.captureGeneration()).toBeUndefined();
+        const result =
+          operation === "reset"
+            ? await workspaceService.resetContext(workspaceId)
+            : operation === "clear"
+              ? await workspaceService.truncateHistory(workspaceId, 1)
+              : await workspaceService.replaceHistory(
+                  workspaceId,
+                  createMuxMessage("replacement", "user", "New context")
+                );
+        expect(result.success).toBe(true);
+        if (operation === "reset") expect(result).toEqual({ success: true, data: "noop" });
+        expect(await journal.captureGeneration()).toBeDefined();
+        if (format === "future")
+          expect(await fsPromises.readFile(pendingPath, "utf8")).toBe(original);
+        else
+          expect(await fsPromises.stat(pendingPath).catch((error: unknown) => error)).toMatchObject(
+            {
+              code: "ENOENT",
+            }
+          );
+        expect(await pending.load(() => true)).toBeUndefined();
+        await workspaceService.disposeSession(workspaceId);
+        const restarted = new CompactionPendingState(
+          pendingPath,
+          new HistoryService(config).getCompactionPendingHistory(workspaceId)
+        );
+        expect(await restarted.load(() => true)).toBeUndefined();
+      } finally {
+        await cleanup();
+      }
+    }
+  );
+
+  test("late no-op reset cleanup preserves a foreign successor after its committed fence", async () => {
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "empty-reset-successor";
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let resetting: ReturnType<WorkspaceService["resetContext"]> | undefined;
+    try {
+      await config.addWorkspace("/tmp/empty-reset-successor", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "empty-reset-successor",
+        projectPath: "/tmp/empty-reset-successor",
+        runtimeConfig: { type: "local" },
+      });
+      const capture = historyService.fenceEmptyContext.bind(historyService);
+      spyOn(historyService, "fenceEmptyContext").mockImplementationOnce(async (...args) => {
+        const captured = await capture(...args);
+        entered.resolve();
+        await release.promise;
+        return captured;
+      });
+      resetting = workspaceService.resetContext(workspaceId);
+      await entered.promise;
+      const foreign = new HistoryService(config);
+      const foreignJournal = foreign.getContinuousCompactionJournal(workspaceId);
+      await foreignJournal.advanceGeneration();
+      const generation = await foreignJournal.captureGeneration();
+      const pendingPath = path.join(config.sessionsDir, workspaceId, "post-compaction.json");
+      const pending = new CompactionPendingState(
+        pendingPath,
+        foreign.getCompactionPendingHistory(workspaceId)
+      );
+      expect(
+        (
+          await pending.publishBoundary({
+            summaryMessage: createMuxMessage("B", "assistant", "New context", {
+              compacted: "user",
+              compactionBoundary: true,
+              compactionEpoch: 1,
+            }),
+            tailCopies: [],
+            updateExisting: false,
+            publication: { generation },
+            attachments: { diffs: [], loadedSkills: [], readFiles: ["/tmp/successor.ts"] },
+            isCurrent: () => true,
+            shouldPersist: () => true,
+            onCommitted: () => undefined,
+          })
+        ).success
+      ).toBe(true);
+      release.resolve();
+      expect(await resetting).toEqual({ success: true, data: "noop" });
+      expect(await foreignJournal.captureGeneration()).toBe(generation);
+      expect((await pending.load(() => true))?.attachments.readFiles).toEqual([
+        "/tmp/successor.ts",
+      ]);
+    } finally {
+      release.resolve();
+      await resetting;
+      await cleanup();
+    }
+  });
+
+  test.each(["absent", "probe error"] as const)(
+    "post-compaction metadata avoids only proven absent pending scans (%s)",
+    async (state) => {
+      const { config, historyService, workspaceService, cleanup } = await createServices();
+      const workspaceId = "pending-metadata-scan";
+      try {
+        await config.addWorkspace("/tmp/pending-metadata-project", {
+          id: workspaceId,
+          name: workspaceId,
+          projectName: "pending-metadata-project",
+          projectPath: "/tmp/pending-metadata-project",
+          runtimeConfig: { type: "local" },
+        });
+        const edited = createMuxMessage("edited", "assistant", "");
+        edited.parts = [
+          {
+            type: "dynamic-tool",
+            toolCallId: "edit",
+            toolName: "file_edit_replace_string",
+            state: "output-available",
+            input: { path: "/tmp/from-history.ts" },
+            output: { success: true, diff: "changed" },
+          },
+        ];
+        expect((await historyService.appendToHistory(workspaceId, edited)).success).toBe(true);
+        const pendingPath = path.join(config.sessionsDir, workspaceId, "post-compaction.json");
+        const stat = fsPromises.stat;
+        const probe = spyOn(fsPromises, "stat").mockImplementation((async (
+          ...args: Parameters<typeof fsPromises.stat>
+        ) => {
+          if (state === "probe error" && args[0] === pendingPath)
+            throw Object.assign(new Error("Probe denied"), { code: "EACCES" });
+          return stat(...args);
+        }) as typeof fsPromises.stat);
+        const proof = spyOn(historyScanner, "readCompactionPendingHistoryObservation");
+        const fallback = spyOn(historyService, "getHistoryFromLatestBoundary");
+        using _spies = {
+          [Symbol.dispose]: () => {
+            probe.mockRestore();
+            proof.mockRestore();
+            fallback.mockRestore();
+          },
+        };
+        for (let attempt = 0; attempt < 2; attempt++) {
+          expect(
+            (await workspaceService.getPostCompactionState(workspaceId)).trackedFilePaths
+          ).toEqual(["/tmp/from-history.ts"]);
+        }
+        expect(proof).toHaveBeenCalledTimes(state === "absent" ? 0 : 2);
+        expect(fallback).toHaveBeenCalledTimes(2);
+        probe.mockRestore();
+
+        // A fresh store models another backend publishing after the earlier absence checks.
+        const foreign = new HistoryService(config);
+        const pending = new CompactionPendingState(
+          pendingPath,
+          foreign.getCompactionPendingHistory(workspaceId)
+        );
+        expect(
+          (
+            await pending.publishBoundary({
+              summaryMessage: createMuxMessage("published", "assistant", "Summary", {
+                compacted: "user",
+                compactionBoundary: true,
+                compactionEpoch: 1,
+              }),
+              tailCopies: [],
+              updateExisting: false,
+              publication: {
+                generation: await foreign
+                  .getContinuousCompactionJournal(workspaceId)
+                  .captureGeneration(),
+              },
+              attachments: {
+                diffs: [{ path: "/tmp/published.ts", diff: "changed", truncated: false }],
+                loadedSkills: [],
+                readFiles: [],
+              },
+              isCurrent: () => true,
+              shouldPersist: () => true,
+              onCommitted: () => undefined,
+            })
+          ).success
+        ).toBe(true);
+        proof.mockClear();
+        fallback.mockClear();
+        expect(
+          (await workspaceService.getPostCompactionState(workspaceId)).trackedFilePaths
+        ).toEqual(["/tmp/published.ts"]);
+        expect(proof).toHaveBeenCalledTimes(1);
+        expect(fallback).not.toHaveBeenCalled();
+      } finally {
+        await cleanup();
+      }
+    }
+  );
+
+  test.each([
+    "current",
+    "foreign boundary",
+    "reset",
+    "future",
+    "directory",
+    "nonempty directory",
+  ] as const)(
+    "post-compaction metadata qualifies pending paths against history (%s)",
+    async (change) => {
+      const { config, historyService, workspaceService, cleanup } = await createServices();
+      const workspaceId = "pending-path-qualification";
+      try {
+        await config.addWorkspace("/tmp/pending-path-project", {
+          id: workspaceId,
+          name: workspaceId,
+          projectName: "pending-path-project",
+          projectPath: "/tmp/pending-path-project",
+          runtimeConfig: { type: "local" },
+        });
+        const pendingPath = path.join(config.sessionsDir, workspaceId, "post-compaction.json");
+        const pending = new CompactionPendingState(
+          pendingPath,
+          historyService.getCompactionPendingHistory(workspaceId)
+        );
+        expect(
+          (
+            await pending.publishBoundary({
+              summaryMessage: createMuxMessage("A", "assistant", "A", {
+                compacted: "user",
+                compactionBoundary: true,
+                compactionEpoch: 1,
+              }),
+              tailCopies: [],
+              updateExisting: false,
+              publication: { generation: undefined },
+              attachments: {
+                diffs: [{ path: "/tmp/pending.ts", diff: "changed", truncated: false }],
+                loadedSkills: [],
+                readFiles: [],
+              },
+              isCurrent: () => true,
+              shouldPersist: () => true,
+              onCommitted: () => undefined,
+            })
+          ).success
+        ).toBe(true);
+        if (change === "foreign boundary")
+          expect(
+            (
+              await historyService.appendToHistory(
+                workspaceId,
+                createMuxMessage("B", "assistant", "B", {
+                  compacted: "user",
+                  compactionBoundary: true,
+                  compactionEpoch: 2,
+                })
+              )
+            ).success
+          ).toBe(true);
+        else if (change === "reset")
+          expect((await historyService.clearHistory(workspaceId)).success).toBe(true);
+        const future = '{"version":9,"diffs":[{"path":"/tmp/future.ts"}]}\n';
+        if (change === "future") await fsPromises.writeFile(pendingPath, future);
+        if (change === "directory" || change === "nonempty directory") {
+          await fsPromises.unlink(pendingPath);
+          await fsPromises.mkdir(pendingPath);
+          if (change === "nonempty directory")
+            await fsPromises.writeFile(path.join(pendingPath, "keep"), "Owned content");
+        }
+        const proof = spyOn(historyScanner, "readCompactionPendingHistoryObservation");
+        using _proof = { [Symbol.dispose]: () => proof.mockRestore() };
+        expect(
+          (await workspaceService.getPostCompactionState(workspaceId)).trackedFilePaths
+        ).toEqual(change === "current" ? ["/tmp/pending.ts"] : []);
+        expect(proof).toHaveBeenCalledTimes(1);
+        if (change === "future")
+          expect(await fsPromises.readFile(pendingPath, "utf8")).toBe(future);
+        if (change === "directory")
+          expect(await fsPromises.stat(pendingPath).catch((error: unknown) => error)).toMatchObject(
+            { code: "ENOENT" }
+          );
+        if (change === "nonempty directory")
+          expect(await fsPromises.readFile(path.join(pendingPath, "keep"), "utf8")).toBe(
+            "Owned content"
+          );
+      } finally {
+        await cleanup();
+      }
+    }
+  );
 
   test("context reset fails when the sandbox invalidation is not durable", async () => {
     // The reset's kernel-vars invalidation is only durable once the
@@ -8235,9 +9437,9 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
 
       const appendReached = createDeferred<void>();
       const releaseAppend = createDeferred<void>();
-      const originalAppend = historyService.appendToHistory.bind(historyService);
-      const appendSpy = spyOn(historyService, "appendToHistory").mockImplementationOnce(
-        async (...args: Parameters<HistoryService["appendToHistory"]>) => {
+      const originalAppend = historyService.acceptCompactionReplacement.bind(historyService);
+      const appendSpy = spyOn(historyService, "acceptCompactionReplacement").mockImplementationOnce(
+        async (...args: Parameters<HistoryService["acceptCompactionReplacement"]>) => {
           appendReached.resolve();
           await releaseAppend.promise;
           return originalAppend(...args);
@@ -8303,9 +9505,9 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       // pre-persist gate, strictly before its rows land.
       const appendReached = createDeferred<void>();
       const releaseAppend = createDeferred<void>();
-      const originalAppend = historyService.appendToHistory.bind(historyService);
-      const appendSpy = spyOn(historyService, "appendToHistory").mockImplementationOnce(
-        async (...args: Parameters<HistoryService["appendToHistory"]>) => {
+      const originalAppend = historyService.acceptCompactionReplacement.bind(historyService);
+      const appendSpy = spyOn(historyService, "acceptCompactionReplacement").mockImplementationOnce(
+        async (...args: Parameters<HistoryService["acceptCompactionReplacement"]>) => {
           appendReached.resolve();
           await releaseAppend.promise;
           return originalAppend(...args);
@@ -8525,9 +9727,10 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       });
       await seedSettledBranchSummaryRegistration(historyService, workspaceId);
 
-      const truncateSpy = spyOn(historyService, "truncateHistory").mockImplementationOnce(() =>
-        Promise.resolve(Err("disk full"))
-      );
+      const truncateSpy = spyOn(
+        historyService,
+        "clearCompactionHistoryUnderHistoryLock"
+      ).mockRejectedValueOnce(new Error("disk full"));
       try {
         expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
           success: false,
@@ -8630,17 +9833,16 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         projectPath: "/tmp/context-reset-history-read-fails-project",
         runtimeConfig: { type: "local" },
       });
-      const historySpy = spyOn(
-        historyService,
-        "getHistoryFromLatestBoundary"
-      ).mockResolvedValueOnce(Err("read failed"));
+      const historySpy = spyOn(historyService, "fenceEmptyContext").mockResolvedValueOnce(
+        Err("read failed")
+      );
 
       try {
         const result = await workspaceService.resetContext(workspaceId);
 
         expect(result).toEqual({
           success: false,
-          error: "Failed to read active context before reset: read failed",
+          error: "read failed",
         });
       } finally {
         historySpy.mockRestore();
@@ -9598,6 +10800,7 @@ describe("WorkspaceService initialize", () => {
   test("disposes transient startup-recovery sessions that go idle", async () => {
     const dispose = mock(() => undefined);
     const fakeSession = {
+      ...createCompactionAdmissionMocks(),
       runStartupRecovery: mock(() => Promise.resolve()),
       shouldRetainAfterStartupRecovery: mock(() => false),
       scheduleStartupRecovery: mock(() => undefined),
@@ -9627,6 +10830,7 @@ describe("WorkspaceService initialize", () => {
     const onChatEvent = mock(() => () => undefined);
     const onMetadataEvent = mock(() => () => undefined);
     const fakeSession = {
+      ...createCompactionAdmissionMocks(),
       runStartupRecovery: mock(() => Promise.resolve()),
       shouldRetainAfterStartupRecovery: mock(() => true),
       scheduleStartupRecovery: mock(() => undefined),
@@ -9654,6 +10858,7 @@ describe("WorkspaceService initialize", () => {
     const onChatEvent = mock(() => () => undefined);
     const onMetadataEvent = mock(() => () => undefined);
     const fakeSession = {
+      ...createCompactionAdmissionMocks(),
       onChatEvent,
       onMetadataEvent,
     } as unknown as AgentSession;
@@ -10157,6 +11362,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     });
 
     fakeSession = {
+      ...createCompactionAdmissionMocks(),
       isBusy: mock(() => true),
       hasQueuedMessages: mock(() => false),
       hasQueuedOrDispatchingEntry: mock(() => false),
@@ -11411,6 +12617,7 @@ describe("WorkspaceService pending auto-title", () => {
     );
 
     fakeSession = {
+      ...createCompactionAdmissionMocks(),
       isBusy: mock(() => false),
       hasQueuedMessages: mock(() => false),
       hasQueuedOrDispatchingEntry: mock(() => false),
@@ -11528,6 +12735,16 @@ describe("WorkspaceService pending auto-title", () => {
   test("concurrent sends only claim one pending auto-title generation", async () => {
     const releaseSend = createDeferred<Result<void, SendMessageError>>();
     fakeSession.sendMessage.mockImplementation(() => releaseSend.promise);
+    const capturesEntered = createDeferred<void>();
+    const releaseCaptures = createDeferred<void>();
+    const capture = historyService.captureCompactionReplacement.bind(historyService);
+    let captures = 0;
+    spyOn(historyService, "captureCompactionReplacement").mockImplementation(async (...args) => {
+      const result = await capture(...args);
+      if (++captures === 2) capturesEntered.resolve();
+      await releaseCaptures.promise;
+      return result;
+    });
     const autoTitleSpy = spyOn(
       workspaceService as unknown as {
         maybeRunPendingAutoTitleFromMessage: (
@@ -11548,6 +12765,8 @@ describe("WorkspaceService pending auto-title", () => {
         agentId: "exec",
       });
 
+      await capturesEntered.promise;
+      releaseCaptures.resolve();
       releaseSend.resolve(Ok(undefined));
       const [firstResult, secondResult] = await Promise.all([firstSend, secondSend]);
 
@@ -16693,6 +17912,7 @@ describe("WorkspaceService archive init cancellation", () => {
       on: mock(() => undefined as unknown as InitStateManager),
       getInitState: mock((id: string) => initStates.get(id)),
       clearInMemoryState: clearInMemoryStateMock,
+      deleteInitStatus: mock(() => Promise.resolve()),
     };
 
     let configState: ProjectsConfig = {
@@ -18567,6 +19787,7 @@ describe("WorkspaceService init cancellation", () => {
         })
       ),
       clearInMemoryState: clearInMemoryStateMock,
+      deleteInitStatus: mock(() => Promise.resolve()),
     };
     const workspaceService = createWorkspaceServiceForTest({
       config: mockConfig,
@@ -18781,6 +20002,7 @@ describe("WorkspaceService init cancellation", () => {
 
     const sessionEmitter = new EventEmitter();
     const fakeSession = {
+      ...createCompactionAdmissionMocks(),
       onChatEvent: (listener: (event: unknown) => void) => {
         sessionEmitter.on("chat-event", listener);
         return () => sessionEmitter.off("chat-event", listener);
@@ -20629,6 +21851,39 @@ describe("WorkspaceService interruptStream", () => {
     await cleanupHistory();
   });
 
+  test("soft Send Now dispatches without requiring a hard Stop receipt", async () => {
+    const workspaceId = "soft-send-now-receipt";
+    const h = await createAgentSessionHarness({ workspaceId });
+    const service = createWorkspaceServiceForTest({
+      config: h.config,
+      historyService: h.historyService,
+      aiService: h.aiService as AIService,
+      initStateManager: h.initStateManager,
+      backgroundProcessManager: h.backgroundProcessManager,
+    });
+    spyOn(service, "getOrCreateSession").mockReturnValue(h.session);
+    const accepted = Promise.withResolvers<void>();
+    try {
+      h.session.queueMessage(
+        "soft queued input",
+        { model: "openai:gpt-4o", agentId: "exec" },
+        { onAccepted: () => accepted.resolve() }
+      );
+      expect(
+        await service.interruptStream(workspaceId, { soft: true, sendQueuedImmediately: true })
+      ).toEqual(Ok(undefined));
+      await accepted.promise;
+      const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success && history.data.some((row) => row.role === "user")).toBe(true);
+      expect(
+        await h.historyService.getCompactionCancellationStorage(workspaceId).read()
+      ).toBeNull();
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
   test("sendQueuedImmediately waits for interrupted accounting and terminal publication", async () => {
     const workspaceId = "ws-interrupt-policy-barrier";
     const completion = Promise.withResolvers<TurnCompletion>();
@@ -20765,6 +22020,7 @@ describe("WorkspaceService interruptStream", () => {
     const restoreQueueToInput = mock(() => undefined);
     const interruptStream = mock(() => Promise.resolve(Ok(undefined)));
     const fakeSession = {
+      ...createCompactionAdmissionMocks(),
       interruptStream,
       sendNextUserQueuedMessage,
       restoreQueueToInput,

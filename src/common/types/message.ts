@@ -1,3 +1,4 @@
+import type { StreamStopCause } from "@/common/types/streamStopCause";
 import type { ModelMessage, UIMessage } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { StreamErrorType } from "./errors";
@@ -1198,6 +1199,8 @@ export interface ContextBudgetRejectedMessage {
 
 // Our custom metadata type
 export interface MuxMetadata {
+  /** Stop replaced by this durably accepted row; its enclosing id/sequence identify the receipt. */
+  compactionReplacementNonce?: string;
   /** Highest persisted history sequence included in the provider request that produced this assistant. */
   requestHistorySequence?: number;
   historySequence?: number; // Assigned by backend for global message ordering (required when writing to history)
@@ -1206,6 +1209,7 @@ export interface MuxMetadata {
   duration?: number;
   ttftMs?: number; // Time-to-first-token measured from stream start; omitted when unavailable
   finishReason?: string; // Provider/model finish reason for the final step (e.g. stop, length)
+  stopCause?: StreamStopCause;
   /** @deprecated Legacy base mode derived from agent definition. */
   mode?: AgentMode;
   timestamp?: number;
@@ -1296,6 +1300,10 @@ export interface MuxMetadata {
    * This lets downstream logic identify compaction boundaries without mutating history.
    */
   compactionBoundary?: boolean;
+  /** Exact composed publication occurrence, shared with the pending file writeId. */
+  compactionPublicationId?: string;
+  /** Captured generation of this publication; legacy rewrites must not inherit it. */
+  compactionPublicationGeneration?: string | null;
   /** Durable provider-context boundary kind. Existing compaction rows are also boundaries via compactionBoundary. */
   contextBoundaryKind?: PersistedContextBoundaryKind;
   toolPolicy?: ToolPolicy; // Tool policy active when this message was sent (user messages only)
@@ -1459,6 +1467,11 @@ export type DisplayedMessage =
       fileParts?: FilePart[]; // Optional attachments
       historySequence: number; // Global ordering across all messages
       isSynthetic?: boolean;
+      /**
+       * Presentation-only row for a first send that is not persisted yet (workspace creation).
+       * Never backed by history, so it cannot be edited, forked, or navigated to.
+       */
+      isPendingSend?: true;
       /** True only for synthetic messages intentionally rendered in the normal transcript. */
       isUiVisible?: boolean;
       /** Durable terminal rejection: keep visible, but never retry this or an older turn. */
@@ -1648,10 +1661,11 @@ export type DisplayedMessage =
   | {
       type: "workspace-init";
       id: string; // Display ID for UI/React keys
-      historySequence: number; // Position in message stream (-1 for ephemeral, non-persisted events)
+      historySequence: number; // -1 for the creation card placed after the first displayed user turn
       status: "running" | "success" | "error";
-      hookPath: string; // Path to the init script being executed
-      lines: Array<{ line: string; isError: boolean }>; // Accumulated output lines (stderr tagged via isError)
+      hookPath: string; // Project path being initialized
+      lines: Array<{ line: string; isError: boolean; step?: boolean }>;
+      progress: { label: string; percent: number } | null;
       exitCode: number | null; // Final exit code (null while running)
       timestamp: number;
       durationMs: number | null; // Duration in milliseconds (null while running)

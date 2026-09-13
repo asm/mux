@@ -22,6 +22,10 @@ import {
   type LoadedSkill,
   type SkillLoadError,
 } from "@/browser/utils/messages/StreamingMessageAggregator";
+import type {
+  PendingCreationInit,
+  PendingInitialUserMessage,
+} from "@/browser/utils/messages/pendingInitialUserMessage";
 import {
   createCompactionCompletion,
   type ResponseCompleteEvent,
@@ -839,6 +843,7 @@ export class WorkspaceStore {
 
   // Idle callbacks keep high-frequency init logs from blocking the renderer.
   private deltaIdleHandles = new Map<string, number>();
+  private idleBumpPreludes = new Map<string, () => void>();
 
   private pendingStreamingMessageBump = new Map<string, string>();
   // Live keyed-channel key per workspace, so every stream-clearing path can
@@ -1114,7 +1119,13 @@ export class WorkspaceStore {
       applyWorkspaceChatEventToAggregator(aggregator, data);
       // Init output can be very high-frequency (e.g. installs, rsync). Like stream/tool deltas,
       // we update aggregator state immediately but coalesce UI bumps to keep the renderer responsive.
-      this.scheduleIdleStateBump(workspaceId);
+      // The aggregator throttles its own cache invalidation separately, so flush it right before
+      // the bump or the bump can render the stale cached row.
+      this.scheduleIdleStateBump(workspaceId, () => aggregator.flushPendingInitOutput());
+    },
+    "init-progress": (workspaceId, aggregator, data) => {
+      applyWorkspaceChatEventToAggregator(aggregator, data);
+      this.scheduleIdleStateBump(workspaceId, () => aggregator.flushPendingInitOutput());
     },
     "init-end": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
@@ -1625,19 +1636,28 @@ export class WorkspaceStore {
    * The "presentation clock" (useSmoothStreamingText) handles visual cadence
    * independently — do not collapse them into a single mechanism.
    */
-  private scheduleIdleStateBump(workspaceId: string): void {
+  private scheduleIdleStateBump(workspaceId: string, beforeBump?: () => void): void {
+    // Record the prelude even when a bump is already scheduled so it runs on that bump.
+    if (beforeBump) {
+      this.idleBumpPreludes.set(workspaceId, beforeBump);
+    }
     // Skip if already scheduled
     if (this.deltaIdleHandles.has(workspaceId)) {
       return;
     }
 
+    const bump = () => {
+      this.deltaIdleHandles.delete(workspaceId);
+      const prelude = this.idleBumpPreludes.get(workspaceId);
+      this.idleBumpPreludes.delete(workspaceId);
+      prelude?.();
+      this.states.bump(workspaceId);
+    };
+
     // requestIdleCallback is not available in some environments (e.g. Node-based unit tests).
     // Fall back to a regular timeout so we still throttle bumps.
     if (typeof requestIdleCallback !== "function") {
-      const handle = setTimeout(() => {
-        this.deltaIdleHandles.delete(workspaceId);
-        this.states.bump(workspaceId);
-      }, 0);
+      const handle = setTimeout(bump, 0);
 
       // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
       this.deltaIdleHandles.set(workspaceId, handle as unknown as number);
@@ -1645,10 +1665,7 @@ export class WorkspaceStore {
     }
 
     const handle = requestIdleCallback(
-      () => {
-        this.deltaIdleHandles.delete(workspaceId);
-        this.states.bump(workspaceId);
-      },
+      bump,
       { timeout: 100 } // Force update within 100ms even if browser stays busy
     );
 
@@ -1936,6 +1953,7 @@ export class WorkspaceStore {
       }
       this.deltaIdleHandles.delete(workspaceId);
     }
+    this.idleBumpPreludes.delete(workspaceId);
   }
 
   /**
@@ -2726,7 +2744,7 @@ export class WorkspaceStore {
     const messages = aggregator.getDisplayedMessages();
     for (let index = messages.length - 1; index >= 0; index--) {
       const message = messages[index];
-      if (message.type !== "user" || message.isSynthetic === true) {
+      if (message.type !== "user" || message.isSynthetic === true || message.isPendingSend) {
         continue;
       }
       // Generated attachment markup is provider context, not part of the user's prompt.
@@ -3987,23 +4005,53 @@ export class WorkspaceStore {
     }
   }
 
-  markPendingInitialSend(workspaceId: string, pendingStreamModel: string | null): void {
+  markPendingInitialSend(
+    workspaceId: string,
+    pendingStreamModel: string | null,
+    pendingUserMessage?: PendingInitialUserMessage,
+    pendingCreationInit?: PendingCreationInit
+  ): void {
     const aggregator = this.aggregators.get(workspaceId);
     if (!aggregator) {
       return;
     }
 
-    aggregator.markOptimisticPendingStreamStart(pendingStreamModel);
+    aggregator.markOptimisticPendingStreamStart(
+      pendingStreamModel,
+      pendingUserMessage,
+      pendingCreationInit
+    );
     this.states.bump(workspaceId);
   }
 
+  /**
+   * A creation send failed or was abandoned: drop the optimistic startup barrier and the
+   * presentation-only first-message row. The stand-in creation card stays: workspace init keeps
+   * running regardless of the send, and the real init-start (live or replayed) replaces it.
+   */
   clearPendingInitialSendState(workspaceId: string): void {
     const aggregator = this.aggregators.get(workspaceId);
-    if (aggregator?.getPendingStreamStartTime() == null) {
+    if (!aggregator) {
       return;
     }
 
-    aggregator.clearPendingStreamStart();
+    const hadPendingStream = aggregator.getPendingStreamStartTime() != null;
+    if (hadPendingStream) {
+      aggregator.clearPendingStreamStart();
+    }
+    const clearedRow = aggregator.clearPendingInitialUserMessage();
+    if (hadPendingStream || clearedRow) {
+      this.states.bump(workspaceId);
+    }
+  }
+
+  markPendingCreationInit(workspaceId: string, pendingCreationInit: PendingCreationInit): void {
+    const aggregator = this.aggregators.get(workspaceId);
+    if (!aggregator) {
+      return;
+    }
+
+    aggregator.markPendingCreationInit(pendingCreationInit);
     this.states.bump(workspaceId);
   }
 
@@ -4818,10 +4866,22 @@ export const workspaceStore = {
    * Mark a newly-created workspace as having its first send in flight.
    * Used by creation mode so the transcript can show the starting barrier immediately.
    */
-  markPendingInitialSend: (workspaceId: string, pendingStreamModel: string | null) =>
-    getStoreInstance().markPendingInitialSend(workspaceId, pendingStreamModel),
+  markPendingInitialSend: (
+    workspaceId: string,
+    pendingStreamModel: string | null,
+    pendingUserMessage?: PendingInitialUserMessage,
+    pendingCreationInit?: PendingCreationInit
+  ) =>
+    getStoreInstance().markPendingInitialSend(
+      workspaceId,
+      pendingStreamModel,
+      pendingUserMessage,
+      pendingCreationInit
+    ),
   clearPendingInitialSendState: (workspaceId: string) =>
     getStoreInstance().clearPendingInitialSendState(workspaceId),
+  markPendingCreationInit: (workspaceId: string, pendingCreationInit: PendingCreationInit) =>
+    getStoreInstance().markPendingCreationInit(workspaceId, pendingCreationInit),
   /**
    * Set the active workspace for onChat subscription management.
    * Exposed for test helpers that bypass React routing effects.

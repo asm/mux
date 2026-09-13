@@ -501,7 +501,7 @@ describe("TaskService", () => {
       childId,
       "Inspect the scratch files",
       expect.any(Object),
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
   });
 
@@ -3417,7 +3417,17 @@ describe("TaskService", () => {
     }
   );
 
-  test.each(["running", "awaiting_report", "stopped", "opted-out"] as const)(
+  const startupGuidanceStates = [
+    "running",
+    "awaiting_report",
+    "stopped",
+    "opted-out",
+    "compaction-stopped",
+    "compaction-unrecorded",
+    "compaction-unsupported",
+    "compaction-during-probe",
+  ] as const;
+  test.each([...startupGuidanceStates])(
     "startup restores question guidance only as a queue (%s)",
     async (state) => {
       const config = await createTestConfig(rootDir);
@@ -3484,11 +3494,50 @@ describe("TaskService", () => {
         config,
         historyService,
       });
-      workspaceService.getStartupRecoveryState = () => session.getStartupRecoveryState();
+      if (state === "compaction-stopped") {
+        expect(await session.cancelCompaction(true)).toEqual(Ok(undefined));
+      }
+      if (state === "compaction-unrecorded") {
+        const publication = spyOn(
+          historyService,
+          "withCompactionStorageLock"
+        ).mockRejectedValueOnce(new Error("Stop publication unavailable"));
+        expect((await session.cancelCompaction(true)).success).toBe(false);
+        publication.mockRestore();
+      }
+      if (state === "compaction-during-probe") {
+        const readTail = historyService.getLastMessages.bind(historyService);
+        spyOn(historyService, "getLastMessages").mockImplementationOnce(async (...args) => {
+          const result = await readTail(...args);
+          expect(await session.cancelCompaction(true)).toEqual(Ok(undefined));
+          return result;
+        });
+      }
+      if (state === "compaction-unsupported") {
+        await fsPromises.writeFile(
+          historyService.getCompactionCancellationStorage(childId).path,
+          JSON.stringify({ version: 99, futureIntent: "Stop" })
+        );
+      }
+      workspaceService.getStartupRecoveryState = () =>
+        session.getStartupRecoveryState(
+          state === "compaction-unrecorded" || state === "compaction-unsupported" ? 25 : undefined
+        );
       try {
         await taskService.initialize();
         expect(compaction).not.toHaveBeenCalled();
-        if (state === "stopped" || state === "opted-out") {
+        if (state === "compaction-unrecorded" || state === "compaction-unsupported") {
+          expect(sends).toHaveLength(0);
+          expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toEqual(guidance);
+          expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("running");
+          return;
+        }
+        if (
+          state === "stopped" ||
+          state === "opted-out" ||
+          state === "compaction-stopped" ||
+          state === "compaction-during-probe"
+        ) {
           expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toBeUndefined();
           expect(sends).toHaveLength(0);
           return;
@@ -3499,6 +3548,7 @@ describe("TaskService", () => {
           expect(sends[index]?.[2].queueDispatchMode).toBe(entry.queueDispatchMode);
           expect(sends[index]?.[3]).toMatchObject({
             restoreQueued: true,
+            acceptanceOrigin: "automatic",
             queueDedupeKey: entry.id,
           });
         }
@@ -3520,6 +3570,7 @@ describe("TaskService", () => {
         const later = findWorkspaceInConfig(config, childId)?.taskPendingGuidance?.[2];
         assert(later != null);
         expect(sends[2]?.[3]?.queueDedupeKey).toBe(later.id);
+        expect(sends[2]?.[3]?.acceptanceOrigin).toBe("automatic");
         await sends[0]?.[3]?.onAccepted?.();
         expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toEqual([
           guidance[1],
@@ -6897,7 +6948,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
 
     const postCfg = config.loadConfigOrDefault();
@@ -6956,7 +7007,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
 
     const postCfg = config.loadConfigOrDefault();
@@ -7010,7 +7061,7 @@ describe("TaskService", () => {
         reasoningMode: "pro",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
 
     // Persisted child settings carry it too, so queued/restart resumes
@@ -7065,7 +7116,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run explore with base pro",
       expect.objectContaining({ agentId: "explore", reasoningMode: "pro" }),
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
   }, 20_000);
 
@@ -7113,7 +7164,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run explore with parent pro mode",
       expect.objectContaining({ agentId: "explore", reasoningMode: "pro" }),
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
   }, 20_000);
 
@@ -7168,7 +7219,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run with mapped alias max",
       expect.objectContaining({ model: "openai:team-sol", thinkingLevel: "max" }),
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
   }, 20_000);
 
@@ -7214,7 +7265,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
 
     const postCfg = config.loadConfigOrDefault();
@@ -7276,7 +7327,7 @@ describe("TaskService", () => {
         thinkingLevel: "off",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
 
     const postCfg = config.loadConfigOrDefault();
@@ -7344,7 +7395,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run researcher with plan pro",
       expect.objectContaining({ agentId: "researcher", reasoningMode: "pro" }),
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
   }, 20_000);
 
@@ -7405,7 +7456,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
 
     const postCfg = config.loadConfigOrDefault();
@@ -7478,7 +7529,7 @@ describe("TaskService", () => {
         thinkingLevel: "off",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
   }, 20_000);
 
@@ -7511,7 +7562,7 @@ describe("TaskService", () => {
         thinkingLevel: "medium",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.aiSettings).toEqual({ model: "openai:gpt-5.2", thinkingLevel: "medium" });
@@ -7549,7 +7600,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
   }, 20_000);
 
@@ -7585,7 +7636,7 @@ describe("TaskService", () => {
         thinkingLevel: "off",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
   }, 20_000);
 
@@ -7615,7 +7666,7 @@ describe("TaskService", () => {
         thinkingLevel: "high",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
   }, 20_000);
 
@@ -7688,7 +7739,7 @@ describe("TaskService", () => {
         thinkingLevel: "medium",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
@@ -7728,7 +7779,7 @@ describe("TaskService", () => {
         thinkingLevel: "off",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe("anthropic:claude-haiku-4-5");
@@ -7770,7 +7821,7 @@ describe("TaskService", () => {
         thinkingLevel: expectedThinkingLevel,
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe(resolvedModel);
@@ -7815,7 +7866,7 @@ describe("TaskService", () => {
         agentId: "exec",
         thinkingLevel: "high",
       }),
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
     const child = findWorkspaceInConfig(config, created.data.taskId);
     expect(child?.taskModelString).toBe("openai:gpt-6-astra");
@@ -7882,7 +7933,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "check provenance",
       expect.objectContaining({ model: expected }),
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
   });
 
@@ -7998,7 +8049,7 @@ describe("TaskService", () => {
       grandchild.data.taskId,
       "grandchild",
       expect.objectContaining({ model: "openai:gpt-5.3-codex" }),
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
     expect(findWorkspaceInConfig(config, grandchild.data.taskId)?.taskModelString).toBe(
       "openai:gpt-5.3-codex"
@@ -8038,7 +8089,7 @@ describe("TaskService", () => {
         created.data.taskId,
         "inherit Standard",
         expect.objectContaining({ reasoningMode: "standard" }),
-        { agentInitiated: true }
+        { acceptanceOrigin: "automatic", agentInitiated: true }
       );
     }
   );
@@ -8079,7 +8130,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "keep explicit overrides",
       expect.objectContaining(expected),
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
   });
 
@@ -8118,7 +8169,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
@@ -8159,7 +8210,7 @@ describe("TaskService", () => {
         thinkingLevel: "medium",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe("openai:gpt-5.2");
@@ -8198,7 +8249,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
   }, 20_000);
 
@@ -8237,7 +8288,7 @@ describe("TaskService", () => {
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
   }, 20_000);
 
@@ -8279,7 +8330,7 @@ describe("TaskService", () => {
         thinkingLevel: expectedThinkingLevel,
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe(resolvedModel);
@@ -8322,7 +8373,7 @@ describe("TaskService", () => {
         thinkingLevel: "high",
         experiments: undefined,
       },
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
   }, 20_000);
 
@@ -10177,7 +10228,7 @@ describe("TaskService", () => {
     expect(resumeStream).toHaveBeenCalledWith(
       parentWorkspaceId,
       expect.objectContaining({ agentId: "plan" }),
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
 
     const parentHistory = await collectFullHistory(historyService, parentWorkspaceId);
@@ -17555,6 +17606,7 @@ describe("TaskService", () => {
     expect(remove).not.toHaveBeenCalled();
     expect(sendMessage).not.toHaveBeenCalled();
     expect(resumeStream).toHaveBeenCalledWith(parentId, expect.any(Object), {
+      acceptanceOrigin: "automatic",
       agentInitiated: true,
     });
     expect(emit).toHaveBeenCalled();
@@ -19177,6 +19229,7 @@ describe("TaskService", () => {
     expect(remove).not.toHaveBeenCalled();
     expect(sendMessageMock).not.toHaveBeenCalled();
     expect(resumeStream).toHaveBeenCalledWith(parentId, expect.any(Object), {
+      acceptanceOrigin: "automatic",
       agentInitiated: true,
     });
   });
@@ -19293,6 +19346,7 @@ describe("TaskService", () => {
     expect(remove).not.toHaveBeenCalled();
     expect(sendMessage).not.toHaveBeenCalled();
     expect(resumeStream).toHaveBeenCalledWith(parentId, expect.any(Object), {
+      acceptanceOrigin: "automatic",
       agentInitiated: true,
     });
   });
@@ -23607,6 +23661,7 @@ describe("TaskService", () => {
       expect.objectContaining({ synthetic: true, agentInitiated: true })
     );
     expect(resumeStream).toHaveBeenCalledWith(parentId, expect.any(Object), {
+      acceptanceOrigin: "automatic",
       agentInitiated: true,
     });
     // The failure details travel via the durable synthetic history message,
@@ -23743,6 +23798,7 @@ describe("TaskService", () => {
     await flushTerminalAttentionDrains(taskService);
     expect(sendMessage).not.toHaveBeenCalled();
     expect(resumeStream).toHaveBeenCalledWith(parentId, expect.any(Object), {
+      acceptanceOrigin: "automatic",
       agentInitiated: true,
     });
 
@@ -23880,6 +23936,7 @@ describe("TaskService", () => {
     await flushTerminalAttentionDrains(taskService);
     expect(sendMessage).not.toHaveBeenCalled();
     expect(resumeStream).toHaveBeenCalledWith(parentId, expect.any(Object), {
+      acceptanceOrigin: "automatic",
       agentInitiated: true,
     });
 
@@ -24051,6 +24108,7 @@ describe("TaskService", () => {
     expect(sendMessage).not.toHaveBeenCalled();
     expect(resumeStream).toHaveBeenCalledTimes(1);
     expect(resumeStream).toHaveBeenCalledWith(parentId, expect.any(Object), {
+      acceptanceOrigin: "automatic",
       agentInitiated: true,
     });
   });
@@ -24156,6 +24214,7 @@ describe("TaskService", () => {
     await flushTerminalAttentionDrains(taskService);
     expect(sendMessage).not.toHaveBeenCalled();
     expect(resumeStream).toHaveBeenCalledWith(parentId, expect.any(Object), {
+      acceptanceOrigin: "automatic",
       agentInitiated: true,
     });
 
@@ -27470,11 +27529,11 @@ describe("TaskService", () => {
     };
 
     // Length-truncated correlated final settles the handle as error and arms a wake.
-    await internal.handleStreamEnd(
-      workspaceTurnStreamEndEvent(parentId, "msg_truncated_error", "Truncated", {
-        finishReason: "length",
-      })
-    );
+    const truncated = workspaceTurnStreamEndEvent(parentId, "msg_truncated_error", "Truncated", {
+      finishReason: "length",
+    });
+    truncated.metadata.historySequence = 1;
+    await internal.handleStreamEnd(truncated);
     const errored = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(errored, "errored handle must exist");
     expect(errored.status).toBe("error");
@@ -27490,7 +27549,9 @@ describe("TaskService", () => {
     workspaceMocks.getQueueCutCutter.mockImplementation(() =>
       ownerFollowUpCutter(parentId, "wst_successor")
     );
-    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_quiet_resettle_cut"));
+    const cut = ownerFollowUpCutEvent(parentId, "msg_quiet_resettle_cut");
+    cut.metadata.historySequence = 2;
+    await internal.handleStreamEnd(cut);
 
     const resettled = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(resettled, "resettled handle must exist");
@@ -27648,11 +27709,16 @@ describe("TaskService", () => {
     const internal = taskService as unknown as {
       handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
     };
-    await internal.handleStreamEnd(
-      workspaceTurnStreamEndEvent(parentId, "msg_truncated_direct_parent", "Truncated", {
+    const truncated = workspaceTurnStreamEndEvent(
+      parentId,
+      "msg_truncated_direct_parent",
+      "Truncated",
+      {
         finishReason: "length",
-      })
+      }
     );
+    truncated.metadata.historySequence = 1;
+    await internal.handleStreamEnd(truncated);
     const errored = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(errored, "errored handle must exist");
     expect(errored.status).toBe("error");
@@ -27673,7 +27739,10 @@ describe("TaskService", () => {
     workspaceMocks.getQueueCutCutter.mockImplementation(() =>
       ownerFollowUpCutter(parentId, "wst_successor")
     );
-    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_quiet_direct_parent_cut"));
+    const successor = ownerFollowUpCutEvent(parentId, "msg_quiet_direct_parent_cut");
+    // Durable ordering proves this cut follows the truncated response.
+    successor.metadata.historySequence = 2;
+    await internal.handleStreamEnd(successor);
 
     const resettled = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(resettled, "resettled handle must exist");
@@ -27760,8 +27829,8 @@ describe("TaskService", () => {
       status: "error",
       workspaceId: "childworkspace",
       messageId: "msg_tool_calls_terminal",
-      error: "Workspace turn ended before completion (finishReason: tool-calls)",
     });
+    expect(snapshot?.error).toContain("unknown stop cause");
   });
 
   test("parent stream-end auto-resumes for active background workspace turns", async () => {
@@ -30946,7 +31015,7 @@ describe("TaskService", () => {
       expect.objectContaining({
         muxMetadata: workspaceTurnMuxMetadata(parentId),
       }),
-      { agentInitiated: true }
+      { acceptanceOrigin: "automatic", agentInitiated: true }
     );
   });
 

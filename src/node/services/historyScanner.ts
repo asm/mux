@@ -1,5 +1,6 @@
 import { createScanner, SyntaxKind } from "jsonc-parser";
 import * as fs from "node:fs/promises";
+import { StringDecoder } from "node:string_decoder";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { createHash } from "node:crypto";
@@ -26,6 +27,7 @@ import {
   type HistoryScanState,
   type HistorySnapshot,
 } from "./historyCursor";
+import type { CompactionPendingBoundary as PendingBoundary } from "./compactionPendingState";
 
 const [resetKeyToken, resetValueToken] = SESSION_HISTORY_RESET_NEEDLE.split(":");
 const resetTokenPattern = new RegExp(
@@ -75,7 +77,44 @@ function decodeResetEscapes(text: string): string {
 function compactResetProbe(text: string): string {
   // Corruption may insert raw or escaped control separators where JSON permits
   // whitespace. Remove them before retaining overlap, including long runs.
-  return text.replace(/[\s\p{Cc}]/gu, "").replace(/\\(?:u00|x)(?:[0189][\da-f]|20|7f)/gi, "");
+  return stripEscapedResetSeparators(stripRawResetSeparators(text));
+}
+
+function stripRawResetSeparators(text: string): string {
+  return text.replace(/[\s\p{Cc}]/gu, "");
+}
+function stripEscapedResetSeparators(text: string): string {
+  return text.replace(/\\(?:u00|x)(?:[0189][\da-f]|20|7f)/gi, "");
+}
+
+/** Streaming counterpart of hasRawResetMarker; each transform keeps only a partial escape. */
+export function createRawHistoryResetProbe() {
+  const decoder = new StringDecoder("utf8");
+  let compactTail = "";
+  let decodeTail = "";
+  let markerTail = "";
+  let found = false;
+  // Separator removal accepts uppercase U/X; decoding keeps its existing case policy.
+  const partialEscape = (text: string) => /\\(?:u[\da-f]{0,3}|x[\da-f]?|)$/i.exec(text)?.[0] ?? "";
+  const pushText = (text: string, final = false) => {
+    text = compactTail + stripRawResetSeparators(text);
+    compactTail = final ? "" : partialEscape(text);
+    text =
+      decodeTail + stripEscapedResetSeparators(text.slice(0, text.length - compactTail.length));
+    decodeTail = final ? "" : partialEscape(text);
+    text = markerTail + decodeResetEscapes(text.slice(0, text.length - decodeTail.length));
+    found ||= text.includes(SESSION_HISTORY_RESET_NEEDLE);
+    markerTail = text.slice(-(SESSION_HISTORY_RESET_NEEDLE.length - 1));
+  };
+  return {
+    push(bytes: Uint8Array) {
+      if (!found) pushText(decoder.write(bytes));
+    },
+    finish() {
+      pushText(decoder.end(), true);
+      return found;
+    },
+  };
 }
 
 export function hasRawResetMarker(text: string): boolean {
@@ -155,6 +194,15 @@ function addHistoryResetProbe(state: HistoryResetProbe, segment: Buffer, reverse
     : probe.slice(-(SESSION_HISTORY_RESET_PROBE_CHARS - 1));
 }
 
+/** Feed one oversized row in reverse byte ranges, using the provider's unchanged recognizer. */
+export function createUnreadableHistoryResetProbe() {
+  const state: HistoryResetProbe = { resetProbe: "", resetStage: 0, possibleReset: false };
+  return {
+    push: (bytes: Buffer) => addHistoryResetProbe(state, bytes, true),
+    hasReset: () => state.possibleReset,
+  };
+}
+
 function classifyHistoryScanRow(text: string, probe: HistoryResetProbe): MuxMessage | null {
   let rowReset = hasRawResetMarker(text);
   probe.possibleReset ||= rowReset;
@@ -197,9 +245,14 @@ function historyFileStamp(
   return stat ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}` : "missing";
 }
 
+interface LocatedHistoryBoundary {
+  offset: number;
+  boundaryPublicationId?: string;
+  boundary: Exclude<PendingBoundary, { kind: "none" }>;
+}
 type ProviderHistoryStart =
-  | { kind: "start"; offset: number }
-  | { kind: "exhausted"; oldestBoundary: number | null; boundaryCount: number };
+  | ({ kind: "start" } & LocatedHistoryBoundary)
+  | { kind: "exhausted"; oldestBoundary: LocatedHistoryBoundary | null; boundaryCount: number };
 
 /** Provider-only location: bound row/probe carryover, not the amount of context scanned. */
 async function findProviderHistoryStart(
@@ -213,7 +266,7 @@ async function findProviderHistoryStart(
   let size = 0;
   let rowEnd = fileSize;
   let unreadableRunEnd: number | null = null;
-  let oldestBoundary: number | null = null;
+  let oldestBoundary: LocatedHistoryBoundary | null = null;
   let boundaryCount = 0;
   const add = (bytes: Buffer) => {
     addHistoryResetProbe(probe, bytes, true);
@@ -221,7 +274,7 @@ async function findProviderHistoryStart(
     if (size <= SESSION_HISTORY_MAX_LINE_BYTES) parts.push(bytes);
     else parts = [];
   };
-  const deliver = (start: number): number | null => {
+  const deliver = (start: number): LocatedHistoryBoundary | null => {
     if (size === 0) {
       rowEnd = start;
       return null;
@@ -236,14 +289,25 @@ async function findProviderHistoryStart(
     if (isManualHistoryReset(message, probe.possibleReset)) {
       // Retain readable reset markers, but never count them as skippable boundaries.
       // Deletion also needs readable malformed-role floors that provider requests exclude.
-      if (durableBoundary || (includeReadableResetFloor && message)) return start;
+      if (durableBoundary || (includeReadableResetFloor && message))
+        return {
+          offset: start,
+          boundaryPublicationId: message.metadata?.compactionPublicationId,
+          boundary: durableBoundary
+            ? { kind: "identified", messageId: message.id }
+            : { kind: "unreadable-reset" },
+        };
       // A fragmented marker may end several rows to the right of the key that
       // completed recognition. Never return any of that unreadable evidence.
-      return unreadableRunEnd ?? rowEnd;
+      return { offset: unreadableRunEnd ?? rowEnd, boundary: { kind: "unreadable-reset" } };
     }
     if (durableBoundary) {
-      oldestBoundary = start;
-      if (boundaryCount++ === skip) return start;
+      oldestBoundary = {
+        offset: start,
+        boundary: { kind: "identified", messageId: message.id },
+        boundaryPublicationId: message.metadata?.compactionPublicationId,
+      };
+      if (boundaryCount++ === skip) return oldestBoundary;
     }
     if (message) {
       probe.resetProbe = "";
@@ -264,26 +328,27 @@ async function findProviderHistoryStart(
     for (let i = chunk.length - 1; i >= 0; i--) {
       if (chunk[i] !== 10) continue;
       add(chunk.subarray(i + 1, edge));
-      const offset = deliver(start + i + 1);
-      if (offset !== null) return { kind: "start", offset };
+      const location = deliver(start + i + 1);
+      if (location !== null) return { kind: "start", ...location };
       edge = i;
     }
     add(chunk.subarray(0, edge));
     end = start;
   }
-  const offset = deliver(0);
-  return offset === null
+  const location = deliver(0);
+  return location === null
     ? { kind: "exhausted", oldestBoundary, boundaryCount }
-    : { kind: "start", offset };
+    : { kind: "start", ...location };
 }
 
 /** Keep raw location and projected tail reads on one verified snapshot, without write-lock re-entry. */
 async function readHistoryProjectionFromLatestBoundary<Row>(
   paths: Record<HistoryArtifact, string>,
   skip: number,
-  project: (value: unknown) => Row | null,
-  includeReadableResetFloor = false
-): Promise<Row[]> {
+  project?: (value: unknown) => Row | null,
+  includeReadableResetFloor = false,
+  clampToOldest = true
+): Promise<{ messages: Row[]; boundary: PendingBoundary; boundaryPublicationId?: string }> {
   assert(Number.isSafeInteger(skip) && skip >= 0, "provider boundary skip must be non-negative");
   const files = new Map<HistoryArtifact, { handle: fs.FileHandle; size: number; stamp: string }>();
   try {
@@ -311,7 +376,7 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
     };
     const readTail = async (artifact: HistoryArtifact, offset: number): Promise<Row[]> => {
       const file = files.get(artifact);
-      if (!file) return [];
+      if (!file || !project) return [];
       assert(offset >= 0 && offset <= file.size, "provider start must be within its snapshot");
       const buffer = Buffer.alloc(file.size - offset);
       const read = await file.handle.read(buffer, 0, buffer.length, offset);
@@ -330,20 +395,27 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
     };
     const chat = await locate("chat", skip);
     let messages: Row[];
-    if (chat.kind === "start") messages = await readTail("chat", chat.offset);
-    else {
+    let boundary: PendingBoundary = { kind: "none" };
+    let boundaryPublicationId: string | undefined;
+    if (chat.kind === "start") {
+      boundary = chat.boundary;
+      boundaryPublicationId = chat.boundaryPublicationId;
+      messages = await readTail("chat", chat.offset);
+    } else {
       const archive = await locate("archive", skip - chat.boundaryCount);
-      if (archive.kind === "start" || archive.oldestBoundary !== null) {
+      if (archive.kind === "start" || (clampToOldest && archive.oldestBoundary !== null)) {
+        const location = archive.kind === "start" ? archive : archive.oldestBoundary!;
+        boundary = location.boundary;
+        boundaryPublicationId = location.boundaryPublicationId;
         messages = [
-          ...(await readTail(
-            "archive",
-            archive.kind === "start" ? archive.offset : archive.oldestBoundary!
-          )),
+          ...(await readTail("archive", location.offset)),
           ...(await readTail("chat", 0)),
         ];
-      } else if (chat.oldestBoundary !== null)
-        messages = await readTail("chat", chat.oldestBoundary);
-      else messages = [...(await readTail("archive", 0)), ...(await readTail("chat", 0))];
+      } else if (clampToOldest && chat.oldestBoundary !== null) {
+        boundary = chat.oldestBoundary.boundary;
+        boundaryPublicationId = chat.oldestBoundary.boundaryPublicationId;
+        messages = await readTail("chat", chat.oldestBoundary.offset);
+      } else messages = [...(await readTail("archive", 0)), ...(await readTail("chat", 0))];
     }
     // Foreign writers can replace either pathname while these descriptors stay
     // open. Never release provider rows assembled from an obsolete raw offset.
@@ -356,7 +428,7 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
         throw new Error("History changed during provider read");
       }
     }
-    return messages;
+    return { messages, boundary, boundaryPublicationId };
   } finally {
     await Promise.all([...files.values()].map((file) => file.handle.close()));
   }
@@ -375,7 +447,34 @@ export function readProviderHistoryFromLatestBoundary(
     skip,
     (value) => (isReadableHistoryMessage(value) ? normalizeLegacyMuxMetadata(value) : null),
     options?.includeReadableResetFloor
+  ).then((view) => view.messages);
+}
+
+/** Exact occurrence evidence shares the verified boundary scan; never persist it in legacy fallback tags. */
+export async function readCompactionPendingHistoryObservation(
+  paths: Record<HistoryArtifact, string>,
+  skip = 0
+) {
+  const { boundary, boundaryPublicationId } = await readHistoryProjectionFromLatestBoundary(
+    paths,
+    skip,
+    undefined,
+    false,
+    false
   );
+  return { boundary, boundaryPublicationId };
+}
+
+/** Inactive pending-state evidence from the same raw locator and snapshot verification as reads. */
+export async function readCompactionPendingHistoryBoundary(
+  paths: Record<HistoryArtifact, string>,
+  skip = 0
+): Promise<PendingBoundary> {
+  // Known absence requires exhausting BOTH files; an unreadable reset never becomes absence.
+  // No row projection is needed, so the verified location does not re-read the active tail.
+  // Retention needs the actual exposed base; provider reads may clamp excessive skips to the oldest window.
+  return (await readHistoryProjectionFromLatestBoundary(paths, skip, undefined, false, false))
+    .boundary;
 }
 
 /** Ordered lifecycle evidence, not a provider message or a source of repaired IDs. */
@@ -398,7 +497,7 @@ export function readHistoryControlEvidenceFromLatestBoundary(
       role: row.role,
       ...(isPlainObject(row.metadata) ? { metadata: row.metadata } : {}),
     });
-  });
+  }).then((view) => view.messages);
 }
 
 export interface BoundedHistoryRow {
@@ -411,6 +510,9 @@ export interface BoundedHistoryRow {
 }
 export interface BoundedHistoryScanOptions {
   cursor?: HistoryScanState;
+  abortSignal?: AbortSignal;
+  /** Absolute performance.now() deadline, shared across composite scans; cleanup is not timed out. */
+  deadline?: number;
   /**
    * Visit rows newest-first. Attribution stays exact: each window span is
    * discovered backwards to its boundary row before any of its rows are
@@ -446,6 +548,11 @@ export async function scanHistoryFilesBounded(
   maxRows = SESSION_HISTORY_MAX_SCAN_ROWS
 ): Promise<BoundedHistoryScanResult> {
   assert(maxBytes >= 0 && maxRows >= 0, "history scan budgets must be non-negative");
+  const interrupted = () => {
+    options.abortSignal?.throwIfAborted();
+    return options.deadline != null && performance.now() >= options.deadline;
+  };
+  options.abortSignal?.throwIfAborted();
   const result: BoundedHistoryScanResult = {
     bytesRead: 0,
     rowsScanned: 0,
@@ -463,7 +570,9 @@ export async function scanHistoryFilesBounded(
   try {
     for (const artifact of ["chat", "archive"] as const) {
       try {
+        options.abortSignal?.throwIfAborted();
         handles.set(artifact, await fs.open(paths[artifact], "r"));
+        options.abortSignal?.throwIfAborted();
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
@@ -483,15 +592,18 @@ export async function scanHistoryFilesBounded(
         if (historyFileStamp(current) !== initialStamps.get(artifact))
           throw new Error("stale_cursor");
       }
+      options.abortSignal?.throwIfAborted();
       return result;
     };
     const read = async (artifact: HistoryArtifact, start: number, length: number) => {
+      options.abortSignal?.throwIfAborted();
       assert(length >= 0 && result.bytesRead + length <= maxBytes);
       const buffer = Buffer.alloc(length);
       const bytesRead = handles.has(artifact)
         ? (await handles.get(artifact)!.read(buffer, 0, length, start)).bytesRead
         : 0;
       result.bytesRead += bytesRead;
+      options.abortSignal?.throwIfAborted();
       return buffer.subarray(0, bytesRead);
     };
     const snapshot = async (
@@ -608,12 +720,13 @@ export async function scanHistoryFilesBounded(
         possibleReset: position.possibleReset,
       };
       const deliver = (edge: number): boolean => {
+        options.abortSignal?.throwIfAborted();
         const start = reverse ? edge : rowEdge;
         const finish = reverse ? (position.oversizedRowEnd ?? rowEdge) : edge;
         if (size === 0 && !skipping) {
           rowEdge = edge;
           position.byteOffset = edge;
-          return true;
+          return !interrupted();
         }
         result.rowsScanned++;
         let message: MuxMessage | null = null;
@@ -640,12 +753,15 @@ export async function scanHistoryFilesBounded(
         position.byteOffset = edge;
         position.skippingOversized = false;
         position.oversizedRowEnd = null;
-        return true;
+        // Row disclosure and its offset commit are atomic with respect to the deadline.
+        // Returning before this commit would repeat a delivered row on the next page.
+        return !interrupted();
       };
       while (
         (reverse ? cursor > lower : cursor < end) &&
         remaining() > 0 &&
-        result.rowsScanned < maxRows
+        result.rowsScanned < maxRows &&
+        !interrupted()
       ) {
         const length = Math.min(
           SESSION_HISTORY_SCAN_CHUNK_BYTES,
@@ -655,6 +771,9 @@ export async function scanHistoryFilesBounded(
         const start = reverse ? cursor - length : cursor;
         const chunk = await read(artifact, start, length);
         if (chunk.length !== length) throw new Error("stale_cursor");
+        // Leave an unprocessed chunk out of the saved position/probe, just like byte
+        // exhaustion. Ordinary partial rows rewind; oversized probes retain progress.
+        if (interrupted()) break;
         let segmentEdge = reverse ? chunk.length : 0;
         const add = (segment: Buffer) => {
           addHistoryResetProbe(probe, segment, reverse);
@@ -898,7 +1017,12 @@ export async function scanHistoryFilesBounded(
       state.phase = "probe";
       return true;
     };
-    while (state.phase !== "done" && remaining() > 0 && result.rowsScanned < maxRows) {
+    while (
+      state.phase !== "done" &&
+      remaining() > 0 &&
+      result.rowsScanned < maxRows &&
+      !interrupted()
+    ) {
       if (state.phase === "probe") {
         if (!(await probePage())) break;
         continue;

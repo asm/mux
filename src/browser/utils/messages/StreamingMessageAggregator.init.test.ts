@@ -1,6 +1,7 @@
 import { describe, it, expect } from "bun:test";
 import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
 import { INIT_HOOK_MAX_LINES } from "@/common/constants/toolLimits";
+import { createMuxMessage } from "@/common/types/message";
 
 interface InitDisplayedMessage {
   type: "workspace-init";
@@ -14,6 +15,109 @@ interface InitDisplayedMessage {
 const waitForInitThrottle = () => new Promise((r) => setTimeout(r, 120));
 
 describe("Init display after cleanup changes", () => {
+  it.each([false, true])(
+    "places init after the first user regardless of early completion (%s)",
+    (completed) => {
+      const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
+      aggregator.handleMessage({ type: "init-start", hookPath: "/project", timestamp: 1 });
+      if (completed) aggregator.handleMessage({ type: "init-end", exitCode: 0, timestamp: 2 });
+      expect(aggregator.getDisplayedMessages().map((message) => message.type)).toEqual([
+        "workspace-init",
+      ]);
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("user", "user", "Create this workspace", {
+          historySequence: 7,
+          timestamp: 3,
+        }),
+      });
+      expect(aggregator.getDisplayedMessages().map((message) => message.type)).toEqual([
+        "user",
+        "workspace-init",
+      ]);
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("assistant", "assistant", "Ready", {
+          historySequence: 8,
+          timestamp: 4,
+        }),
+      });
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("next-user", "user", "Continue", { historySequence: 9, timestamp: 5 }),
+      });
+      expect(aggregator.getDisplayedMessages().map((message) => message.type)).toEqual([
+        "user",
+        "workspace-init",
+        "assistant",
+        "user",
+      ]);
+    }
+  );
+
+  it("propagates steps and throttles progress until another step or completion clears it", () => {
+    const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
+    const progress = {
+      type: "init-progress" as const,
+      label: "Updating files",
+      percent: 87,
+      timestamp: 2,
+    };
+    aggregator.handleMessage(progress);
+    expect(aggregator.getDisplayedMessages()).toEqual([]);
+    aggregator.handleMessage({ type: "init-start", hookPath: "/project", timestamp: 1 });
+    const before = aggregator.getDisplayedMessages();
+    aggregator.handleMessage(progress);
+    expect(aggregator.getDisplayedMessages()).toBe(before);
+    aggregator.flushPendingInitOutput();
+    expect(aggregator.getDisplayedMessages()[0]).toMatchObject({
+      progress: { label: "Updating files", percent: 87 },
+    });
+    const step = { type: "init-output" as const, line: "Running hook", step: true, timestamp: 3 };
+    aggregator.handleMessage(step);
+    aggregator.flushPendingInitOutput();
+    expect(aggregator.getDisplayedMessages()[0]).toMatchObject({
+      progress: null,
+      lines: [{ line: step.line, isError: false, step: true }],
+    });
+    aggregator.handleMessage(progress);
+    aggregator.handleMessage({ type: "init-output", line: "Raw output", timestamp: 4 });
+    aggregator.flushPendingInitOutput();
+    expect(aggregator.getDisplayedMessages()[0]).toMatchObject({
+      progress: { label: "Updating files", percent: 87 },
+    });
+    aggregator.handleMessage({ type: "init-end", exitCode: 0, timestamp: 5 });
+    expect(aggregator.getDisplayedMessages()[0]).toMatchObject({ progress: null });
+    const finished = aggregator.getDisplayedMessages();
+    aggregator.handleMessage(progress);
+    aggregator.flushPendingInitOutput();
+    expect(aggregator.getDisplayedMessages()).toEqual(finished);
+  });
+
+  it("keeps checklist lines and live progress unchanged during reconnect replay", () => {
+    const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
+    const start = { type: "init-start" as const, hookPath: "/project", timestamp: 1 };
+    const step = { type: "init-output" as const, line: "Checkout", step: true, timestamp: 2 };
+    aggregator.handleMessage(start);
+    aggregator.handleMessage(step);
+    aggregator.handleMessage({
+      type: "init-progress",
+      label: "Updating files",
+      percent: 87,
+      timestamp: 3,
+    });
+    aggregator.flushPendingInitOutput();
+    const before = aggregator.getDisplayedMessages();
+    aggregator.handleMessage({ ...start, replay: true });
+    aggregator.handleMessage({ ...step, replay: true });
+    aggregator.flushPendingInitOutput();
+    expect(aggregator.getDisplayedMessages()).toEqual(before);
+    expect(aggregator.getDisplayedMessages()[0]).toMatchObject({
+      lines: [{ line: step.line, isError: false, step: true }],
+      progress: { label: "Updating files", percent: 87 },
+    });
+  });
+
   it("should display init messages correctly", async () => {
     const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
 
@@ -60,6 +164,60 @@ describe("Init display after cleanup changes", () => {
     expect((messages[0] as InitDisplayedMessage).exitCode).toBe(0);
   });
 
+  it.each([
+    { exitCode: 0, status: "success" as const },
+    { exitCode: 1, status: "error" as const },
+  ])(
+    "never publishes a running row while replaying a completed init (exit $exitCode)",
+    ({ exitCode, status }) => {
+      const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
+      const statuses: string[] = [];
+      const record = () => {
+        const init = aggregator
+          .getDisplayedMessages()
+          .find((message) => message.type === "workspace-init");
+        statuses.push(init ? init.status : "missing");
+      };
+
+      aggregator.handleMessage({
+        type: "init-start",
+        hookPath: "/project",
+        timestamp: 1_000,
+        replay: true,
+        completed: { exitCode, endTime: 4_500 },
+      });
+      record();
+      for (const [index, line] of ["Preparing checkout", "Running hook"].entries()) {
+        aggregator.handleMessage({
+          type: "init-output",
+          line,
+          step: true,
+          timestamp: 2_000 + index,
+          lineNumber: index,
+          replay: true,
+        });
+        aggregator.flushPendingInitOutput();
+        record();
+      }
+      aggregator.handleMessage({ type: "init-end", exitCode, timestamp: 4_500, replay: true });
+      record();
+
+      expect(statuses).toEqual([status, status, status, status]);
+      const init = aggregator
+        .getDisplayedMessages()
+        .find((message) => message.type === "workspace-init");
+      expect(init).toMatchObject({
+        status,
+        exitCode,
+        durationMs: 3_500,
+        lines: [
+          { line: "Preparing checkout", isError: false, step: true },
+          { line: "Running hook", isError: false, step: true },
+        ],
+      });
+    }
+  );
+
   it("should treat replayed init-start/output for the same running init as idempotent", () => {
     const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
 
@@ -105,6 +263,57 @@ describe("Init display after cleanup changes", () => {
       { line: "Installing dependencies...", isError: false },
       { line: "Syncing repository over SSH...", isError: false },
     ]);
+  });
+
+  it("adopts terminal metadata when the same running init is replayed as completed", () => {
+    const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
+    const initRow = () =>
+      aggregator.getDisplayedMessages().find((message) => message.type === "workspace-init");
+
+    aggregator.handleMessage({
+      type: "init-start",
+      hookPath: "/project/.xum/init",
+      timestamp: 1_000,
+    });
+    aggregator.handleMessage({
+      type: "init-output",
+      line: "Installing dependencies...",
+      timestamp: 1_001,
+      isError: false,
+    });
+    aggregator.flushPendingInitOutput();
+    expect(initRow()).toMatchObject({ status: "running" });
+
+    // Reconnect after the init finished server-side: the replayed init-start already knows
+    // the outcome, so the retained row must not stay "running" until init-end is replayed.
+    aggregator.resetForReplay();
+    aggregator.handleMessage({
+      type: "init-start",
+      hookPath: "/project/.xum/init",
+      timestamp: 1_000,
+      replay: true,
+      completed: { exitCode: 0, endTime: 4_000 },
+    });
+    expect(initRow()).toMatchObject({
+      status: "success",
+      exitCode: 0,
+      durationMs: 3_000,
+      lines: [{ line: "Installing dependencies...", isError: false }],
+    });
+
+    aggregator.handleMessage({
+      type: "init-output",
+      line: "Installing dependencies...",
+      timestamp: 1_001,
+      isError: false,
+      replay: true,
+    });
+    aggregator.handleMessage({ type: "init-end", exitCode: 0, timestamp: 4_000, replay: true });
+    aggregator.flushPendingInitOutput();
+    expect(initRow()).toMatchObject({
+      status: "success",
+      lines: [{ line: "Installing dependencies...", isError: false }],
+    });
   });
 
   it("should preserve duplicate replayed init lines that share a timestamp", () => {

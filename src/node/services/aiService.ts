@@ -972,6 +972,9 @@ export class AIService extends EventEmitter {
         if (combinedAbortSignal.aborted) {
           return Ok(this.createAbortedTurnHandle(syntheticMessageId, combinedAbortSignal));
         }
+        if (!combinedAbortSignal.aborted) await opts.assertAdmissionCurrent?.();
+        if (combinedAbortSignal.aborted)
+          return Ok(this.createAbortedTurnHandle(syntheticMessageId, combinedAbortSignal));
         const result = await this.mockAiStreamPlayer.play(messages, workspaceId, {
           model: modelString,
           agentId,
@@ -1022,6 +1025,9 @@ export class AIService extends EventEmitter {
         return buildOutcome.result;
       }
 
+      // Prepared candidates must use the final caller's admission, not their earlier preview.
+      buildOutcome.turnExecutionOptions.assertAdmissionCurrent = opts.assertAdmissionCurrent;
+      buildOutcome.turnExecutionOptions.withAdmissionCurrent = opts.withAdmissionCurrent;
       // Routed project-skill turns: the consent gate rides
       // turnExecutionOptions into StreamManager.startStream, which invokes
       // it inside its critical section (mutex held, safety and temp-dir

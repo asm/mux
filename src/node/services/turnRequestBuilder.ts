@@ -1,4 +1,5 @@
 import { stepMessagesCarryProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
+import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/common/utils/shell";
 import type { OnStepSettled } from "./streamManager";
@@ -35,6 +36,7 @@ import {
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 
 import type { SendMessageError } from "@/common/types/errors";
+import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import type { PreDispatchConsentGate } from "@/node/services/streamManager";
@@ -306,6 +308,9 @@ export interface StreamMessageOptions {
   onPreStartError?: (event: ErrorEvent) => void;
   /** Synchronous registration of the facade's handleless startup notification identity. */
   onStreamStarting?: (messageId: string) => void;
+  /** Revalidate recorded admission after asynchronous startup, without acquiring new authority. */
+  assertAdmissionCurrent?: () => Promise<void>;
+  withAdmissionCurrent?: (construct: () => void) => Promise<void>;
   /** Tool names that should be delegated back to ACP clients for this request. */
   delegatedToolNames?: string[];
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
@@ -341,6 +346,7 @@ export interface StreamMessageOptions {
   prospectiveGoalStatusForToolAvailability?: GoalRecordV1["status"] | null;
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
   onStepSettled?: OnStepSettled;
   /**
    * Whether a token-budget rollover could actually be sealed for this request (mode active and
@@ -535,6 +541,7 @@ interface WorkflowResultContinuationSender {
     message: string,
     options: SendMessageOptions,
     internal?: {
+      acceptanceOrigin?: TurnAcceptanceOrigin;
       skipAutoResumeReset?: boolean;
       synthetic?: boolean;
       agentInitiated?: boolean;
@@ -897,6 +904,7 @@ export class TurnRequestBuilder {
       workspaceGoalService,
       disableWorkspaceAgents,
       hasQueuedMessages,
+      getQueuedInputStopCause,
       onStepSettled,
       contextBudgetRolloverAvailable,
       requestAssemblySnapshot,
@@ -2162,6 +2170,7 @@ export class TurnRequestBuilder {
                     },
                   },
                   {
+                    acceptanceOrigin: "automatic",
                     skipAutoResumeReset: true,
                     synthetic: true,
                     agentInitiated: true,
@@ -3274,6 +3283,7 @@ export class TurnRequestBuilder {
         toolPolicy: effectiveToolPolicy,
         providedStreamToken: streamToken,
         hasQueuedMessages,
+        getQueuedInputStopCause,
         onStepSettled,
         workspaceName: metadata.name,
         thinkingLevel: streamThinkingLevel,

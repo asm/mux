@@ -1572,6 +1572,111 @@ describe("WorkspaceStore", () => {
       mockChatScript([], { keepOpen: true });
     });
 
+    it("keeps the pending first-message row while hidden snapshot rows stream in", async () => {
+      // Skill, MCP prompt, and @file first sends persist hidden synthetic user rows before the
+      // durable message; each live event bumps state, so the row must survive that bump.
+      const workspaceId = "workspace-pending-row-hidden-snapshots";
+      let releaseUserRow!: () => void;
+      const userRowReady = new Promise<void>((resolve) => {
+        releaseUserRow = resolve;
+      });
+
+      mockChatStreamFor(workspaceId, async function* () {
+        yield { type: "caught-up", replay: "full" };
+        yield {
+          type: "message",
+          ...createMuxMessage("skill-snapshot-1", "user", "<agent-skill>body</agent-skill>", {
+            historySequence: 1,
+            timestamp: Date.now(),
+            synthetic: true,
+            agentSkillSnapshot: { skillName: "x", scope: "project", sha256: "abc" },
+          }),
+        };
+        await userRowReady;
+        yield {
+          type: "message",
+          ...createMuxMessage("user-1", "user", "Build the thing", {
+            historySequence: 2,
+            timestamp: Date.now(),
+          }),
+        };
+      });
+
+      createAndAddWorkspace(store, workspaceId);
+      store.markPendingInitialSend(workspaceId, "openai:gpt-4o-mini", {
+        content: "Build the thing",
+        timestamp: Date.now(),
+      });
+
+      const userRows = () =>
+        store.getWorkspaceState(workspaceId).messages.filter((message) => message.type === "user");
+      // The hidden snapshot row is filtered from display, so observe its arrival through the
+      // pending-stream model it resets; the pending row must still be the only visible user row.
+      const sawSnapshot = await waitUntil(
+        () => store.getWorkspaceState(workspaceId).pendingStreamModel === null
+      );
+      expect(sawSnapshot).toBe(true);
+      expect(userRows()).toHaveLength(1);
+      expect(userRows()[0]).toMatchObject({ isPendingSend: true });
+
+      releaseUserRow();
+      const replaced = await waitUntil(() => {
+        const rows = userRows();
+        return rows.length === 1 && rows[0].historyId === "user-1";
+      });
+      expect(replaced).toBe(true);
+    });
+
+    it("carries a creation card without marking a pending stream", () => {
+      const workspaceId = "workspace-goal-creation-card";
+      const internalStore = getInternal<{
+        resetChatStateForReplay: (workspaceId: string) => void;
+      }>(store);
+
+      createAndAddWorkspace(store, workspaceId);
+      store.markPendingCreationInit(workspaceId, {
+        workspaceName: "dark-mode",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: "/project",
+        timestamp: 1,
+      });
+      internalStore.resetChatStateForReplay(workspaceId);
+
+      const state = store.getWorkspaceState(workspaceId);
+      expect(state.isStreamStarting).toBe(false);
+      expect(state.messages.map((message) => message.type)).toEqual(["workspace-init"]);
+    });
+
+    it("keeps the creation card when the first send fails before init-start arrives", () => {
+      const workspaceId = "workspace-first-send-failed";
+
+      createAndAddWorkspace(store, workspaceId);
+      store.markPendingInitialSend(
+        workspaceId,
+        "openai:gpt-4o-mini",
+        { content: "Build the thing", timestamp: 1 },
+        {
+          workspaceName: "dark-mode",
+          nameGenerated: true,
+          kind: undefined,
+          hookPath: "/project",
+          timestamp: 1,
+        }
+      );
+      expect(store.getWorkspaceState(workspaceId).messages.map((m) => m.type)).toEqual([
+        "user",
+        "workspace-init",
+      ]);
+
+      // The failure drops the prompt and the startup barrier; init is still running, so the
+      // card stays as the workspace's only provisioning status.
+      store.clearPendingInitialSendState(workspaceId);
+      const state = store.getWorkspaceState(workspaceId);
+      expect(state.isStreamStarting).toBe(false);
+      expect(state.messages.map((m) => m.type)).toEqual(["workspace-init"]);
+    });
+
     it("preserves optimistic startup across full replay resets", () => {
       const workspaceId = "workspace-full-replay-pending-start";
       const requestedModel = "openai:gpt-4o-mini";
@@ -3036,6 +3141,7 @@ describe("WorkspaceStore", () => {
             isError: false,
             timestamp: 1_001,
           };
+          yield { type: "init-progress", label: "Checkout", percent: 87, timestamp: 1_002 };
           return;
         }
 
@@ -3075,7 +3181,8 @@ describe("WorkspaceStore", () => {
         return (
           state.loading === false &&
           initMessage?.status === "running" &&
-          initMessage.lines[0]?.line === firstLine
+          initMessage.lines[0]?.line === firstLine &&
+          initMessage.progress?.percent === 87
         );
       });
       expect(sawInitialInit).toBe(true);
@@ -3126,6 +3233,60 @@ describe("WorkspaceStore", () => {
         );
       });
       expect(stayedVisibleAfterCaughtUp).toBe(true);
+    });
+
+    it("shows init progress on the coalesced bump without waiting for the aggregator throttle", async () => {
+      const workspaceId = "workspace-init-progress-bump";
+      let releaseProgress: (() => void) | undefined;
+      const progressAtBump: Array<number | null> = [];
+
+      const readInitProgress = (): number | null => {
+        const initMessage = store
+          .getWorkspaceState(workspaceId)
+          .messages.find(
+            (message): message is Extract<DisplayedMessage, { type: "workspace-init" }> =>
+              message.type === "workspace-init"
+          );
+        return initMessage?.progress?.percent ?? null;
+      };
+
+      mockChatStreamFor(workspaceId, async function* () {
+        yield { type: "caught-up" };
+        await Promise.resolve();
+        yield { type: "init-start", hookPath: "/tmp/project", timestamp: 1_000 };
+        await new Promise<void>((resolve) => {
+          releaseProgress = resolve;
+        });
+        yield {
+          type: "init-output",
+          line: "Checking out files...",
+          step: true,
+          isError: false,
+          timestamp: 1_001,
+        };
+        yield { type: "init-progress", label: "Updating files", percent: 87, timestamp: 1_002 };
+      });
+
+      createAndAddWorkspace(store, workspaceId);
+      const unsubscribe = store.subscribeKey(workspaceId, () => {
+        progressAtBump.push(readInitProgress());
+      });
+      try {
+        // Reading state here caches the running card without progress, which is the
+        // stale snapshot a later bump must not re-render.
+        const sawRunningCard = await waitUntil(
+          () => readInitProgress() === null && releaseProgress !== undefined
+        );
+        expect(sawRunningCard).toBe(true);
+        progressAtBump.length = 0;
+
+        releaseProgress?.();
+
+        expect(await waitUntil(() => progressAtBump.length > 0)).toBe(true);
+        expect(progressAtBump[0]).toBe(87);
+      } finally {
+        unsubscribe();
+      }
     });
 
     it("active workspace still shows starting during legitimate startup gap", async () => {
@@ -3217,6 +3378,88 @@ describe("WorkspaceStore", () => {
       });
       expect(sawPendingModel).toBe(true);
     });
+  });
+
+  describe("completed init replay", () => {
+    it.each([
+      { exitCode: 0, status: "success" },
+      { exitCode: 1, status: "error" },
+    ])(
+      "never publishes a running init row while replaying a finished init (exit $exitCode)",
+      async ({ exitCode, status }) => {
+        const workspaceId = `completed-init-replay-${exitCode}`;
+        let releaseCaughtUp!: () => void;
+        const caughtUpReady = new Promise<void>((resolve) => {
+          releaseCaughtUp = resolve;
+        });
+        const replayedInit: WorkspaceChatMessage[] = [
+          {
+            type: "init-start",
+            hookPath: "/project",
+            timestamp: 1_000,
+            replay: true,
+            completed: { exitCode, endTime: 4_500 },
+          },
+          {
+            type: "init-output",
+            line: "Preparing checkout",
+            step: true,
+            isError: false,
+            timestamp: 2_000,
+            lineNumber: 0,
+            replay: true,
+          },
+          {
+            type: "init-output",
+            line: "Running hook",
+            step: true,
+            isError: false,
+            timestamp: 2_001,
+            lineNumber: 1,
+            replay: true,
+          },
+          { type: "init-end", exitCode, timestamp: 4_500, replay: true },
+        ];
+        mockChatStreamFor(workspaceId, async function* () {
+          for (const event of replayedInit) {
+            yield event;
+            await tick();
+          }
+          await caughtUpReady;
+          yield { type: "caught-up", replay: "full" };
+        });
+
+        const findInitRow = () =>
+          store
+            .getWorkspaceState(workspaceId)
+            .messages.find((message) => message.type === "workspace-init");
+
+        createAndAddWorkspace(store, workspaceId);
+        const publishedStatuses: string[] = [];
+        const unsubscribe = store.subscribeKey(workspaceId, () => {
+          const init = findInitRow();
+          if (init) publishedStatuses.push(init.status);
+        });
+
+        expect(
+          await waitUntil(() => {
+            const init = findInitRow();
+            return init?.exitCode === exitCode && init.lines.length === 2;
+          })
+        ).toBe(true);
+        expect(store.getWorkspaceState(workspaceId).isTranscriptCaughtUp).toBe(false);
+
+        releaseCaughtUp();
+        expect(
+          await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)
+        ).toBe(true);
+        unsubscribe();
+
+        expect(publishedStatuses.length).toBeGreaterThan(0);
+        expect(publishedStatuses.every((published) => published === status)).toBe(true);
+        expect(findInitRow()).toMatchObject({ status, exitCode, durationMs: 3_500 });
+      }
+    );
   });
 
   describe("history pagination", () => {

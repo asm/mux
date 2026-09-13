@@ -911,48 +911,6 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     await session.dispose();
   });
 
-  it("fails closed when the refused compaction request cannot be rolled back", async () => {
-    // deleteMessages can fail with the row still on disk. The refusal must
-    // then stamp the surviving compaction request provider-ineligible and key
-    // the abandon marker to it, so neither request assembly nor startup
-    // replay can pick up the prompt it carries.
-    const workspacePath = await createWorkspaceWithSkill({
-      skillName: "done",
-      metadataYaml: "metadata:\n  model-class: small\n",
-    });
-    const harnessArgs: Parameters<typeof createRoutingHarness>[0] = {
-      workspacePath,
-      configValues: { modelClasses: { small: "haiku+0" } },
-    };
-    const { session, historyService } = await createRoutingHarness(harnessArgs);
-    forceOnSendCompaction(session);
-    revokeTrustAfterRouting(session, harnessArgs);
-    const deleteSpy = spyOn(historyService, "deleteMessages").mockResolvedValue(
-      Err("history locked")
-    );
-    try {
-      const result = await session.sendMessage("Use skill done", skillSendOptions());
-      expect(result.success).toBe(false);
-    } finally {
-      deleteSpy.mockRestore();
-    }
-
-    const history = await historyService.getHistoryFromLatestBoundary("ws-skill-routing");
-    if (!history.success) throw new Error(history.error);
-    const compactionRequest = history.data.find(
-      (message) => message.metadata?.muxMetadata?.type === "compaction-request"
-    );
-    if (compactionRequest == null) throw new Error("expected the unremovable row to survive");
-    expect(compactionRequest.metadata?.preStreamRejected).toBe(true);
-    const abandon = (
-      session as unknown as {
-        startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
-      }
-    ).startupAutoRetryAbandon;
-    expect(abandon).toEqual({ reason: "pre_stream_rejected", userMessageId: compactionRequest.id });
-    await session.dispose();
-  });
-
   it("excludes a stamped assistant partial from the provider request", async () => {
     // A refused turn's surviving partial committed as an assistant row (a fork
     // commits the source's partial) and stamped provider-ineligible: its tool

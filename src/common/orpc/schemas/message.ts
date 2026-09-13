@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { StreamStopCauseSchema } from "@/common/types/streamStopCause";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { ThinkingLevelSchema } from "../../types/thinking";
 import { AgentIdSchema } from "./agentDefinition";
@@ -161,6 +162,7 @@ export const MuxMessageSchema = z.object({
   metadata: z
     .object({
       historySequence: z.number().optional(),
+      compactionReplacementNonce: z.string().min(1).optional().catch(undefined),
       // Step cuts are an optimization; malformed legacy metadata must not block chat replay.
       stepStartPartIndices: z.array(z.number()).optional().catch(undefined),
       timestamp: z.number().optional(),
@@ -177,6 +179,7 @@ export const MuxMessageSchema = z.object({
       contextUsage: z.any().optional(),
       providerMetadata: z.record(z.string(), z.unknown()).optional(),
       contextProviderMetadata: z.record(z.string(), z.unknown()).optional(),
+      stopCause: StreamStopCauseSchema.optional().catch(undefined),
       duration: z.number().optional(),
       ttftMs: z.number().optional(),
       systemMessageTokens: z.number().optional(),
@@ -194,6 +197,8 @@ export const MuxMessageSchema = z.object({
       compactionEpoch: CompactionEpochSchema,
       // Durable boundary marker for compaction summaries.
       compactionBoundary: z.boolean().optional(),
+      compactionPublicationId: z.string().min(1).optional().catch(undefined),
+      compactionPublicationGeneration: z.string().min(1).nullable().optional().catch(undefined),
       contextBoundaryKind: z.literal(CONTEXT_BOUNDARY_KINDS.RESET).optional(),
       toolPolicy: z.any().optional(),
       disableWorkspaceAgents: z.boolean().optional(),

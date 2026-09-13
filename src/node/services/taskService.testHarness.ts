@@ -45,6 +45,7 @@ export function createMockInitStateManager(): InitStateManager {
     startInit: mock(() => undefined),
     enterHookPhase: mock(() => undefined),
     appendOutput: mock(() => undefined),
+    reportProgress: mock(() => undefined),
     endInit: mock(() => Promise.resolve()),
     getInitState: mock(() => undefined),
     readInitStatus: mock(() => Promise.resolve(null)),
@@ -275,6 +276,7 @@ export function createAIServiceMocks(
       getStreamInfo,
       getProvidersConfig,
       replayStream,
+      acquireStreamStartLock: mock(() => Promise.resolve(undefined)),
       on,
       off,
     } as unknown as AIService,
@@ -297,6 +299,8 @@ export function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverride
   const isWorkflowInvocationCurrent =
     overrides.isWorkflowInvocationCurrent ?? mock(() => Promise.resolve(true));
   const mocks = {
+    acquireIdleTurnExclusion:
+      overrides.acquireIdleTurnExclusion ?? mock(() => Ok({ [Symbol.dispose]: () => undefined })),
     sendMessage:
       overrides.sendMessage ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined))),
     resumeStream:

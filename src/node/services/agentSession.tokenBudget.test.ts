@@ -12,6 +12,7 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { SendMessageError } from "@/common/types/errors";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { Err, Ok } from "@/common/types/result";
+import assert from "@/common/utils/assert";
 import { prepareProviderRequestMessages } from "./turnContextAssembler";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
@@ -23,11 +24,16 @@ import {
   FLUSH_MAX_OUTPUT_TOKENS,
 } from "@/common/constants/contextBudget";
 import type { AgentSessionAIService } from "./agentSession";
+import { CompactionCancellation } from "./compactionCancellation";
+import { HistoryService } from "./historyService";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
 import { createTurnCompletionController, type SettledStepBudget } from "./streamManager";
 import { createRolloverPrefix, type ContextWindowRollover } from "./contextWindowRollover";
 import * as rolloverMessages from "./contextWindowRollover";
 import * as contextLimits from "@/common/utils/compaction/contextLimit";
+import { CompactionPendingState } from "./compactionPendingState";
+import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
+import { log } from "./log";
 
 const workspaceId = "token-budget-session";
 const model = "openai:gpt-4o";
@@ -362,6 +368,22 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
+  test("queued context-budget rejection persists once without restoring a duplicate draft", async () => {
+    const h = await setup();
+    const failed = Promise.withResolvers<void>();
+    h.session.queueMessage("oversized ".repeat(60_000), options, {
+      onAcceptedPreStreamFailure: () => failed.resolve(),
+    });
+    h.session.sendQueuedMessages();
+    await failed.promise;
+    await h.session.waitForIdle();
+    const rows = await allRows(h);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].metadata?.contextBudgetRejected).toBe(true);
+    expect(h.events.filter((event) => event.type === "restore-to-input")).toHaveLength(0);
+    expect(h.requests).toHaveLength(0);
+  });
+
   test.each([false, true])(
     "a rejected tail never retries the older completed turn after restart (legacy=%s)",
     async (legacy) => {
@@ -411,11 +433,17 @@ describe("AgentSession token-budget lifecycle", () => {
     h.session.setAutoCompactionThreshold(1);
     await seedHistory(h, 20_000);
     const before = await allRows(h);
-    const append = spyOn(h.historyService, "appendToHistory");
+    const append = spyOn(h.historyService, "acceptCompactionReplacement");
     const batch = spyOn(h.historyService, "appendManyToHistory");
     expect((await h.session.sendMessage("Ordinary next request", options)).success).toBe(true);
     expect(batch).not.toHaveBeenCalled();
-    expect(append.mock.calls.some(([, row]) => text(row) === "Ordinary next request")).toBe(true);
+    expect(
+      append.mock.calls.some(
+        ([, , operation]) =>
+          operation.kind === "append" &&
+          operation.messages.some((row) => text(row) === "Ordinary next request")
+      )
+    ).toBe(true);
     expect((await allRows(h)).slice(0, before.length)).toEqual(before);
     expect(h.requests).toHaveLength(1);
   });
@@ -423,7 +451,7 @@ describe("AgentSession token-budget lifecycle", () => {
   test("a failed single-user append preserves old history and does not dispatch", async () => {
     const h = await setup();
     const before = await allRows(h);
-    spyOn(h.historyService, "appendToHistory").mockResolvedValueOnce(Err("disk full"));
+    spyOn(h.historyService, "acceptCompactionReplacement").mockResolvedValueOnce(Err("disk full"));
     expect((await h.session.sendMessage("Not durably accepted", options)).success).toBe(false);
     expect(await allRows(h)).toEqual(before);
     expect(h.requests).toHaveLength(0);
@@ -435,15 +463,18 @@ describe("AgentSession token-budget lifecycle", () => {
     const before = await allRows(h);
     const controller = new AbortController();
     const cancelState = { canceledBeforeAcceptance: false };
-    const append = h.historyService.appendToHistory.bind(h.historyService);
-    spyOn(h.historyService, "appendToHistory").mockImplementationOnce(async (id, row) => {
-      const result = await append(id, row);
-      controller.abort();
-      return result;
-    });
+    const append = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
+      async (...args) => {
+        const result = await append(...args);
+        controller.abort();
+        return result;
+      }
+    );
     expect(
       (
         await h.session.sendMessage("Cancel after persistence", options, {
+          acceptanceOrigin: "automatic",
           cancelSignal: controller.signal,
           cancelState,
         })
@@ -549,11 +580,13 @@ describe("AgentSession token-budget lifecycle", () => {
           await cleanup();
         });
       } else {
-        const append = h.historyService.appendManyToHistory.bind(h.historyService);
-        spyOn(h.historyService, "appendManyToHistory").mockImplementationOnce(async (id, rows) => {
-          replaceRegistration();
-          return append(id, rows);
-        });
+        const append = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+        spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
+          async (...args) => {
+            replaceRegistration();
+            return append(...args);
+          }
+        );
       }
       try {
         expect((await h.session.sendMessage("Admitted turn", options)).success).toBe(true);
@@ -828,6 +861,88 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
+  test.each([
+    { inputTokens: 110_000, automatic: true },
+    { inputTokens: 1_000, automatic: true },
+    { inputTokens: 110_000, automatic: false },
+  ])(
+    "token-budget send preserves scoped Stop recovery (tokens=$inputTokens, automatic=$automatic)",
+    async ({ inputTokens, automatic }) => {
+      const h = await setup();
+      await h.session.cancelCompaction();
+      await h.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("canceled-summary", "assistant", "Canceled summary", {
+          model,
+          compactionBoundary: true,
+          compacted: "user",
+          contextUsage: { inputTokens, outputTokens: 10, totalTokens: inputTokens + 10 },
+          muxMetadata: {
+            type: "compaction-summary",
+            pendingFollowUp: { text: "old continuation", model, agentId: "exec" },
+          },
+        })
+      );
+      expect(await h.session.isAutomaticSendBlocked()).toBe(false);
+      const storage = h.historyService.getCompactionCancellationStorage(workspaceId);
+      const stopped = await storage.read();
+      expect(stopped?.scope.kind).toBe("summary");
+      const result = await h.session.sendMessage("Fresh input", options, {
+        acceptanceOrigin: automatic ? "automatic" : "manual",
+        synthetic: automatic,
+      });
+      const latest = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      assert(latest.success);
+      const activeSummary = latest.data.some((row) => row.id === "canceled-summary");
+      expect(await storage.read()).toEqual(automatic ? stopped : null);
+      await h.session.dispose();
+      const restarted = await createAgentSessionHarness({
+        workspaceId,
+        config: h.config,
+        historyService: new HistoryService(h.config),
+      });
+      harnesses.push(restarted);
+      expect(await restarted.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(false);
+      // Recovery after restart must still find and clean the canceled handoff in its epoch.
+      expect({
+        accepted: result.success,
+        providerStarts: h.requests.length,
+        resets: rolloverRows(latest.data).length,
+        activeSummary,
+        remainingStop: await storage.read(),
+      }).toEqual({
+        accepted: !automatic || inputTokens === 1_000,
+        providerStarts: !automatic || inputTokens === 1_000 ? 1 : 0,
+        resets: automatic ? 0 : 1,
+        activeSummary: automatic,
+        remainingStop: null,
+      });
+    }
+  );
+
+  test("fresh automatic rollover replaces fully settled Stop without scoped debt", async () => {
+    const h = await setup();
+    await seedHistory(h, 110_000);
+    expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+    const storage = h.historyService.getCompactionCancellationStorage(workspaceId);
+    const stopped = await storage.read();
+    assert(stopped?.version === 2);
+    expect(stopped.scope.kind).toBe("unresolved");
+    expect(
+      await h.session.sendMessage("Fresh automatic input", options, {
+        acceptanceOrigin: "automatic",
+        synthetic: true,
+      })
+    ).toEqual(Ok(undefined));
+    const latest = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+    assert(latest.success);
+    expect(rolloverRows(latest.data)).toHaveLength(1);
+    expect(latest.data.some((row) => row.id === "old-answer")).toBe(false);
+    expect(latest.data.at(-1)?.metadata?.compactionReplacementNonce).toBe(stopped.nonce);
+    expect(await storage.read()).toBeNull();
+    expect(h.requests).toHaveLength(1);
+  });
+
   test("on-send rollover appends reset, hidden lead-in, skill snapshot and the original user together", async () => {
     const h = await setup();
     await seedHistory(h, 110_000);
@@ -847,7 +962,7 @@ describe("AgentSession token-budget lifecycle", () => {
         runtimeConfig: { type: "local" },
       } as FrontendWorkspaceMetadata)
     );
-    const append = spyOn(h.historyService, "appendManyToHistory");
+    const append = spyOn(h.historyService, "acceptCompactionReplacement");
     const result = await h.session.sendMessage("Do the requested work", {
       ...options,
       muxMetadata: {
@@ -873,7 +988,9 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(text(user)).toBe("Do the requested work");
     expect(user.metadata?.muxMetadata?.type).toBe("agent-skill");
     expect(append.mock.calls).toHaveLength(1);
-    expect(append.mock.calls[0][1].map((row) => row.id)).toEqual(
+    const operation = append.mock.calls[0][2];
+    assert(operation.kind === "append");
+    expect(operation.messages.map((row) => row.id)).toEqual(
       rows.slice(boundaryIndex).map((row) => row.id)
     );
     expect(h.requests).toHaveLength(1);
@@ -1365,11 +1482,152 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
+  test.each(
+    (["on-send", "emergency"] as const).flatMap((mode) =>
+      (
+        [
+          "committed",
+          "append-failed",
+          "ack-failed",
+          "successor",
+          "cleanup-failed",
+          "ack-and-cleanup-failed",
+        ] as const
+      ).map((outcome) => ({ mode, outcome }))
+    )
+  )(
+    "rollover pending cleanup follows durable history ($mode, $outcome)",
+    async ({ mode, outcome }) => {
+      const h = await setup({
+        failure:
+          mode === "emergency" ? (attempt) => (attempt === 1 ? exceeded : undefined) : undefined,
+      });
+      await seedHistory(h, mode === "emergency" ? 20_000 : 110_000);
+      const sessionDir = path.join(h.config.sessionsDir, workspaceId);
+      const pendingPath = path.join(sessionDir, POST_COMPACTION_STATE_FILENAME);
+      const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
+      let before = "";
+      let successor = "";
+      const acknowledgmentFailure = "injected post-commit failure";
+      const cleanupFails = outcome === "cleanup-failed" || outcome === "ack-and-cleanup-failed";
+      const reportedErrors = spyOn(log, "error");
+      const cleanup = h.session.applyContextResetSideEffects.bind(h.session);
+      spyOn(h.session, "applyContextResetSideEffects").mockImplementationOnce(async (...args) => {
+        // A foreign pending publication can arrive after preparation, including after the
+        // emergency path rejected an earlier attachment. The reset must retire this owner too.
+        before = JSON.stringify({
+          version: 1,
+          createdAt: 1,
+          publicationGeneration: (await journal.captureGeneration()) ?? null,
+          diffs: [{ path: "/before.ts", diff: "+before", truncated: false }],
+          loadedSkills: [{ name: "before", scope: "project", body: "Pre-reset instructions" }],
+          readFiles: ["/before.ts"],
+        });
+        await fs.writeFile(pendingPath, before);
+        await cleanup(...args);
+      });
+      const afterPublication = async () => {
+        if (outcome === "successor") {
+          const pending = new CompactionPendingState(
+            pendingPath,
+            h.historyService.getCompactionPendingHistory(workspaceId)
+          );
+          expect(
+            (
+              await pending.publishBoundary({
+                summaryMessage: createMuxMessage("successor", "assistant", "New context", {
+                  compacted: "user",
+                  compactionBoundary: true,
+                  compactionEpoch: 1,
+                }),
+                tailCopies: [],
+                updateExisting: false,
+                attachments: { diffs: [], loadedSkills: [], readFiles: ["/after.ts"] },
+                publication: { generation: await journal.captureGeneration() },
+                isCurrent: () => true,
+                shouldPersist: () => true,
+                onCommitted: () => undefined,
+              })
+            ).success
+          ).toBe(true);
+          successor = await fs.readFile(pendingPath, "utf8");
+        }
+        if (cleanupFails) {
+          const unlink = fs.unlink;
+          spyOn(fs, "unlink").mockImplementation((file) =>
+            file === pendingPath
+              ? Promise.reject(
+                  Object.assign(new Error("pending unlink failed"), { code: "EACCES" })
+                )
+              : unlink(file)
+          );
+        }
+        if (outcome === "ack-failed" || outcome === "ack-and-cleanup-failed") {
+          throw new Error(acknowledgmentFailure);
+        }
+      };
+      // Both paths use the guarded history receipt; retain real disk publication.
+      const accept = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+      spyOn(h.historyService, "acceptCompactionReplacement").mockImplementation(async (...args) => {
+        const operation = args[2];
+        const rollover = operation.kind === "append" && rolloverRows(operation.messages).length > 0;
+        if (rollover && outcome === "append-failed") return Err("injected rollover append failure");
+        const result = await accept(...args);
+        if (rollover && result.success && result.data.kind === "accepted") await afterPublication();
+        return result;
+      });
+      const sent = await h.session.sendMessage("Roll over this window", options);
+      if (cleanupFails) {
+        const causes = reportedErrors.mock.calls.flatMap((args) =>
+          args.filter((value): value is Error => value instanceof Error).map((error) => error.cause)
+        );
+        expect(causes).toContainEqual(expect.objectContaining({ code: "EACCES" }));
+      }
+      expect(sent.success).toBe(
+        outcome === "committed" || outcome === "successor" || outcome === "cleanup-failed"
+      );
+      expect(rolloverRows(await allRows(h))).toHaveLength(outcome === "append-failed" ? 0 : 1);
+      const persistedPending = await fs.readFile(pendingPath, "utf8").catch((error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        throw error;
+      });
+      // Generation fences protect the current reader only. Removing the compatible bytes is
+      // what prevents a preceding version from reloading them immediately after a downgrade.
+      expect(persistedPending).toBe(
+        outcome === "successor"
+          ? successor
+          : outcome === "append-failed" || cleanupFails
+            ? before
+            : undefined
+      );
+      if (!sent.success) {
+        expect(h.requests).toHaveLength(mode === "emergency" ? 1 : 0);
+        if (outcome === "ack-and-cleanup-failed") {
+          expect(sent.error).toMatchObject({ type: "unknown", raw: acknowledgmentFailure });
+        }
+      }
+      if (outcome === "cleanup-failed") {
+        expect(h.requests).toHaveLength(mode === "emergency" ? 2 : 1);
+        h.settleStream(0);
+        await h.session.waitForIdle();
+        expect((await h.session.sendMessage("Continue accepted work", options)).success).toBe(true);
+        const rows = await allRows(h);
+        expect(rolloverRows(rows)).toHaveLength(1);
+        const active = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(active.success).toBe(true);
+        if (active.success)
+          expect(active.data.filter((row) => text(row) === "Roll over this window")).toHaveLength(
+            1
+          );
+      }
+    }
+  );
+
   test("failed atomic append preserves history and retry after fail-closed cleanup", async () => {
     const h = await setup();
     await seedHistory(h, 110_000);
     const cleanup = spyOn(h.session, "applyContextResetSideEffects");
-    const append = spyOn(h.historyService, "appendManyToHistory").mockImplementationOnce(
+    const append = spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
       async () => {
         expect(cleanup).toHaveBeenCalledTimes(1);
         await Promise.resolve();
@@ -1379,7 +1637,9 @@ describe("AgentSession token-budget lifecycle", () => {
     expect((await h.session.sendMessage("Retry me", options)).success).toBe(false);
     expect(rolloverRows(await allRows(h))).toHaveLength(0);
     expect(h.requests).toHaveLength(0);
-    const failedRollover = append.mock.calls[0][1][0].metadata?.muxMetadata;
+    const failedOperation = append.mock.calls[0][2];
+    assert(failedOperation.kind === "append");
+    const failedRollover = failedOperation.messages[0].metadata?.muxMetadata;
     expect((await h.session.sendMessage("Retry me", options)).success).toBe(true);
     const rows = await allRows(h);
     expect(rolloverRows(rows)).toHaveLength(1);
@@ -1390,10 +1650,10 @@ describe("AgentSession token-budget lifecycle", () => {
   test("a published rollover is not repeated when its append acknowledgment fails", async () => {
     const h = await setup();
     await seedHistory(h, 110_000);
-    const append = h.historyService.appendManyToHistory.bind(h.historyService);
-    spyOn(h.historyService, "appendManyToHistory").mockImplementationOnce(
-      async (workspace, rows) => {
-        const result = await append(workspace, rows);
+    const append = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
+      async (...args) => {
+        const result = await append(...args);
         if (!result.success) throw new Error(result.error);
         throw new Error("directory sync failed after publication");
       }
@@ -1723,6 +1983,129 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(text(rows.at(-1)!)).toBe("Later question");
   });
 
+  test.each([false, true])(
+    "separate queued inputs survive their own replacement retirement (reset=%s)",
+    async (reset) => {
+      const h = await setup();
+      await seedHistory(h, reset ? 110_000 : 20_000);
+      const foreign = new CompactionCancellation(
+        new HistoryService(h.config).getCompactionCancellationStorage(workspaceId)
+      );
+      await foreign.cancel({ retainUntilReplacement: true });
+      for (const message of ["First after Stop", "Second after Stop"])
+        h.session.queueMessage(message, options, { onAccepted: () => undefined });
+      h.session.sendQueuedMessages();
+      await h.waitForRequest(1);
+      h.settleStream(0, { finishReason: "stop" });
+      await h.waitForRequest(2);
+      const rows = await allRows(h);
+      expect(
+        rows.filter((row) => ["First after Stop", "Second after Stop"].includes(text(row)))
+      ).toHaveLength(2);
+      expect(rolloverRows(rows)).toHaveLength(reset ? 1 : 0);
+    }
+  );
+
+  test.each([false, true])(
+    "separate automatic inputs survive settled Stop retirement (reset=%s)",
+    async (reset) => {
+      const h = await setup();
+      await seedHistory(h, reset ? 110_000 : 20_000);
+      const foreign = new CompactionCancellation(
+        new HistoryService(h.config).getCompactionCancellationStorage(workspaceId)
+      );
+      await foreign.cancel({ settled: Promise.resolve(true) });
+      for (const message of ["First after Stop", "Second after Stop"])
+        h.session.queueMessage(message, options, {
+          acceptanceOrigin: "automatic",
+          synthetic: true,
+          onAccepted: () => undefined,
+        });
+      h.session.sendQueuedMessages();
+      await h.waitForRequest(1);
+      h.settleStream(0, { finishReason: "stop" });
+      await h.waitForRequest(2);
+      const rows = await allRows(h);
+      expect(
+        rows.filter((row) => ["First after Stop", "Second after Stop"].includes(text(row)))
+      ).toHaveLength(2);
+      expect(rolloverRows(rows)).toHaveLength(reset ? 1 : 0);
+    }
+  );
+
+  test("cancellation before an owned reset receipt releases its automatic caller without publication", async () => {
+    const h = await setup();
+    await seedHistory(h, 110_000);
+    const controller = new AbortController();
+    const canceled = mock(() => undefined);
+    const failed = mock(() => undefined);
+    const accept = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "acceptCompactionReplacement").mockImplementation(async (...args) => {
+      if (args[2].kind === "append" && rolloverRows(args[2].messages).length > 0)
+        controller.abort();
+      return accept(...args);
+    });
+    expect(
+      (
+        await h.session.sendMessage("Automatic reset", options, {
+          acceptanceOrigin: "automatic",
+          synthetic: true,
+          cancelSignal: controller.signal,
+          onCanceled: canceled,
+          onAcceptedPreStreamFailure: failed,
+        })
+      ).success
+    ).toBe(true);
+    expect(canceled).toHaveBeenCalledTimes(1);
+    expect(failed).not.toHaveBeenCalled();
+    expect(h.requests).toHaveLength(0);
+    expect(rolloverRows(await allRows(h))).toHaveLength(0);
+  });
+
+  test.each(["before", "after"] as const)(
+    "owned rollover cannot reauthorize queued input across a foreign Stop %s its receipt",
+    async (phase) => {
+      const h = await setup();
+      await seedHistory(h, 110_000);
+      h.session.queueMessage("Queued before foreign Stop", options);
+      const foreign = new CompactionCancellation(
+        new HistoryService(h.config).getCompactionCancellationStorage(workspaceId)
+      );
+      let stopped: Awaited<ReturnType<typeof foreign.read>> = null;
+      const stop = async () => {
+        await foreign.cancel({ retainUntilReplacement: true });
+        stopped = await foreign.read();
+      };
+      const accept = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+      let intercepted = false;
+      spyOn(h.historyService, "acceptCompactionReplacement").mockImplementation(async (...args) => {
+        const reset = args[2].kind === "append" && rolloverRows(args[2].messages).length > 0;
+        if (reset && phase === "before") await stop();
+        const result = await accept(...args);
+        if (reset) {
+          intercepted = true;
+          if (phase === "after") await stop();
+        }
+        return result;
+      });
+      const result = await h.session.sendMessage("Reset this window", options);
+      expect(result.success).toBe(false);
+      // A reset receipt retains accepted input, but cannot authorize provider startup
+      // after another backend's Stop supersedes the original request frontier.
+      expect(h.requests).toHaveLength(0);
+      await h.session.waitForIdle();
+      expect(intercepted).toBe(true);
+      const rows = await allRows(h);
+      expect(rows.some((row) => text(row) === "Queued before foreign Stop")).toBe(false);
+      expect(rolloverRows(rows)).toHaveLength(phase === "before" ? 0 : 1);
+      expect(rows.filter((row) => text(row) === "Reset this window")).toHaveLength(
+        phase === "before" ? 0 : 1
+      );
+      expect(stopped).not.toBeNull();
+      expect(await foreign.read()).toEqual(stopped);
+    }
+  );
+
   test("a user message queued behind the flush pair lands in the fresh window", async () => {
     const h = await setup();
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);
@@ -2009,24 +2392,29 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(await allRows(h))).toHaveLength(0);
   });
 
-  test("a Stop during flush admission degrades the flush instead of running it unsealed", async () => {
+  test("a Stop during flush admission refuses the automatic flush and continuation", async () => {
     const h = await setup();
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);
     expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
     const capture = h.aiService.captureRequestAssemblySnapshot!.bind(h.aiService);
+    const stopped = Promise.withResolvers<void>();
     // interruptStream clears the pending reset and its paired continuation while the flush
     // dispatch is still awaiting its admission checks.
     spyOn(h.aiService, "captureRequestAssemblySnapshot").mockImplementationOnce(async (id) => {
       expect((await h.session.interruptStream()).success).toBe(true);
+      stopped.resolve();
       return capture(id);
     });
-    await h.finishAndDispatch();
+    h.settleStream(0);
+    await stopped.promise;
+    await h.session.waitForIdle();
     const rows = await allRows(h);
     expect(warningRows(rows)).toHaveLength(0);
-    const trigger = rows.at(-1)!;
-    expect(text(trigger)).toBe("Continue");
-    expect(trigger.metadata?.muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
+    expect(h.requests).toHaveLength(1);
+    expect(rows.some((row) => row.metadata?.muxMetadata?.contextBudgetFlush)).toBe(false);
+    expect(
+      await h.historyService.getCompactionCancellationStorage(workspaceId).read()
+    ).not.toBeNull();
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
   });
 
@@ -3427,16 +3815,15 @@ describe("AgentSession token-budget lifecycle", () => {
       await fs.writeFile(mentioned, "accepted original bytes\n");
       await fs.utimes(mentioned, new Date(1000), new Date(1000));
       await seedHistory(h, 20000);
-      const append = h.historyService.appendManyToHistory.bind(h.historyService);
-      spyOn(h.historyService, "appendManyToHistory").mockImplementation(async (id, rows) => {
-        const rollover = rows.some(
-          (row) => row.metadata?.muxMetadata?.type === "context-window-rollover"
-        );
+      const accept = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+      spyOn(h.historyService, "acceptCompactionReplacement").mockImplementation(async (...args) => {
+        const operation = args[2];
+        const rollover = operation.kind === "append" && rolloverRows(operation.messages).length > 0;
         if (rollover) {
           expect(trackedFilePaths(h)).toEqual([]);
           if (failure === "append-failure") return Err("injected emergency append failure");
         }
-        const result = await append(id, rows);
+        const result = await accept(...args);
         if (rollover && failure === "shutdown-after-append") h.session.beginShutdown();
         return result;
       });

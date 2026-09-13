@@ -1841,12 +1841,8 @@ export class TaskService implements AgentTaskIntegration {
     this.aiService.on("stream-end", (payload: unknown) => {
       if (!isStreamEndEvent(payload)) return;
 
-      // Captured synchronously at event time, BEFORE the workspace event lock:
-      // another operation holding the lock would otherwise let the session
-      // drain the real (manual/cross-owner) cutter and engage a later
-      // same-owner follow-up during the wait, misattributing the cut and
-      // wrongly suppressing the real cutter's wake (see
-      // QueueCutAttributionSnapshot).
+      // New streams persist attribution at the stop decision. Keep this snapshot for legacy events
+      // and disposable ownership transfer, before the event lock lets another input enter the queue.
       const queueCutSnapshot = this.getWorkspaceTurnManager().captureQueueCutAttributionSnapshot(
         payload.workspaceId
       );
@@ -2576,7 +2572,7 @@ export class TaskService implements AgentTaskIntegration {
         "Xum restarted while this task was running. Continue where you left off. " +
           restartCompletionInstruction,
         sendOptions,
-        { synthetic: true, agentInitiated: true }
+        { acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true }
       );
       const durationMs = Date.now() - resumeStartedAt;
       if (!sendResult.success) {
@@ -2779,7 +2775,10 @@ export class TaskService implements AgentTaskIntegration {
 
     this.initStateManager.startInit(workspaceId, projectPath);
     return {
-      logStep: (message: string) => this.initStateManager.appendOutput(workspaceId, message, false),
+      logStep: (message: string) =>
+        this.initStateManager.appendOutput(workspaceId, message, false, true),
+      logProgress: (label: string, percent: number) =>
+        this.initStateManager.reportProgress(workspaceId, label, percent),
       logStdout: (line: string) => this.initStateManager.appendOutput(workspaceId, line, false),
       logStderr: (line: string) => this.initStateManager.appendOutput(workspaceId, line, true),
       logComplete: (exitCode: number) => void this.initStateManager.endInit(workspaceId, exitCode),
@@ -3668,6 +3667,7 @@ export class TaskService implements AgentTaskIntegration {
     const sendResult =
       plan.start.kind === "sendMessage"
         ? await this.workspaceService.sendMessage(plan.taskId, plan.start.prompt, startOptions, {
+            acceptanceOrigin: "automatic",
             allowQueuedAgentTask: true,
             agentInitiated: true,
             ...(plan.start.carriesProjectSkillContent === true
@@ -3675,6 +3675,7 @@ export class TaskService implements AgentTaskIntegration {
               : {}),
           })
         : await this.workspaceService.resumeStream(plan.taskId, startOptions, {
+            acceptanceOrigin: "automatic",
             allowQueuedAgentTask: true,
             agentInitiated: true,
           });
@@ -4376,7 +4377,10 @@ export class TaskService implements AgentTaskIntegration {
           reasoningMode: effectiveReasoningMode,
           experiments: args.experiments,
         },
-        { agentInitiated: true }
+        {
+          acceptanceOrigin: "automatic",
+          agentInitiated: true,
+        }
       )
       .catch((error: unknown) => Err(getErrorMessage(error)));
     if (!sendResult.success) {
@@ -4782,6 +4786,7 @@ export class TaskService implements AgentTaskIntegration {
     const onCanceled = () => clear(true);
     // Live and restored guidance must share the same handoff and settlement lifecycle.
     return {
+      acceptanceOrigin: "automatic" as const,
       synthetic: true,
       agentInitiated: true,
       startStreamInBackground: true,
@@ -5531,6 +5536,7 @@ export class TaskService implements AgentTaskIntegration {
 
         let accepted = false;
         const sendResult = await this.workspaceService.sendMessage(targetId, trigger, sendOptions, {
+          acceptanceOrigin: "automatic",
           admissionStale,
           synthetic: true,
           agentInitiated: true,
@@ -7955,6 +7961,7 @@ export class TaskService implements AgentTaskIntegration {
       // suppressed ones first cannot go stale against a delivery.
       await markSuppressedSuperseded();
       const resumeResult = await this.workspaceService.resumeStream(ownerWorkspaceId, sendOptions, {
+        acceptanceOrigin: "automatic",
         agentInitiated: true,
       });
       if (!resumeResult.success) {
@@ -7984,7 +7991,13 @@ export class TaskService implements AgentTaskIntegration {
       prompt,
       sendOptions,
       // Synthetic, idle-only auto-resume — same flags as the active-work auto-resume path.
-      { skipAutoResumeReset: true, synthetic: true, agentInitiated: true, requireIdle: true }
+      {
+        acceptanceOrigin: "automatic",
+        skipAutoResumeReset: true,
+        synthetic: true,
+        agentInitiated: true,
+        requireIdle: true,
+      }
     );
     // Deferred until after the delivery attempt so no await separates the
     // batch revalidation above from sendMessage. Best-effort: an early return
@@ -8032,6 +8045,7 @@ export class TaskService implements AgentTaskIntegration {
           prompt,
           sendOptions,
           {
+            acceptanceOrigin: "automatic",
             skipAutoResumeReset: true,
             synthetic: true,
             agentInitiated: true,
@@ -8350,6 +8364,7 @@ export class TaskService implements AgentTaskIntegration {
         ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
       },
       {
+        acceptanceOrigin: "automatic",
         skipAutoResumeReset: true,
         synthetic: true,
         agentInitiated: true,
@@ -8567,6 +8582,7 @@ export class TaskService implements AgentTaskIntegration {
           : {}),
       },
       {
+        acceptanceOrigin: "automatic",
         synthetic: true,
         agentInitiated: true,
         startStreamInBackground: true,
@@ -10962,7 +10978,11 @@ export class TaskService implements AgentTaskIntegration {
           ? { toolPolicy: [{ regex_match: "^propose_plan$", action: "require" as const }] }
           : {}),
       },
-      { synthetic: true, agentInitiated: true }
+      {
+        acceptanceOrigin: "automatic",
+        synthetic: true,
+        agentInitiated: true,
+      }
     );
     const durationMs = Date.now() - startedAt;
     if (!sendResult.success) {
@@ -11023,7 +11043,11 @@ export class TaskService implements AgentTaskIntegration {
         reasoningMode: coerceOpenAIReasoningMode(entry.workspace.aiSettings?.reasoningMode),
         experiments: entry.workspace.taskExperiments,
       },
-      { synthetic: true, agentInitiated: true }
+      {
+        acceptanceOrigin: "automatic",
+        synthetic: true,
+        agentInitiated: true,
+      }
     );
     if (!sendResult.success) {
       log.error("Failed to prompt task for active background awaitables", {
@@ -11279,7 +11303,13 @@ export class TaskService implements AgentTaskIntegration {
         prompt,
         sendOptions,
         // Skip auto-resume counter reset — this IS an auto-resume, not a user message.
-        { skipAutoResumeReset: true, synthetic: true, agentInitiated: true, requireIdle: true }
+        {
+          acceptanceOrigin: "automatic",
+          skipAutoResumeReset: true,
+          synthetic: true,
+          agentInitiated: true,
+          requireIdle: true,
+        }
       );
       if (!sendResult.success && isWorkspaceBusyIdleOnlySend(sendResult.error)) {
         activeWorkspaceTurnIds =
@@ -11329,6 +11359,7 @@ export class TaskService implements AgentTaskIntegration {
           }),
           sendOptions,
           {
+            acceptanceOrigin: "automatic",
             skipAutoResumeReset: true,
             synthetic: true,
             agentInitiated: true,
@@ -12151,7 +12182,11 @@ export class TaskService implements AgentTaskIntegration {
             ...(effectiveReasoningMode != null ? { reasoningMode: effectiveReasoningMode } : {}),
             experiments: args.entry.workspace.taskExperiments,
           },
-          { synthetic: true, agentInitiated: true }
+          {
+            acceptanceOrigin: "automatic",
+            synthetic: true,
+            agentInitiated: true,
+          }
         );
         if (!sendKickoffResult.success) {
           // Keep status as "running" so the restart handler in initialize() can
