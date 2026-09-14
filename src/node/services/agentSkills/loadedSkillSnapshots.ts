@@ -349,10 +349,18 @@ function summaryCarriesProjectSkillContent(message: MuxMessage): boolean {
   const metadata = message.metadata;
   if (metadata?.carriesProjectSkillContent === true) return true;
   if (metadata?.carriesProjectSkillContent === false) return false;
+  return isDurableSummaryRow(message);
+}
+
+/**
+ * Every durable summary row a side channel distills from the transcript:
+ * compaction and branch summaries, /refine's proposal/audit rows, and a child
+ * task's report (distilled from the child's whole context). Unstamped, its
+ * provenance is unknown.
+ */
+function isDurableSummaryRow(message: MuxMessage): boolean {
+  const metadata = message.metadata;
   const kind = metadata?.muxMetadata?.type;
-  // Every durable summary row a side channel distills from the transcript:
-  // compaction and branch summaries, /refine's proposal/audit rows, and a
-  // child task's report (distilled from the child's whole context).
   return (
     metadata?.compactionBoundary === true ||
     (metadata?.compacted !== undefined && metadata.compacted !== false) ||
@@ -451,12 +459,15 @@ export function withholdProjectSkillContentFromRequest(
       // notifications, prompt snapshots) were produced while the content was
       // in context too; only the user's own prompts and turn-starting
       // synthetic requests stay verbatim — unless the row itself is stamped as
-      // carrying (a child's progress report, a forwarded agent message): its
-      // text IS the content, wherever it sits in the turn.
+      // carrying (a child's progress report, a forwarded agent message, the
+      // opening prompt a parent authored for a child task — an agent-written
+      // row that is not synthetic): its text IS the content, wherever it sits
+      // in the turn and whatever its shape.
       if (
-        message.metadata?.synthetic === true &&
-        (message.metadata.carriesProjectSkillContent === true ||
-          (projectContentInContext && !isTurnStartingUserRow(message)))
+        message.metadata?.carriesProjectSkillContent === true ||
+        (message.metadata?.synthetic === true &&
+          projectContentInContext &&
+          !isTurnStartingUserRow(message))
       ) {
         kept.push({
           ...message,
@@ -615,10 +626,20 @@ export function redactProjectSkillToolResults(messages: MuxMessage[]): MuxMessag
     // Stamped USER rows (a child's report or progress wake, a forwarded agent
     // message) are withheld by withholdProjectSkillContentFromRequest with
     // their own message; this pass covers assistant rows only.
+    // An ordinary assistant turn stamped at dispatch (its request advertised
+    // project skill descriptions — see turnRequestBuilder) is withheld the
+    // same way, in the turn's own words.
     if (message.role === "assistant" && summaryCarriesProjectSkillContent(message)) {
       return {
         ...message,
-        parts: [{ type: "text", text: COMPACTION_SUMMARY_WITHHELD_MESSAGE }],
+        parts: [
+          {
+            type: "text",
+            text: isDurableSummaryRow(message)
+              ? COMPACTION_SUMMARY_WITHHELD_MESSAGE
+              : PROJECT_SKILL_TURN_WITHHELD_MESSAGE,
+          },
+        ],
       };
     }
     let changed = false;

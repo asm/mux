@@ -101,6 +101,50 @@ describe("estimatePdfAttachmentTokens", () => {
     expect(estimatePdfAttachmentTokens(pdfDataUrl(pdf))).toBe(2 * PDF_TOKENS_PER_PAGE_ESTIMATE);
   });
 
+  it("reads each stream's own dictionary, not the previous object's", () => {
+    // A Flate content stream right after an object stream: a window of bytes
+    // before its keyword still holds the object stream's /ObjStm, and the
+    // content (page-like text as DATA) would be inflated and counted. Only the
+    // dictionary that owns the stream decides, and nested dictionaries do not
+    // confuse the parse.
+    const content = deflateSync(
+      Buffer.from("BT (/Type /Page and /Type /Pages /Count 40) Tj ET\n".repeat(50), "latin1")
+    );
+    const pdf = Buffer.concat([
+      Buffer.from("%PDF-1.5\n", "latin1"),
+      flateObjectStream(
+        101,
+        Array.from(
+          { length: 2 },
+          (_, index) => `${index + 2} 0 << /Type /Page /Parent 1 0 R >>`
+        ).join("\n")
+      ),
+      Buffer.from(
+        `7 0 obj\n<< /Filter /FlateDecode /DecodeParms << /Predictor 1 >> /Length ${content.length} >>\nstream\n`,
+        "latin1"
+      ),
+      content,
+      Buffer.from("\nendstream\nendobj\n%%EOF\n", "latin1"),
+    ]);
+    expect(estimatePdfAttachmentTokens(pdfDataUrl(pdf))).toBe(2 * PDF_TOKENS_PER_PAGE_ESTIMATE);
+  });
+
+  it("treats a stream whose dictionary cannot be delimited as an unknown page count", () => {
+    // The word "stream" inside a string is no stream object and is skipped;
+    // a stream closing a dictionary whose brackets never balance may be an
+    // object stream holding uncounted pages, so the cap applies.
+    const skipped =
+      "%PDF-1.4\n1 0 obj\n<< /Type /Page /Title (a stream of text) >>\nendobj\n" +
+      "9 0 obj\n<< /Type /Pages /Kids [1 0 R] /Count 1 >>\nendobj\n";
+    expect(estimatePdfAttachmentTokens(pdfDataUrl(skipped))).toBe(PDF_TOKENS_PER_PAGE_ESTIMATE);
+    const unbalanced =
+      "%PDF-1.4\n1 0 obj\n<< /Type /Page >>\nendobj\n" +
+      "5 0 obj\n/Type /ObjStm /Filter /FlateDecode >>\nstream\nxx\nendstream\nendobj\n";
+    expect(estimatePdfAttachmentTokens(pdfDataUrl(unbalanced))).toBe(
+      PDF_MAX_PAGES_ESTIMATE * PDF_TOKENS_PER_PAGE_ESTIMATE
+    );
+  });
+
   it("caps the recovered page count at the provider limit", () => {
     // Providers reject longer documents anyway, so a larger count (real or a
     // false positive) cannot price a request beyond the cap.

@@ -10799,6 +10799,60 @@ describe("TaskService", () => {
     ).toBe(true);
   });
 
+  test("retitleDescendantAgentTask commits the provenance stamp ahead of the title", async () => {
+    // Two config writes: the stamp lands first so a repository-derived title
+    // is never readable with a clean marker, and a stamp that cannot be
+    // written refuses the retitle before the title changes.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-retitle-order";
+    const childTaskId = "child-retitle-order";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          parentWorkspaceId,
+          taskStatus: "reported",
+          title: "Old title",
+        }),
+      ],
+      testTaskSettings()
+    );
+    const stampSeenAtTitleWrite: Array<boolean | undefined> = [];
+    const updateTitle = mock((): Promise<Result<void>> => {
+      stampSeenAtTitleWrite.push(
+        findWorkspaceInConfig(config, childTaskId)?.taskCarriesProjectSkillContent
+      );
+      return Promise.resolve(Ok(undefined));
+    });
+    const { workspaceService } = createWorkspaceServiceMocks({ updateTitle });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const stampFailure = spyOn(taskService, "editWorkspaceEntry").mockRejectedValueOnce(
+      new Error("disk full")
+    );
+    try {
+      expect(
+        await taskService.retitleDescendantAgentTask(parentWorkspaceId, childTaskId, "Derived", {
+          carriesProjectSkillContent: true,
+        })
+      ).toEqual(Err({ code: "update_failed", message: "disk full" }));
+      expect(updateTitle).not.toHaveBeenCalled();
+      expect(findWorkspaceInConfig(config, childTaskId)?.title).toBe("Old title");
+
+      expect(
+        await taskService.retitleDescendantAgentTask(parentWorkspaceId, childTaskId, "Derived", {
+          carriesProjectSkillContent: true,
+        })
+      ).toEqual(Ok({ title: "Derived" }));
+      expect(stampSeenAtTitleWrite).toEqual([true]);
+    } finally {
+      stampFailure.mockRestore();
+    }
+  });
+
   test("retitleDescendantAgentTask rejects missing, foreign, self, and workflow-owned targets", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");

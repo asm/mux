@@ -4465,14 +4465,22 @@ export class TaskService implements AgentTaskIntegration {
         return Err({ code: "invalid_scope" as const });
       }
 
+      // Provenance is committed AHEAD of the title (like a memory write's
+      // taint ahead of its content): a repository-derived title must never be
+      // readable with a clean marker, so a failed stamp refuses the retitle,
+      // while a stamp whose title write then fails only over-approximates.
+      if (options?.carriesProjectSkillContent === true) {
+        try {
+          await this.editWorkspaceEntry(taskId, (workspace) => {
+            workspace.taskCarriesProjectSkillContent = true;
+          });
+        } catch (error) {
+          return Err({ code: "update_failed" as const, message: getErrorMessage(error) });
+        }
+      }
       const result = await this.workspaceService.updateTitle(taskId, trimmedTitle);
       if (!result.success) {
         return Err({ code: "update_failed" as const, message: result.error });
-      }
-      if (options?.carriesProjectSkillContent === true) {
-        await this.editWorkspaceEntry(taskId, (workspace) => {
-          workspace.taskCarriesProjectSkillContent = true;
-        });
       }
       return Ok({ title: trimmedTitle });
     });

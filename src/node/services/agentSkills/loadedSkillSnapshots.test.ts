@@ -970,6 +970,45 @@ describe("stamped server-generated rows and task report outputs", () => {
     expect(withholdProjectSkillContentFromRequest([own])[0]).toBe(own);
   });
 
+  it("withholds a stamped user row whatever its shape, and a stamped assistant turn whole", () => {
+    // The opening prompt a parent authored for a child task is stamped as
+    // carrying but is not synthetic: its text is the content all the same.
+    const opening = createMuxMessage("child-opening", "user", "Apply: PROJECT BODY", {
+      carriesProjectSkillContent: true,
+    });
+    const reply = createMuxMessage("child-reply", "assistant", "Applied PROJECT BODY");
+    const withheld = withholdProjectSkillContentFromRequest([opening, reply]);
+    expect(withheld[0].parts).toEqual([
+      { type: "text", text: PROJECT_SKILL_SYNTHETIC_ROW_WITHHELD_MESSAGE },
+    ]);
+    expect(withheld[1].parts).toEqual([
+      { type: "text", text: PROJECT_SKILL_TURN_WITHHELD_MESSAGE },
+    ]);
+    expect(JSON.stringify(withheld)).not.toContain("PROJECT BODY");
+
+    // An ordinary assistant turn stamped at dispatch (its request advertised
+    // project skill descriptions) is withheld in the turn's own words — not a
+    // summary's — and taints the rows after it.
+    const own = createMuxMessage("own", "user", "Summarize the conventions", { timestamp: 1 });
+    const stamped = createMuxMessage("stamped", "assistant", "The conventions say: DESCRIPTION", {
+      timestamp: 2,
+      carriesProjectSkillContent: true,
+    });
+    const next = createMuxMessage("next", "user", "Thanks", { timestamp: 3 });
+    const later = createMuxMessage("later", "assistant", "Restating DESCRIPTION", {
+      timestamp: 4,
+    });
+    const rows = withholdProjectSkillContentFromRequest([own, stamped, next, later]);
+    expect(rows[0]).toBe(own);
+    expect(rows[1].parts).toEqual([{ type: "text", text: PROJECT_SKILL_TURN_WITHHELD_MESSAGE }]);
+    expect(rows[3].parts).toEqual([{ type: "text", text: PROJECT_SKILL_TURN_WITHHELD_MESSAGE }]);
+    expect(JSON.stringify(rows)).not.toContain("DESCRIPTION");
+    expect(JSON.stringify(rows)).not.toContain(COMPACTION_SUMMARY_WITHHELD_MESSAGE);
+    // An unstamped ordinary turn is clean.
+    const clean = createMuxMessage("clean", "assistant", "Plain reply", { timestamp: 5 });
+    expect(withholdProjectSkillContentFromRequest([own, clean])[1]).toBe(clean);
+  });
+
   it("classifies task and task_await results by their report provenance stamp", () => {
     expect(
       toolOutputCarriesProjectSkillContent("task", {

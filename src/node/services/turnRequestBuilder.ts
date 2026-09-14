@@ -3244,12 +3244,14 @@ export class TurnRequestBuilder {
       // trust are project content the row scan never sees, so they arm the
       // gate like a snapshot row (an untrusted routed turn filters them out of
       // the description instead — see buildSkillReadDescription).
+      const toolDescriptionsCarryProjectSkillContent =
+        excludeProjectSkillContent !== true &&
+        (availableSkills ?? []).some(
+          (skill) => skill.scope === "project" && skill.advertise !== false
+        );
       const preDispatchConsentGate = withToolDescriptionProvenance(
         opts.preDispatchConsentGate,
-        excludeProjectSkillContent !== true &&
-          (availableSkills ?? []).some(
-            (skill) => skill.scope === "project" && skill.advertise !== false
-          )
+        toolDescriptionsCarryProjectSkillContent
       );
       const turnExecutionOptions: TurnExecutionOptions = {
         workspaceId,
@@ -3277,6 +3279,11 @@ export class TurnRequestBuilder {
           ...(routeProvider != null ? { routeProvider } : {}),
           ...(muxMetadata !== undefined ? { muxMetadata } : {}),
           ...(acpPromptId != null ? { acpPromptId } : {}),
+          // The reply was produced with those descriptions in context and can
+          // quote them; no row records that channel, so the turn's own row is
+          // stamped (MuxMetadata.carriesProjectSkillContent) and a later
+          // routed request that excludes project skill content withholds it.
+          ...(toolDescriptionsCarryProjectSkillContent ? { carriesProjectSkillContent: true } : {}),
         },
         providerOptions: streamProviderOptions,
         maxOutputTokens,

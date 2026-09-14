@@ -10,8 +10,11 @@ import {
 const PAGE_OBJECT_PATTERN = /\/Type\s*\/Page(?![s])/g;
 /** Page-tree nodes carry their descendant page count: `/Type /Pages ... /Count N`. */
 const PAGE_TREE_COUNT_PATTERN = /\/Type\s*\/Pages\b[^>]*?\/Count\s+(\d+)/g;
-/** Stream dictionaries sit right before the `stream` keyword; this window covers them. */
-const STREAM_DICTIONARY_WINDOW_CHARS = 512;
+/**
+ * Longest stream dictionary the backward parse walks before giving up: a
+ * dictionary far larger than any writer emits is a malformed object.
+ */
+const MAX_STREAM_DICTIONARY_CHARS = 64 * 1024;
 /**
  * A direct `/Length N` in a stream dictionary. An indirect reference
  * (`/Length 12 0 R`) is left alone: resolving it needs the object table.
@@ -54,14 +57,53 @@ function declaredPayloadEnd(dictionary: string, text: string, dataStart: number)
 }
 
 /**
- * Every stream payload (`stream … endstream`) with the dictionary window that
- * precedes it. The raw scans skip the payloads — page-like text inside a
+ * The dictionary that owns the `stream` keyword at `keywordAt`: the `<< … >>`
+ * (nested dictionaries included) closing, whitespace apart, right before it.
+ * Parsed backward from the keyword rather than taken from a window of bytes
+ * before it — a window reaches into the previous object, whose `/ObjStm` or
+ * `/Length` would then be read as this stream's and a Flate content stream
+ * that follows an object stream would be inflated and scanned as
+ * dictionaries. `none`: no dictionary closes there (the word inside a string
+ * or content). `unbalanced`: a dictionary closes there but its brackets never
+ * balance within the bound — a malformed object whose stream is undecodable.
+ */
+function enclosingStreamDictionary(
+  text: string,
+  keywordAt: number
+): { kind: "dictionary"; text: string } | { kind: "none" } | { kind: "unbalanced" } {
+  let end = keywordAt;
+  while (end > 0 && /\s/.test(text[end - 1])) end--;
+  if (!text.endsWith(">>", end)) return { kind: "none" };
+  const floor = Math.max(0, end - MAX_STREAM_DICTIONARY_CHARS);
+  let depth = 0;
+  let at = end;
+  while (at >= floor + 2) {
+    const pair = text.slice(at - 2, at);
+    if (pair === ">>") {
+      depth++;
+      at -= 2;
+      continue;
+    }
+    if (pair === "<<") {
+      depth--;
+      at -= 2;
+      if (depth === 0) return { kind: "dictionary", text: text.slice(at, keywordAt) };
+      continue;
+    }
+    at--;
+  }
+  return { kind: "unbalanced" };
+}
+
+/**
+ * Every stream payload (`stream … endstream`) with the dictionary that owns
+ * it. The raw scans skip the payloads — page-like text inside a
  * content stream (a document about PDF syntax) is data, not a dictionary —
  * and the inflater picks the object streams among them.
  */
 function* streamPayloads(
   text: string
-): Generator<{ dictionary: string; dataStart: number; endAt: number }> {
+): Generator<{ dictionary: string | null; dataStart: number; endAt: number }> {
   let cursor = 0;
   for (;;) {
     const keywordAt = text.indexOf("stream", cursor);
@@ -71,15 +113,18 @@ function* streamPayloads(
       cursor = keywordAt + "stream".length;
       continue;
     }
+    const owner = enclosingStreamDictionary(text, keywordAt);
+    if (owner.kind === "none") {
+      cursor = keywordAt + "stream".length;
+      continue;
+    }
     let dataStart = keywordAt + "stream".length;
     if (text[dataStart] === "\r") dataStart++;
     if (text[dataStart] === "\n") dataStart++;
-    const dictionary = text.slice(
-      Math.max(0, keywordAt - STREAM_DICTIONARY_WINDOW_CHARS),
-      keywordAt
-    );
+    // A malformed dictionary has no usable length: null stands for it.
+    const dictionary = owner.kind === "dictionary" ? owner.text : null;
     const endAt =
-      declaredPayloadEnd(dictionary, text, dataStart) ??
+      (dictionary === null ? null : declaredPayloadEnd(dictionary, text, dataStart)) ??
       text.indexOf(END_STREAM_KEYWORD, dataStart);
     if (endAt === -1) return;
     cursor = text.indexOf(END_STREAM_KEYWORD, endAt) + END_STREAM_KEYWORD.length;
@@ -113,6 +158,12 @@ function inflatedStreams(bytes: Buffer, text: string): { decoded: string[]; comp
   let total = 0;
   let complete = true;
   for (const { dictionary, dataStart, endAt } of streamPayloads(text)) {
+    // A stream whose dictionary cannot be delimited may be an object stream
+    // holding pages no other source counts: undecodable, so unknown.
+    if (dictionary === null) {
+      complete = false;
+      break;
+    }
     if (!dictionary.includes("/ObjStm") || !dictionary.includes("/FlateDecode")) continue;
     if (total >= MAX_INFLATED_TOTAL_BYTES) {
       complete = false;

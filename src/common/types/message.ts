@@ -1286,6 +1286,14 @@ export interface MuxMetadata {
    * build that did not track provenance — unknown, treated as TRUE across the
    * trust boundary until a newer summary replaces it. Sticky across chained
    * summaries.
+   *
+   * The same TRUE stamp marks two other rows whose text is project-derived by
+   * a channel the row scan cannot see: a server-generated USER row (a child
+   * task's report or progress wake, a forwarded agent message, the opening
+   * prompt a parent authored for a child) and an ordinary ASSISTANT turn whose
+   * request advertised project skill descriptions in a tool description under
+   * trust. Both are withheld whole from a request that excludes project skill
+   * content. UNDEFINED on such rows means clean (they are stamped at write).
    */
   carriesProjectSkillContent?: boolean;
   /**
