@@ -5939,7 +5939,7 @@ describe("WorkspaceStore", () => {
     });
   });
 
-  describe("getWorkspaceLastUserPrompt", () => {
+  describe("getWorkspaceLastUserPromptInfo", () => {
     const seedUserMessages = (workspaceId: string, rows: Array<{ id: string; text: string }>) => {
       const rawStore = getInternal<{
         handleChatMessage: (workspaceId: string, data: WorkspaceChatMessage) => void;
@@ -5967,7 +5967,7 @@ describe("WorkspaceStore", () => {
         { id: "u2", text: "second prompt" },
       ]);
 
-      expect(store.getWorkspaceLastUserPrompt(workspaceId)).toBe("second prompt");
+      expect(store.getWorkspaceLastUserPromptInfo(workspaceId)?.text).toBe("second prompt");
     });
 
     it("keeps scanning past an attachment-only turn with empty text", () => {
@@ -5978,7 +5978,9 @@ describe("WorkspaceStore", () => {
         { id: "u2", text: "   " },
       ]);
 
-      expect(store.getWorkspaceLastUserPrompt(workspaceId)).toBe("describe this screenshot");
+      expect(store.getWorkspaceLastUserPromptInfo(workspaceId)?.text).toBe(
+        "describe this screenshot"
+      );
     });
 
     it("keeps scanning past a staged-attachment notice", () => {
@@ -5999,7 +6001,9 @@ describe("WorkspaceStore", () => {
         { id: "u2", text: notice.trimStart() },
       ]);
 
-      expect(store.getWorkspaceLastUserPrompt(workspaceId)).toBe("summarize the attached data");
+      expect(store.getWorkspaceLastUserPromptInfo(workspaceId)?.text).toBe(
+        "summarize the attached data"
+      );
     });
 
     it("returns null when every user turn is empty", () => {
@@ -6007,7 +6011,7 @@ describe("WorkspaceStore", () => {
       createAndAddWorkspace(store, workspaceId);
       seedUserMessages(workspaceId, [{ id: "u1", text: "" }]);
 
-      expect(store.getWorkspaceLastUserPrompt(workspaceId)).toBeNull();
+      expect(store.getWorkspaceLastUserPromptInfo(workspaceId)).toBeNull();
     });
 
     it("does not invalidate the footer prompt projection for assistant stream deltas", () => {
@@ -6059,7 +6063,7 @@ describe("WorkspaceStore", () => {
         metadata: { historySequence: 2, timestamp: 2_000 },
       });
 
-      expect(store.getWorkspaceLastUserPrompt(workspaceId)).toBe("second prompt");
+      expect(store.getWorkspaceLastUserPromptInfo(workspaceId)?.text).toBe("second prompt");
       expect(store.getWorkspaceHistoryEpoch(workspaceId)).toBe(epoch);
     });
 
@@ -6077,7 +6081,7 @@ describe("WorkspaceStore", () => {
       });
 
       expect(store.getWorkspaceHistoryEpoch(workspaceId)).toBeGreaterThan(epoch);
-      expect(store.getWorkspaceLastUserPrompt(workspaceId)).toBe("first prompt");
+      expect(store.getWorkspaceLastUserPromptInfo(workspaceId)?.text).toBe("first prompt");
     });
 
     it("advances the history epoch when a full replay replaces the transcript", () => {
@@ -6091,7 +6095,7 @@ describe("WorkspaceStore", () => {
         .loadHistoricalMessages([], false, { mode: "replace" });
 
       expect(store.getWorkspaceHistoryEpoch(workspaceId)).toBeGreaterThan(epoch);
-      expect(store.getWorkspaceLastUserPrompt(workspaceId)).toBeNull();
+      expect(store.getWorkspaceLastUserPromptInfo(workspaceId)).toBeNull();
     });
   });
 });
