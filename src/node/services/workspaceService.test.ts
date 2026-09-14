@@ -16266,6 +16266,80 @@ describe("WorkspaceService remove shared memory owner pinning", () => {
       createRuntimeSpy.mockRestore();
     }
   });
+
+  test("aborts a non-forced removal when the owner cannot be resolved from a readable config", async () => {
+    // An unreadable config.json: the lenient read yields an empty topology
+    // (this workspace would look like its own owner — no pins, no handover),
+    // the strict one throws. The removal must decide from the strict read.
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: `${projectPath}/mid` })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    const { config } = buildConfig({ persistPins: true });
+    const loadConfigOrDefault = mock((options?: { throwOnError?: boolean }) => {
+      if (options?.throwOnError === true) throw new Error("config.json unreadable (EIO)");
+      return { projects: new Map() };
+    });
+    (config as { loadConfigOrDefault: unknown }).loadConfigOrDefault = loadConfigOrDefault;
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        aiService: buildAiService(),
+      });
+      const refused = await workspaceService.remove("ws-mid");
+      expect(refused.success).toBe(false);
+      if (!refused.success) {
+        expect(refused.error).toContain("config.json unreadable");
+        expect(refused.error).toContain("retry the removal");
+      }
+      expect(deleteWorkspace).not.toHaveBeenCalled();
+      expect(config.removeWorkspace).not.toHaveBeenCalled();
+      expect(config.editConfig).not.toHaveBeenCalled();
+
+      // Forced removal accepts the loss and proceeds.
+      const forced = await workspaceService.remove("ws-mid", true);
+      expect(forced.success).toBe(true);
+      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  test("pins surviving descendants even when the removed node's metadata cannot be built", async () => {
+    // The phantom-cleanup path: no metadata, yet the config entry is removed
+    // all the same — the pin is a config-only edit and must still land, or a
+    // surviving child silently falls back to a private notebook.
+    class PhantomAiService extends EventEmitter {
+      isStreaming = mock(() => false);
+      stopStream = mock(() => Promise.resolve({ success: true as const, data: undefined }));
+      getWorkspaceMetadata = mock(() =>
+        Promise.resolve({ success: false as const, error: "metadata unavailable" })
+      );
+    }
+    const { config, topology } = buildConfig({ persistPins: true });
+    const workspaceService = createWorkspaceServiceForTest({
+      config,
+      aiService: new PhantomAiService() as unknown as AIService,
+    });
+    const result = await workspaceService.remove("ws-mid");
+    expect(result.success).toBe(true);
+    expect(config.removeWorkspace).toHaveBeenCalledTimes(1);
+    const grand = topology.projects.get(projectPath)!.workspaces.find((ws) => ws.id === "ws-grand");
+    expect(grand?.memoryOwnerWorkspaceId).toBe("ws-owner");
+
+    // ...and a pin that does not persist still aborts the non-forced removal
+    // on that path, before the config entry is dropped.
+    const unpersisted = buildConfig({ persistPins: false });
+    const refusing = createWorkspaceServiceForTest({
+      config: unpersisted.config,
+      aiService: new PhantomAiService() as unknown as AIService,
+    });
+    const refused = await refusing.remove("ws-mid");
+    expect(refused.success).toBe(false);
+    expect(unpersisted.config.removeWorkspace).not.toHaveBeenCalled();
+  });
 });
 
 describe("WorkspaceService remove desktop session cleanup", () => {
@@ -16302,6 +16376,11 @@ describe("WorkspaceService remove desktop session cleanup", () => {
       removeWorkspace: removeWorkspaceMock,
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+      // The descendant pin pass edits whatever topology a test installed.
+      editConfig: mock((edit: (cfg: unknown) => unknown) => {
+        edit(mockConfig.loadConfigOrDefault!());
+        return Promise.resolve();
+      }) as unknown as MockWorkspaceConfig["editConfig"],
     };
 
     workspaceService = createWorkspaceServiceForTest({
