@@ -1394,20 +1394,76 @@ export class MCPServerManager {
     return { registryPath: this.componentPolicy?.registryPath ?? "", imports: null };
   }
 
-  private async withComponentPolicyFence<T>(
+  private async withPluginAdmissionFence<T>(
     name: string,
     info: MCPServerInfo | undefined,
     dispatch: () => T,
-    options: { signal?: AbortSignal; timeoutMs?: number } = {}
+    options: { signal?: AbortSignal; timeoutMs?: number; workspaceId?: string } = {}
   ): Promise<{ pending: T }> {
-    const release = await this.acquireComponentPolicyFence(name, info, options);
+    const deadlineAt = Date.now() + (options.timeoutMs ?? CALL_GATE_TIMEOUT_MS);
+    // A named connection test is an explicit user action, not workspace admission.
+    const release =
+      options.workspaceId === undefined
+        ? await this.acquireComponentPolicyFence(name, info, options)
+        : await this.acquirePluginAdmissionFence(name, info, options);
     try {
+      if (options.signal?.aborted) throw new Error(`MCP request for '${name}' was aborted`);
+      if (Date.now() >= deadlineAt)
+        throw new Error(`MCP server '${name}' is unavailable: admission timed out`);
       const pending = dispatch();
       // Observe early rejection while admission locks are being released.
       Promise.resolve(pending).catch(() => undefined);
       return { pending };
     } finally {
       await release();
+    }
+  }
+
+  private async acquirePluginAdmissionFence(
+    name: string,
+    info: MCPServerInfo | undefined,
+    options: { signal?: AbortSignal; timeoutMs?: number; workspaceId?: string }
+  ): Promise<() => Promise<void>> {
+    const deadlineAt = Date.now() + (options.timeoutMs ?? CALL_GATE_TIMEOUT_MS);
+    const remainingMs = () => Math.max(0, deadlineAt - Date.now());
+    const workspaceId = options.workspaceId;
+    const plugin =
+      info?.plugin ??
+      (workspaceId !== undefined
+        ? this.workspaceServers.get(workspaceId)?.enabledServers[name]?.plugin
+        : undefined);
+    // Without explicit workspace consent, every global-plugin admission must
+    // establish current global consent, including startup without a cached entry.
+    const requiresGlobalConsent =
+      plugin?.sourceScope === "global" &&
+      !(
+        workspaceId !== undefined &&
+        this.lastWorkspaceRequestOptions.get(workspaceId)?.overrides?.enabledServers?.includes(name)
+      );
+    const releaseGlobal = requiresGlobalConsent
+      ? await this.configService.acquireGlobalPluginEnablementFence(name, {
+          signal: options.signal,
+          timeoutMs: remainingMs(),
+        })
+      : undefined;
+    try {
+      // Global consent is locked before the component try-lock. Uninstall can
+      // hold the component writer lock while pruning global consent, so this
+      // inner acquisition must remain non-blocking to avoid an inverted wait.
+      const release = await this.acquireComponentPolicyFence(name, info, {
+        signal: options.signal,
+        timeoutMs: remainingMs(),
+      });
+      return async () => {
+        try {
+          await release();
+        } finally {
+          await releaseGlobal?.();
+        }
+      };
+    } catch (error) {
+      await releaseGlobal?.();
+      throw error;
     }
   }
 
@@ -4043,12 +4099,10 @@ export class MCPServerManager {
           const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
           let pending: ReturnType<MCPServerInstance["getPrompt"]> | "retry";
           if (acquireOverridesLock === undefined || readOverridesEpoch === undefined) {
-            ({ pending } = await this.withComponentPolicyFence(
-              serverName,
-              undefined,
-              dispatch,
-              options
-            ));
+            ({ pending } = await this.withPluginAdmissionFence(serverName, undefined, dispatch, {
+              ...options,
+              workspaceId,
+            }));
           } else {
             // ONE deadline for acquisition and the fenced epoch read: the outer
             // abort race cannot stop this callback, so a stalled home filesystem
@@ -4078,7 +4132,8 @@ export class MCPServerManager {
               ) {
                 return { epochMoved: true } as const;
               }
-              ({ pending } = await this.withComponentPolicyFence(serverName, undefined, dispatch, {
+              ({ pending } = await this.withPluginAdmissionFence(serverName, undefined, dispatch, {
+                workspaceId,
                 signal: options?.signal,
                 timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
               }));
@@ -4492,7 +4547,7 @@ export class MCPServerManager {
         // Admit the named test after disk/OAuth preparation, before its connection
         // deadline starts. Ad-hoc drafts never carry managed plugin provenance.
         try {
-          const { pending } = await this.withComponentPolicyFence(trimmedName, server, () =>
+          const { pending } = await this.withPluginAdmissionFence(trimmedName, server, () =>
             runServerTest(launch, projectPath, `server "${trimmedName}"`)
           );
           return await pending;
@@ -4985,11 +5040,11 @@ export class MCPServerManager {
           const acquireOverridesLock = this.pluginInvalidation?.acquireOverridesLock;
           const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
           if (acquireOverridesLock === undefined || readOverridesEpoch === undefined) {
-            const { pending } = await this.withComponentPolicyFence(
+            const { pending } = await this.withPluginAdmissionFence(
               serverName,
               servedInfo,
               dispatch,
-              { signal: abortSignal, timeoutMs: remainingMs() }
+              { workspaceId, signal: abortSignal, timeoutMs: remainingMs() }
             );
             if (pending === "retry") continue;
             return await pending;
@@ -5034,7 +5089,8 @@ export class MCPServerManager {
               // iteration's preflight evicts and re-derives from disk.
               continue;
             }
-            ({ pending } = await this.withComponentPolicyFence(serverName, servedInfo, dispatch, {
+            ({ pending } = await this.withPluginAdmissionFence(serverName, servedInfo, dispatch, {
+              workspaceId,
               signal: abortSignal,
               timeoutMs: remainingMs(),
             }));
@@ -5379,7 +5435,8 @@ export class MCPServerManager {
             onActivity,
             signal,
             onAbortCleanup,
-            prior
+            prior,
+            workspaceId
           );
           if (started === null) {
             return null;
@@ -5416,7 +5473,15 @@ export class MCPServerManager {
       }
     }
 
-    return this.startRemoteInstance(name, info, projectSecrets, onActivity, signal, onAbortCleanup);
+    return this.startRemoteInstance(
+      name,
+      info,
+      projectSecrets,
+      onActivity,
+      signal,
+      onAbortCleanup,
+      workspaceId
+    );
   }
 
   /**
@@ -5428,9 +5493,9 @@ export class MCPServerManager {
    * the epoch) before the read — observed here, the launch refused — or
    * waits until the process exists, after which the bracket's postflight
    * closes it. The lock is released as soon as exec returned; the MCP
-   * handshake never runs under it. Managed components also acquire the
-   * plugin writer lock after overrides, through the same launch interval.
-   * Untracked, unmanaged servers retain their plain launch path.
+   * handshake never runs under it. Global consent and managed-component
+   * admission use the same fence as tool/prompt calls, through that launch
+   * interval. Untracked ordinary servers retain their plain launch path.
    */
   private async launchUnderOverrideFence<T>(
     name: string,
@@ -5439,6 +5504,7 @@ export class MCPServerManager {
     launch: (launchSignal: AbortSignal) => Promise<T>,
     signal: AbortSignal,
     options?: {
+      workspaceId?: string;
       /**
        * Release the lock once `launch` has settled OR this many ms have
        * passed, whichever comes first. Remote (HTTP/SSE) connections: the
@@ -5467,7 +5533,12 @@ export class MCPServerManager {
       readOverridesEpoch !== undefined &&
       this.pluginInvalidationTokenSeen;
     const plugin = this.managedPluginServers.get(name) ?? info.plugin;
-    if (!trackOverrides && plugin?.componentPolicy === undefined) return launch(signal);
+    if (
+      !trackOverrides &&
+      plugin?.componentPolicy === undefined &&
+      plugin?.sourceScope !== "global"
+    )
+      return launch(signal);
     // ONE deadline for acquisition and the fenced reads (see getPrompt).
     const fenceDeadlineAt = Date.now() + CALL_GATE_TIMEOUT_MS;
     const release = trackOverrides
@@ -5484,7 +5555,7 @@ export class MCPServerManager {
       }
     };
     let pending: Promise<T> | undefined;
-    let releaseComponents: (() => Promise<void>) | undefined;
+    let releaseAdmission: (() => Promise<void>) | undefined;
     try {
       if (trackOverrides) {
         const epochRead = await raceWithAbortAndTimeout(readOverridesEpoch(), {
@@ -5507,13 +5578,16 @@ export class MCPServerManager {
           );
         }
       }
-      // Try the plugin writer lock SECOND: uninstall holds it while pruning
-      // overrides. Keep it through actual exec/connection initiation, not the
-      // earlier discovery or semaphore wait, so removal cannot precede a spawn.
-      releaseComponents = await this.acquireComponentPolicyFence(name, info, {
+      // The same consent decision gates calls and launches, but startup holds
+      // it through actual exec/connection initiation, not only the callback.
+      releaseAdmission = await this.acquirePluginAdmissionFence(name, info, {
+        workspaceId: options?.workspaceId,
         signal,
         timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
       });
+      if (signal.aborted) throw new Error("MCP server startup was aborted");
+      if (Date.now() >= fenceDeadlineAt)
+        throw new Error("MCP server startup admission timed out; retry");
       if (options?.abortAfterMs !== undefined) {
         const { ms, serverName } = options.abortAfterMs;
         const launchAbort = new AbortController();
@@ -5556,7 +5630,7 @@ export class MCPServerManager {
       // handshake below: every settings save and prune would otherwise queue
       // behind an endpoint-controlled request for the whole startup deadline.
       try {
-        await releaseComponents?.();
+        await releaseAdmission?.();
       } finally {
         await releaseOnce();
       }
@@ -5576,7 +5650,8 @@ export class MCPServerManager {
     onActivity: () => void,
     signal: AbortSignal,
     onAbortCleanup: ((cleanupPromise: Promise<void>) => void) | undefined,
-    prior: PriorDiscovery | undefined
+    prior: PriorDiscovery | undefined,
+    workspaceId?: string
   ): Promise<{ instance: MCPServerInstance; prior: PriorDiscovery } | null> {
     {
       log.debug("[MCP] Spawning stdio server", { name });
@@ -5597,7 +5672,7 @@ export class MCPServerManager {
         // held for the whole startup deadline, and the launch must not be
         // released to send its command after a revocation: abort it instead
         // (see launchUnderOverrideFence).
-        { abortAfterMs: { ms: STDIO_LAUNCH_FENCE_MS, serverName: name } }
+        { workspaceId, abortAfterMs: { ms: STDIO_LAUNCH_FENCE_MS, serverName: name } }
       );
 
       const cleanupSpawnedExecStream = async () => {
@@ -5816,7 +5891,8 @@ export class MCPServerManager {
     projectSecrets: Record<string, string> | undefined,
     onActivity: () => void,
     signal: AbortSignal,
-    onAbortCleanup?: (cleanupPromise: Promise<void>) => void
+    onAbortCleanup?: (cleanupPromise: Promise<void>) => void,
+    workspaceId?: string
   ): Promise<MCPServerInstance | null> {
     const { headers } = resolveHeaders(info.headers, projectSecrets);
     const design = info.managed === "claude-design" ? this.configService.claudeDesign : undefined;
@@ -5881,7 +5957,7 @@ export class MCPServerManager {
             ...(prior !== undefined ? { prior } : {}),
           }),
         signal,
-        { releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
+        { workspaceId, releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
       );
 
     const trySse = () =>
@@ -5898,7 +5974,7 @@ export class MCPServerManager {
             ...(prior !== undefined ? { prior } : {}),
           }),
         signal,
-        { releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
+        { workspaceId, releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
       );
 
     let client: Awaited<ReturnType<typeof createMCPClient>> | null = null;
