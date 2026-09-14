@@ -89,7 +89,7 @@ import {
   type NodeAgentDefinitionContext,
 } from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
 import { targetWorkspaceBucketToLayer } from "@/common/types/agentAiSettings";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { lookupMinThinkingLevelOverride } from "@/common/utils/thinking/policy";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
 import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
 import {
@@ -156,7 +156,10 @@ import {
   ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME,
   ADDITIONAL_SYSTEM_CONTEXT_FILENAME,
 } from "@/node/services/additionalSystemContext";
-import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
+import {
+  generateWorkspaceIdentity,
+  type NameGenerationCandidate,
+} from "@/node/services/workspaceTitleGenerator";
 import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
 import type { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
@@ -7959,56 +7962,97 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
-   * Candidate list for "small model" callers (title + AI sidebar status).
-   * Global preferences first, then any workspace-configured model so a
-   * custom-model workspace still works when global preferences are
-   * unavailable. Public so AgentStatusService can share the precedence.
+   * Ordered naming candidates shared by every naming path (pre-creation,
+   * fork auto-title, regenerate title). The user's configured `name_workspace`
+   * settings (workspace bucket, then agent defaults) lead with their thinking
+   * level; the hardcoded small-model fallbacks come next, then any
+   * workspace-configured models and caller-supplied fallbacks (e.g. the model
+   * selected for a workspace that does not exist yet) so a custom-model setup
+   * still works when the preferred providers are unavailable.
    */
-  public async getWorkspaceTitleModelCandidates(workspaceId: string): Promise<string[]> {
-    const candidates: string[] = [];
-    const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
-    const metadata = metadataResult.success ? metadataResult.data : undefined;
+  public async getWorkspaceNamingCandidates(
+    workspaceId: string | undefined,
+    extraFallbackModels: string[] = []
+  ): Promise<NameGenerationCandidate[]> {
+    const metadataResult = workspaceId
+      ? await this.aiService.getWorkspaceMetadata(workspaceId)
+      : undefined;
+    const metadata = metadataResult?.success ? metadataResult.data : undefined;
 
-    // A configured name_workspace model (workspace bucket, then agent
-    // defaults) leads the candidate list. Model-only: this runtime ignores
-    // thinking and reasoning parameters. Defensive config read: tests
-    // construct the service with partial Config mocks.
-    let agentAiDefaults: AgentAiDefaults | undefined;
+    // Defensive config read: tests construct the service with partial Config mocks.
+    let cfg: Pick<ProjectsConfig, "agentAiDefaults" | "defaultModel" | "minThinkingLevelByModel">;
     try {
-      agentAiDefaults = this.config.loadConfigOrDefault().agentAiDefaults;
+      cfg = this.config.loadConfigOrDefault();
     } catch {
-      agentAiDefaults = undefined;
+      cfg = {};
     }
     const nameBucket = metadata?.aiSettingsByAgent?.name_workspace;
+    // The workspace's active model (selected agent first; legacy settings can be
+    // stale once per-agent settings exist), or the caller's models for a workspace
+    // that does not exist yet.
+    const activeModels = metadata
+      ? deriveSideChannelModelCandidates(metadata)
+      : extraFallbackModels;
     const resolved = resolveAgentAiSettings({
       targetAgentId: "name_workspace",
       profile: "interactive",
-      agentAiDefaults,
-      targetWorkspaceSettings: nameBucket ? { model: nameBucket.model } : undefined,
+      agentAiDefaults: cfg.agentAiDefaults,
+      targetWorkspaceSettings: nameBucket
+        ? { model: nameBucket.model, thinkingLevel: nameBucket.thinkingLevel }
+        : undefined,
+      // A thinking-only naming override inherits the model the user actually
+      // works with (active workspace/caller model, then the configured app
+      // default), not the built-in constant.
+      fallbacks: activeModels.map((model) => ({ model })),
+      defaultModel: cfg.defaultModel,
+      minThinkingLevelByModel: cfg.minThinkingLevelByModel,
     });
-    if (resolved.sources.model.tier !== "default") {
-      candidates.push(resolved.selected.model);
-    }
-    for (const preferred of NAME_GEN_PREFERRED_MODELS) {
-      if (!candidates.includes(preferred)) {
-        candidates.push(preferred);
-      }
-    }
-    if (!metadata) {
-      return candidates;
-    }
 
-    const fallbackModels = [
-      metadata.aiSettings?.model,
-      ...Object.values(metadata.aiSettingsByAgent ?? {}).map((settings) => settings.model),
-    ];
-    for (const model of fallbackModels) {
-      if (model && !candidates.includes(model)) {
-        candidates.push(model);
+    const candidates: NameGenerationCandidate[] = [];
+    const withFloor = (model: string, thinkingLevel?: ThinkingLevel): NameGenerationCandidate => {
+      const minThinkingLevel = lookupMinThinkingLevelOverride(cfg.minThinkingLevelByModel, model);
+      return {
+        model,
+        ...(thinkingLevel !== undefined && { thinkingLevel }),
+        ...(minThinkingLevel !== undefined && { minThinkingLevel }),
+      };
+    };
+    const modelTier = resolved.sources.model.tier;
+    const explicitNamingModel = modelTier !== "fallback" && modelTier !== "default";
+    if (explicitNamingModel || resolved.sources.thinkingLevel.tier !== "default") {
+      // Only explicit naming settings lead. Thinking-only overrides count (the
+      // model then inherits); an inherited model alone does not, so an unset
+      // naming agent keeps the hardcoded small models first. Selected (not
+      // effective) thinking: the generator clamps against the creation-time
+      // route/config receipt rather than this resolver's view.
+      candidates.push(withFloor(resolved.selected.model, resolved.selected.thinkingLevel));
+    }
+    const pushFallback = (model: string | undefined) => {
+      if (model && !candidates.some((candidate) => candidate.model === model)) {
+        candidates.push(withFloor(model));
       }
+    };
+    for (const preferred of NAME_GEN_PREFERRED_MODELS) {
+      pushFallback(preferred);
+    }
+    for (const model of activeModels) {
+      pushFallback(model);
+    }
+    for (const model of extraFallbackModels) {
+      pushFallback(model);
     }
 
     return candidates;
+  }
+
+  /**
+   * Model-only view of getWorkspaceNamingCandidates for "small model" callers
+   * whose runtime ignores thinking (AI sidebar status). Public so
+   * AgentStatusService can share the precedence.
+   */
+  public async getWorkspaceTitleModelCandidates(workspaceId: string): Promise<string[]> {
+    const candidates = await this.getWorkspaceNamingCandidates(workspaceId);
+    return candidates.map((candidate) => candidate.model);
   }
 
   private async maybeRunPendingAutoTitleFromMessage(
@@ -8021,7 +8065,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
 
     try {
-      const candidates = await this.getWorkspaceTitleModelCandidates(workspaceId);
+      const candidates = await this.getWorkspaceNamingCandidates(workspaceId);
       const result = await generateWorkspaceIdentity(trimmedMessage, candidates, this.aiService);
       if (result.success) {
         const persistResult = await this.updateWorkspaceTitleState(workspaceId, {
@@ -8380,7 +8424,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const { conversationContext, latestUserText } =
       buildWorkspaceTitleConversationContext(contextTurns);
 
-    const candidates = await this.getWorkspaceTitleModelCandidates(workspaceId);
+    const candidates = await this.getWorkspaceNamingCandidates(workspaceId);
 
     const result = await generateWorkspaceIdentity(
       firstUserText,
