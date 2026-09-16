@@ -357,12 +357,14 @@ import {
   normalizeArchiveUntrackedPaths,
   type AgentTaskIntegration,
   type ArchiveWorkspaceOptions,
+  type QueueCutReceipt,
   type SendMessageInternalOptions,
   type TurnAcceptanceOrigin,
   type WorkspaceHost,
   type WorkspaceLiveActivity,
 } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import { WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE } from "@/constants/agentMessaging";
 import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
@@ -1744,6 +1746,8 @@ export interface WorkspaceServiceEvents {
   activity: (event: { workspaceId: string; activity: WorkspaceActivitySnapshot | null }) => void;
   /** Request an incremental analytics ingest outside the stream-end path. */
   analyticsIngest: (event: { workspaceId: string }) => void;
+  /** An admitted session turn generation ended for good (see TurnAdmissionHost). */
+  "workspace-turn-settled": (event: { workspaceId: string; turnGeneration: symbol }) => void;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
@@ -4661,6 +4665,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // is released at its queue/session handoff so a follow-up dispatched
       // from within that turn does not veto itself.
       hasExternalSendPreflight: () => this.hasSessionInvisiblePreflight(workspaceId),
+      isStopInProgress: () =>
+        this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true,
+      getStopEpoch: () => this.agentTaskIntegration?.getWorkspaceStopEpoch(workspaceId) ?? 0,
+      onTurnSettled: (turnGeneration) =>
+        this.emit("workspace-turn-settled", { workspaceId, turnGeneration }),
     });
   }
 
@@ -11639,6 +11648,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           raw: CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE,
         });
       }
+      // Stop-cascade barrier (before queueing or starting): nothing may feed a workspace whose
+      // stop latch is held; the session re-checks at admission for sends already in preflight.
+      if (this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true) {
+        log.debug("sendMessage blocked: a stop is in progress", { workspaceId });
+        return Err({ type: "unknown", raw: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE });
+      }
       const dedupeKey = internal?.queueDedupeKey;
       if (dedupeKey && this.sessions.get(workspaceId)?.hasQueuedDedupeKey(dedupeKey)) {
         return Ok(undefined);
@@ -12091,13 +12106,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           Promise.resolve(undefined)
         );
       }
-      if (internal?.admissionStale == null) {
+      const continuationSendState = getContinuationSendState();
+      // WTM-correlated sends already own their attempt and execution mirror. A second manual
+      // rescue would replace that ownership, defeating rollback when admission is refused.
+      // Use the dispatched correlation: a downgraded continuation still needs ordinary rescue.
+      if (
+        internal?.admissionStale == null &&
+        parseWorkspaceTurnTaskCorrelation(continuationSendState.options.muxMetadata) == null
+      ) {
         previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
         resumedInterruptedTask =
           (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
       }
 
-      const continuationSendState = getContinuationSendState();
       const onAcceptedPreStreamFailure = async (error: SendMessageError) => {
         if (resumedInterruptedTask && normalizedOptions?.editMessageId) {
           try {
@@ -12298,6 +12319,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           type: "unknown",
           raw: "Workspace is being archived. Unarchive it before resuming.",
         });
+      }
+      if (this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true) {
+        log.debug("resumeStream blocked: a stop is in progress", { workspaceId });
+        return Err({ type: "unknown", raw: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE });
       }
       {
         const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
@@ -12723,6 +12748,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
 
         if (!allowQueueDispatch && (stopAdmission() || session.closingSignal.aborted)) return false;
+
+        // The cascade above persisted every descendant's terminal status (each keeps its own
+        // retained stop latch until it settles), so this workspace's hard-interrupt latch has
+        // done its job. Release it BEFORE the user's send-now: queued dispatch honors the stop
+        // barrier and would otherwise hold the very entry the user asked to send, with nothing
+        // left to drain it after the finally. A failed cascade keeps the latch until the finally.
+        if (allowQueueDispatch && descendantsSettled) {
+          releaseHardStopLatch?.();
+          releaseHardStopLatch = undefined;
+        }
 
         // Handle queued messages based on option
         if (allowQueueDispatch && options?.sendQueuedImmediately) {
@@ -13200,6 +13235,52 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   getQueueCutCutter(workspaceId: string): QueueCutCutter | undefined {
     const session = this.sessions.get(workspaceId.trim());
     return session?.getQueueCutCutter();
+  }
+
+  getTurnGeneration(workspaceId: string): symbol | undefined {
+    return this.sessions.get(workspaceId.trim())?.getTurnGeneration();
+  }
+
+  clearQueueCutReceipts(workspaceId: string): void {
+    this.sessions.get(workspaceId.trim())?.clearQueueCutReceipts();
+  }
+
+  /** See AgentSession queue-cut receipts (QueueCutReceipt). */
+  getQueueCutReceipt(workspaceId: string, entryId: string): QueueCutReceipt | undefined {
+    return this.sessions.get(workspaceId.trim())?.getQueueCutReceipt(entryId);
+  }
+
+  markQueueCutSourceHandled(workspaceId: string, entryId: string): void {
+    this.sessions.get(workspaceId.trim())?.markQueueCutSourceHandled(entryId);
+  }
+
+  disposeQueueCut(workspaceId: string, entryId: string): boolean {
+    return this.sessions.get(workspaceId.trim())?.disposeQueueCut(entryId) ?? false;
+  }
+
+  onQueuedMessageChanged(listener: (workspaceId: string) => void): () => void {
+    const handler = (payload: { workspaceId: string; message: WorkspaceChatMessage }) => {
+      if (payload.message.type === "queued-message-changed") listener(payload.workspaceId);
+    };
+    this.on("chat", handler);
+    return () => {
+      this.off("chat", handler);
+    };
+  }
+
+  getActiveTurnGeneration(workspaceId: string): symbol | undefined {
+    return this.sessions.get(workspaceId.trim())?.getActiveTurnGeneration();
+  }
+
+  onWorkspaceTurnSettled(
+    listener: (workspaceId: string, turnGeneration: symbol) => void
+  ): () => void {
+    const handler = (payload: { workspaceId: string; turnGeneration: symbol }) =>
+      listener(payload.workspaceId, payload.turnGeneration);
+    this.on("workspace-turn-settled", handler);
+    return () => {
+      this.off("workspace-turn-settled", handler);
+    };
   }
 
   /** See AgentSession.getStoppablePreparingWorkspaceTurn. */
