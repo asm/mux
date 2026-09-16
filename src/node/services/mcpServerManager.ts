@@ -91,6 +91,37 @@ const MCP_STARTUP_TIMEOUT_MS = 60_000; // 60s — generous for npx package downl
 // while several unhealthy servers' startup deadlines overlap instead of stacking.
 const MCP_STARTUP_CONCURRENCY = 4;
 const MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS = 5_000; // fail-safe so timeout error cannot hang forever
+/**
+ * Timed-out servers are restarted from the cached same-signature path, and
+ * each restart blocks the turn for up to MCP_STARTUP_TIMEOUT_MS. Without
+ * backoff a server that never comes up costs every turn a full startup
+ * timeout. Every timeout, the initial startup included, counts as a failure:
+ * a UAT with an immediate first retry and a 5 s base measured the full
+ * timeout on 4 of 8 turns at human cadence, because a wait shorter than the
+ * timeout it gates is no wait at all. The base equals the startup timeout so
+ * a retry is never spent sooner than it would cost, each further consecutive
+ * timeout doubles it, capped so a server that does recover is picked up
+ * within a few minutes. Reset when the retry succeeds, when the entry is
+ * replaced by a config change, or when a plugin invalidation re-queues the
+ * server (markServersForRetry).
+ */
+const TIMED_OUT_RETRY_BACKOFF_BASE_MS = MCP_STARTUP_TIMEOUT_MS;
+const TIMED_OUT_RETRY_BACKOFF_MAX_MS = 5 * 60_000;
+
+interface TimedOutRetryBackoff {
+  retryTimeouts: number;
+  /** When the latest timed-out attempt finished, not when its batch settled. */
+  lastAttemptAtMs: number;
+}
+
+/** Wait required after `retryTimeouts` consecutive failed retries before the next attempt. */
+function timedOutRetryBackoffMs(retryTimeouts: number): number {
+  if (retryTimeouts <= 0) return 0;
+  return Math.min(
+    TIMED_OUT_RETRY_BACKOFF_BASE_MS * 2 ** (retryTimeouts - 1),
+    TIMED_OUT_RETRY_BACKOFF_MAX_MS
+  );
+}
 
 /** Detect errors from the MCP SDK indicating the client/transport is closed.
  *  We match on known message patterns rather than error classes so wrapped or
@@ -1051,7 +1082,8 @@ interface MCPServerInstance {
    * list results carry ttlMs/cacheScope freshness hints: a still-fresh cached
    * list is served with zero round trips, a stale one refetches. Legacy
    * connections keep the previous instance-lifetime tool caching (their list
-   * results carry no freshness hints).
+   * results carry no freshness hints). Invoked off the send path
+   * (refreshInstanceToolsInBackground), never awaited by a turn.
    */
   refreshTools?: () => Promise<void>;
   /** Fetches prompts/list without mutating instance state; refreshInstancePrompts alone normalizes and stores the catalog. */
@@ -1165,6 +1197,13 @@ interface WorkspaceServers {
   timedOutServerNames: string[];
   /** Prevent concurrent cached retries from stacking startup attempts for the same server. */
   retryingTimedOutServerNames: Set<string>;
+  /**
+   * Consecutive startup timeouts (initial start included) per server still in
+   * `timedOutServerNames`, gating getTimedOutServerNamesToRetry (see
+   * TIMED_OUT_RETRY_BACKOFF_BASE_MS). No record (plugin re-queue) means the
+   * next serve retries immediately.
+   */
+  timedOutRetryBackoff?: Map<string, TimedOutRetryBackoff>;
   /** Blocks prompt invocation on stale clients while an active lease defers restart. */
   stalePromptServerNames?: Set<string>;
   /** Dedupes send-path background prompt refreshes so streams never stack them. */
@@ -1294,6 +1333,8 @@ export class MCPServerManager {
     MCPServerInstance,
     { started: number; applied: number }
   >();
+  /** Dedupes send-path background tool refreshes per instance; see refreshInstanceToolsInBackground. */
+  private readonly toolRefreshesInFlight = new WeakMap<MCPServerInstance, Promise<void>>();
   // Bumped by removal-style stops (stopServers without retainRestartOptions).
   // Startups run outside any lock shared with removal, so an abort-abandoned
   // startup can finish after the workspace is gone; the epoch check makes it
@@ -2007,22 +2048,43 @@ export class MCPServerManager {
     this.eraVerdicts.set(key, { prior, cachedAtMs: Date.now() });
   }
 
-  private async refreshModernInstanceTools(
-    instances: Map<string, MCPServerInstance>
-  ): Promise<void> {
-    await Promise.all(
-      [...instances.values()].map(async (instance) => {
-        if (instance.isClosed || !instance.refreshTools) return;
-        try {
-          await instance.refreshTools();
-        } catch (error) {
+  /**
+   * Send-path tool freshness is stale-while-revalidate, like prompts below.
+   * Every cached instance already holds the catalog fetched at startup, and a
+   * blocking tools/list to every modern server on every turn cost hundreds of
+   * milliseconds per turn on real setups (and up to the SDK timeout when one
+   * server hangs). The turn serves the held catalog; the refresh routes
+   * through the SDK's SEP-2549 response cache, so a still-fresh list costs no
+   * round trip, a stale one (ttlMs elapsed or evicted by
+   * notifications/tools/list_changed) refetches here and lands for the next
+   * turn. Deduped per instance so stacked turns cannot pile up requests on a
+   * slow server; only servers still enabled after the concurrent-mutation
+   * repair are queried because a detached refresh cannot be cancelled.
+   */
+  private refreshInstanceToolsInBackground(entry: WorkspaceServers): void {
+    for (const [serverName, instance] of entry.instances) {
+      if (!entry.enabledServerNames.has(serverName)) continue;
+      if (instance.isClosed || !instance.refreshTools) continue;
+      if (this.toolRefreshesInFlight.has(instance)) continue;
+      log.debug("[MCP] Serving cached tool catalog; refreshing in background", {
+        name: instance.name,
+        toolCount: Object.keys(instance.tools).length,
+      });
+      const refresh = instance
+        .refreshTools()
+        .catch((error: unknown) => {
           log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
             name: instance.name,
             error: getErrorMessage(error),
           });
-        }
-      })
-    );
+        })
+        .finally(() => {
+          if (this.toolRefreshesInFlight.get(instance) === refresh) {
+            this.toolRefreshesInFlight.delete(instance);
+          }
+        });
+      this.toolRefreshesInFlight.set(instance, refresh);
+    }
   }
 
   /**
@@ -2199,12 +2261,91 @@ export class MCPServerManager {
     entry: WorkspaceServers,
     enabledServers: MCPServerMap
   ): string[] {
-    return entry.timedOutServerNames.filter(
-      (serverName) =>
-        enabledServers[serverName] !== undefined &&
-        !entry.instances.has(serverName) &&
-        !entry.retryingTimedOutServerNames.has(serverName)
+    const now = Date.now();
+    return entry.timedOutServerNames.filter((serverName) => {
+      if (
+        enabledServers[serverName] === undefined ||
+        entry.instances.has(serverName) ||
+        entry.retryingTimedOutServerNames.has(serverName)
+      ) {
+        return false;
+      }
+      const retryAfterMs = this.timedOutRetryWaitMs(entry, serverName, now);
+      if (retryAfterMs <= 0) return true;
+      // Info, not debug: this is the only evidence that a turn ran without
+      // the server on purpose rather than the server silently vanishing.
+      log.info("[MCP] Skipping timed-out server retry during backoff", {
+        serverName,
+        retryTimeouts: entry.timedOutRetryBackoff?.get(serverName)?.retryTimeouts,
+        retryAfterMs,
+      });
+      return false;
+    });
+  }
+
+  /** Milliseconds until `serverName` may be retried; 0 when no backoff is pending. */
+  private timedOutRetryWaitMs(entry: WorkspaceServers, serverName: string, now: number): number {
+    const backoff = entry.timedOutRetryBackoff?.get(serverName);
+    if (backoff === undefined) return 0;
+    return Math.max(
+      0,
+      backoff.lastAttemptAtMs + timedOutRetryBackoffMs(backoff.retryTimeouts) - now
     );
+  }
+
+  /**
+   * Backoff state to carry into a same-signature full restart forced by a
+   * closed companion instance. That restart replaces the cache entry, so
+   * without this a backed-off server would be started again at once and
+   * charge another startup timeout every time a companion dies, and one whose
+   * window had already elapsed would restart its schedule from the base
+   * instead of continuing it. `records` keeps every still-enabled, still-down
+   * server's history for the outcome accounting of the new batch; `waiting`
+   * names the ones still inside their window, which stay out of that batch.
+   */
+  private timedOutRetryBackoffToCarry(
+    entry: WorkspaceServers,
+    enabledServers: MCPServerMap
+  ): { records: Map<string, TimedOutRetryBackoff>; waiting: Set<string> } {
+    const records = new Map<string, TimedOutRetryBackoff>();
+    const waiting = new Set<string>();
+    const now = Date.now();
+    for (const [serverName, backoff] of entry.timedOutRetryBackoff ?? []) {
+      if (enabledServers[serverName] === undefined || entry.instances.has(serverName)) continue;
+      records.set(serverName, backoff);
+      if (this.timedOutRetryWaitMs(entry, serverName, now) > 0) waiting.add(serverName);
+    }
+    return { records, waiting };
+  }
+
+  /**
+   * Record startup outcomes for backoff, from the initial start, cached-path
+   * retries, and closed-client restarts alike. A timeout lengthens the wait,
+   * measured from when that server's attempt finished (startups run four at a
+   * time, so a batch can settle long after its first wave timed out); any
+   * other outcome (started, hard failure that leaves the retry list,
+   * plugin-tree invalidation) clears it.
+   */
+  private recordStartupTimeoutOutcomes(
+    entry: WorkspaceServers,
+    attempted: Iterable<string>,
+    timedOutNames: Iterable<string>,
+    timedOutAtMs?: ReadonlyMap<string, number>
+  ): void {
+    const timedOut = new Set(timedOutNames);
+    const now = Date.now();
+    for (const serverName of attempted) {
+      if (!timedOut.has(serverName)) {
+        entry.timedOutRetryBackoff?.delete(serverName);
+        continue;
+      }
+      entry.timedOutRetryBackoff ??= new Map();
+      const previous = entry.timedOutRetryBackoff.get(serverName);
+      entry.timedOutRetryBackoff.set(serverName, {
+        retryTimeouts: (previous?.retryTimeouts ?? 0) + 1,
+        lastAttemptAtMs: timedOutAtMs?.get(serverName) ?? now,
+      });
+    }
   }
 
   /**
@@ -2532,8 +2673,8 @@ export class MCPServerManager {
   }
 
   /**
-   * Skips tools/list refreshes on cached instances so an unrelated server's
-   * 60-second SDK timeout cannot block prompt paths.
+   * `refreshToolCatalogs` false (prompt paths) skips the background tool and
+   * prompt catalog refreshes on cached instances entirely.
    */
   private async ensureWorkspaceServers(
     requestOptions: MCPWorkspaceRequestOptions,
@@ -2796,6 +2937,7 @@ export class MCPServerManager {
             instances: retriedInstances,
             failedServerNames: retryFailedNames,
             timedOutServerNames: retryTimedOutNames = [],
+            timedOutAtMs: retryTimedOutAtMs,
           } = await this.startServers(
             serversToRetry,
             runtime,
@@ -2871,6 +3013,12 @@ export class MCPServerManager {
                 ...retryTimedOutNames,
                 ...invalidatedRetryKeys,
               ];
+              this.recordStartupTimeoutOutcomes(
+                existing,
+                retryingServerNames,
+                retryTimedOutNames,
+                retryTimedOutAtMs
+              );
             }
           );
           if (retryOwnershipLost) {
@@ -2921,11 +3069,6 @@ export class MCPServerManager {
         serverCount: enabledEntries.length,
       });
 
-      if (refreshToolCatalogs) {
-        // Honor SEP-2549 freshness hints instead of caching tool lists for the instance lifetime.
-        await this.refreshModernInstanceTools(existing.instances);
-      }
-
       // A trust or settings mutation can land while getAllServers() runs above;
       // re-derive enablement so this cached return cannot leave a revoked
       // repo-local server invocable.
@@ -2939,6 +3082,7 @@ export class MCPServerManager {
       // Spawned after the repair: a detached refresh cannot be cancelled, so
       // it must never target servers a concurrent mutation just revoked.
       if (refreshToolCatalogs) {
+        this.refreshInstanceToolsInBackground(existing);
         this.refreshInstancePromptsInBackground(existing);
       }
 
@@ -3011,6 +3155,7 @@ export class MCPServerManager {
           instances: restartedInstances,
           failedServerNames: failedNames,
           timedOutServerNames: timedOutNames = [],
+          timedOutAtMs: restartTimedOutAtMs,
         } = await this.startServers(
           serversToRestart,
           runtime,
@@ -3050,6 +3195,12 @@ export class MCPServerManager {
               ...timedOutNames,
               ...invalidatedRestartKeys,
             ];
+            this.recordStartupTimeoutOutcomes(
+              existing,
+              Object.keys(serversToRestart),
+              timedOutNames,
+              restartTimedOutAtMs
+            );
             existing.stats = this.createWorkspaceStats(
               existing.stats.enabledServerCount,
               existing.instances,
@@ -3135,17 +3286,12 @@ export class MCPServerManager {
         );
       }
 
-      if (refreshToolCatalogs) {
-        // Honor SEP-2549 freshness hints instead of caching tool lists for the instance lifetime.
-        await this.refreshModernInstanceTools(instancesForTools);
-      }
-
       // Runs after the staleness recompute so the delete above cannot clobber
-      // staleness detected from a mutation newer than this call's config read,
-      // and after the awaited tool refresh: a publication landing during that
-      // await replaces the recorded options while its own listServers is still
-      // pending, so `existing.enabledServerNames` is only trustworthy once the
-      // repair has re-derived it here — the serve's last await before return.
+      // staleness detected from a mutation newer than this call's config read:
+      // a publication landing during an await replaces the recorded options
+      // while its own listServers is still pending, so
+      // `existing.enabledServerNames` is only trustworthy once the repair has
+      // re-derived it here — the serve's last await before return.
       const enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
         workspaceId,
         options,
@@ -3156,6 +3302,7 @@ export class MCPServerManager {
       // Spawned after the repair so the uncancellable detached refresh cannot
       // target servers a concurrent mutation just revoked.
       if (refreshToolCatalogs) {
+        this.refreshInstanceToolsInBackground(existing);
         this.refreshInstancePromptsInBackground(existing);
       }
 
@@ -3184,9 +3331,6 @@ export class MCPServerManager {
         );
         if (current.configSignature === signature && !currentHasClosedInstance) {
           current.lastActivity = Date.now();
-          if (refreshToolCatalogs) {
-            await this.refreshModernInstanceTools(current.instances);
-          }
           // Repair again in case a mutation landed after the concurrent starter's check.
           const enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
             workspaceId,
@@ -3197,6 +3341,7 @@ export class MCPServerManager {
           // Spawned after the repair so the uncancellable detached refresh
           // cannot target servers a concurrent mutation just revoked.
           if (refreshToolCatalogs) {
+            this.refreshInstanceToolsInBackground(current);
             this.refreshInstancePromptsInBackground(current);
           }
           return this.serveResult(
@@ -3221,9 +3366,20 @@ export class MCPServerManager {
         return undefined;
       }
       const retained = addedServerNames !== undefined ? current : undefined;
+      // Reaching here with the same signature means a closed companion forced
+      // a full restart; backed-off servers keep their schedule across it. A
+      // changed signature is a config change and starts everything afresh.
+      const carriedBackoff =
+        retained === undefined && current?.configSignature === signature
+          ? this.timedOutRetryBackoffToCarry(current, enabledServers)
+          : { records: new Map<string, TimedOutRetryBackoff>(), waiting: new Set<string>() };
       const serversToStart = addedServerNames
         ? Object.fromEntries(enabledEntries.filter(([name]) => addedServerNames.includes(name)))
-        : enabledServers;
+        : carriedBackoff.waiting.size === 0
+          ? enabledServers
+          : Object.fromEntries(
+              Object.entries(enabledServers).filter(([name]) => !carriedBackoff.waiting.has(name))
+            );
       if (Object.keys(serversToStart).length > 0) {
         log.info("[MCP] Starting servers", {
           workspaceId,
@@ -3245,8 +3401,9 @@ export class MCPServerManager {
       await this.assertOverridesEpochUnmovedBeforeStart();
       const {
         instances,
-        failedServerNames: startFailedNames,
+        failedServerNames: startedFailedNames,
         timedOutServerNames: startTimedOutNames = [],
+        timedOutAtMs: startTimedOutAtMs,
       } = await this.startServers(
         serversToStart,
         runtime,
@@ -3256,6 +3413,8 @@ export class MCPServerManager {
         () => this.markActivity(workspaceId),
         workspaceId
       );
+      // Still-waiting servers were not attempted this time but are still down.
+      const startFailedNames = [...startedFailedNames, ...carriedBackoff.waiting];
 
       const stats = this.createWorkspaceStats(enabledEntries.length, instances, startFailedNames);
 
@@ -3309,6 +3468,15 @@ export class MCPServerManager {
             retained.enabledServers = enabledServers;
             retained.enabledServersGeneration = configGenerationUsed;
             retained.timedOutServerNames.push(...startTimedOutNames, ...invalidatedKeys);
+            // Config signature moved: give every pending retry a fresh start,
+            // then count this start's timeouts as their first failure.
+            delete retained.timedOutRetryBackoff;
+            this.recordStartupTimeoutOutcomes(
+              retained,
+              Object.keys(serversToStart),
+              startTimedOutNames,
+              startTimedOutAtMs
+            );
             retained.stats = this.createWorkspaceStats(enabledEntries.length, retained.instances, [
               ...retained.stats.failedServerNames,
               ...startFailedNames,
@@ -3326,10 +3494,25 @@ export class MCPServerManager {
             enabledServers,
             enabledServersGeneration: configGenerationUsed,
             stats: this.createWorkspaceStats(enabledEntries.length, instances, startFailedNames),
-            timedOutServerNames: [...startTimedOutNames, ...invalidatedKeys],
+            timedOutServerNames: [
+              ...carriedBackoff.waiting,
+              ...startTimedOutNames,
+              ...invalidatedKeys,
+            ],
             retryingTimedOutServerNames: new Set(),
             lastActivity: Date.now(),
+            ...(carriedBackoff.records.size > 0
+              ? { timedOutRetryBackoff: new Map(carriedBackoff.records) }
+              : {}),
           };
+          // Attempted names, not just timed-out ones: a carried record whose
+          // server came up this time must clear rather than linger.
+          this.recordStartupTimeoutOutcomes(
+            entry,
+            Object.keys(serversToStart),
+            startTimedOutNames,
+            startTimedOutAtMs
+          );
           this.workspaceServers.set(workspaceId, entry);
         }
       );
@@ -3357,10 +3540,11 @@ export class MCPServerManager {
         configGenerationUsed
       );
       if (refreshToolCatalogs) {
-        if (retained) await this.refreshModernInstanceTools(retained.instances);
         const promptInstances = this.promptEligibleInstances(entry);
         // Retained catalogs stay stale-while-revalidate; only new servers need
         // the initial awaited fetch. Do not wait on an old background refresh.
+        // New servers' tools were fetched by startServers, so tools need no
+        // awaited fetch here at all.
         await this.refreshInstancePrompts(
           retained
             ? new Map([...promptInstances].filter(([name]) => instances.has(name)))
@@ -3372,7 +3556,10 @@ export class MCPServerManager {
           entry,
           configGenerationUsed
         );
-        if (retained) this.refreshInstancePromptsInBackground(entry);
+        if (retained) {
+          this.refreshInstanceToolsInBackground(entry);
+          this.refreshInstancePromptsInBackground(entry);
+        }
       }
 
       // entry.stats, not the pre-publication `stats`: invalidated instances
@@ -4276,6 +4463,9 @@ export class MCPServerManager {
       if (!pending.has(serverKey)) {
         entry.timedOutServerNames.push(serverKey);
       }
+      // An explicit re-queue (plugin tree swap, component re-add) is a new
+      // configuration for the server, not another failure: retry at once.
+      entry.timedOutRetryBackoff?.delete(serverKey);
     }
   }
 
@@ -5223,10 +5413,13 @@ export class MCPServerManager {
     instances: Map<string, MCPServerInstance>;
     failedServerNames: string[];
     timedOutServerNames: string[];
+    /** When each timed-out attempt finished; the batch itself settles later. */
+    timedOutAtMs: Map<string, number>;
   }> {
     const instances = new Map<string, MCPServerInstance>();
     const failedServerNames: string[] = [];
     const timedOutServerNames: string[] = [];
+    const timedOutAtMs = new Map<string, number>();
     const entries = Object.entries(servers);
 
     // Bounded concurrency so one unresponsive server's 60s startup deadline
@@ -5252,6 +5445,7 @@ export class MCPServerManager {
           failedServerNames.push(name);
           if (isMCPStartupTimeoutError(error)) {
             timedOutServerNames.push(name);
+            timedOutAtMs.set(name, Date.now());
           }
           return null;
         } finally {
@@ -5268,7 +5462,7 @@ export class MCPServerManager {
       }
     }
 
-    return { instances, failedServerNames, timedOutServerNames };
+    return { instances, failedServerNames, timedOutServerNames, timedOutAtMs };
   }
 
   private async startSingleServer(
