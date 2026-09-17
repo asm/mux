@@ -1,5 +1,6 @@
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { randomUUID } from "node:crypto";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import assert from "node:assert/strict";
 import * as path from "node:path";
 import * as fsPromises from "fs/promises";
@@ -1102,6 +1103,110 @@ function collectReferencedTaskIdsFromTaskToolOutput(output: unknown, into: Set<s
       }
     }
   }
+}
+
+type CompletedTaskReportReceipt =
+  | { kind: "initial"; taskId: string; reportMarkdown: string }
+  | {
+      kind: "continuation";
+      taskId: string;
+      handleId?: string;
+      messageId: string;
+      reportMarkdown: string;
+    };
+
+/** Read only canonical task-result containers, never arbitrary JSON or prose. */
+function completedTaskReports(toolName: unknown, output: unknown): CompletedTaskReportReceipt[] {
+  if (!isPlainObject(output)) return [];
+  const rows: unknown[] = [];
+  if (toolName === "task") {
+    if (output.status === "completed") rows.push(output);
+    // A group can return completed members while other members are still running.
+    if (Array.isArray(output.reports)) output.reports.forEach((row: unknown) => rows.push(row));
+  } else if (toolName === "task_await" && Array.isArray(output.results)) {
+    output.results.forEach((row: unknown) => {
+      if (isPlainObject(row) && row.status === "completed") rows.push(row);
+    });
+  }
+  return rows.flatMap((row): CompletedTaskReportReceipt[] => {
+    if (
+      !isPlainObject(row) ||
+      typeof row.taskId !== "string" ||
+      typeof row.reportMarkdown !== "string"
+    )
+      return [];
+    const messageId =
+      row.messageId ??
+      (isPlainObject(row.finalMessageRef) ? row.finalMessageRef.messageId : undefined);
+    // Workspace-target tools expose a handle; stable-child awaits expose the child itself.
+    const handleId = isWorkspaceTurnTaskId(row.taskId) ? row.taskId : undefined;
+    const taskId = handleId != null ? coerceNonEmptyString(row.workspaceId) : row.taskId;
+    if (taskId == null) return [];
+    if (typeof messageId === "string") {
+      return [
+        { kind: "continuation", taskId, handleId, messageId, reportMarkdown: row.reportMarkdown },
+      ];
+    }
+    return handleId == null
+      ? [{ kind: "initial", taskId, reportMarkdown: row.reportMarkdown }]
+      : [];
+  });
+}
+
+function sameTaskReportReceipt(
+  a: CompletedTaskReportReceipt,
+  b: CompletedTaskReportReceipt
+): boolean {
+  return (
+    a.kind === b.kind &&
+    a.taskId === b.taskId &&
+    a.reportMarkdown === b.reportMarkdown &&
+    (a.kind === "initial" ||
+      (b.kind === "continuation" && a.messageId === b.messageId && a.handleId === b.handleId))
+  );
+}
+
+/** Only model-visible successful tool results prove consumption. UI telemetry does not. */
+function collectCompletedTaskReportReceipts(message: MuxMessage): CompletedTaskReportReceipt[] {
+  const reports: CompletedTaskReportReceipt[] = [];
+  const succeeded = (call: unknown): call is Record<string, unknown> =>
+    isPlainObject(call) &&
+    call.failed !== true &&
+    call.error == null &&
+    call.ok !== false &&
+    (call.state == null || call.state === "output-available");
+  const visit = (call: unknown, depth: number): void => {
+    if (depth > 30 || !succeeded(call)) return;
+    const output = call.output ?? call.result;
+    if (!isPlainObject(output)) return;
+    reports.push(...completedTaskReports(call.toolName, output));
+    if (call.toolName !== "code_execution") return;
+
+    // Classic executions expose these result records to the model, even when a later
+    // call fails. Persistent kernels replace them with summaries that contain no report.
+    if (Array.isArray(output.toolCalls)) {
+      for (const nested of output.toolCalls) visit(nested, depth + 1);
+    }
+    // Persistent nestedCalls hold UI-only full values. Use them solely as provenance for
+    // a complete canonical report deliberately returned through output.result. Offload
+    // handles, previews, hidden values, and unrelated returns must retain their wake.
+    if (Array.isArray(call.nestedCalls)) {
+      for (const nested of call.nestedCalls) {
+        if (!succeeded(nested)) continue;
+        const genuine = completedTaskReports(nested.toolName, nested.output);
+        const visible = completedTaskReports(nested.toolName, output.result);
+        reports.push(
+          ...visible.filter((receipt) =>
+            genuine.some((source) => sameTaskReportReceipt(source, receipt))
+          )
+        );
+      }
+    }
+  };
+  for (const part of message.parts) {
+    if (isDynamicToolPart(part) && part.state === "output-available") visit(part, 0);
+  }
+  return reports;
 }
 
 interface RecoveredTaskToolInput {
@@ -8750,22 +8855,25 @@ export class TaskService implements AgentTaskIntegration {
     return { deliverableNotificationIds, latestMessageTimestampByTaskId };
   }
 
-  private async consumeRespondedAgentTerminalAttention(ownerWorkspaceId: string): Promise<void> {
+  /** Acknowledge only durably completed answers, before their receipts can be compacted away. */
+  async acknowledgeAgentReports(ownerWorkspaceId: string): Promise<ReadonlySet<string>> {
+    const consumedIds = new Set<string>();
     const pending = (await this.terminalAttentionStore.listPending(ownerWorkspaceId)).filter(
       (notification) => notification.sourceKind === "agent_task"
     );
-    if (pending.length === 0) return;
+    if (pending.length === 0) return consumedIds;
 
     const pendingIds = new Set(pending.map((notification) => notification.sourceId));
     const terminalSequenceByTaskId = new Map<string, number>();
-    const responded = new Set<string>();
+    let coveredHistorySequence = -1;
+    const toolReportsByTaskId = new Map<string, CompletedTaskReportReceipt[]>();
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(ownerWorkspaceId);
     if (!historyResult.success) {
       log.warn("Failed to inspect terminal sub-agent responses", {
         ownerWorkspaceId,
         error: historyResult.error,
       });
-      return;
+      return consumedIds;
     }
 
     for (const message of historyResult.data) {
@@ -8778,25 +8886,78 @@ export class TaskService implements AgentTaskIntegration {
         const historySequence = message.metadata?.historySequence;
         if (taskId != null && pendingIds.has(taskId) && typeof historySequence === "number") {
           terminalSequenceByTaskId.set(taskId, historySequence);
-          responded.delete(taskId);
         }
         continue;
       }
 
-      if (message.role === "assistant" && message.metadata?.partial !== true) {
+      if (
+        message.role === "assistant" &&
+        message.metadata?.partial !== true &&
+        message.metadata?.finishReason === "stop" &&
+        message.metadata?.agentId !== "compact" &&
+        message.metadata?.mode !== "compact"
+      ) {
+        // A late task_await can supply a report inside this SDK stream even though the
+        // request's history watermark predates it. Collect receipts independently of row
+        // order: the assistant placeholder is updated in place ahead of mid-stream reports.
+        for (const report of collectCompletedTaskReportReceipts(message)) {
+          if (!pendingIds.has(report.taskId)) continue;
+          const reports = toolReportsByTaskId.get(report.taskId) ?? [];
+          reports.push(report);
+          toolReportsByTaskId.set(report.taskId, reports);
+        }
         const requestHistorySequence = message.metadata?.requestHistorySequence;
         if (typeof requestHistorySequence !== "number") continue;
-        for (const [taskId, terminalSequence] of terminalSequenceByTaskId) {
-          if (requestHistorySequence >= terminalSequence) responded.add(taskId);
-        }
+        coveredHistorySequence = Math.max(coveredHistorySequence, requestHistorySequence);
       }
     }
 
+    const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
+    const owners = [
+      ownerWorkspaceId,
+      ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, ownerWorkspaceId),
+    ];
     for (const notification of pending) {
-      if (responded.has(notification.sourceId)) {
+      const terminalSequence = terminalSequenceByTaskId.get(notification.sourceId);
+      let consumed = terminalSequence != null && coveredHistorySequence >= terminalSequence;
+      const reports = toolReportsByTaskId.get(notification.sourceId) ?? [];
+      if (!consumed && notification.terminalOutcome === "completed" && reports.length > 0) {
+        if (notification.generationId == null) {
+          // Initial assignments have no execution identity; continuations do. Never let
+          // a stable child ID's older receipt consume a later assignment's notification.
+          consumed = reports.some((report) => report.kind === "initial");
+        } else {
+          // Resolve the notification's assignment, not the child's latest execution: the
+          // parent may already have reawakened that child before this drain gets its turn.
+          const [handleId] = notification.generationId.split(":");
+          if (!isWorkspaceTurnTaskId(handleId)) continue;
+          let record: WorkspaceTurnTaskHandleRecord | null = null;
+          for (const ownerId of owners) {
+            record = await this.getWorkspaceTurnManager().getWorkspaceTurnRecord(ownerId, handleId);
+            if (record != null) break;
+          }
+          if (record?.status === "completed" && record.workspaceId === notification.sourceId) {
+            const generation =
+              this.getWorkspaceTurnManager().workspaceTurnTerminalAttentionGenerationId(record);
+            consumed =
+              (notification.generationId === generation ||
+                notification.generationId === record.handleId) &&
+              reports.some(
+                (report) =>
+                  report.kind === "continuation" &&
+                  (report.handleId == null || report.handleId === record.handleId) &&
+                  report.messageId === record.messageId &&
+                  report.reportMarkdown === record.reportMarkdown
+              );
+          }
+        }
+      }
+      if (consumed) {
         await this.terminalAttentionStore.markDelivered(ownerWorkspaceId, notification.id);
+        consumedIds.add(notification.id);
       }
     }
+    return consumedIds;
   }
 
   /**
@@ -8833,7 +8994,7 @@ export class TaskService implements AgentTaskIntegration {
         await this.terminalAttentionStore.delete(ownerWorkspaceId, notification.id);
       }
     }
-    const pending = allPending.filter((notification) => notification.sourceKind !== "workflow_run");
+    let pending = allPending.filter((notification) => notification.sourceKind !== "workflow_run");
     const queuedWorkflowRunIds = Array.from(
       this.pendingWorkflowRunAttention.get(ownerWorkspaceId) ?? []
     );
@@ -8872,7 +9033,7 @@ export class TaskService implements AgentTaskIntegration {
       ownerHasPendingQueuedPreparingOrRetry;
     if (
       this.aiService.isStreaming(ownerWorkspaceId) ||
-      ownerHasPendingQueuedPreparingOrRetry ||
+      ownerHasBusyQueuedOrRetry ||
       this.interruptedParentWorkspaceIds.has(ownerWorkspaceId)
     ) {
       if (ownerHasBusyQueuedOrRetry && !this.interruptedParentWorkspaceIds.has(ownerWorkspaceId)) {
@@ -8885,6 +9046,13 @@ export class TaskService implements AgentTaskIntegration {
     if (await this.hasBlockingActiveWorkForTerminalDrain(ownerWorkspaceId, taskIndex)) {
       return;
     }
+
+    // Reconcile only after observing idle: an earlier history snapshot can still contain
+    // the streaming placeholder, then race the final answer and start a duplicate turn.
+    // Normal completion acknowledges before compaction; this is recovery for missed
+    // callbacks or reports whose notification was published after the answer committed.
+    const consumedIds = await this.acknowledgeAgentReports(ownerWorkspaceId);
+    pending = pending.filter((notification) => !consumedIds.has(notification.id));
 
     const agentNotifications = pending.filter(
       (notification) => notification.sourceKind === "agent_task"
@@ -12453,11 +12621,6 @@ export class TaskService implements AgentTaskIntegration {
     if (this.pendingNotifyOnTerminalPersists.size > 0) {
       await Promise.all([...this.pendingNotifyOnTerminalPersists]);
     }
-
-    // A parent response after a terminal report consumes that report's outbox entry. This also
-    // closes the crash-recovery path where startup auto-retry finishes a response before the
-    // terminal-attention drain gets a chance to resume it.
-    await this.consumeRespondedAgentTerminalAttention(workspaceId);
 
     // The owner's own stream ending is the signal to retry any terminal wake-ups that were deferred
     // while it was busy. Drain checks idle internally and leaves notifications pending otherwise.
