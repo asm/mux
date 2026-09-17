@@ -177,7 +177,7 @@ const ToolAllowlistSection: React.FC<{
   );
 };
 
-type MCPOAuthLoginStatus = "idle" | "starting" | "waiting" | "success" | "error";
+type MCPOAuthLoginStatus = "idle" | "starting" | "waiting" | "completing" | "success" | "error";
 
 interface MCPOAuthAuthStatus {
   serverUrl?: string;
@@ -278,7 +278,8 @@ function useMCPOAuthLogin(input: {
   const [loginStatus, setLoginStatus] = useState<MCPOAuthLoginStatus>("idle");
   const [loginError, setLoginError] = useState<string | null>(null);
 
-  const loginInProgress = loginStatus === "starting" || loginStatus === "waiting";
+  const loginInProgress =
+    loginStatus === "starting" || loginStatus === "waiting" || loginStatus === "completing";
 
   const cancelLogin = useCallback(() => {
     loginAttemptRef.current++;
@@ -393,8 +394,16 @@ function useMCPOAuthLogin(input: {
       }
 
       if (waitResult.success) {
-        setLoginStatus("success");
+        // The flow is finished on the backend, so there is nothing left to cancel.
+        setFlowId(null);
+        // Stay in progress until the success callback settles: callers lock UI on
+        // `loginInProgress`, and the callback may still be writing config.
+        setLoginStatus("completing");
         await onSuccess?.();
+        if (attempt !== loginAttemptRef.current) {
+          return;
+        }
+        setLoginStatus("success");
         return;
       }
 
@@ -420,22 +429,16 @@ function useMCPOAuthLogin(input: {
   };
 }
 
-const MCPOAuthRequiredCallout: React.FC<{
-  serverName: string;
-  pendingServer?: MCPOAuthPendingServerConfig;
+type MCPOAuthLoginController = ReturnType<typeof useMCPOAuthLogin>;
+
+const MCPOAuthRequiredCalloutView: React.FC<{
+  login: MCPOAuthLoginController;
   disabledReason?: string;
-  onLoginSuccess?: () => void | Promise<void>;
-}> = ({ serverName, pendingServer, disabledReason, onLoginSuccess }) => {
+}> = (props) => {
   const { api } = useAPI();
   const isDesktop = !!window.api;
-
-  const { loginStatus, loginError, loginInProgress, startLogin, cancelLogin } = useMCPOAuthLogin({
-    api,
-    isDesktop,
-    serverName,
-    pendingServer,
-    onSuccess: onLoginSuccess,
-  });
+  const disabledReason = props.disabledReason;
+  const { loginStatus, loginError, loginInProgress, startLogin, cancelLogin } = props.login;
 
   const mcpOauthApi = getMCPOAuthAPI(api);
   const loginFlowMode = getMCPOAuthLoginFlowMode({
@@ -469,7 +472,7 @@ const MCPOAuthRequiredCallout: React.FC<{
       {loginInProgress ? (
         <>
           <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          Waiting for login...
+          {loginStatus === "completing" ? "Finishing…" : "Waiting for login..."}
         </>
       ) : (
         "Login via OAuth"
@@ -498,7 +501,9 @@ const MCPOAuthRequiredCallout: React.FC<{
             </>
           )}
 
-          {loginStatus === "success" && <p className="text-muted mt-0.5">Logged in.</p>}
+          {(loginStatus === "completing" || loginStatus === "success") && (
+            <p className="text-muted mt-0.5">Logged in.</p>
+          )}
 
           {loginStatus === "error" && loginError && (
             <p className="text-destructive mt-0.5">OAuth error: {loginError}</p>
@@ -517,7 +522,9 @@ const MCPOAuthRequiredCallout: React.FC<{
             loginButton
           )}
 
-          {loginStatus === "waiting" && (
+          {/* Also offered while starting: OAuth discovery can stall, and callers lock their
+              form on loginInProgress, so the user needs a way out before the browser opens. */}
+          {(loginStatus === "starting" || loginStatus === "waiting") && (
             <Button variant="secondary" size="sm" onClick={cancelLogin}>
               Cancel
             </Button>
@@ -526,6 +533,24 @@ const MCPOAuthRequiredCallout: React.FC<{
       </div>
     </div>
   );
+};
+
+const MCPOAuthRequiredCallout: React.FC<{
+  serverName: string;
+  pendingServer?: MCPOAuthPendingServerConfig;
+  disabledReason?: string;
+  onLoginSuccess?: () => void | Promise<void>;
+}> = (props) => {
+  const { api } = useAPI();
+  const login = useMCPOAuthLogin({
+    api,
+    isDesktop: !!window.api,
+    serverName: props.serverName,
+    pendingServer: props.pendingServer,
+    onSuccess: props.onLoginSuccess,
+  });
+
+  return <MCPOAuthRequiredCalloutView login={login} disabledReason={props.disabledReason} />;
 };
 
 const RemoteMCPOAuthSection: React.FC<{
@@ -935,54 +960,6 @@ export const MCPSettingsSection: React.FC = () => {
   const serverDisplayValue = (entry: MCPServerInfo): string =>
     entry.transport === "stdio" ? entry.command : entry.url;
 
-  const handleTestNewServer = useCallback(async () => {
-    if (!api || !newServer.value.trim()) return;
-    setTestingNew(true);
-    setNewTestResult(null);
-
-    try {
-      const { headers, validation } =
-        newServer.transport === "stdio"
-          ? { headers: undefined, validation: { errors: [], warnings: [] } }
-          : mcpHeaderRowsToRecord(newServer.headersRows, {
-              knownSecretKeys: new Set(globalSecretKeys),
-            });
-
-      if (validation.errors.length > 0) {
-        throw new Error(validation.errors[0]);
-      }
-
-      const pendingName = newServer.name.trim();
-
-      const result = await api.mcp.test({
-        ...(newServer.transport === "stdio"
-          ? { command: newServer.value.trim() }
-          : {
-              ...(pendingName ? { name: pendingName } : {}),
-              transport: newServer.transport,
-              url: newServer.value.trim(),
-              headers,
-            }),
-      });
-
-      setNewTestResult({ result, testedAt: Date.now() });
-    } catch (err) {
-      setNewTestResult({
-        result: { success: false, error: err instanceof Error ? err.message : "Test failed" },
-        testedAt: Date.now(),
-      });
-    } finally {
-      setTestingNew(false);
-    }
-  }, [
-    api,
-    newServer.name,
-    newServer.transport,
-    newServer.value,
-    newServer.headersRows,
-    globalSecretKeys,
-  ]);
-
   const handleAddServer = useCallback(async () => {
     if (!api || !newServer.name.trim() || !newServer.value.trim()) return;
 
@@ -1129,6 +1106,101 @@ export const MCPSettingsSection: React.FC = () => {
   const canTest =
     newServer.value.trim().length > 0 &&
     (newServer.transport === "stdio" || newHeadersValidation.errors.length === 0);
+
+  // OAuth login for the add-server draft lives here rather than in the callout so the form
+  // can lock while the browser round-trip is pending. The success callback closes over the
+  // draft it authorized; if the user could edit fields or click "Add" in the meantime, that
+  // stale draft would be written over the newer one.
+  const newServerName = newServer.name.trim();
+  const newServerUrl = newServer.value.trim();
+  // If the server already exists in config, prefer that config for OAuth.
+  const newServerOauthPendingServer: MCPOAuthPendingServerConfig | undefined =
+    newServerName && !servers[newServerName] && newServer.transport !== "stdio" && newServerUrl
+      ? { transport: newServer.transport, url: newServerUrl }
+      : undefined;
+  const newServerOauthDisabledReason = !newServerName
+    ? "Enter a server name to enable OAuth login."
+    : (servers[newServerName]?.transport ?? newServer.transport) === "stdio"
+      ? "OAuth login is only supported for remote (http/sse) MCP servers."
+      : undefined;
+  const newServerOauthLogin = useMCPOAuthLogin({
+    api,
+    isDesktop: !!window.api,
+    serverName: newServerName,
+    pendingServer: newServerOauthPendingServer,
+    onSuccess: async () => {
+      setMcpOauthRefreshNonce((prev) => prev + 1);
+      if (!api) return;
+      // Re-read config rather than trusting the `servers` snapshot: if another writer added
+      // this name during the browser round-trip, only refresh that row's test result so we
+      // never overwrite its config with the draft.
+      const current = (await api.mcp.list({})) ?? {};
+      if (current[newServerName]) {
+        // Install the fresh list so the row is visible before its test result lands.
+        await refresh();
+        await handleTest(newServerName);
+        return;
+      }
+      // The user already named the server and authorized it in the browser.
+      // Add it now so they don't have to remember to click "Add" afterwards.
+      await handleAddServer();
+    },
+  });
+  const newServerOauthPending = newServerOauthLogin.loginInProgress;
+  // With no flow in flight, cancelLogin() is a pure state reset.
+  const resetNewServerOauthLogin = newServerOauthLogin.cancelLogin;
+
+  const handleTestNewServer = useCallback(async () => {
+    if (!api || !newServer.value.trim()) return;
+    setTestingNew(true);
+    setNewTestResult(null);
+    // The login controller outlives the callout, so drop any status left over from a
+    // previous draft; the callout must describe the server being tested now.
+    resetNewServerOauthLogin();
+
+    try {
+      const { headers, validation } =
+        newServer.transport === "stdio"
+          ? { headers: undefined, validation: { errors: [], warnings: [] } }
+          : mcpHeaderRowsToRecord(newServer.headersRows, {
+              knownSecretKeys: new Set(globalSecretKeys),
+            });
+
+      if (validation.errors.length > 0) {
+        throw new Error(validation.errors[0]);
+      }
+
+      const pendingName = newServer.name.trim();
+
+      const result = await api.mcp.test({
+        ...(newServer.transport === "stdio"
+          ? { command: newServer.value.trim() }
+          : {
+              ...(pendingName ? { name: pendingName } : {}),
+              transport: newServer.transport,
+              url: newServer.value.trim(),
+              headers,
+            }),
+      });
+
+      setNewTestResult({ result, testedAt: Date.now() });
+    } catch (err) {
+      setNewTestResult({
+        result: { success: false, error: err instanceof Error ? err.message : "Test failed" },
+        testedAt: Date.now(),
+      });
+    } finally {
+      setTestingNew(false);
+    }
+  }, [
+    api,
+    newServer.name,
+    newServer.transport,
+    newServer.value,
+    newServer.headersRows,
+    globalSecretKeys,
+    resetNewServerOauthLogin,
+  ]);
 
   const editHeadersValidation =
     editing && editing.transport !== "stdio"
@@ -1480,6 +1552,7 @@ export const MCPSettingsSection: React.FC = () => {
                     placeholder="e.g., memory"
                     value={newServer.name}
                     onChange={(e) => setNewServer((prev) => ({ ...prev, name: e.target.value }))}
+                    disabled={newServerOauthPending}
                     className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 text-sm focus:outline-none"
                   />
                 </div>
@@ -1488,6 +1561,7 @@ export const MCPSettingsSection: React.FC = () => {
                   <label className="text-muted mb-1 block text-xs">Transport</label>
                   <Select
                     value={newServer.transport}
+                    disabled={newServerOauthPending}
                     onValueChange={(value) =>
                       setNewServer((prev) => ({
                         ...prev,
@@ -1530,6 +1604,7 @@ export const MCPSettingsSection: React.FC = () => {
                     value={newServer.value}
                     onChange={(e) => setNewServer((prev) => ({ ...prev, value: e.target.value }))}
                     spellCheck={false}
+                    disabled={newServerOauthPending}
                     className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
                   />
                 </div>
@@ -1546,7 +1621,7 @@ export const MCPSettingsSection: React.FC = () => {
                         }))
                       }
                       secretKeys={globalSecretKeys}
-                      disabled={addingServer || testingNew}
+                      disabled={addingServer || testingNew || newServerOauthPending}
                     />
                   </div>
                 )}
@@ -1588,50 +1663,9 @@ export const MCPSettingsSection: React.FC = () => {
                   !newTestResult.result.success &&
                   newTestResult.result.oauthChallenge && (
                     <div className="mt-2">
-                      <MCPOAuthRequiredCallout
-                        serverName={newServer.name.trim()}
-                        pendingServer={(() => {
-                          const pendingName = newServer.name.trim();
-                          if (!pendingName) {
-                            return undefined;
-                          }
-
-                          // If the server already exists in config, prefer that config for OAuth.
-                          const existing = servers[pendingName];
-                          if (existing) {
-                            return undefined;
-                          }
-
-                          if (newServer.transport === "stdio") {
-                            return undefined;
-                          }
-
-                          const url = newServer.value.trim();
-                          if (!url) {
-                            return undefined;
-                          }
-
-                          return { transport: newServer.transport, url };
-                        })()}
-                        disabledReason={(() => {
-                          const pendingName = newServer.name.trim();
-                          if (!pendingName) {
-                            return "Enter a server name to enable OAuth login.";
-                          }
-
-                          const existing = servers[pendingName];
-
-                          const transport = existing?.transport ?? newServer.transport;
-                          if (transport === "stdio") {
-                            return "OAuth login is only supported for remote (http/sse) MCP servers.";
-                          }
-
-                          return undefined;
-                        })()}
-                        onLoginSuccess={async () => {
-                          setMcpOauthRefreshNonce((prev) => prev + 1);
-                          await handleTestNewServer();
-                        }}
+                      <MCPOAuthRequiredCalloutView
+                        login={newServerOauthLogin}
+                        disabledReason={newServerOauthDisabledReason}
                       />
                     </div>
                   )}
@@ -1640,7 +1674,7 @@ export const MCPSettingsSection: React.FC = () => {
                     variant="outline"
                     size="sm"
                     onClick={() => void handleTestNewServer()}
-                    disabled={!canTest || testingNew}
+                    disabled={!canTest || testingNew || newServerOauthPending}
                   >
                     {testingNew ? (
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -1652,7 +1686,7 @@ export const MCPSettingsSection: React.FC = () => {
                   <Button
                     size="sm"
                     onClick={() => void handleAddServer()}
-                    disabled={!canAdd || addingServer}
+                    disabled={!canAdd || addingServer || newServerOauthPending}
                   >
                     {addingServer ? (
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
