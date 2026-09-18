@@ -174,7 +174,9 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
 
   /** Report a fixed recorded usage (threshold 90%, no force) so the routed pending-payload estimate decides. */
   function stubCompactionMonitor(session: object, usagePercentage: number): void {
-    (session as { compactionMonitor: unknown }).compactionMonitor = {
+    (
+      session as unknown as { contextController: { compactionMonitor: unknown } }
+    ).contextController.compactionMonitor = {
       checkBeforeSend: mock(() => ({
         shouldShowWarning: false,
         shouldForceCompact: false,
@@ -190,7 +192,9 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
 
   /** Force the next send onto the on-send compaction path (mirrors the autoCompaction fixtures). */
   function forceOnSendCompaction(session: object): void {
-    (session as { compactionMonitor: unknown }).compactionMonitor = {
+    (
+      session as unknown as { contextController: { compactionMonitor: unknown } }
+    ).contextController.compactionMonitor = {
       checkBeforeSend: mock(() => ({
         shouldShowWarning: true,
         shouldForceCompact: true,
@@ -815,7 +819,9 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     // untrusted project — only the attachment channel is under test.
     const withReader = session as unknown as {
       buildSkillReader: (...args: unknown[]) => (skillName: string) => Promise<ResolvedAgentSkill>;
-      compactionHandler: { peekPendingState: () => Promise<unknown> };
+      contextController: {
+        transitionalCompactionHandler: { peekPendingState: () => Promise<unknown> };
+      };
     };
     const originalBuild = withReader.buildSkillReader.bind(session);
     spyOn(withReader, "buildSkillReader").mockImplementation((...args: unknown[]) => {
@@ -825,7 +831,10 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
         return { ...resolved, package: { ...resolved.package, scope: "global" as const } };
       };
     });
-    spyOn(withReader.compactionHandler, "peekPendingState").mockResolvedValue({
+    spyOn(
+      withReader.contextController.transitionalCompactionHandler,
+      "peekPendingState"
+    ).mockResolvedValue({
       diffs: [],
       loadedSkills: extras?.loadedSkills ?? pendingLoadedSkills,
       readFiles: [],
@@ -2196,16 +2205,25 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
         setCompactionStage: (token: symbol, stage: string) => void;
         finishCompactionObservation: (token: symbol) => boolean;
       };
-      finishContinuousCompaction: (
-        applied: boolean,
-        context: unknown,
-        token: symbol
-      ) => Promise<void>;
-      buildContinuousCompactionFollowUp: (context: unknown) => { routedProjectConsent?: boolean };
+      // The continuous strategy owns the fold's follow-up and recovery send;
+      // the session only dispatches them (SessionContextHost.sendCompactionRequest).
+      contextController: {
+        continuous: {
+          finishContinuousCompaction: (
+            applied: boolean,
+            context: unknown,
+            token: symbol
+          ) => Promise<void>;
+          buildContinuousCompactionFollowUp: (context: unknown) => {
+            routedProjectConsent?: boolean;
+          };
+        };
+      };
     };
-    expect(internals.buildContinuousCompactionFollowUp(context).routedProjectConsent).toBe(true);
+    const strategy = internals.contextController.continuous;
+    expect(strategy.buildContinuousCompactionFollowUp(context).routedProjectConsent).toBe(true);
     expect(
-      internals.buildContinuousCompactionFollowUp({ ...context, routedConsentRejection: undefined })
+      strategy.buildContinuousCompactionFollowUp({ ...context, routedConsentRejection: undefined })
         .routedProjectConsent
     ).toBeUndefined();
 
@@ -2214,7 +2232,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     if (token == null) throw new Error("expected a compaction observation token");
     internals.coordinator.setCompactionStage(token, "stopping");
     internals.coordinator.setCompactionStage(token, "stopped");
-    await internals.finishContinuousCompaction(false, context, token);
+    await strategy.finishContinuousCompaction(false, context, token);
     internals.coordinator.finishCompactionObservation(token);
     expect(sendSpy).toHaveBeenCalledTimes(1);
     const internal = sendSpy.mock.calls[0][2] as { inheritedConsentRejection?: unknown };
@@ -2922,7 +2940,11 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     ).mockResolvedValue({ text: "summary", model: USER_MODEL });
     type Row = ReturnType<typeof createMuxMessage>;
     const deps = Reflect.get(
-      (session as unknown as { continuousCompactor: object }).continuousCompactor,
+      (
+        session as unknown as {
+          contextController: { continuous: { continuousCompactor: object } };
+        }
+      ).contextController.continuous.continuousCompactor,
       "deps"
     ) as {
       summarize(
@@ -3203,11 +3225,13 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       // ...nothing project-scoped rode into the carried-over pending state...
       const pending = await (
         session as unknown as {
-          compactionHandler: {
-            peekPendingState: () => Promise<{ loadedSkills: Array<{ name: string }> } | null>;
+          contextController: {
+            compaction: {
+              peekPendingState: () => Promise<{ loadedSkills: Array<{ name: string }> } | null>;
+            };
           };
         }
-      ).compactionHandler.peekPendingState();
+      ).contextController.compaction.peekPendingState();
       expect(pending?.loadedSkills.some((skill) => skill.name === "done") ?? false).toBe(false);
       // ...and the sidecar is a valid document again.
       expect((await readDurableRejectedTurnKeys(preferencePath)).success).toBe(true);
@@ -3230,8 +3254,10 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     const internals = session as unknown as {
       pendingRejectedTurnRepair: { userMessageIds: string[] } | null;
       loadAutoRetryEnabledPreference: () => Promise<boolean>;
-      compactionHandler: {
-        peekPendingState: () => Promise<{ loadedSkills: Array<{ name: string }> } | null>;
+      contextController: {
+        compaction: {
+          peekPendingState: () => Promise<{ loadedSkills: Array<{ name: string }> } | null>;
+        };
       };
     };
     await internals.loadAutoRetryEnabledPreference();
@@ -3253,7 +3279,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     }
     expect(internals.pendingRejectedTurnRepair).toBeNull();
     // ...and nothing project-scoped rode into the carried-over pending state.
-    const pending = await internals.compactionHandler.peekPendingState();
+    const pending = await internals.contextController.compaction.peekPendingState();
     expect(pending?.loadedSkills.some((skill) => skill.name === "done") ?? false).toBe(false);
     await session.dispose();
   });
