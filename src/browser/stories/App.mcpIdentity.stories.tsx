@@ -5,6 +5,7 @@ import { appMeta, AppWithMocks, type AppStory } from "./meta";
 import { expandLeftSidebar, selectWorkspace } from "./helpers/uiState";
 import { createMockORPCClient } from "./mocks/orpc";
 import { createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
+import notionIcon from "./assets/notion-mcp.png?inline";
 
 export default {
   ...appMeta,
@@ -14,7 +15,7 @@ export default {
     docs: {
       description: {
         component:
-          "Server-reported identity (text only) in MCP settings rows and the workspace MCP dialog. Branding appears after a connection test and lives in memory for the current configuration load; the configured key stays the primary label.",
+          "Server-reported identity and host-decoded icons in MCP settings rows and the workspace MCP dialog. Branding appears after a connection test and lives in memory for the current configuration load; the configured key stays the primary label.",
       },
     },
   },
@@ -23,6 +24,10 @@ export default {
 const NOTION = "notion-work";
 const LOCAL = "local-docs";
 const INFO_BUTTON = `Server information: ${NOTION}`;
+// Notion's SVG logo rasterized by the host's strict icon pipeline (62×64 PNG).
+// ?inline yields the data URL shape the badge accepts (isPngDataUrl), so the
+// story exercises the real render path without a story-only production API.
+const NOTION_ICON: string = notionIcon;
 
 function setupIdentityStory(transport: "http" | "auto" = "http") {
   expandLeftSidebar();
@@ -34,6 +39,7 @@ function setupIdentityStory(transport: "http" | "auto" = "http") {
   selectWorkspace(workspace);
   // Branding is never persisted; start every story from an empty test cache.
   updatePersistedState(getMCPTestResultsKey("__global__"), {});
+  updatePersistedState(getMCPTestResultsKey(workspace.projectPath, workspace.id), {});
   return createMockORPCClient({
     projects: groupWorkspacesByProject([workspace]),
     workspaces: [workspace],
@@ -52,6 +58,7 @@ function setupIdentityStory(transport: "http" | "auto" = "http") {
         {
           success: true,
           tools: ["notion_ai_search", "notion_fetch", "notion_create_pages"],
+          icon: NOTION_ICON,
           serverInfo: {
             name: "Notion MCP",
             version: "1.2.0",
@@ -101,7 +108,10 @@ async function testBothServers(root: HTMLElement) {
       within(serverRow(root, name)).getByRole("button", { name: "Test connection" })
     );
   }
-  await within(serverRow(root, NOTION)).findByRole("button", { name: INFO_BUTTON });
+  const badge = await within(serverRow(root, NOTION)).findByRole("button", {
+    name: INFO_BUTTON,
+  });
+  await expect(badge.querySelector("img")).toHaveAttribute("src", NOTION_ICON);
   await within(serverRow(root, NOTION)).findByText("3 tools");
   await within(serverRow(root, LOCAL)).findByText("2 tools");
   await expect(
@@ -134,6 +144,7 @@ export const SettingsServerDetails: AppStory = {
     await testBothServers(canvasElement);
     await userEvent.click(within(canvasElement).getByRole("button", { name: INFO_BUTTON }));
     const popover = await within(document.body).findByRole("dialog", { name: `About ${NOTION}` });
+    await expect(popover.querySelector("img")).toHaveAttribute("src", NOTION_ICON);
     await expect(popover).toHaveTextContent("Notion MCP");
     await expect(popover).toHaveTextContent("v1.2.0");
     await expect(popover).toHaveTextContent("http · https://mcp.notion.com");
@@ -188,9 +199,23 @@ export const WorkspaceModalAfterFetch: AppStory = {
     );
     await expect(within(row).queryByRole("button", { name: INFO_BUTTON })).not.toBeInTheDocument();
     await userEvent.click(within(row).getByRole("button", { name: "Fetch Tools" }));
-    await within(row).findByRole("button", { name: INFO_BUTTON });
+    const badge = await within(row).findByRole("button", { name: INFO_BUTTON });
+    await expect(badge.querySelector("img")).toHaveAttribute("src", NOTION_ICON);
     await waitFor(() =>
       expect(within(row).getByRole("button", { name: "Refresh Tools" })).toBeVisible()
     );
+  },
+};
+
+export const WorkspaceModalPhone: AppStory = {
+  ...WorkspaceModalAfterFetch,
+  globals: phoneGlobals,
+  parameters: phoneParameters,
+  play: async (context) => {
+    await expect(context.parameters.pixel).toEqual(phoneParameters.pixel);
+    await WorkspaceModalAfterFetch.play?.(context);
+    if (window.innerWidth < 768) {
+      await expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
+    }
   },
 };
