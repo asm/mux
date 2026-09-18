@@ -3,7 +3,6 @@ import { describe, expect, test, mock, spyOn } from "bun:test";
 import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
-import { AgentSession } from "./agentSession";
 import type { Config } from "@/node/config";
 import { createTestHistoryService } from "./testHistoryService";
 import type { AIService } from "./aiService";
@@ -18,7 +17,11 @@ import {
   startAbandonedBranchSummaryInBackground,
   type BranchSummaryAiService,
 } from "./branchSummary";
-import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  createStreamLifecycleMocks,
+  createTestAgentSession,
+} from "./agentSession.testHarness";
 import type { StreamMessageOptions } from "./aiService";
 import type { TurnCompletion } from "./streamManager";
 import type { TurnCoordinator } from "./turnCoordinator";
@@ -76,7 +79,7 @@ describe("AgentSession disposal race conditions", () => {
       sessionsDir: "/tmp",
     } as unknown as Config;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId: "ws",
       config,
       historyService,
@@ -177,7 +180,7 @@ describe("AgentSession disposal race conditions", () => {
       }
     );
     try {
-      const session = new AgentSession({
+      const session = createTestAgentSession({
         workspaceId,
         config,
         historyService,
@@ -299,7 +302,7 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId: "ws",
       config,
       historyService,
@@ -381,7 +384,7 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId: "ws",
       config,
       historyService,
@@ -470,7 +473,7 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId: "ws",
       config,
       historyService,
@@ -613,7 +616,7 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId: "ws",
       config,
       historyService,

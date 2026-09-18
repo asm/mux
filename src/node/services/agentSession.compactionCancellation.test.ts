@@ -2,7 +2,7 @@ import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as fileIO from "node:fs/promises";
 import * as path from "node:path";
-import * as atomicWrite from "write-file-atomic";
+import * as atomicWrite from "@/node/utils/writeFileAtomic";
 import { historyWriteLockPath } from "./workspaceRemoval";
 import assert from "@/common/utils/assert";
 import nodeAssert from "node:assert/strict";
@@ -30,17 +30,21 @@ const options = { model: "openai:gpt-4o", agentId: "exec" };
 const fixtures: AgentSessionHarness[] = [];
 
 interface Internals {
-  compactionMonitor: CompactionMonitor;
+  contextController: {
+    compactionMonitor: CompactionMonitor;
+    continuous: {
+      continuousCompactor: ContinuousCompactor;
+      recoverCompaction(): Promise<boolean>;
+      observeCompaction(
+        ...args: Parameters<ContinuousCompactor["observe"]>
+      ): ReturnType<ContinuousCompactor["observe"]>;
+    };
+    summarize: { interruptForCompaction(): Promise<void> };
+  };
   coordinator: TurnCoordinator;
   compactionCancellation: CompactionCancellation;
   fileChangeTracker: FileChangeTracker;
-  continuousCompactor: ContinuousCompactor;
-  recoverCompaction(): Promise<boolean>;
-  interruptForCompaction(): Promise<void>;
   compactionRecoveryBlocked(): Promise<boolean>;
-  observeCompaction(
-    ...args: Parameters<ContinuousCompactor["observe"]>
-  ): ReturnType<ContinuousCompactor["observe"]>;
   dispatchPendingFollowUp(): Promise<boolean>;
   scheduleStartupAutoRetryIfNeeded(): Promise<string>;
 }
@@ -71,6 +75,68 @@ afterEach(async () => {
 });
 
 describe("compaction cancellation runtime", () => {
+  test.each([
+    { abandonPartial: false, pending: false },
+    { abandonPartial: true, pending: false },
+    { abandonPartial: false, pending: true },
+  ])(
+    "public interrupt preserves synchronous reset order (%j)",
+    async ({ abandonPartial, pending }) => {
+      const h = await fixture();
+      const budget = h.session as unknown as {
+        clearContextBudgetState(): void;
+        contextBudgetGeneration: number;
+        contextBudgetWarningClaimed: boolean;
+        contextBudgetFlushClaimed: boolean;
+      };
+      budget.contextBudgetWarningClaimed = true;
+      budget.contextBudgetFlushClaimed = true;
+      const generation = budget.contextBudgetGeneration;
+      const token = pending ? h.state.coordinator.beginCompactionObservation("continuous") : null;
+      if (pending) {
+        assert(token != null);
+        h.state.coordinator.setCompactionStage(token, "stopping");
+        expect(h.state.coordinator.midStreamCompactionPending).toBe(true);
+      }
+      const order: string[] = [];
+      const clear = budget.clearContextBudgetState.bind(budget);
+      spyOn(budget, "clearContextBudgetState").mockImplementation(() => {
+        order.push("budget");
+        clear();
+      });
+      const abandon = h.state.coordinator.abandonCompaction.bind(h.state.coordinator);
+      spyOn(h.state.coordinator, "abandonCompaction").mockImplementation(() => {
+        order.push("abandon");
+        abandon();
+      });
+      const compactor = h.state.contextController.continuous.continuousCompactor;
+      const reset = compactor.reset.bind(compactor);
+      spyOn(compactor, "reset").mockImplementation((reason) => {
+        order.push(reason);
+        reset(reason);
+      });
+      const stopping = h.session.interruptStream({ abandonPartial });
+      try {
+        // No await: admission and stale-work invalidation must precede the physical stop.
+        expect(budget.contextBudgetGeneration).toBe(generation + 1);
+        expect(budget.contextBudgetWarningClaimed).toBe(false);
+        expect(budget.contextBudgetFlushClaimed).toBe(false);
+        // Ordinary Stop cancels compaction before budget cleanup. The later abandon branch
+        // remains separate: moving either reset would change its synchronous admission fence.
+        expect(order).toEqual([
+          "abandon",
+          "user-interrupt",
+          "budget",
+          ...(abandonPartial || pending ? ["abandon", "user-interrupt"] : []),
+        ]);
+        expect((await stopping).success).toBe(true);
+      } finally {
+        await stopping;
+        if (token != null) h.state.coordinator.finishCompactionObservation(token);
+      }
+    }
+  );
+
   test("an unsupported scoped V2 cannot authorize legacy compaction", async () => {
     const h = await fixture();
     await h.session.cancelCompaction();
@@ -97,8 +163,8 @@ describe("compaction cancellation runtime", () => {
     });
     await fileIO.writeFile(h.storage.path, unsupported);
     const before = await h.rows();
-    spyOn(h.state.compactionMonitor, "getThreshold").mockReturnValue(0.7);
-    spyOn(h.state.compactionMonitor, "checkBeforeSend").mockReturnValue({
+    spyOn(h.state.contextController.compactionMonitor, "getThreshold").mockReturnValue(0.7);
+    spyOn(h.state.contextController.compactionMonitor, "checkBeforeSend").mockReturnValue({
       shouldShowWarning: true,
       shouldForceCompact: true,
       usagePercentage: 95,
@@ -145,8 +211,8 @@ describe("compaction cancellation runtime", () => {
         .dispatchPendingCompactionFollowUpIfNeeded()
         .catch((error: unknown) => String(error));
       expect(failedCleanup).toContain("injected cleanup failure");
-      spyOn(h.state.compactionMonitor, "getThreshold").mockReturnValue(0.7);
-      spyOn(h.state.compactionMonitor, "checkBeforeSend").mockReturnValue({
+      spyOn(h.state.contextController.compactionMonitor, "getThreshold").mockReturnValue(0.7);
+      spyOn(h.state.contextController.compactionMonitor, "checkBeforeSend").mockReturnValue({
         shouldShowWarning: usagePercentage > 70,
         shouldForceCompact: usagePercentage > 70,
         usagePercentage,
@@ -187,8 +253,8 @@ describe("compaction cancellation runtime", () => {
 
   test("automatic input still starts legacy compaction without cancellation debt", async () => {
     const h = await fixture();
-    spyOn(h.state.compactionMonitor, "getThreshold").mockReturnValue(0.7);
-    spyOn(h.state.compactionMonitor, "checkBeforeSend").mockReturnValue({
+    spyOn(h.state.contextController.compactionMonitor, "getThreshold").mockReturnValue(0.7);
+    spyOn(h.state.contextController.compactionMonitor, "checkBeforeSend").mockReturnValue({
       shouldShowWarning: true,
       shouldForceCompact: true,
       usagePercentage: 95,
@@ -1979,12 +2045,13 @@ describe("compaction cancellation runtime", () => {
         await h.session.cancelCompaction();
         return blocked;
       });
-      const recover = spyOn(h.state.continuousCompactor, "recover").mockResolvedValue(true);
-      const observe = spyOn(h.state.continuousCompactor, "observe").mockResolvedValue("applied");
+      const strategy = h.state.contextController.continuous;
+      const recover = spyOn(strategy.continuousCompactor, "recover").mockResolvedValue(true);
+      const observe = spyOn(strategy.continuousCompactor, "observe").mockResolvedValue("applied");
       expect(
         kind === "recover"
-          ? await h.state.recoverCompaction()
-          : await h.state.observeCompaction(95, {
+          ? await strategy.recoverCompaction()
+          : await strategy.observeCompaction(95, {
               enabled: true,
               model: options.model,
               contextWindowTokens: 100_000,
@@ -2035,7 +2102,7 @@ describe("compaction cancellation runtime", () => {
       completion.resolve({ status: "aborted", abortReason: "system" });
       return Ok(undefined);
     });
-    const compact = h.state.interruptForCompaction();
+    const compact = h.state.contextController.summarize.interruptForCompaction();
     try {
       await entered.promise;
       await h.session.cancelCompaction();
@@ -2547,8 +2614,9 @@ describe("compaction cancellation runtime", () => {
       fixtures.push(fresh);
       const freshStream = spyOn(fresh.aiService, "streamMessage");
       const state = fresh.session as unknown as Internals;
-      const recovery = spyOn(state.continuousCompactor, "recover");
-      expect(await state.recoverCompaction()).toBe(false);
+      const strategy = state.contextController.continuous;
+      const recovery = spyOn(strategy.continuousCompactor, "recover");
+      expect(await strategy.recoverCompaction()).toBe(false);
       expect(await state.scheduleStartupAutoRetryIfNeeded()).toBe("completed");
       expect(await state.dispatchPendingFollowUp()).toBe(false);
       expect(recovery).not.toHaveBeenCalled();

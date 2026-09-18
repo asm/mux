@@ -6,6 +6,7 @@ import type { Config } from "@/node/config";
 
 import type { AIService } from "./aiService";
 import { AgentSession } from "./agentSession";
+import { ContextManagementService } from "./contextManagement/contextManagementService";
 import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { InitStateManager } from "./initStateManager";
@@ -70,6 +71,11 @@ describe("AgentSession queued delivery", () => {
       config,
       historyService: created.historyService,
       aiService,
+      contextManagement: new ContextManagementService({
+        config,
+        historyService: created.historyService,
+        aiService,
+      }),
       initStateManager,
       backgroundProcessManager,
     });

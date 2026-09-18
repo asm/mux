@@ -1,4 +1,3 @@
-import { HistoryCursorStore } from "./historyCursor";
 import {
   HistoryAppendProvenance,
   HISTORY_PROVENANCE_MAX_RECEIPT_BYTES,
@@ -52,7 +51,7 @@ import {
   type CompactionReplacementOperation,
   type CompactionReplacementOutcome,
 } from "./compactionCancellation";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import assert from "node:assert";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { Result } from "@/common/types/result";
@@ -370,9 +369,45 @@ interface SubagentTranscriptDependencies {
   aiService: Pick<AIService, "getWorkspaceMetadata">;
 }
 
-export class HistoryService {
-  readonly cursors = new HistoryCursorStore();
+/**
+ * Overlay partial.json onto persisted history rows. The row sharing the partial's
+ * historySequence is the in-flight turn's placeholder; the partial replaces it only when it
+ * carries more parts. The partial and history are read without a shared lock, so a partial
+ * read just before commitPartial can be staler than the durable row the history read then
+ * sees; the part-count guard keeps the fuller durable row in that window.
+ */
+export function mergeTranscriptPartial(
+  messages: MuxMessage[],
+  partial: MuxMessage | null
+): MuxMessage[] {
+  if (!partial) return messages;
 
+  const partialSeq = partial.metadata?.historySequence;
+  if (partialSeq === undefined) return [...messages, partial];
+
+  const existingIndex = messages.findIndex(
+    (message) => message.metadata?.historySequence === partialSeq
+  );
+  if (existingIndex >= 0) {
+    const existing = messages[existingIndex];
+    if ((partial.parts?.length ?? 0) <= (existing.parts?.length ?? 0)) return messages;
+    const next = [...messages];
+    next[existingIndex] = partial;
+    return next;
+  }
+
+  const insertIndex = messages.findIndex((message) => {
+    const sequence = message.metadata?.historySequence;
+    return typeof sequence === "number" && sequence > partialSeq;
+  });
+  if (insertIndex < 0) return [...messages, partial];
+
+  const next = [...messages];
+  next.splice(insertIndex, 0, partial);
+  return next;
+}
+
+export class HistoryService {
   private getAppendProvenance(workspaceId: string): HistoryAppendProvenance {
     return new HistoryAppendProvenance(this.getSessionDir(workspaceId));
   }
@@ -1009,34 +1044,6 @@ export class HistoryService {
     }
   }
 
-  private mergeTranscriptPartial(messages: MuxMessage[], partial: MuxMessage | null): MuxMessage[] {
-    if (!partial) return messages;
-
-    const partialSeq = partial.metadata?.historySequence;
-    if (partialSeq === undefined) return [...messages, partial];
-
-    const existingIndex = messages.findIndex(
-      (message) => message.metadata?.historySequence === partialSeq
-    );
-    if (existingIndex >= 0) {
-      const existing = messages[existingIndex];
-      if ((partial.parts?.length ?? 0) <= (existing.parts?.length ?? 0)) return messages;
-      const next = [...messages];
-      next[existingIndex] = partial;
-      return next;
-    }
-
-    const insertIndex = messages.findIndex((message) => {
-      const sequence = message.metadata?.historySequence;
-      return typeof sequence === "number" && sequence > partialSeq;
-    });
-    if (insertIndex < 0) return [...messages, partial];
-
-    const next = [...messages];
-    next.splice(insertIndex, 0, partial);
-    return next;
-  }
-
   private async readTranscriptFromPaths(params: {
     workspaceId: string;
     chatPath?: string;
@@ -1066,7 +1073,7 @@ export class HistoryService {
     if (!messages && !archivedMessages && !partial) {
       throw new Error("Transcript not found (missing " + params.logLabel + ")");
     }
-    return this.mergeTranscriptPartial([...(archivedMessages ?? []), ...(messages ?? [])], partial);
+    return mergeTranscriptPartial([...(archivedMessages ?? []), ...(messages ?? [])], partial);
   }
 
   private async findSubagentTranscriptByScanningSessions(taskId: string): Promise<{

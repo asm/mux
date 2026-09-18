@@ -75,6 +75,7 @@ ESBUILD_SERVER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --
 
 # Common esbuild flags for tokenizer worker bundle used by server-bundle runtime.
 ESBUILD_TOKENIZER_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/tokenizer.worker.js --minify
+ESBUILD_MCP_ICON_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/mcpIconDecode.js --external:sharp --minify
 
 # Include formatting rules
 include fmt.mk
@@ -310,11 +311,12 @@ build-static: ## Copy static assets to dist
 		cp "$$f" "dist/typescript-lib/$$(basename $$f).txt"; \
 	done
 
-build-docker-runtime: build-main build-renderer build-static dist/runtime/server-bundle.js dist/runtime/tokenizer.worker.js dist/static/.copied ## Build Docker runtime artifacts
+build-docker-runtime: build-main build-renderer build-static dist/runtime/server-bundle.js dist/runtime/tokenizer.worker.js dist/runtime/mcpIconDecode.js dist/static/.copied ## Build Docker runtime artifacts
 
 verify-docker-runtime-artifacts: build-docker-runtime ## Verify required Docker runtime artifacts exist
 	@test -f dist/runtime/server-bundle.js
 	@test -f dist/runtime/tokenizer.worker.js
+	@test -f dist/runtime/mcpIconDecode.js
 	@test -f dist/static/splash.html
 	@test -f dist/typescript-lib/lib.es2023.d.ts.txt
 
@@ -333,6 +335,18 @@ dist/runtime/tokenizer.worker.js: build-main
 	@test -f dist/node/utils/main/tokenizer.worker.js
 	@mkdir -p dist/runtime
 	@$(ESBUILD_BIN) dist/node/utils/main/tokenizer.worker.js $(ESBUILD_TOKENIZER_WORKER_FLAGS)
+
+# The disposable icon decoder must remain a separate process in bundled runtimes.
+dist/runtime/mcpIconDecode.js: build-main
+	@echo "Bundling MCP icon decoder for Docker..."
+	@test -f dist/node/workers/mcpIconDecode.js
+	@mkdir -p dist/runtime
+	@$(ESBUILD_BIN) dist/node/workers/mcpIconDecode.js $(ESBUILD_MCP_ICON_WORKER_FLAGS)
+
+.PHONY: test-mcp-icon-electron
+test-mcp-icon-electron: dist/runtime/mcpIconDecode.js ## Verify emitted and bundled icon workers with Electron's executable
+	@MCP_ICON_TEST_EXEC_PATH="$$(bun -p 'require("electron")')" MCP_ICON_TEST_WORKER_PATH="$(CURDIR)/dist/node/workers/mcpIconDecode.js" bun test src/node/services/mcpIconDecodeClient.test.ts
+	@MCP_ICON_TEST_EXEC_PATH="$$(bun -p 'require("electron")')" MCP_ICON_TEST_WORKER_PATH="$(CURDIR)/dist/runtime/mcpIconDecode.js" bun test src/node/services/mcpIconDecodeClient.test.ts
 
 # Docker runtime keeps static assets under dist/static/ for compatibility with existing image layout.
 dist/static/.copied: static/splash.html
@@ -421,6 +435,18 @@ typecheck: node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(
 		"$(TSGO) --noEmit" \
 		"$(TSGO) --noEmit -p tsconfig.main.json"
 endif
+
+PERF_REPETITIONS ?= 3
+.PHONY: perf-workspace-scale
+perf-workspace-scale: build-main ## Benchmark workspace-scale startup, RPCs, and config I/O (Linux)
+	@set -eu; fixtures=$$(mktemp -d); trap 'rm -rf "$$fixtures"' EXIT; \
+	for spec in "realistic 1801 41 0.70 real-1801-a70 2" "realistic 1801 41 0 real-1801-a0 1" "realistic 546 41 0 real-546-a0 2" "minimal 1801 41 0.70 min-1801-a70 1" "realistic 50 5 0 real-50-a0 1"; do \
+		read -r profile count projects archived label launches <<< "$$spec"; \
+		root="$$fixtures/$$label"; \
+		bun scripts/perf/workspace-scale/generate-fixture.ts --root "$$root" --workspaces "$$count" --projects "$$projects" --archived "$$archived" --profile "$$profile"; \
+		bun scripts/perf/workspace-scale/config-micro.ts --root "$$root" --label "$$label"; \
+		bun scripts/perf/workspace-scale/run-server-bench.ts --root "$$root" --label "$$label" --repetitions $(PERF_REPETITIONS) --launches "$$launches"; \
+	done
 
 check-deadcode: node_modules/.installed ## Check for potential dead code (manual only, not in static-check)
 	@echo "Checking for potential dead code with ts-prune..."

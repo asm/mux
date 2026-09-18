@@ -1023,6 +1023,15 @@ export const router = (authToken?: string) => {
         .output(schemas.mcp.test.output)
         .handler(({ context, input }) => context.mcpServerManager.testForApi(input)),
 
+      icon: t
+        .input(schemas.mcp.icon.input)
+        .output(schemas.mcp.icon.output)
+        .handler(({ context, input }) => context.mcpServerManager.getIcon(input.iconRef)),
+      icons: t
+        .input(schemas.mcp.icons.input)
+        .output(schemas.mcp.icons.output)
+        .handler(({ context, input }) => context.mcpServerManager.getIcons(input.iconRefs)),
+
       setEnabled: t
         .input(schemas.mcp.setEnabled.input)
         .output(schemas.mcp.setEnabled.output)
@@ -1357,9 +1366,16 @@ export const router = (authToken?: string) => {
       generate: t
         .input(schemas.nameGeneration.generate.input)
         .output(schemas.nameGeneration.generate.output)
-        .handler(({ context, input }) =>
-          generateWorkspaceIdentity(input.message, input.candidates, context.aiService)
-        ),
+        .handler(async ({ context, input }) => {
+          // Pre-creation naming has no workspace yet: the configured naming
+          // agent (model + thinking) still leads; the caller's models only fill
+          // in after the built-in fallbacks.
+          const candidates = await context.workspaceService.getWorkspaceNamingCandidates(
+            undefined,
+            input.candidates
+          );
+          return generateWorkspaceIdentity(input.message, candidates, context.aiService);
+        }),
     },
     coder: {
       getInfo: t

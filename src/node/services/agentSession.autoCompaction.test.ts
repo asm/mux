@@ -15,12 +15,14 @@ import { ProvidersConfigStore, type Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { InitStateManager } from "@/node/services/initStateManager";
-import { AgentSession } from "./agentSession";
+import type { AgentSession } from "./agentSession";
 import type { CompactionMonitor } from "./compactionMonitor";
+import { buildAutoCompactionFollowUp } from "./contextManagement/compactionRequests";
 import {
   createAgentSessionHarness,
   createStartedTurnHandle,
   createStreamLifecycleMocks,
+  createTestAgentSession,
 } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 
@@ -76,7 +78,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       materializeFileAtMentionsSnapshot: (
         text: string
       ) => Promise<{ snapshotMessage: MuxMessage; materializedTokens: string[] } | null>;
-      compactionMonitor: CompactionMonitor;
+      contextController: { compactionMonitor: CompactionMonitor };
     };
 
     internals.materializeFileAtMentionsSnapshot = mock((_text: string) =>
@@ -86,7 +88,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       })
     );
 
-    internals.compactionMonitor = {
+    internals.contextController.compactionMonitor = {
       checkBeforeSend: mock(() => ({
         shouldShowWarning: true,
         shouldForceCompact: true,
@@ -149,6 +151,62 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     await session.dispose();
   });
 
+  test.each(["continuousCompaction", "tokenBudget"] as const)(
+    "idle compaction publishes a summary under %s",
+    async (strategy) => {
+      const workspaceId = `idle-${strategy}`;
+      const model = "openai:gpt-4o";
+      const outcome = mock((_success: boolean) => undefined);
+      const h = await createAgentSessionHarness({ workspaceId, onIdleCompactionOutcome: outcome });
+      historyCleanup = h.cleanup;
+      try {
+        expect(
+          (
+            await h.historyService.appendToHistory(
+              workspaceId,
+              createMuxMessage("earlier-user", "user", "Preserve the earlier investigation")
+            )
+          ).success
+        ).toBe(true);
+        const stream = spyOn(h.aiService, "streamMessage");
+        expect(
+          (
+            await h.session.sendMessage("Summarize the idle workspace", {
+              model,
+              agentId: "compact",
+              experiments: { [strategy]: true },
+              muxMetadata: {
+                type: "compaction-request",
+                rawCommand: "/compact",
+                parsed: {},
+                source: "idle-compaction",
+              },
+            })
+          ).success
+        ).toBe(true);
+        expect(stream).toHaveBeenCalledTimes(1);
+        expect(stream.mock.calls[0][0].onStepSettled).toBeUndefined();
+        await runSessionTerminalPolicy(h.session, h.aiEmitter, {
+          type: "stream-end",
+          workspaceId,
+          messageId: "test-assistant-message",
+          parts: [{ type: "text", text: "The investigation is complete; retain its conclusions." }],
+          metadata: { model, agentId: "compact", finishReason: "stop" },
+        });
+        const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(history.success).toBe(true);
+        if (!history.success) throw new Error(history.error);
+        expect(history.data.filter((row) => row.metadata?.compactionBoundary)).toHaveLength(1);
+        expect(history.data[0].metadata?.compacted).toBe("idle");
+        expect(outcome).toHaveBeenCalledTimes(1);
+        expect(outcome).toHaveBeenCalledWith(true);
+        expect(stream).toHaveBeenCalledTimes(1);
+      } finally {
+        await h.session.dispose();
+      }
+    }
+  );
+
   test("tracks a compaction request when a synthetic snapshot follows it", async () => {
     const model = "openai:gpt-4o";
     const { session } = await createSessionHarness({
@@ -201,7 +259,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
 
     const internals = session as unknown as {
       materializeAgentSkillSnapshots: (...args: unknown[]) => Promise<MuxMessage[]>;
-      compactionMonitor: CompactionMonitor;
+      contextController: { compactionMonitor: CompactionMonitor };
     };
 
     // Materialization can execute skill dynamic-context directives (side effects),
@@ -210,7 +268,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const materializeSkillSnapshots = mock(() => Promise.resolve([]));
     internals.materializeAgentSkillSnapshots = materializeSkillSnapshots;
 
-    internals.compactionMonitor = {
+    internals.contextController.compactionMonitor = {
       checkBeforeSend: mock(() => ({
         shouldShowWarning: true,
         shouldForceCompact: true,
@@ -261,8 +319,10 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         if (!seedResult.success) throw new Error(seedResult.error);
       }
 
-      const internals = session as unknown as { compactionMonitor: CompactionMonitor };
-      internals.compactionMonitor = {
+      const internals = session as unknown as {
+        contextController: { compactionMonitor: CompactionMonitor };
+      };
+      internals.contextController.compactionMonitor = {
         checkBeforeSend: mock(() => ({
           shouldShowWarning: true,
           shouldForceCompact: true,
@@ -315,22 +375,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(unstamped).toBeUndefined();
   });
 
-  test("preserves goal kind and goal identity on auto-compaction follow-up requests", async () => {
-    const { session } = await createSessionHarness({
-      workspaceId: "ws-auto-compaction-goal-kind",
-    });
-
-    const followUp = (
-      session as unknown as {
-        buildAutoCompactionFollowUp: (params: {
-          messageText: string;
-          options: SendMessageOptions;
-          modelForStream: string;
-          goalKind?: typeof GOAL_CONTINUATION_KIND;
-          goalId?: string;
-        }) => CompactionFollowUpRequest;
-      }
-    ).buildAutoCompactionFollowUp({
+  test("preserves goal kind and goal identity on auto-compaction follow-up requests", () => {
+    // The builder is a pure shared helper now; no session fixture is needed to reach it.
+    const followUp = buildAutoCompactionFollowUp({
       messageText: "Continue goal",
       options: { model: "openai:gpt-4o", agentId: "exec" },
       modelForStream: "openai:gpt-4o",
@@ -342,7 +389,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cIv2E): the re-dispatched follow-up row must
     // stay goal-scoped instead of degrading to a legacy unscoped row.
     expect(followUp.goalId).toBe("goal-compaction-scope");
-    await session.dispose();
   });
 
   test("triggers on-send compaction at threshold even before force buffer", async () => {
@@ -358,7 +404,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       streamMessage: streamMessage as unknown as AIService["streamMessage"],
     });
 
-    (session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+    (
+      session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
+    ).contextController.compactionMonitor = {
       checkBeforeSend: mock(() => ({
         shouldShowWarning: true,
         shouldForceCompact: false,
@@ -412,7 +460,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       streamMessage: streamMessage as unknown as AIService["streamMessage"],
     });
 
-    (session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+    (
+      session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
+    ).contextController.compactionMonitor = {
       checkBeforeSend: mock(() => ({
         shouldShowWarning: true,
         shouldForceCompact: true,
@@ -858,7 +908,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       }),
     } as unknown as BackgroundProcessManager;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId,
       config,
       historyService,
@@ -875,7 +925,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     }));
     const checkMidStream = mock((_params: unknown) => false);
 
-    (session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+    (
+      session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
+    ).contextController.compactionMonitor = {
       checkBeforeSend,
       checkMidStream,
       resetForNewStream: mock(() => undefined),
@@ -980,7 +1032,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId,
       config,
       historyService,
@@ -999,7 +1051,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       };
     });
 
-    (session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+    (
+      session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
+    ).contextController.compactionMonitor = {
       checkBeforeSend,
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
@@ -1092,7 +1146,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId,
       config,
       historyService,
@@ -1102,12 +1156,12 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     });
 
     const internals = session as unknown as {
-      compactionMonitor: CompactionMonitor;
+      contextController: { compactionMonitor: CompactionMonitor };
       sendMessage: AgentSession["sendMessage"];
     };
 
     let midStreamChecks = 0;
-    internals.compactionMonitor = {
+    internals.contextController.compactionMonitor = {
       checkBeforeSend: mock(() => ({
         shouldShowWarning: false,
         shouldForceCompact: false,
@@ -1243,7 +1297,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
-    const session = new AgentSession({
+    const session = createTestAgentSession({
       workspaceId,
       config,
       historyService,
@@ -1258,7 +1312,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       return midStreamChecks === 1;
     });
 
-    (session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+    (
+      session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
+    ).contextController.compactionMonitor = {
       checkBeforeSend: mock(() => ({
         shouldShowWarning: false,
         shouldForceCompact: false,
@@ -1409,7 +1465,9 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
     historyCleanup = harness.cleanup;
 
     // Cross the on-send threshold unconditionally.
-    (harness.session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+    (
+      harness.session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
+    ).contextController.compactionMonitor = {
       checkBeforeSend: mock(() => ({
         shouldShowWarning: true,
         shouldForceCompact: true,
@@ -1450,8 +1508,11 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
         workspaceId: "ws-auto-compaction-synthetic-guidance",
       });
 
-      const monitor = (fixture.session as unknown as { compactionMonitor: CompactionMonitor })
-        .compactionMonitor;
+      const monitor = (
+        fixture.session as unknown as {
+          contextController: { compactionMonitor: CompactionMonitor };
+        }
+      ).contextController.compactionMonitor;
       let firstCheck = true;
       spyOn(monitor, "checkBeforeSend").mockImplementation(() => {
         const high = firstCheck;

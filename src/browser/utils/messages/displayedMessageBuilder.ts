@@ -169,6 +169,7 @@ function createCompactionBoundaryRow(
     type: "compaction-boundary",
     id: `${message.id}-compaction-boundary`,
     historySequence,
+    timestamp: message.metadata?.timestamp,
     boundaryKind: getContextBoundaryKind(message) ?? CONTEXT_BOUNDARY_KINDS.COMPACTION,
     position: "start",
     contextWindowRollover: isRolloverBoundary(message) ? true : undefined,
@@ -405,6 +406,7 @@ function buildUserDisplayedMessages(options: {
               contextTokens: muxMeta.contextTokens,
               maxTokens: muxMeta.maxTokens,
               final: muxMeta.final === true,
+              handoff: muxMeta.handoff === true,
             }
           : undefined,
       // The peer-message wake trigger is a synthetic machine row: mark it so prompt
@@ -639,6 +641,7 @@ function appendToolRows(
     historySequence: options.historySequence,
     isLastPartOfMessage: options.isLastPartOfMessage,
     ...(part.workflowRun != null ? { workflowRun: part.workflowRun } : {}),
+    ...(part.mcpServer != null ? { mcpServer: part.mcpServer } : {}),
     timestamp: part.timestamp ?? options.baseTimestamp,
     ...(part.executionStartedAt != null ? { executionStartedAt: part.executionStartedAt } : {}),
     nestedCalls,

@@ -7,8 +7,8 @@ import * as path from "node:path";
 import type { Config } from "@/node/config";
 
 import type { AIService } from "./aiService";
-import { AgentSession } from "./agentSession";
-import { createStreamLifecycleMocks } from "./agentSession.testHarness";
+import type { AgentSession } from "./agentSession";
+import { createStreamLifecycleMocks, createTestAgentSession } from "./agentSession.testHarness";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { InitStateManager } from "./initStateManager";
 import { createTestHistoryService } from "./testHistoryService";
@@ -26,7 +26,7 @@ interface PrivateSessionAccess {
   midStreamCompactionPending: boolean;
   coordinator: TurnCoordinator;
   activeStreamContext?: { modelString: string; options?: unknown; providersConfig: null };
-  interruptForCompaction: () => Promise<void>;
+  contextController: { summarize: { interruptForCompaction: () => Promise<void> } };
 }
 
 describe("AgentSession.drainQueuedMessagesIfIdle", () => {
@@ -74,7 +74,7 @@ describe("AgentSession.drainQueuedMessagesIfIdle", () => {
       srcDir: path.join(created.config.rootDir, "src"),
       loadConfigOrDefault: mock(() => ({})),
     } as unknown as Config;
-    session = new AgentSession({
+    session = createTestAgentSession({
       workspaceId: WORKSPACE_ID,
       config,
       historyService: created.historyService,
@@ -142,7 +142,7 @@ describe("AgentSession.drainQueuedMessagesIfIdle", () => {
       Err({ type: "unknown", raw: "compaction request rejected before admission" })
     );
 
-    await privateSession.interruptForCompaction();
+    await privateSession.contextController.summarize.interruptForCompaction();
 
     expect(privateSession.midStreamCompactionPending).toBe(false);
     expect(dispatch).toHaveBeenCalledTimes(1);

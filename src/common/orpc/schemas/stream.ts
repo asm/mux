@@ -1,5 +1,6 @@
 import { StreamStopCauseSchema } from "@/common/types/streamStopCause";
 import { z } from "zod";
+import { MCPToolCallDisplaySchema } from "./mcp";
 import { AgentDefinitionScopeSchema, AgentIdSchema } from "./agentDefinition";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 import { AgentModeSchema } from "../../types/mode";
@@ -499,6 +500,7 @@ export const ToolCallEndEventSchema = z.object({
   toolCallId: z.string(),
   toolName: z.string(),
   result: z.unknown(),
+  mcpServer: MCPToolCallDisplaySchema.optional().catch(undefined),
   providerExecuted: z
     .boolean()
     .optional()
@@ -780,6 +782,8 @@ export const UpdateStatusSchema = z.discriminatedUnion("type", [
   }),
   z.object({ type: z.literal("downloading"), percent: z.number().nullable() }),
   z.object({ type: z.literal("downloaded"), info: z.object({ version: z.string() }) }),
+  // Emitted synchronously once an install is going ahead, before the process restarts.
+  z.object({ type: z.literal("restarting"), info: z.object({ version: z.string() }) }),
   z.object({
     type: z.literal("error"),
     phase: z.enum(["check", "download", "install"]),

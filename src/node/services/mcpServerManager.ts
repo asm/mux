@@ -3,6 +3,18 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { OAuthClientProvider, PriorDiscovery } from "@modelcontextprotocol/client";
 import type { Tool } from "ai";
+import { getExecutionScope } from "./tools/withExecutionScope";
+import { MCPIconRegistry, type MCPIconOwner } from "./mcpIconRegistry";
+import { resolveServerIcon } from "./mcpServerIcon";
+import {
+  buildToolCallDisplay,
+  describeConnection,
+  normalizeServerIdentity,
+  takeStandardDisplayMeta,
+  type IconCandidate,
+  type NormalizedServerIdentity,
+} from "./mcpServerIdentity";
+import { ToolCallDisplayRegistry } from "./toolCallDisplayRegistry";
 import {
   createMCPClient,
   isModernEra,
@@ -16,6 +28,8 @@ import { MCPStdioTransport } from "@/node/services/mcpStdioTransport";
 import type {
   BearerChallenge,
   MCPHeaderValue,
+  MCPConnectionRef,
+  MCPServerIdentity,
   MCPServerInfo,
   MCPServerMap,
   MCPServerTransport,
@@ -24,6 +38,7 @@ import type {
   WorkspaceMCPOverrides,
 } from "@/common/types/mcp";
 import assert from "@/common/utils/assert";
+import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
 import { shellQuote } from "@/common/utils/shell";
 import { requiredPropertyNames, schemaAcceptsNull } from "@/common/utils/tools/schemaSanitizer";
 import type { Runtime } from "@/node/runtime/Runtime";
@@ -91,6 +106,37 @@ const MCP_STARTUP_TIMEOUT_MS = 60_000; // 60s — generous for npx package downl
 // while several unhealthy servers' startup deadlines overlap instead of stacking.
 const MCP_STARTUP_CONCURRENCY = 4;
 const MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS = 5_000; // fail-safe so timeout error cannot hang forever
+/**
+ * Timed-out servers are restarted from the cached same-signature path, and
+ * each restart blocks the turn for up to MCP_STARTUP_TIMEOUT_MS. Without
+ * backoff a server that never comes up costs every turn a full startup
+ * timeout. Every timeout, the initial startup included, counts as a failure:
+ * a UAT with an immediate first retry and a 5 s base measured the full
+ * timeout on 4 of 8 turns at human cadence, because a wait shorter than the
+ * timeout it gates is no wait at all. The base equals the startup timeout so
+ * a retry is never spent sooner than it would cost, each further consecutive
+ * timeout doubles it, capped so a server that does recover is picked up
+ * within a few minutes. Reset when the retry succeeds, when the entry is
+ * replaced by a config change, or when a plugin invalidation re-queues the
+ * server (markServersForRetry).
+ */
+const TIMED_OUT_RETRY_BACKOFF_BASE_MS = MCP_STARTUP_TIMEOUT_MS;
+const TIMED_OUT_RETRY_BACKOFF_MAX_MS = 5 * 60_000;
+
+interface TimedOutRetryBackoff {
+  retryTimeouts: number;
+  /** When the latest timed-out attempt finished, not when its batch settled. */
+  lastAttemptAtMs: number;
+}
+
+/** Wait required after `retryTimeouts` consecutive failed retries before the next attempt. */
+function timedOutRetryBackoffMs(retryTimeouts: number): number {
+  if (retryTimeouts <= 0) return 0;
+  return Math.min(
+    TIMED_OUT_RETRY_BACKOFF_BASE_MS * 2 ** (retryTimeouts - 1),
+    TIMED_OUT_RETRY_BACKOFF_MAX_MS
+  );
+}
 
 /** Detect errors from the MCP SDK indicating the client/transport is closed.
  *  We match on known message patterns rather than error classes so wrapped or
@@ -277,7 +323,19 @@ function rawInputSchema(inputSchema: unknown): unknown {
  */
 export function wrapMCPTools(
   tools: Record<string, Tool>,
-  options?: { onActivity?: () => void; onClosed?: () => void }
+  options?: {
+    onActivity?: () => void;
+    onClosed?: () => void;
+    display?: {
+      connection: MCPConnectionRef;
+      identity?: MCPServerIdentity;
+      /** Handshake icons, used only when a call falls back to the connection identity. */
+      iconCandidates?: readonly IconCandidate[];
+      registry: ToolCallDisplayRegistry;
+      /** One owner per connected generation; without this, snapshots carry no iconRef. */
+      icons?: { registry: MCPIconRegistry; owner: MCPIconOwner };
+    };
+  }
 ): Record<string, Tool> {
   const { onActivity, onClosed } = options ?? {};
   const wrapped: Record<string, Tool> = {};
@@ -296,6 +354,9 @@ export function wrapMCPTools(
         // calls (including closed-client races) still count as activity.
         onActivity?.();
 
+        // Set once a result's snapshot is published, so the failure path never
+        // replaces response metadata with the weaker connection identity.
+        let published = false;
         try {
           const abortSignal =
             context && typeof context === "object" && "abortSignal" in context
@@ -307,8 +368,50 @@ export function wrapMCPTools(
             () => Promise.resolve(originalExecute(sanitizedArgs, context)) as Promise<unknown>,
             { toolName, timeoutMs: MCP_TOOL_CALL_TIMEOUT_MS, signal: abortSignal }
           );
-          return transformMCPResult(result as MCPCallToolResult);
+          // The standard key is UI-only for newly produced results. Keeping it
+          // in output would also expose it to the model when history is replayed.
+          const { rest, displayKeyValue } = takeStandardDisplayMeta(result);
+          const response = normalizeServerIdentity(displayKeyValue);
+          const identity = response?.identity ?? options?.display?.identity;
+          const scope = getExecutionScope(context);
+          if (scope && identity && options?.display) {
+            const { display } = options;
+            // A result that names its own identity also owns its artwork: a
+            // response identity without icons stays unbranded instead of
+            // borrowing the handshake's. Registration only mints the ref;
+            // resolution runs in the background and is never awaited here.
+            const candidates = response ? response.iconCandidates : (display.iconCandidates ?? []);
+            const iconRef = display.icons?.registry.ensure(
+              display.icons.owner,
+              candidates,
+              display.connection
+            );
+            const snapshot = buildToolCallDisplay({
+              connection: display.connection,
+              identity,
+              source: response ? "response" : "connection",
+              ...(iconRef ? { iconRef } : {}),
+            });
+            if (snapshot) {
+              published = display.registry.set(scope, context.toolCallId, snapshot);
+            }
+          }
+          return transformMCPResult(rest as MCPCallToolResult);
         } catch (error) {
+          // A call that throws or hits its deadline produced no result metadata,
+          // but the failed part still belongs to a known server: publish the
+          // handshake identity for it before the client may be recycled. Only
+          // here, not before every call, so a successful result's own identity
+          // is still the first and only snapshot for its call.
+          const scope = getExecutionScope(context);
+          if (!published && scope && options?.display?.identity) {
+            const snapshot = buildToolCallDisplay({
+              connection: options.display.connection,
+              identity: options.display.identity,
+              source: "connection",
+            });
+            if (snapshot) options.display.registry.set(scope, context.toolCallId, snapshot);
+          }
           if (shouldRecycleClientAfterToolError(error)) {
             try {
               onClosed?.();
@@ -725,7 +828,8 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
 
 /**
  * Run a test connection to an MCP server.
- * Connects, fetches tools, then closes.
+ * Connects, fetches tools, then closes; a successful connection then has its
+ * handshake icon resolved (bounded by the icon resolver's own deadline).
  */
 async function runServerTest(
   server:
@@ -737,7 +841,9 @@ async function runServerTest(
         authProvider?: OAuthClientProvider;
       },
   projectPath: string,
-  logContext: string
+  logContext: string,
+  /** Configured server key the icon binding is described under. */
+  connectionKey: string
 ): Promise<MCPTestResult> {
   // Resettable deadline: the fragile-legacy stdio respawn below restarts the
   // clock so the compatibility retry gets a full test window instead of
@@ -759,10 +865,16 @@ async function runServerTest(
   };
   armTestDeadline();
 
+  // Captured by the connection attempt for the icon step below, which runs
+  // only after the race has produced a success verdict.
+  const observed: { current?: { identity: NormalizedServerIdentity; binding: MCPConnectionRef } } =
+    {};
+
   const testPromise = (async (): Promise<MCPTestResult> => {
     let stdioTransport: MCPStdioTransport | null = null;
     let client: Awaited<ReturnType<typeof createMCPClient>> | null = null;
     let getCapturedWwwAuthenticateHeader: (() => string | null) | null = null;
+    let actualTransport: "http" | "sse" | undefined;
 
     try {
       if (server.transport === "stdio") {
@@ -837,12 +949,15 @@ async function runServerTest(
 
         if (server.transport === "http") {
           client = await tryHttp();
+          actualTransport = "http";
         } else if (server.transport === "sse") {
           client = await trySse();
+          actualTransport = "sse";
         } else {
           // auto
           try {
             client = await tryHttp();
+            actualTransport = "http";
           } catch (error) {
             if (!shouldAutoFallbackToSse(error)) {
               throw error;
@@ -851,6 +966,7 @@ async function runServerTest(
               status: extractHttpStatusCode(error),
             });
             client = await trySse();
+            actualTransport = "sse";
           }
         }
       }
@@ -858,6 +974,22 @@ async function runServerTest(
       const tools = await client.tools();
       const toolNames = Object.keys(tools);
       const protocolVersion = client.negotiatedProtocolVersion();
+      const normalizedIdentity = normalizeServerIdentity(client.serverInfo());
+      const serverInfo = normalizedIdentity?.identity;
+      if (normalizedIdentity) {
+        // Remote icons are bound to the configured URL's origin (never a
+        // reported website), on the transport that actually connected.
+        observed.current = {
+          identity: normalizedIdentity,
+          binding: describeConnection(
+            connectionKey,
+            server.transport === "stdio"
+              ? { transport: "stdio", command: server.command, disabled: false }
+              : { transport: server.transport, url: server.url, disabled: false },
+            actualTransport
+          ),
+        };
+      }
 
       await client.close();
       client = null;
@@ -875,6 +1007,7 @@ async function runServerTest(
         success: true,
         tools: toolNames,
         ...(protocolVersion !== undefined ? { protocolVersion } : {}),
+        ...(serverInfo ? { serverInfo } : {}),
       };
     } catch (error) {
       const message = getErrorMessage(error);
@@ -911,7 +1044,33 @@ async function runServerTest(
     }
   })();
 
-  return Promise.race([testPromise, timeoutPromise]);
+  let result: MCPTestResult;
+  try {
+    result = await Promise.race([testPromise, timeoutPromise]);
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+  // Icon work starts only after a successful, in-deadline connection: awaiting
+  // it inside the race would turn a slow-but-good handshake into a timeout,
+  // and a failed or timed-out test has no identity worth decorating.
+  if (!result.success || !observed.current) {
+    return result;
+  }
+  // The test returns the image bytes directly and never exposes a ref, so it
+  // resolves through the process-wide resolver (same gate, deadline, and
+  // origin binding as tool calls) without admitting anything into the
+  // historical icon registry, whose entries belong to chat history.
+  const { identity, binding } = observed.current;
+  if (identity.iconCandidates.length === 0) {
+    return result;
+  }
+  let icon: unknown = null;
+  try {
+    icon = await resolveServerIcon(identity.iconCandidates, binding);
+  } catch {
+    // Icon failures never fail a successful connection test.
+  }
+  return isPngDataUrl(icon) ? { ...result, icon } : result;
 }
 
 type MCPPromptContent = MCPGetPromptResult["messages"][number]["content"];
@@ -1037,6 +1196,8 @@ export function normalizePromptCatalog(prompts: MCPPrompt[], serverName: string)
 
 interface MCPServerInstance {
   name: string;
+  identity?: MCPServerIdentity;
+  connectionRef: MCPConnectionRef;
   /** Resolved transport actually used (auto may fall back to sse). */
   resolvedTransport: ResolvedTransport;
   autoFallbackUsed: boolean;
@@ -1051,7 +1212,8 @@ interface MCPServerInstance {
    * list results carry ttlMs/cacheScope freshness hints: a still-fresh cached
    * list is served with zero round trips, a stale one refetches. Legacy
    * connections keep the previous instance-lifetime tool caching (their list
-   * results carry no freshness hints).
+   * results carry no freshness hints). Invoked off the send path
+   * (refreshInstanceToolsInBackground), never awaited by a turn.
    */
   refreshTools?: () => Promise<void>;
   /** Fetches prompts/list without mutating instance state; refreshInstancePrompts alone normalizes and stores the catalog. */
@@ -1165,6 +1327,13 @@ interface WorkspaceServers {
   timedOutServerNames: string[];
   /** Prevent concurrent cached retries from stacking startup attempts for the same server. */
   retryingTimedOutServerNames: Set<string>;
+  /**
+   * Consecutive startup timeouts (initial start included) per server still in
+   * `timedOutServerNames`, gating getTimedOutServerNamesToRetry (see
+   * TIMED_OUT_RETRY_BACKOFF_BASE_MS). No record (plugin re-queue) means the
+   * next serve retries immediately.
+   */
+  timedOutRetryBackoff?: Map<string, TimedOutRetryBackoff>;
   /** Blocks prompt invocation on stale clients while an active lease defers restart. */
   stalePromptServerNames?: Set<string>;
   /** Dedupes send-path background prompt refreshes so streams never stack them. */
@@ -1177,6 +1346,7 @@ interface WorkspaceServers {
 }
 
 export interface MCPServerManagerOptions {
+  toolCallDisplayRegistry?: ToolCallDisplayRegistry;
   config?: Config;
   telemetryService?: Pick<TelemetryService, "capture">;
   /** Inline stdio servers to use (merged with config file servers by default) */
@@ -1267,6 +1437,9 @@ function categorizeMcpTestError(error: string): "timeout" | "connect" | "http_st
 }
 
 export class MCPServerManager {
+  private readonly toolCallDisplayRegistry: ToolCallDisplayRegistry;
+  /** Session-local server artwork behind the opaque `iconRef`s on tool-call snapshots. */
+  private readonly iconRegistry = new MCPIconRegistry(resolveServerIcon);
   private readonly workspaceServers = new Map<string, WorkspaceServers>();
   // Survives idle cleanup so an explicit prompt invocation can revive reaped
   // servers at send time; forgotten only on workspace removal.
@@ -1294,6 +1467,8 @@ export class MCPServerManager {
     MCPServerInstance,
     { started: number; applied: number }
   >();
+  /** Dedupes send-path background tool refreshes per instance; see refreshInstanceToolsInBackground. */
+  private readonly toolRefreshesInFlight = new WeakMap<MCPServerInstance, Promise<void>>();
   // Bumped by removal-style stops (stopServers without retainRestartOptions).
   // Startups run outside any lock shared with removal, so an abort-abandoned
   // startup can finish after the workspace is gone; the epoch check makes it
@@ -1355,6 +1530,8 @@ export class MCPServerManager {
     policyService?: PolicyService
   ) {
     this.policyService = policyService ?? null;
+    this.toolCallDisplayRegistry =
+      options?.toolCallDisplayRegistry ?? new ToolCallDisplayRegistry();
     this.config = options?.config ?? null;
     this.telemetryService = options?.telemetryService ?? null;
     this.idleCheckInterval = setInterval(() => this.cleanupIdleServers(), IDLE_CHECK_INTERVAL_MS);
@@ -1394,20 +1571,76 @@ export class MCPServerManager {
     return { registryPath: this.componentPolicy?.registryPath ?? "", imports: null };
   }
 
-  private async withComponentPolicyFence<T>(
+  private async withPluginAdmissionFence<T>(
     name: string,
     info: MCPServerInfo | undefined,
     dispatch: () => T,
-    options: { signal?: AbortSignal; timeoutMs?: number } = {}
+    options: { signal?: AbortSignal; timeoutMs?: number; workspaceId?: string } = {}
   ): Promise<{ pending: T }> {
-    const release = await this.acquireComponentPolicyFence(name, info, options);
+    const deadlineAt = Date.now() + (options.timeoutMs ?? CALL_GATE_TIMEOUT_MS);
+    // A named connection test is an explicit user action, not workspace admission.
+    const release =
+      options.workspaceId === undefined
+        ? await this.acquireComponentPolicyFence(name, info, options)
+        : await this.acquirePluginAdmissionFence(name, info, options);
     try {
+      if (options.signal?.aborted) throw new Error(`MCP request for '${name}' was aborted`);
+      if (Date.now() >= deadlineAt)
+        throw new Error(`MCP server '${name}' is unavailable: admission timed out`);
       const pending = dispatch();
       // Observe early rejection while admission locks are being released.
       Promise.resolve(pending).catch(() => undefined);
       return { pending };
     } finally {
       await release();
+    }
+  }
+
+  private async acquirePluginAdmissionFence(
+    name: string,
+    info: MCPServerInfo | undefined,
+    options: { signal?: AbortSignal; timeoutMs?: number; workspaceId?: string }
+  ): Promise<() => Promise<void>> {
+    const deadlineAt = Date.now() + (options.timeoutMs ?? CALL_GATE_TIMEOUT_MS);
+    const remainingMs = () => Math.max(0, deadlineAt - Date.now());
+    const workspaceId = options.workspaceId;
+    const plugin =
+      info?.plugin ??
+      (workspaceId !== undefined
+        ? this.workspaceServers.get(workspaceId)?.enabledServers[name]?.plugin
+        : undefined);
+    // Without explicit workspace consent, every global-plugin admission must
+    // establish current global consent, including startup without a cached entry.
+    const requiresGlobalConsent =
+      plugin?.sourceScope === "global" &&
+      !(
+        workspaceId !== undefined &&
+        this.lastWorkspaceRequestOptions.get(workspaceId)?.overrides?.enabledServers?.includes(name)
+      );
+    const releaseGlobal = requiresGlobalConsent
+      ? await this.configService.acquireGlobalPluginEnablementFence(name, {
+          signal: options.signal,
+          timeoutMs: remainingMs(),
+        })
+      : undefined;
+    try {
+      // Global consent is locked before the component try-lock. Uninstall can
+      // hold the component writer lock while pruning global consent, so this
+      // inner acquisition must remain non-blocking to avoid an inverted wait.
+      const release = await this.acquireComponentPolicyFence(name, info, {
+        signal: options.signal,
+        timeoutMs: remainingMs(),
+      });
+      return async () => {
+        try {
+          await release();
+        } finally {
+          await releaseGlobal?.();
+        }
+      };
+    } catch (error) {
+      await releaseGlobal?.();
+      throw error;
     }
   }
 
@@ -1951,22 +2184,43 @@ export class MCPServerManager {
     this.eraVerdicts.set(key, { prior, cachedAtMs: Date.now() });
   }
 
-  private async refreshModernInstanceTools(
-    instances: Map<string, MCPServerInstance>
-  ): Promise<void> {
-    await Promise.all(
-      [...instances.values()].map(async (instance) => {
-        if (instance.isClosed || !instance.refreshTools) return;
-        try {
-          await instance.refreshTools();
-        } catch (error) {
+  /**
+   * Send-path tool freshness is stale-while-revalidate, like prompts below.
+   * Every cached instance already holds the catalog fetched at startup, and a
+   * blocking tools/list to every modern server on every turn cost hundreds of
+   * milliseconds per turn on real setups (and up to the SDK timeout when one
+   * server hangs). The turn serves the held catalog; the refresh routes
+   * through the SDK's SEP-2549 response cache, so a still-fresh list costs no
+   * round trip, a stale one (ttlMs elapsed or evicted by
+   * notifications/tools/list_changed) refetches here and lands for the next
+   * turn. Deduped per instance so stacked turns cannot pile up requests on a
+   * slow server; only servers still enabled after the concurrent-mutation
+   * repair are queried because a detached refresh cannot be cancelled.
+   */
+  private refreshInstanceToolsInBackground(entry: WorkspaceServers): void {
+    for (const [serverName, instance] of entry.instances) {
+      if (!entry.enabledServerNames.has(serverName)) continue;
+      if (instance.isClosed || !instance.refreshTools) continue;
+      if (this.toolRefreshesInFlight.has(instance)) continue;
+      log.debug("[MCP] Serving cached tool catalog; refreshing in background", {
+        name: instance.name,
+        toolCount: Object.keys(instance.tools).length,
+      });
+      const refresh = instance
+        .refreshTools()
+        .catch((error: unknown) => {
           log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
             name: instance.name,
             error: getErrorMessage(error),
           });
-        }
-      })
-    );
+        })
+        .finally(() => {
+          if (this.toolRefreshesInFlight.get(instance) === refresh) {
+            this.toolRefreshesInFlight.delete(instance);
+          }
+        });
+      this.toolRefreshesInFlight.set(instance, refresh);
+    }
   }
 
   /**
@@ -2143,12 +2397,91 @@ export class MCPServerManager {
     entry: WorkspaceServers,
     enabledServers: MCPServerMap
   ): string[] {
-    return entry.timedOutServerNames.filter(
-      (serverName) =>
-        enabledServers[serverName] !== undefined &&
-        !entry.instances.has(serverName) &&
-        !entry.retryingTimedOutServerNames.has(serverName)
+    const now = Date.now();
+    return entry.timedOutServerNames.filter((serverName) => {
+      if (
+        enabledServers[serverName] === undefined ||
+        entry.instances.has(serverName) ||
+        entry.retryingTimedOutServerNames.has(serverName)
+      ) {
+        return false;
+      }
+      const retryAfterMs = this.timedOutRetryWaitMs(entry, serverName, now);
+      if (retryAfterMs <= 0) return true;
+      // Info, not debug: this is the only evidence that a turn ran without
+      // the server on purpose rather than the server silently vanishing.
+      log.info("[MCP] Skipping timed-out server retry during backoff", {
+        serverName,
+        retryTimeouts: entry.timedOutRetryBackoff?.get(serverName)?.retryTimeouts,
+        retryAfterMs,
+      });
+      return false;
+    });
+  }
+
+  /** Milliseconds until `serverName` may be retried; 0 when no backoff is pending. */
+  private timedOutRetryWaitMs(entry: WorkspaceServers, serverName: string, now: number): number {
+    const backoff = entry.timedOutRetryBackoff?.get(serverName);
+    if (backoff === undefined) return 0;
+    return Math.max(
+      0,
+      backoff.lastAttemptAtMs + timedOutRetryBackoffMs(backoff.retryTimeouts) - now
     );
+  }
+
+  /**
+   * Backoff state to carry into a same-signature full restart forced by a
+   * closed companion instance. That restart replaces the cache entry, so
+   * without this a backed-off server would be started again at once and
+   * charge another startup timeout every time a companion dies, and one whose
+   * window had already elapsed would restart its schedule from the base
+   * instead of continuing it. `records` keeps every still-enabled, still-down
+   * server's history for the outcome accounting of the new batch; `waiting`
+   * names the ones still inside their window, which stay out of that batch.
+   */
+  private timedOutRetryBackoffToCarry(
+    entry: WorkspaceServers,
+    enabledServers: MCPServerMap
+  ): { records: Map<string, TimedOutRetryBackoff>; waiting: Set<string> } {
+    const records = new Map<string, TimedOutRetryBackoff>();
+    const waiting = new Set<string>();
+    const now = Date.now();
+    for (const [serverName, backoff] of entry.timedOutRetryBackoff ?? []) {
+      if (enabledServers[serverName] === undefined || entry.instances.has(serverName)) continue;
+      records.set(serverName, backoff);
+      if (this.timedOutRetryWaitMs(entry, serverName, now) > 0) waiting.add(serverName);
+    }
+    return { records, waiting };
+  }
+
+  /**
+   * Record startup outcomes for backoff, from the initial start, cached-path
+   * retries, and closed-client restarts alike. A timeout lengthens the wait,
+   * measured from when that server's attempt finished (startups run four at a
+   * time, so a batch can settle long after its first wave timed out); any
+   * other outcome (started, hard failure that leaves the retry list,
+   * plugin-tree invalidation) clears it.
+   */
+  private recordStartupTimeoutOutcomes(
+    entry: WorkspaceServers,
+    attempted: Iterable<string>,
+    timedOutNames: Iterable<string>,
+    timedOutAtMs?: ReadonlyMap<string, number>
+  ): void {
+    const timedOut = new Set(timedOutNames);
+    const now = Date.now();
+    for (const serverName of attempted) {
+      if (!timedOut.has(serverName)) {
+        entry.timedOutRetryBackoff?.delete(serverName);
+        continue;
+      }
+      entry.timedOutRetryBackoff ??= new Map();
+      const previous = entry.timedOutRetryBackoff.get(serverName);
+      entry.timedOutRetryBackoff.set(serverName, {
+        retryTimeouts: (previous?.retryTimeouts ?? 0) + 1,
+        lastAttemptAtMs: timedOutAtMs?.get(serverName) ?? now,
+      });
+    }
   }
 
   /**
@@ -2476,8 +2809,8 @@ export class MCPServerManager {
   }
 
   /**
-   * Skips tools/list refreshes on cached instances so an unrelated server's
-   * 60-second SDK timeout cannot block prompt paths.
+   * `refreshToolCatalogs` false (prompt paths) skips the background tool and
+   * prompt catalog refreshes on cached instances entirely.
    */
   private async ensureWorkspaceServers(
     requestOptions: MCPWorkspaceRequestOptions,
@@ -2740,6 +3073,7 @@ export class MCPServerManager {
             instances: retriedInstances,
             failedServerNames: retryFailedNames,
             timedOutServerNames: retryTimedOutNames = [],
+            timedOutAtMs: retryTimedOutAtMs,
           } = await this.startServers(
             serversToRetry,
             runtime,
@@ -2815,6 +3149,12 @@ export class MCPServerManager {
                 ...retryTimedOutNames,
                 ...invalidatedRetryKeys,
               ];
+              this.recordStartupTimeoutOutcomes(
+                existing,
+                retryingServerNames,
+                retryTimedOutNames,
+                retryTimedOutAtMs
+              );
             }
           );
           if (retryOwnershipLost) {
@@ -2865,11 +3205,6 @@ export class MCPServerManager {
         serverCount: enabledEntries.length,
       });
 
-      if (refreshToolCatalogs) {
-        // Honor SEP-2549 freshness hints instead of caching tool lists for the instance lifetime.
-        await this.refreshModernInstanceTools(existing.instances);
-      }
-
       // A trust or settings mutation can land while getAllServers() runs above;
       // re-derive enablement so this cached return cannot leave a revoked
       // repo-local server invocable.
@@ -2883,6 +3218,7 @@ export class MCPServerManager {
       // Spawned after the repair: a detached refresh cannot be cancelled, so
       // it must never target servers a concurrent mutation just revoked.
       if (refreshToolCatalogs) {
+        this.refreshInstanceToolsInBackground(existing);
         this.refreshInstancePromptsInBackground(existing);
       }
 
@@ -2955,6 +3291,7 @@ export class MCPServerManager {
           instances: restartedInstances,
           failedServerNames: failedNames,
           timedOutServerNames: timedOutNames = [],
+          timedOutAtMs: restartTimedOutAtMs,
         } = await this.startServers(
           serversToRestart,
           runtime,
@@ -2994,6 +3331,12 @@ export class MCPServerManager {
               ...timedOutNames,
               ...invalidatedRestartKeys,
             ];
+            this.recordStartupTimeoutOutcomes(
+              existing,
+              Object.keys(serversToRestart),
+              timedOutNames,
+              restartTimedOutAtMs
+            );
             existing.stats = this.createWorkspaceStats(
               existing.stats.enabledServerCount,
               existing.instances,
@@ -3079,17 +3422,12 @@ export class MCPServerManager {
         );
       }
 
-      if (refreshToolCatalogs) {
-        // Honor SEP-2549 freshness hints instead of caching tool lists for the instance lifetime.
-        await this.refreshModernInstanceTools(instancesForTools);
-      }
-
       // Runs after the staleness recompute so the delete above cannot clobber
-      // staleness detected from a mutation newer than this call's config read,
-      // and after the awaited tool refresh: a publication landing during that
-      // await replaces the recorded options while its own listServers is still
-      // pending, so `existing.enabledServerNames` is only trustworthy once the
-      // repair has re-derived it here — the serve's last await before return.
+      // staleness detected from a mutation newer than this call's config read:
+      // a publication landing during an await replaces the recorded options
+      // while its own listServers is still pending, so
+      // `existing.enabledServerNames` is only trustworthy once the repair has
+      // re-derived it here — the serve's last await before return.
       const enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
         workspaceId,
         options,
@@ -3100,6 +3438,7 @@ export class MCPServerManager {
       // Spawned after the repair so the uncancellable detached refresh cannot
       // target servers a concurrent mutation just revoked.
       if (refreshToolCatalogs) {
+        this.refreshInstanceToolsInBackground(existing);
         this.refreshInstancePromptsInBackground(existing);
       }
 
@@ -3128,9 +3467,6 @@ export class MCPServerManager {
         );
         if (current.configSignature === signature && !currentHasClosedInstance) {
           current.lastActivity = Date.now();
-          if (refreshToolCatalogs) {
-            await this.refreshModernInstanceTools(current.instances);
-          }
           // Repair again in case a mutation landed after the concurrent starter's check.
           const enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
             workspaceId,
@@ -3141,6 +3477,7 @@ export class MCPServerManager {
           // Spawned after the repair so the uncancellable detached refresh
           // cannot target servers a concurrent mutation just revoked.
           if (refreshToolCatalogs) {
+            this.refreshInstanceToolsInBackground(current);
             this.refreshInstancePromptsInBackground(current);
           }
           return this.serveResult(
@@ -3165,9 +3502,20 @@ export class MCPServerManager {
         return undefined;
       }
       const retained = addedServerNames !== undefined ? current : undefined;
+      // Reaching here with the same signature means a closed companion forced
+      // a full restart; backed-off servers keep their schedule across it. A
+      // changed signature is a config change and starts everything afresh.
+      const carriedBackoff =
+        retained === undefined && current?.configSignature === signature
+          ? this.timedOutRetryBackoffToCarry(current, enabledServers)
+          : { records: new Map<string, TimedOutRetryBackoff>(), waiting: new Set<string>() };
       const serversToStart = addedServerNames
         ? Object.fromEntries(enabledEntries.filter(([name]) => addedServerNames.includes(name)))
-        : enabledServers;
+        : carriedBackoff.waiting.size === 0
+          ? enabledServers
+          : Object.fromEntries(
+              Object.entries(enabledServers).filter(([name]) => !carriedBackoff.waiting.has(name))
+            );
       if (Object.keys(serversToStart).length > 0) {
         log.info("[MCP] Starting servers", {
           workspaceId,
@@ -3189,8 +3537,9 @@ export class MCPServerManager {
       await this.assertOverridesEpochUnmovedBeforeStart();
       const {
         instances,
-        failedServerNames: startFailedNames,
+        failedServerNames: startedFailedNames,
         timedOutServerNames: startTimedOutNames = [],
+        timedOutAtMs: startTimedOutAtMs,
       } = await this.startServers(
         serversToStart,
         runtime,
@@ -3200,6 +3549,8 @@ export class MCPServerManager {
         () => this.markActivity(workspaceId),
         workspaceId
       );
+      // Still-waiting servers were not attempted this time but are still down.
+      const startFailedNames = [...startedFailedNames, ...carriedBackoff.waiting];
 
       const stats = this.createWorkspaceStats(enabledEntries.length, instances, startFailedNames);
 
@@ -3253,6 +3604,15 @@ export class MCPServerManager {
             retained.enabledServers = enabledServers;
             retained.enabledServersGeneration = configGenerationUsed;
             retained.timedOutServerNames.push(...startTimedOutNames, ...invalidatedKeys);
+            // Config signature moved: give every pending retry a fresh start,
+            // then count this start's timeouts as their first failure.
+            delete retained.timedOutRetryBackoff;
+            this.recordStartupTimeoutOutcomes(
+              retained,
+              Object.keys(serversToStart),
+              startTimedOutNames,
+              startTimedOutAtMs
+            );
             retained.stats = this.createWorkspaceStats(enabledEntries.length, retained.instances, [
               ...retained.stats.failedServerNames,
               ...startFailedNames,
@@ -3270,10 +3630,25 @@ export class MCPServerManager {
             enabledServers,
             enabledServersGeneration: configGenerationUsed,
             stats: this.createWorkspaceStats(enabledEntries.length, instances, startFailedNames),
-            timedOutServerNames: [...startTimedOutNames, ...invalidatedKeys],
+            timedOutServerNames: [
+              ...carriedBackoff.waiting,
+              ...startTimedOutNames,
+              ...invalidatedKeys,
+            ],
             retryingTimedOutServerNames: new Set(),
             lastActivity: Date.now(),
+            ...(carriedBackoff.records.size > 0
+              ? { timedOutRetryBackoff: new Map(carriedBackoff.records) }
+              : {}),
           };
+          // Attempted names, not just timed-out ones: a carried record whose
+          // server came up this time must clear rather than linger.
+          this.recordStartupTimeoutOutcomes(
+            entry,
+            Object.keys(serversToStart),
+            startTimedOutNames,
+            startTimedOutAtMs
+          );
           this.workspaceServers.set(workspaceId, entry);
         }
       );
@@ -3301,10 +3676,11 @@ export class MCPServerManager {
         configGenerationUsed
       );
       if (refreshToolCatalogs) {
-        if (retained) await this.refreshModernInstanceTools(retained.instances);
         const promptInstances = this.promptEligibleInstances(entry);
         // Retained catalogs stay stale-while-revalidate; only new servers need
         // the initial awaited fetch. Do not wait on an old background refresh.
+        // New servers' tools were fetched by startServers, so tools need no
+        // awaited fetch here at all.
         await this.refreshInstancePrompts(
           retained
             ? new Map([...promptInstances].filter(([name]) => instances.has(name)))
@@ -3316,7 +3692,10 @@ export class MCPServerManager {
           entry,
           configGenerationUsed
         );
-        if (retained) this.refreshInstancePromptsInBackground(entry);
+        if (retained) {
+          this.refreshInstanceToolsInBackground(entry);
+          this.refreshInstancePromptsInBackground(entry);
+        }
       }
 
       // entry.stats, not the pre-publication `stats`: invalidated instances
@@ -4043,12 +4422,10 @@ export class MCPServerManager {
           const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
           let pending: ReturnType<MCPServerInstance["getPrompt"]> | "retry";
           if (acquireOverridesLock === undefined || readOverridesEpoch === undefined) {
-            ({ pending } = await this.withComponentPolicyFence(
-              serverName,
-              undefined,
-              dispatch,
-              options
-            ));
+            ({ pending } = await this.withPluginAdmissionFence(serverName, undefined, dispatch, {
+              ...options,
+              workspaceId,
+            }));
           } else {
             // ONE deadline for acquisition and the fenced epoch read: the outer
             // abort race cannot stop this callback, so a stalled home filesystem
@@ -4078,7 +4455,8 @@ export class MCPServerManager {
               ) {
                 return { epochMoved: true } as const;
               }
-              ({ pending } = await this.withComponentPolicyFence(serverName, undefined, dispatch, {
+              ({ pending } = await this.withPluginAdmissionFence(serverName, undefined, dispatch, {
+                workspaceId,
                 signal: options?.signal,
                 timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
               }));
@@ -4221,6 +4599,9 @@ export class MCPServerManager {
       if (!pending.has(serverKey)) {
         entry.timedOutServerNames.push(serverKey);
       }
+      // An explicit re-queue (plugin tree swap, component re-add) is a new
+      // configuration for the server, not another failure: retry at once.
+      entry.timedOutRetryBackoff?.delete(serverKey);
     }
   }
 
@@ -4359,6 +4740,22 @@ export class MCPServerManager {
     }
   }
 
+  /**
+   * Resolve an `iconRef` from a tool-call snapshot to its bounded PNG data
+   * URL. Lookup only: unknown, expired, or evicted refs yield null without
+   * any network or decode work.
+   */
+  getIcon(iconRef: string): Promise<string | null> {
+    return this.iconRegistry.get(iconRef);
+  }
+
+  /** Bulk form of getIcon: one registry lookup per distinct ref, still never a fetch. */
+  async getIcons(iconRefs: readonly string[]): Promise<Record<string, string | null>> {
+    const distinct = [...new Set(iconRefs)];
+    const icons = await Promise.all(distinct.map((iconRef) => this.iconRegistry.get(iconRef)));
+    return Object.fromEntries(distinct.map((iconRef, index) => [iconRef, icons[index]]));
+  }
+
   async testForApi(
     input: {
       projectPath?: string;
@@ -4492,8 +4889,8 @@ export class MCPServerManager {
         // Admit the named test after disk/OAuth preparation, before its connection
         // deadline starts. Ad-hoc drafts never carry managed plugin provenance.
         try {
-          const { pending } = await this.withComponentPolicyFence(trimmedName, server, () =>
-            runServerTest(launch, projectPath, `server "${trimmedName}"`)
+          const { pending } = await this.withPluginAdmissionFence(trimmedName, server, () =>
+            runServerTest(launch, projectPath, `server "${trimmedName}"`, trimmedName)
           );
           return await pending;
         } catch (error) {
@@ -4529,7 +4926,12 @@ export class MCPServerManager {
       if (!isTransportAllowed("stdio")) {
         return { success: false, error: "MCP transport is disabled by policy" };
       }
-      return runServerTest({ transport: "stdio", command }, projectPath, "command");
+      return runServerTest(
+        { transport: "stdio", command },
+        projectPath,
+        "command",
+        trimmedName ?? "command"
+      );
     }
 
     if (url?.trim()) {
@@ -4560,7 +4962,8 @@ export class MCPServerManager {
             ...(authProvider ? { authProvider } : {}),
           },
           projectPath,
-          trimmedName ? `server "${trimmedName}" (url)` : "url"
+          trimmedName ? `server "${trimmedName}" (url)` : "url",
+          trimmedName ?? "url"
         );
       } catch (error) {
         const message = getErrorMessage(error);
@@ -4985,11 +5388,11 @@ export class MCPServerManager {
           const acquireOverridesLock = this.pluginInvalidation?.acquireOverridesLock;
           const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
           if (acquireOverridesLock === undefined || readOverridesEpoch === undefined) {
-            const { pending } = await this.withComponentPolicyFence(
+            const { pending } = await this.withPluginAdmissionFence(
               serverName,
               servedInfo,
               dispatch,
-              { signal: abortSignal, timeoutMs: remainingMs() }
+              { workspaceId, signal: abortSignal, timeoutMs: remainingMs() }
             );
             if (pending === "retry") continue;
             return await pending;
@@ -5034,7 +5437,8 @@ export class MCPServerManager {
               // iteration's preflight evicts and re-derives from disk.
               continue;
             }
-            ({ pending } = await this.withComponentPolicyFence(serverName, servedInfo, dispatch, {
+            ({ pending } = await this.withPluginAdmissionFence(serverName, servedInfo, dispatch, {
+              workspaceId,
               signal: abortSignal,
               timeoutMs: remainingMs(),
             }));
@@ -5167,10 +5571,13 @@ export class MCPServerManager {
     instances: Map<string, MCPServerInstance>;
     failedServerNames: string[];
     timedOutServerNames: string[];
+    /** When each timed-out attempt finished; the batch itself settles later. */
+    timedOutAtMs: Map<string, number>;
   }> {
     const instances = new Map<string, MCPServerInstance>();
     const failedServerNames: string[] = [];
     const timedOutServerNames: string[] = [];
+    const timedOutAtMs = new Map<string, number>();
     const entries = Object.entries(servers);
 
     // Bounded concurrency so one unresponsive server's 60s startup deadline
@@ -5196,6 +5603,7 @@ export class MCPServerManager {
           failedServerNames.push(name);
           if (isMCPStartupTimeoutError(error)) {
             timedOutServerNames.push(name);
+            timedOutAtMs.set(name, Date.now());
           }
           return null;
         } finally {
@@ -5212,7 +5620,7 @@ export class MCPServerManager {
       }
     }
 
-    return { instances, failedServerNames, timedOutServerNames };
+    return { instances, failedServerNames, timedOutServerNames, timedOutAtMs };
   }
 
   private async startSingleServer(
@@ -5379,7 +5787,8 @@ export class MCPServerManager {
             onActivity,
             signal,
             onAbortCleanup,
-            prior
+            prior,
+            workspaceId
           );
           if (started === null) {
             return null;
@@ -5416,7 +5825,15 @@ export class MCPServerManager {
       }
     }
 
-    return this.startRemoteInstance(name, info, projectSecrets, onActivity, signal, onAbortCleanup);
+    return this.startRemoteInstance(
+      name,
+      info,
+      projectSecrets,
+      onActivity,
+      signal,
+      onAbortCleanup,
+      workspaceId
+    );
   }
 
   /**
@@ -5428,9 +5845,9 @@ export class MCPServerManager {
    * the epoch) before the read — observed here, the launch refused — or
    * waits until the process exists, after which the bracket's postflight
    * closes it. The lock is released as soon as exec returned; the MCP
-   * handshake never runs under it. Managed components also acquire the
-   * plugin writer lock after overrides, through the same launch interval.
-   * Untracked, unmanaged servers retain their plain launch path.
+   * handshake never runs under it. Global consent and managed-component
+   * admission use the same fence as tool/prompt calls, through that launch
+   * interval. Untracked ordinary servers retain their plain launch path.
    */
   private async launchUnderOverrideFence<T>(
     name: string,
@@ -5439,6 +5856,7 @@ export class MCPServerManager {
     launch: (launchSignal: AbortSignal) => Promise<T>,
     signal: AbortSignal,
     options?: {
+      workspaceId?: string;
       /**
        * Release the lock once `launch` has settled OR this many ms have
        * passed, whichever comes first. Remote (HTTP/SSE) connections: the
@@ -5467,7 +5885,12 @@ export class MCPServerManager {
       readOverridesEpoch !== undefined &&
       this.pluginInvalidationTokenSeen;
     const plugin = this.managedPluginServers.get(name) ?? info.plugin;
-    if (!trackOverrides && plugin?.componentPolicy === undefined) return launch(signal);
+    if (
+      !trackOverrides &&
+      plugin?.componentPolicy === undefined &&
+      plugin?.sourceScope !== "global"
+    )
+      return launch(signal);
     // ONE deadline for acquisition and the fenced reads (see getPrompt).
     const fenceDeadlineAt = Date.now() + CALL_GATE_TIMEOUT_MS;
     const release = trackOverrides
@@ -5484,7 +5907,7 @@ export class MCPServerManager {
       }
     };
     let pending: Promise<T> | undefined;
-    let releaseComponents: (() => Promise<void>) | undefined;
+    let releaseAdmission: (() => Promise<void>) | undefined;
     try {
       if (trackOverrides) {
         const epochRead = await raceWithAbortAndTimeout(readOverridesEpoch(), {
@@ -5507,13 +5930,16 @@ export class MCPServerManager {
           );
         }
       }
-      // Try the plugin writer lock SECOND: uninstall holds it while pruning
-      // overrides. Keep it through actual exec/connection initiation, not the
-      // earlier discovery or semaphore wait, so removal cannot precede a spawn.
-      releaseComponents = await this.acquireComponentPolicyFence(name, info, {
+      // The same consent decision gates calls and launches, but startup holds
+      // it through actual exec/connection initiation, not only the callback.
+      releaseAdmission = await this.acquirePluginAdmissionFence(name, info, {
+        workspaceId: options?.workspaceId,
         signal,
         timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
       });
+      if (signal.aborted) throw new Error("MCP server startup was aborted");
+      if (Date.now() >= fenceDeadlineAt)
+        throw new Error("MCP server startup admission timed out; retry");
       if (options?.abortAfterMs !== undefined) {
         const { ms, serverName } = options.abortAfterMs;
         const launchAbort = new AbortController();
@@ -5556,7 +5982,7 @@ export class MCPServerManager {
       // handshake below: every settings save and prune would otherwise queue
       // behind an endpoint-controlled request for the whole startup deadline.
       try {
-        await releaseComponents?.();
+        await releaseAdmission?.();
       } finally {
         await releaseOnce();
       }
@@ -5576,7 +6002,8 @@ export class MCPServerManager {
     onActivity: () => void,
     signal: AbortSignal,
     onAbortCleanup: ((cleanupPromise: Promise<void>) => void) | undefined,
-    prior: PriorDiscovery | undefined
+    prior: PriorDiscovery | undefined,
+    workspaceId?: string
   ): Promise<{ instance: MCPServerInstance; prior: PriorDiscovery } | null> {
     {
       log.debug("[MCP] Spawning stdio server", { name });
@@ -5597,7 +6024,7 @@ export class MCPServerManager {
         // held for the whole startup deadline, and the launch must not be
         // released to send its command after a revocation: abort it instead
         // (see launchUnderOverrideFence).
-        { abortAfterMs: { ms: STDIO_LAUNCH_FENCE_MS, serverName: name } }
+        { workspaceId, abortAfterMs: { ms: STDIO_LAUNCH_FENCE_MS, serverName: name } }
       );
 
       const cleanupSpawnedExecStream = async () => {
@@ -5736,8 +6163,21 @@ export class MCPServerManager {
           return null;
         }
 
+        const normalizedIdentity = normalizeServerIdentity(readyClient.serverInfo());
+        const identity = normalizedIdentity?.identity;
+        const connectionRef = describeConnection(name, info, "stdio");
+        // One icon owner per connected generation: tool refreshes reuse it,
+        // a reconnect gets a fresh one so historical refs are never relabeled.
+        const iconOwner: MCPIconOwner = {};
         const wrapRawTools = (raw: Record<string, Tool>) =>
           wrapMCPTools(raw, {
+            display: {
+              connection: connectionRef,
+              identity,
+              iconCandidates: normalizedIdentity?.iconCandidates,
+              registry: this.toolCallDisplayRegistry,
+              icons: { registry: this.iconRegistry, owner: iconOwner },
+            },
             onActivity,
             onClosed: () => {
               if (instanceRef.current) instanceRef.current.isClosed = true;
@@ -5757,6 +6197,8 @@ export class MCPServerManager {
 
         const instance: MCPServerInstance = {
           name,
+          identity,
+          connectionRef,
           resolvedTransport: "stdio",
           autoFallbackUsed: false,
           tools,
@@ -5816,7 +6258,8 @@ export class MCPServerManager {
     projectSecrets: Record<string, string> | undefined,
     onActivity: () => void,
     signal: AbortSignal,
-    onAbortCleanup?: (cleanupPromise: Promise<void>) => void
+    onAbortCleanup?: (cleanupPromise: Promise<void>) => void,
+    workspaceId?: string
   ): Promise<MCPServerInstance | null> {
     const { headers } = resolveHeaders(info.headers, projectSecrets);
     const design = info.managed === "claude-design" ? this.configService.claudeDesign : undefined;
@@ -5881,7 +6324,7 @@ export class MCPServerManager {
             ...(prior !== undefined ? { prior } : {}),
           }),
         signal,
-        { releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
+        { workspaceId, releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
       );
 
     const trySse = () =>
@@ -5898,7 +6341,7 @@ export class MCPServerManager {
             ...(prior !== undefined ? { prior } : {}),
           }),
         signal,
-        { releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
+        { workspaceId, releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
       );
 
     let client: Awaited<ReturnType<typeof createMCPClient>> | null = null;
@@ -6012,8 +6455,20 @@ export class MCPServerManager {
 
       let clientClosed = false;
 
+      const normalizedIdentity = normalizeServerIdentity(activeClient.serverInfo());
+      const identity = normalizedIdentity?.identity;
+      const connectionRef = describeConnection(name, info, resolvedTransport);
+      // One icon owner per connected generation (see the stdio path).
+      const iconOwner: MCPIconOwner = {};
       const wrapRawTools = (raw: Record<string, Tool>) =>
         wrapMCPTools(raw, {
+          display: {
+            connection: connectionRef,
+            identity,
+            iconCandidates: normalizedIdentity?.iconCandidates,
+            registry: this.toolCallDisplayRegistry,
+            icons: { registry: this.iconRegistry, owner: iconOwner },
+          },
           onActivity,
           onClosed: () => {
             if (instanceRef.current) instanceRef.current.isClosed = true;
@@ -6036,6 +6491,8 @@ export class MCPServerManager {
       let unsubscribeDesign: (() => void) | undefined;
       const instance: MCPServerInstance = {
         name,
+        identity,
+        connectionRef,
         resolvedTransport,
         autoFallbackUsed,
         tools,

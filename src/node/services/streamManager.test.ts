@@ -532,14 +532,17 @@ describe("StreamManager - nested kernel call race and replay", () => {
     getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
 
     // execute() wins the race: nested start arrives before the parent part exists.
-    streamManager.emitNestedToolEvent(workspaceId, messageId, {
-      type: "tool-call-start",
-      callId: "nested-race-workflow",
-      toolName: "workflow_run",
-      args: { __kernelBounded: true, bytes: 18_457, preview: "{…}" },
-      parentToolCallId: "code-exec-race",
-      startTime: timestamp,
-    });
+    streamManager.emitNestedToolEvent(
+      { workspaceId, messageId, token: "test" },
+      {
+        type: "tool-call-start",
+        callId: "nested-race-workflow",
+        toolName: "workflow_run",
+        args: { __kernelBounded: true, bytes: 18_457, preview: "{…}" },
+        parentToolCallId: "code-exec-race",
+        startTime: timestamp,
+      }
+    );
 
     // The workflow attachment lands while the nested record is still buffered.
     const attached = await streamManager.attachWorkflowRunToToolCall({
@@ -733,16 +736,19 @@ describe("StreamManager - nested kernel call race and replay", () => {
     });
     getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
 
-    streamManager.emitNestedToolEvent(workspaceId, messageId, {
-      type: "tool-call-end",
-      callId: "nested-ts",
-      toolName: "bash",
-      args: {},
-      parentToolCallId: "code-exec-ts",
-      startTime: timestamp,
-      endTime: timestamp + 5,
-      result: { ok: true },
-    });
+    streamManager.emitNestedToolEvent(
+      { workspaceId, messageId, token: "test" },
+      {
+        type: "tool-call-end",
+        callId: "nested-ts",
+        toolName: "bash",
+        args: {},
+        parentToolCallId: "code-exec-ts",
+        startTime: timestamp,
+        endTime: timestamp + 5,
+        result: { ok: true },
+      }
+    );
 
     expect((streamInfo.toolCompletionTimestamps as Map<string, number>).get("nested-ts")).toBe(
       timestamp + 5
@@ -812,16 +818,19 @@ describe("StreamManager - nested tool call normalization", () => {
     const events: unknown[] = [];
     onTurnEngineEvent(streamManager, "tool-call-start", (event: unknown) => events.push(event));
 
-    streamManager.emitNestedToolEvent(workspaceId, messageId, {
-      type: "tool-call-start",
-      callId: "nested-1",
-      toolName: "linear_list_teams",
-      // Zero-argument guest call: JSON cannot represent undefined, so both the
-      // persisted record and the wire event must carry {} instead.
-      args: undefined,
-      parentToolCallId: "parent-1",
-      startTime: timestamp,
-    });
+    streamManager.emitNestedToolEvent(
+      { workspaceId, messageId, token: "test" },
+      {
+        type: "tool-call-start",
+        callId: "nested-1",
+        toolName: "linear_list_teams",
+        // Zero-argument guest call: JSON cannot represent undefined, so both the
+        // persisted record and the wire event must carry {} instead.
+        args: undefined,
+        parentToolCallId: "parent-1",
+        startTime: timestamp,
+      }
+    );
 
     const parentPart = parts[0] as { nestedCalls?: Array<{ input?: unknown }> };
     expect(parentPart.nestedCalls).toHaveLength(1);
@@ -1867,6 +1876,43 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
   });
 });
 
+describe("StreamManager - stop scoped to a captured execution", () => {
+  test("expectedMessageId skips a replacement start and still stops the captured one", async () => {
+    const manager = new StreamManager(historyService);
+    const workspaceId = "expected-message-stop";
+    // A start is pending (admitted turn between registration and its provider request).
+    const pending = manager.beginStreamStart({ workspaceId });
+    try {
+      // A late stop captured for an OLDER execution must not cancel this replacement.
+      expect(
+        await manager.stopStream(workspaceId, { expectedMessageId: "older-execution" })
+      ).toEqual(Ok(undefined));
+      expect(pending.abortSignal.aborted).toBe(false);
+      // The stop captured for THIS execution proceeds.
+      expect(
+        await manager.stopStream(workspaceId, { expectedMessageId: pending.syntheticMessageId })
+      ).toEqual(Ok(undefined));
+      expect(pending.abortSignal.aborted).toBe(true);
+    } finally {
+      pending.finish();
+    }
+  });
+
+  test("a registered stream with a different messageId is left untouched by a scoped stop", async () => {
+    const manager = new StreamManager(historyService);
+    const workspaceId = "expected-message-registered";
+    const abortController = new AbortController();
+    const streamInfo = createStreamInfoForTests({ messageId: "replacement-B", abortController });
+    getWorkspaceStreamsForTests(manager).set(workspaceId, streamInfo);
+    expect(await manager.stopStream(workspaceId, { expectedMessageId: "captured-A" })).toEqual(
+      Ok(undefined)
+    );
+    expect(abortController.signal.aborted).toBe(false);
+    expect(getWorkspaceStreamsForTests(manager).get(workspaceId)).toBe(streamInfo);
+    getWorkspaceStreamsForTests(manager).delete(workspaceId);
+  });
+});
+
 describe("StreamManager - stopWhen configuration", () => {
   type StopWhenCondition = (options: { steps: unknown[] }) => boolean | Promise<boolean>;
   type BuildStopWhenCondition = (request: {
@@ -2026,7 +2072,7 @@ describe("StreamManager - stopWhen configuration", () => {
     "budget %s stops with only turn-end input queued and evaluates settled fallback usage",
     async (decision) => {
       const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>
-        Promise.resolve(decision)
+        Promise.resolve({ decision })
       );
       const sessionHistory = tool({ inputSchema: z.object({}) });
       const [, stop] = buildStopWhenForTests()({
@@ -2072,9 +2118,43 @@ describe("StreamManager - stopWhen configuration", () => {
     }
   );
 
+  test.each([
+    ["warn", "continue-entry"],
+    ["rollover", "continue-entry"],
+    ["block", undefined],
+  ] as const)(
+    "budget %s binds the session's designated continuation into the stop cause",
+    async (decision, expectedEntryId) => {
+      const request: Parameters<BuildStopWhenCondition>[0] = {
+        hasQueuedMessages: () => false,
+        // The session names its successor with the decision; a blocked stop hands over to none.
+        onStepSettled: () => Promise.resolve({ decision, continuationEntryId: "continue-entry" }),
+        modelString: "anthropic:claude-sonnet-4-5",
+      };
+      const [, stop] = buildStopWhenForTests()(request);
+      const step = { steps: [{ usage: undefined, toolResults: [] }] };
+      if (decision === "block") {
+        let thrown: unknown;
+        try {
+          await stop(step);
+        } catch (error) {
+          thrown = error;
+        }
+        expect(thrown).toBeInstanceOf(Error);
+      } else {
+        expect(await stop(step)).toBe(true);
+      }
+      expect(request.stopCause).toEqual({
+        kind: "context-budget",
+        decision,
+        ...(expectedEntryId != null ? { continuationEntryId: expectedEntryId } : {}),
+      });
+    }
+  );
+
   test("a settled successful new_context result is reported alongside its siblings", async () => {
     const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>
-      Promise.resolve("rollover")
+      Promise.resolve({ decision: "rollover" })
     );
     const [, stop] = buildStopWhenForTests()({
       hasQueuedMessages: () => false,
@@ -2125,7 +2205,7 @@ describe("StreamManager - stopWhen configuration", () => {
 
   test("successful required completion wins over rollover while a failed tool still evaluates budget", async () => {
     const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>
-      Promise.resolve("rollover")
+      Promise.resolve({ decision: "rollover" })
     );
     const [, stop, required] = buildStopWhenForTests()({
       onStepSettled,

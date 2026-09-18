@@ -12,7 +12,7 @@
  */
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { Effect, Schema, Semaphore } from "effect";
 import type { MemoryScope } from "@/common/constants/memory";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -85,6 +85,12 @@ export interface MemoryMetaEntry {
 /** Unknown provenance is tainted: only a verified-clean entry reads as clean. */
 export function memoryEntryCarriesProjectSkillContent(entry: MemoryMetaEntry | undefined): boolean {
   return entry?.carriesProjectSkillContent !== false;
+}
+
+function maxTimestamp(a: number | null, b: number | null): number | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  return Math.max(a, b);
 }
 
 const EMPTY_ENTRY: MemoryMetaEntry = {
@@ -285,6 +291,38 @@ export class MemoryMetaService {
       }),
 
     /**
+     * Fold a subtree's entries into a second key, keeping the source: a
+     * legacy sub-agent note copied into the shared store stays readable by a
+     * downgraded build under its child key, so its pin/stats must too. A
+     * missing target entry is copied; an existing one keeps the larger
+     * counters/timestamps, and its pin either stands (`pinned: "target"`, a
+     * first adoption must not override the owner's own choice) or follows the
+     * source (`pinned: "source"`, the child changed it since the last
+     * adoption — see MemoryService.adoptLegacyPrivateStore). Idempotent.
+     */
+    mergeKeys: (
+      sourceLogicalKey: string,
+      targetLogicalKey: string,
+      options: { pinned: "target" | "source" }
+    ): Effect.Effect<void, MemoryMetaWriteError> =>
+      this.mutate((entries) => {
+        for (const [key, source] of Object.entries(entries)) {
+          if (!keyInSubtree(key, sourceLogicalKey)) continue;
+          const targetKey = `${targetLogicalKey}${key.slice(sourceLogicalKey.length)}`;
+          const target = entries[targetKey];
+          entries[targetKey] =
+            target === undefined
+              ? { ...source }
+              : {
+                  pinned: options.pinned === "source" ? source.pinned : target.pinned,
+                  accessCount: Math.max(target.accessCount, source.accessCount),
+                  lastAccessedAt: maxTimestamp(target.lastAccessedAt, source.lastAccessedAt),
+                  lastWriteAt: maxTimestamp(target.lastWriteAt, source.lastWriteAt),
+                };
+        }
+      }),
+
+    /**
      * Drop all entries for a deleted file or directory subtree so a future file
      * at the same path never resurrects stale pins or stats.
      */
@@ -309,20 +347,41 @@ export class MemoryMetaService {
    * degrade to "no metadata" (logged for diagnosis) and only writes can fail.
    */
   private load(): Effect.Effect<MemoryMetaFile> {
+    return Effect.map(this.loadWithHealth(), (loaded) => loaded.meta);
+  }
+
+  /**
+   * `load()` plus whether this view is a healed substitute for a sidecar that
+   * exists but could not be read. Reads may serve that substitute; a mutation
+   * must not (see mutateLocked()). Read fresh from disk every time (see load()).
+   */
+  private loadWithHealth(): Effect.Effect<{ meta: MemoryMetaFile; readFailed: boolean }> {
     return Effect.promise(() => this.loadFromDisk());
   }
 
-  private async loadFromDisk(): Promise<MemoryMetaFile> {
-    let parsed: unknown = null;
+  private async loadFromDisk(): Promise<{ meta: MemoryMetaFile; readFailed: boolean }> {
+    let raw: string | null = null;
+    let readFailed = false;
     try {
-      parsed = JSON.parse(await fsPromises.readFile(this.metaPath, "utf-8"));
+      raw = await fsPromises.readFile(this.metaPath, "utf-8");
     } catch (error) {
       // Missing file is the normal first-run case; anything else is healed to empty.
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         log.debug("[MemoryMetaService] healing unreadable sidecar", { error });
+        readFailed = true;
       }
     }
-    return sanitizeMetaFile(parsed);
+    let parsed: unknown = null;
+    if (raw !== null) {
+      try {
+        parsed = JSON.parse(raw);
+      } catch (error) {
+        // Corrupt content (unlike a failed read) IS the file's state: healing
+        // it to empty and letting the next mutation rewrite it is the fix.
+        log.debug("[MemoryMetaService] healing corrupt sidecar", { error });
+      }
+    }
+    return { meta: sanitizeMetaFile(parsed), readFailed };
   }
 
   /**
@@ -354,7 +413,17 @@ export class MemoryMetaService {
       timeoutMs: MEMORY_META_LOCK_TIMEOUT_MS,
       label: "memory sidecar lock",
     });
-    const meta = await this.loadFromDisk();
+    const { meta, readFailed } = await this.loadFromDisk();
+    // A read that healed to empty is fine to serve, but rewriting the sidecar
+    // from it would erase every existing pin and usage stat the moment the
+    // file becomes readable again. Fail the mutation instead; the caller
+    // retries on a later call, which re-reads.
+    if (readFailed) {
+      throw new MemoryMetaWriteError({
+        metaPath: this.metaPath,
+        reason: "sidecar exists but could not be read; refusing to overwrite it",
+      });
+    }
     const entries = { ...meta.entries };
     update(entries);
     for (const [key, entry] of Object.entries(entries)) {
@@ -382,6 +451,21 @@ export class MemoryMetaService {
     return Effect.runPromise(this.effects.getEntries());
   }
 
+  /**
+   * `getEntries()` that refuses a healed substitute: throws when the sidecar
+   * exists but could not be read. For decisions that consume the entries
+   * destructively — the legacy-notebook handover before a sub-agent's session
+   * is deleted folds child-keyed pins/usage into the owner key; an empty
+   * substitute would fold nothing, report success, and strand the entries.
+   */
+  async getEntriesOrThrow(): Promise<Map<string, MemoryMetaEntry>> {
+    const { meta, readFailed } = await Effect.runPromise(this.loadWithHealth());
+    if (readFailed) {
+      throw new Error(`memory metadata sidecar could not be read at ${this.metaPath}`);
+    }
+    return new Map(Object.entries(meta.entries).map(([key, entry]) => [key, { ...entry }]));
+  }
+
   async setPinned(logicalKey: string, pinned: boolean): Promise<void> {
     await Effect.runPromise(this.effects.setPinned(logicalKey, pinned));
   }
@@ -405,6 +489,15 @@ export class MemoryMetaService {
    */
   async renameKeys(oldLogicalKey: string, newLogicalKey: string): Promise<void> {
     await Effect.runPromise(this.effects.renameKeys(oldLogicalKey, newLogicalKey));
+  }
+
+  /** Fold a subtree's entries into `targetLogicalKey`, keeping the source (see effects). */
+  async mergeKeys(
+    sourceLogicalKey: string,
+    targetLogicalKey: string,
+    options: { pinned: "target" | "source" }
+  ): Promise<void> {
+    await Effect.runPromise(this.effects.mergeKeys(sourceLogicalKey, targetLogicalKey, options));
   }
 
   /**

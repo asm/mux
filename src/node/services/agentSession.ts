@@ -8,7 +8,10 @@ import type { AIService } from "./aiService";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { PreparedStreamMessage } from "./turnRequestBuilder";
-import { estimateFreshRequestTokensForModel } from "./contextBudgetCounting";
+import {
+  estimateFreshRequestTokensForModel,
+  estimateToolResultTokensForModel,
+} from "./contextBudgetCounting";
 import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
@@ -28,7 +31,7 @@ import {
   evaluateStepBudget,
   type StepBudgetEvaluation,
   getContextBudgetHardCeiling,
-  getContextBudgetRolloverPoint,
+  getContextBudgetHandoffPoint,
   resolveContextBudgetFlushThinking,
   estimateFreshRequestTokens,
 } from "@/common/utils/compaction/contextBudget";
@@ -39,10 +42,11 @@ import {
   hasRolloverEligibleMessages,
   hasUnconsumedNewContextRequest,
   estimateLastStepToolResults,
+  getLastStepToolResults,
   type ContextWindowRollover,
 } from "./contextWindowRollover";
 import { resolveAgentForStream, type AgentResolutionResult } from "./agentResolution";
-import type { SettledStepBudget } from "./streamManager";
+import type { SettledStepBudget, SettledStepOutcome } from "./streamManager";
 import type { TurnStreamHandle } from "./streamManager";
 import type { StreamManager } from "./streamManager";
 import type { PreDispatchConsentGateContext } from "./streamManager";
@@ -70,13 +74,13 @@ import {
   type TurnId,
   type QueueDrainTrigger,
   type OperationId,
-  type CompactionToken,
   type StreamErrorRecoveryOutcome,
 } from "./turnCoordinator";
 export type { StreamErrorRecoveryOutcome } from "./turnCoordinator";
 import type { StreamMessageOptions } from "@/node/services/turnRequestBuilder";
 import type { HistoryService } from "@/node/services/historyService";
-import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
+import type { QueueCutReceipt, TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
+import { WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE } from "@/constants/agentMessaging";
 import {
   CompactionCancellation,
   matchesCompactionCancellation,
@@ -185,7 +189,7 @@ import {
   sanitizeAgentSkillRefs,
   sanitizeMcpPromptRefs,
   isCompactionSummaryMetadata,
-  pickPreservedSendOptions,
+  parseWorkspaceTurnTaskCorrelation,
   pickStartupRetrySendOptions,
   prepareUserMessageForSend,
   type AgentSkillReference,
@@ -195,15 +199,12 @@ import {
   type MuxMessageMetadata,
   type MuxFilePart,
   type MuxMessage,
-  type ReviewNoteDataForDisplay,
   type StartupRetrySendOptions,
   type WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
 import { toValidGoalId } from "@/common/types/goal";
-import { selectKeepRecentTailStartIndex } from "@/common/utils/messages/keepRecentTail";
 import { extractReadFilePaths, mergeReadFilePaths } from "@/common/utils/messages/extractReadFiles";
 import { isNonNegativeInteger } from "@/common/utils/numbers";
-import { RLM_KEEP_RECENT_FLOOR_TOKENS } from "@/constants/rlmCompaction";
 import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
@@ -222,7 +223,16 @@ import type { GoalStreamOriginKind, WorkspaceGoalService } from "./workspaceGoal
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
-import { CompactionHandler } from "./compactionHandler";
+import type { CompactionHandler } from "./compactionHandler";
+import type { ContextManagementService } from "./contextManagement/contextManagementService";
+import type { SessionContextController } from "./contextManagement/sessionContextController";
+import type { SessionContextHost } from "./contextManagement/sessionContextHost";
+import type { ContextDispatchRequest, CompactionContinuation } from "./contextManagement/types";
+import {
+  inheritOpenWorkspaceTurnMetadata,
+  computeKeepRecentTailStamp,
+  isCompactionRequestMetadata,
+} from "./contextManagement/compactionRequests";
 import { RetryManager, type RetryFailureError, type RetryStatusEvent } from "./retryManager";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import type { Scope } from "effect";
@@ -244,7 +254,6 @@ import {
 } from "@/common/utils/messages/extractEditedFiles";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCompactionCheck";
-import { ROUTED_SEND_COMPACTION_HEADROOM_PERCENT } from "@/common/constants/ui";
 import { MAX_AGENT_SKILL_SNAPSHOT_CHARS } from "@/common/constants/attachments";
 import { MCP_PROMPT_MAX_TEXT_BYTES } from "@/common/constants/toolLimits";
 import type { AgentSkillScope } from "@/common/types/agentSkill";
@@ -320,28 +329,13 @@ import {
   AUTO_RETRY_PREFERENCE_FILE,
   parseStrictPendingRejectedTurnRepairKeys,
 } from "@/node/services/rejectedTurnRepairRecord";
-import { CompactionMonitor, type CompactionStatusEvent } from "./compactionMonitor";
-import { injectPostCompactionAttachments } from "@/browser/utils/messages/modelMessageTransform";
-import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
-import { ContinuousCompactor, type ContinuousCompactionContext } from "./continuousCompactor";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
-import { summarizeContinuousCompaction } from "./continuousCompactionSummary";
 
 /** See AgentSession.createRoutedMemoryConsent. Mutable: the resolver records what it included. */
 interface RoutedMemoryConsent {
   excludeProjectSkillContent: boolean;
   carriesProjectSkillContent: boolean;
 }
-
-type SessionCompactionContext = ContinuousCompactionContext & {
-  sendOptions?: SendMessageOptions;
-  /**
-   * The observed turn is skill-routed (resumeStream's routed predicate:
-   * compactionBaseOptions set): its summaries and swapped prefixes leave for
-   * the routed/compact provider under the routed request's consent rules.
-   */
-  routedTurn?: boolean;
-};
 
 /**
  * Result shape for turn-starting session methods. failureHandled marks errors
@@ -362,41 +356,24 @@ type AgentSessionInterruptResult = Result<void> & { streamStopped?: true };
 // Re-export types from FileChangeTracker for backward compatibility
 export type { FileState } from "@/node/services/utils/fileChangeTracker";
 
-// Type guard for compaction request metadata
-// Supports both new `followUpContent` and legacy `continueMessage` for backwards compatibility
-interface CompactionRequestMetadata {
-  type: "compaction-request";
-  source?: "idle-compaction" | "auto-compaction";
-  parsed: {
-    followUpContent?: CompactionFollowUpRequest;
-    // Legacy field - older persisted requests may use this instead of followUpContent
-    continueMessage?: {
-      text?: string;
-      imageParts?: FilePart[];
-      reviews?: ReviewNoteDataForDisplay[];
-      muxMetadata?: MuxMessageMetadata;
-      model?: string;
-      agentId?: string;
-      mode?: "exec" | "plan"; // Legacy: older versions stored mode instead of agentId
-    };
-  };
-}
-
 type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPolicy"]>;
 
 // Wake continuations must retain their delegated turn correlation through candidate preparation.
+// An explicit correlation (a workspace-turn-task row, or a wake row that reactivated an inactive
+// sub-agent under a fresh continuation) wins; a plain wake inherits the still-open turn from history.
 function resolveStreamMuxMetadata(
   options: MuxMessageMetadata | undefined,
   retry: MuxMessageMetadata | undefined,
   messages: MuxMessage[]
 ): ReturnType<typeof inheritOpenWorkspaceTurnMetadata> {
-  return options?.type === "workspace-turn-task"
-    ? options
-    : retry?.type === "workspace-turn-task"
-      ? retry
-      : retry?.type === "bash-monitor-wake"
-        ? inheritOpenWorkspaceTurnMetadata(messages)
-        : undefined;
+  const explicit =
+    parseWorkspaceTurnTaskCorrelation(options) ?? parseWorkspaceTurnTaskCorrelation(retry);
+  if (explicit != null) {
+    return { type: "workspace-turn-task", ...explicit };
+  }
+  return retry?.type === "bash-monitor-wake"
+    ? inheritOpenWorkspaceTurnMetadata(messages)
+    : undefined;
 }
 
 function manualSendPreservesGoalActivation(
@@ -663,50 +640,7 @@ function hasSameWorkspaceTurnCorrelation(
  * persisted on each continuation's assistant message, so chains survive
  * restarts.
  */
-export function inheritOpenWorkspaceTurnMetadata(
-  messages: readonly MuxMessage[]
-): Extract<MuxMessageMetadata, { type: "workspace-turn-task" }> | undefined {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i];
-    const muxMetadata = message.metadata?.muxMetadata;
-    if (message.role === "assistant") {
-      if (
-        muxMetadata?.type === "workspace-turn-task" &&
-        message.metadata?.partial !== true &&
-        message.metadata?.finishReason === "tool-calls"
-      ) {
-        return muxMetadata;
-      }
-      // On-send compaction can consume a monitor-wake continuation mid-turn,
-      // hiding the correlated queue-cut assistant behind the new boundary. The
-      // pre-compaction correlation is stamped on the summary's pending
-      // follow-up (see the on-send divert in sendMessage), so the wake
-      // continuation re-inherits it from there.
-      if (
-        muxMetadata?.type === "compaction-summary" &&
-        muxMetadata.pendingFollowUp?.workspaceTurnMetadata != null
-      ) {
-        return muxMetadata.pendingFollowUp.workspaceTurnMetadata;
-      }
-      return undefined;
-    }
-    if (message.role === "user") {
-      if (muxMetadata?.type === "bash-monitor-wake") {
-        continue;
-      }
-      return undefined;
-    }
-  }
-  return undefined;
-}
-
-function isCompactionRequestMetadata(meta: unknown): meta is CompactionRequestMetadata {
-  if (typeof meta !== "object" || meta === null) return false;
-  const obj = meta as Record<string, unknown>;
-  if (obj.type !== "compaction-request") return false;
-  if (typeof obj.parsed !== "object" || obj.parsed === null) return false;
-  return true;
-}
+export { inheritOpenWorkspaceTurnMetadata } from "./contextManagement/compactionRequests";
 
 /**
  * Replace the auto-retry preference file atomically (temp file + rename): a
@@ -891,7 +825,7 @@ const ACCEPTED_WITHOUT_STREAM: SendMessageAccepted = { acceptedWithoutStream: tr
  * (prepareStep) invocation, whose refusal surfaces through the stream's own
  * error path — the gate then leaves the visible error emission to it.
  */
-type RoutedConsentRejection = (
+export type RoutedConsentRejection = (
   requestCarriesProjectContent?: boolean,
   midStream?: boolean
 ) => Promise<SendMessageError | null>;
@@ -1059,6 +993,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
 }
 
 interface AgentSessionOptions {
+  contextManagement: ContextManagementService;
   effectRunner?: EffectRunner;
   appFiberScope?: Scope.Scope;
   workspaceId: string;
@@ -1111,6 +1046,17 @@ interface AgentSessionOptions {
    */
   hasExternalSendPreflight?: () => boolean;
   onContextWindowRollover?: () => void;
+  /** Await durable response bookkeeping before compaction, queued input, or idle. */
+  onBeforeTurnCompletion?: () => Promise<void>;
+  /**
+   * Stop-cascade admission barrier and generation for this workspace (TaskService via
+   * WorkspaceService). Consulted at every turn admission and by the provider-start fence; an
+   * accepted turn captures the epoch at admission and must not start once it moved.
+   */
+  isStopInProgress?: () => boolean;
+  getStopEpoch?: () => number;
+  /** Authoritative turn settlement for stop cascades: the admitted generation ended for good. */
+  onTurnSettled?: (turnGeneration: symbol) => void;
 }
 
 interface CachedMemoryContext {
@@ -1280,6 +1226,14 @@ interface PreparationAttempt {
   failureAttempts?: number;
   failure?: SendMessageError;
   onFailure?: (error: SendMessageError) => Promise<void> | void;
+  /** Queue entry this attempt dispatched when a cut receipt names it (see QueueCutReceipt). */
+  queueCutEntryId?: string;
+  /**
+   * Workspace stop epoch captured when the coordinator admitted this turn. The provider-start
+   * fence refuses to start once a stop bumped it (a stop's single stopStream cannot capture a
+   * turn that had no registered start yet); prepared candidates never refresh it at startup.
+   */
+  admissionStopEpoch?: number;
 }
 
 export class AgentSession {
@@ -1302,6 +1256,10 @@ export class AgentSession {
   private readonly onPostCompactionStateChange?: () => void;
   private readonly onDeferredSendDelivered?: (text: string) => void;
   private readonly hasExternalSendPreflight?: () => boolean;
+  private readonly isStopInProgress: () => boolean;
+  private readonly getStopEpoch: () => number;
+  private readonly onTurnSettled?: (turnGeneration: symbol) => void;
+  private readonly onBeforeTurnCompletion?: AgentSessionOptions["onBeforeTurnCompletion"];
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
@@ -1309,6 +1267,8 @@ export class AgentSession {
     [];
   private readonly coordinator = new TurnCoordinator({
     streamStarted: (payload) => {
+      // The admitted successor now owns completion through its own stream end.
+      this.settleAdmittedQueueCutReceipts(this.coordinator.turnId, "streaming");
       this.dispatchingQueuedEntry = false;
       this.dispatchingQueuedEntryMuxMetadata = undefined;
       this.preparingWorkspaceTurnMetadata = undefined;
@@ -1321,7 +1281,13 @@ export class AgentSession {
       this.queuedProviderToolEndAbortInFlight = false;
       this.activeToolCallIds.clear();
     },
-    phaseChanged: (phase, isCurrent) => this.publishTurnPhase(phase, isCurrent),
+    phaseChanged: (phase, isCurrent) => {
+      this.publishTurnPhase(phase, isCurrent);
+      // The coordinator transitions a generation to idle only from its owner's completion paths
+      // (finished turn, failed/withdrawn preparation, preemption), so this is that turn's
+      // settlement — a stop cascade waiting on the captured generation may release its latch.
+      if (phase === "idle") this.onTurnSettled?.(this.coordinator.turnId);
+    },
     drainQueue: () => {
       if (!this.messageQueue.isEmpty()) this.sendQueuedMessages("idle");
     },
@@ -1357,9 +1323,13 @@ export class AgentSession {
   private readonly activeToolCallIds = new Set<string>();
 
   private readonly messageQueue = new MessageQueue();
-  private readonly compactionHandler: CompactionHandler;
-  private readonly compactionMonitor: CompactionMonitor;
-  private readonly continuousCompactor: ContinuousCompactor;
+  /**
+   * Receipts for queue entries this session selected to cut a live turn (queued-input stop or
+   * context-budget hand-over), keyed by entry id. See QueueCutReceipt for the lifecycle; only
+   * cuts register, so entries that never cut a turn retain nothing here.
+   */
+  private readonly queueCutReceipts = new Map<string, QueueCutReceipt>();
+  private readonly contextController: SessionContextController;
   private readonly compactionCancellation: CompactionCancellation;
   private compactionStopGeneration = 0;
   private pendingResumeIntent?: AbortController;
@@ -1373,7 +1343,7 @@ export class AgentSession {
     steps: [
       () =>
         this.runStartupRecoveryStep(() => this.requireGoalAcknowledgmentForCrashRecoveredPartial()),
-      () => this.runStartupRecoveryStep(() => this.recoverCompaction()),
+      () => this.runStartupRecoveryStep(() => this.contextController.recover()),
       () => this.runStartupRecoveryStep(() => this.dispatchPendingFollowUp()),
       () =>
         this.runStartupRecoveryStep(() =>
@@ -1422,11 +1392,13 @@ export class AgentSession {
   /** Request-assembly snapshot admitted when a final flush was promised; pins the sealing reset. */
   private pendingRolloverSnapshot?: RequestAssemblySnapshot;
   private contextBudgetWarningClaimed = false;
+  private contextBudgetHandoffClaimed = false;
   /** One final pre-rollover notes flush per window; derived from history on restart. */
   private contextBudgetFlushClaimed = false;
-  private pendingBudgetWarning?: true;
+  private pendingBudgetPrompt?: "warn" | "handoff";
   private contextBudgetGeneration = 0;
-  // Unknown after restart: do not spend the window's warning on guessed permissions.
+  // Settled-step capability, used only to admit a legacy persisted final flush; advisories
+  // resolve the dispatching permissions instead (unknown after restart until a step settles).
   private contextBudgetMemoryWritable: boolean | undefined;
   private contextBudgetHistoryAvailable = false;
   private readonly onContextWindowRollover?: () => void;
@@ -1436,13 +1408,6 @@ export class AgentSession {
   private get midStreamCompactionPending(): boolean {
     return this.coordinator.midStreamCompactionPending;
   }
-  private get continuousCompactionAbandoned(): boolean {
-    return this.coordinator.compactionIntent.abandoned;
-  }
-  private get continuousCompactionObserving(): boolean {
-    return this.coordinator.compactionIntent.observation?.kind === "continuous";
-  }
-  private continuousCompactionObservation: Promise<void> | null = null;
 
   /** Tracks file state for detecting external edits. */
   private readonly fileChangeTracker = new FileChangeTracker();
@@ -1481,6 +1446,24 @@ export class AgentSession {
    * prompt-cache-stable bytes without preserving stale files forever.
    */
   private memoryContextByModelString = new Map<string, CachedMemoryContext>();
+
+  /**
+   * Drop the cached memory context so the next stream rebuilds the index and
+   * hot set from disk. Own memory tool calls clear it on tool-call-end; this
+   * entry point is for writes by OTHER sessions to a store this session also
+   * reads (a sub-agent editing the task tree's shared workspace notes).
+   */
+  invalidateMemoryContext(): void {
+    this.memoryContextByModelString.clear();
+    // A build already awaiting buildMemorySessionContext read the pre-write
+    // files, and a rollover candidate stages its cache in a separate map that
+    // is installed later: bumping the generation stops both from
+    // (re)populating the cache with the stale snapshot.
+    this.memoryContextGeneration++;
+  }
+
+  private memoryContextGeneration = 0;
+
   /**
    * Cache the last-known experiment state so we don't spam metadata refresh
    * when post-compaction context is disabled.
@@ -1619,10 +1602,10 @@ export class AgentSession {
       streamManager,
       mcpServerManager,
       initStateManager,
-      telemetryService,
       backgroundProcessManager,
       workspaceGoalService,
       sessionUsageService,
+      telemetryService,
       keepBackgroundProcesses,
       sanitizeCliWorkspaceRegistration,
       onCompactionComplete,
@@ -1630,6 +1613,10 @@ export class AgentSession {
       onPostCompactionStateChange,
       onDeferredSendDelivered,
       hasExternalSendPreflight,
+      isStopInProgress,
+      getStopEpoch,
+      onTurnSettled,
+      onBeforeTurnCompletion,
     } = options;
 
     assert(typeof workspaceId === "string", "workspaceId must be a string");
@@ -1663,140 +1650,82 @@ export class AgentSession {
     this.onPostCompactionStateChange = onPostCompactionStateChange;
     this.onDeferredSendDelivered = onDeferredSendDelivered;
     this.hasExternalSendPreflight = hasExternalSendPreflight;
+    this.isStopInProgress = isStopInProgress ?? (() => false);
+    this.getStopEpoch = getStopEpoch ?? (() => 0);
+    this.onTurnSettled = onTurnSettled;
+    this.onBeforeTurnCompletion = onBeforeTurnCompletion;
 
-    this.compactionHandler = new CompactionHandler({
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Accessors must read live session state, not the host object's receiver.
+    const session = this;
+    const contextHost: SessionContextHost = {
       workspaceId: this.workspaceId,
-      historyService: this.historyService,
       sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
-      telemetryService,
       emitter: this.emitter,
+      coordinator: this.coordinator,
       // The in-memory quarantine plus every outstanding repair key: a heartbeat
       // reset or compaction that runs before startup recovery stamped the keyed
       // rows must still keep them out of the carried-over pending state.
       getQuarantinedRowIds: () =>
         new Set([...this.unstampedRejectedRowIds, ...this.outstandingRejectedTurnKeys()]),
-      onCompactionComplete: (metadata) => {
-        // RLM keep-recent floor: tail copies after the boundary mean the
-        // summary is no longer the last row; stash its ID so the stream-end
-        // follow-up dispatch can target it directly.
-        // Reset on every completion: a resumeless continuous fold may precede a
-        // legacy compaction whose current follow-up is on its final summary row.
-        this.coordinator.recordCompactionSummary(
-          (metadata.preservedTailMessageCount ?? 0) > 0 ? metadata.summaryMessageId : null
-        );
-        onCompactionComplete?.(metadata);
+      streams: {
+        isStreaming: (id) => this.streamManager.isStreaming(id),
+        getStreamInfo: (id) => this.streamManager.getStreamInfo(id),
+        setPrefixSwap: (id, swap) => this.streamManager.setPrefixSwap?.(id, swap) ?? false,
+        clearPrefixSwap: (id) => this.streamManager.clearPrefixSwap?.(id),
+        getPrefixSwapState: (id) => this.streamManager.getPrefixSwapState?.(id) ?? "none",
+        getPrefixSwapPreparation: (id) => this.streamManager.getPrefixSwapPreparation?.(id) ?? null,
+        stopStream: (id, options) => this.streamManager.stopStream(id, options),
       },
-      onIdleCompactionOutcome,
-    });
-
-    this.compactionMonitor = new CompactionMonitor(
-      this.workspaceId,
-      (event: CompactionStatusEvent) => this.emitChatEvent(event)
-    );
-
-    this.continuousCompactor = new ContinuousCompactor({
-      workspaceId: this.workspaceId,
-      enterExecution: () => this.coordinator.enterExecution(),
-      historyService: this.historyService,
-      compactionHandler: this.compactionHandler,
-      streamManager: {
-        isStreaming: (workspaceId) => this.streamManager.isStreaming(workspaceId),
-        setPrefixSwap: (workspaceId, swap) =>
-          this.streamManager.setPrefixSwap?.(workspaceId, swap) ?? false,
-        clearPrefixSwap: (workspaceId) => this.streamManager.clearPrefixSwap?.(workspaceId),
-        getPrefixSwapState: (workspaceId) =>
-          this.streamManager.getPrefixSwapState?.(workspaceId) ?? "none",
-        getStreamInfo: (workspaceId) => {
-          const info = this.streamManager.getStreamInfo(workspaceId);
-          return (
-            info && {
-              ...info,
-              stepStartIndices: info.stepStartIndices ?? [],
-              currentStepStartIndex: info.currentStepStartIndex ?? 0,
-            }
-          );
+      state: {
+        get stream() {
+          return session.activeStreamContext;
+        },
+        get userMessageId() {
+          return session.activeStreamUserMessageId;
+        },
+        get usage() {
+          return session.getUsageState();
+        },
+        get systemMessageTokens() {
+          return session.lastSystemMessageTokens;
+        },
+        get providersConfig() {
+          return session.getProvidersConfigSafe();
         },
       },
-      prepare: () =>
-        eventSpine.run("compaction.prepare", {
-          workspaceId: this.workspaceId,
-          reason: "continuous-eager",
-        }),
-      estimateAttachmentTokens: async (head) => {
-        const attachments = await this.buildContinuousCompactionAttachments(head);
-        return injectPostCompactionAttachments([], attachments).reduce(
-          (sum, row) => sum + estimateMuxMessageTokens(row),
-          0
+      transitionContextState: (transition) => {
+        if (transition === "invalidate") this.clearUsageState();
+        else this.lastUsageState = undefined;
+      },
+      onCompactionObservationSettled: () => this.drainQueuedMessagesIfIdle(),
+      isCompactionRecoveryBlocked: () => this.compactionRecoveryBlocked(),
+      captureCompactionAdmission: (origin) => this.captureCompactionAdmission(origin),
+      waitForIdle: () => this.waitForIdle(),
+      isWorkspaceArchivedOnDisk: () => this.isWorkspaceArchivedOnDisk(),
+      buildAutoCompactionRequest: (input) => this.buildAutoCompactionRequest(input),
+      sendCompactionRequest: (request, continuation) =>
+        this.sendCompactionRequest(request, continuation),
+      dispatchPendingFollowUp: async (summaryId, admissionStale, inheritedConsentRejection) => {
+        await this.dispatchPendingFollowUp(
+          summaryId ?? undefined,
+          admissionStale,
+          false,
+          inheritedConsentRejection
         );
       },
-      prepareSwap: async (head) => {
-        // A consumed swap may need the fast-stop fallback on a provider-family hop.
-        if (!this.activeStreamContext?.options) return null;
-        const prepared = this.streamManager.getPrefixSwapPreparation?.(this.workspaceId);
-        if (!prepared) return null;
-        // The swapped prefix is rebuilt from history copies and ships to the
-        // live (possibly routed) provider mid-stream: the same provider-copy
-        // rules as the summarizer head, applied at rebuild time so the durable
-        // journal keeps the unfiltered sources. Post-compaction loaded-skill
-        // attachments are a second channel for the same content.
-        const eligible = await this.prepareContinuousCompactionRows(
-          head,
-          this.activeStreamContext.compactionBaseOptions != null
-        );
-        if (eligible === null) return null;
-        const attachments = await this.buildContinuousCompactionAttachments(eligible.rows);
-        const swapAttachments = eligible.projectContentWithheld
-          ? (excludeProjectSkillContentFromAttachments(attachments) ?? [])
-          : attachments;
-        return {
-          ...prepared,
-          attachments: swapAttachments,
-          prefixRows: (rows: MuxMessage[]) => {
-            const filtered = this.excludeRejectedRows(rows);
-            return eligible.projectContentWithheld
-              ? withholdProjectSkillContentFromRequest(filtered)
-              : filtered;
-          },
-          // The swap's own consent verdict for the per-step gate: content kept
-          // under trust arms it (a revocation before the swapped prefix ships
-          // then refuses the step); withheld content never does — withheld
-          // copies keep their provenance stamps, so they must not be rescanned.
-          prefixCarriesProjectSkillContent: eligible.projectContentWithheld
-            ? () => false
-            : (rows: MuxMessage[]) =>
-                messagesCarryProjectSkillContent(rows) ||
-                attachmentsCarryProjectSkillContent(swapAttachments),
-        };
-      },
-      summarize: async (head, signal, context: SessionCompactionContext) => {
-        const baseOptions = context.sendOptions ?? { model: context.model, agentId: "exec" };
-        const request = this.buildAutoCompactionRequest({
-          baseOptions,
-          followUpContent: { text: "Continue", model: context.model, agentId: "exec" },
-          reason: "on-send",
-        });
-        // The compactor reads RAW history; what its summarizer sends is a
-        // provider request like any other (see prepareContinuousCompactionRows).
-        const eligible = await this.prepareContinuousCompactionRows(
-          head,
-          context.routedTurn === true
-        );
-        if (eligible === null || eligible.rows.length === 0) return null;
-        return summarizeContinuousCompaction({
-          workspaceId: this.workspaceId,
-          config: this.config,
-          aiService: this.aiService,
-          sessionUsageService: this.sessionUsageService,
-          head: eligible.rows,
-          signal,
-          context,
-          baseOptions,
-          compactOptions: request.sendOptions,
-          beforeDispatch: () => this.continuousCompactionRowsStillEligible(eligible),
-        });
-      },
-      fastApply: (apply) => this.interruptForContinuousCompaction(apply),
-    });
+      // Provider-facing copies of continuous-compaction rows follow the routed
+      // request's own consent rules (see prepareContinuousCompactionRows).
+      prepareContinuousCompactionRows: (rows, routedTurn) =>
+        this.prepareContinuousCompactionRows(rows, routedTurn),
+      continuousCompactionRowsStillEligible: (prepared) =>
+        this.continuousCompactionRowsStillEligible(prepared),
+      excludeRejectedRows: (rows) => this.excludeRejectedRows(rows),
+      buildAttachments: (input) => this.buildAttachmentsFromContext(input),
+      emitChatEvent: (event) => this.emitChatEvent(event),
+      onCompactionComplete: (metadata) => onCompactionComplete?.(metadata),
+      onIdleCompactionOutcome: (success) => onIdleCompactionOutcome?.(success),
+    };
+    this.contextController = options.contextManagement.openSession(contextHost);
 
     this.retryManager = new RetryManager(
       this.workspaceId,
@@ -1833,7 +1762,7 @@ export class AgentSession {
    */
   beginShutdown(): void {
     this.coordinator.beginShutdown();
-    this.continuousCompactor.reset("shutdown");
+    this.contextController.beginShutdown();
     this.retryManager.cancel();
   }
 
@@ -1891,6 +1820,7 @@ export class AgentSession {
     };
     // Latch admission without publishing idle before stopStream captures the old attempt.
     this.coordinator.beginShutdown();
+    this.queueCutReceipts.clear();
     const stopped = cleanup("stopStream", () =>
       this.streamManager.stopStream(this.workspaceId, {
         abandonPartial: true,
@@ -1906,9 +1836,7 @@ export class AgentSession {
         if (this.coordinator.disposed) this.replayPublication.disable();
       }
     });
-    const compactionStopped = cleanup("compaction", () =>
-      this.continuousCompactor.reset("dispose")
-    );
+    const compactionStopped = cleanup("compaction", () => this.contextController.dispose());
     const retryStopped = cleanup("retry", () => this.retryManager.dispose());
     const backgroundStopped = this.keepBackgroundProcesses
       ? undefined
@@ -4129,6 +4057,11 @@ export class AgentSession {
       );
       throw error;
     } finally {
+      // A dispatched cut entry whose attempt resolved without a stream or a failure settlement
+      // (withdrawn send, pre-admission early return) also never runs; settle it before idle.
+      if (attempt.outcome !== "delivered" && attempt.outcome !== "background") {
+        this.recordQueueCutSuccessorPreStreamFailure(attempt);
+      }
       try {
         if (this.preparingQueuedInput?.attempt === attempt) {
           // A dequeued manual send can fail even after Send Now refreshes its Stop admission.
@@ -4175,6 +4108,9 @@ export class AgentSession {
   ): Promise<void> {
     if (attempt.failureNotified || (!attempt.queued && attempt.durability !== "accepted")) return;
     attempt.failure ??= error;
+    // Evidence for the cut stream's owner precedes the enqueuer's own callback and the idle
+    // publication that follows in completePreparation.
+    this.recordQueueCutSuccessorPreStreamFailure(attempt);
     while ((attempt.failureAttempts ?? 0) < 2) {
       attempt.failureAttempts = (attempt.failureAttempts ?? 0) + 1;
       try {
@@ -4311,7 +4247,7 @@ export class AgentSession {
     const rollbackPersistedTurnRows = async (): Promise<boolean> => {
       if (replacementCommitted) return false;
       if (persistedCancelableMessageIds.length === 0) return true;
-      this.continuousCompactor.reset("delete-messages");
+      this.contextController.reset("delete-messages");
       const rollbackResult = await this.historyService.deleteMessages(
         this.workspaceId,
         persistedCancelableMessageIds
@@ -4771,7 +4707,7 @@ export class AgentSession {
       // Reserve before interrupting: terminal policy can otherwise start queued work
       // while stopStream settles, leaving this edit waiting on the wrong turn.
       attempt.editReservation = this.coordinator.reserve("edit");
-      this.continuousCompactor.reset("edit");
+      this.contextController.reset("edit");
       // Ignore our own reservation when deciding whether a turn needs to settle.
       if (this.coordinator.phase !== "idle") {
         // If a turn is still PREPARING/STREAMING, interrupt aggressively — history is about to be
@@ -4814,6 +4750,11 @@ export class AgentSession {
       if (this.coordinator.admissionBlocked || isAdmissionStale()) {
         return refuseBeforeAcceptance(
           createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
+        );
+      }
+      if (this.isStopInProgress()) {
+        return refuseBeforeAcceptance(
+          createUnknownSendMessageError(WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE)
         );
       }
       if (this.coordinator.closing) {
@@ -4988,7 +4929,7 @@ export class AgentSession {
     const isCompactionRequest = isCompactionRequestMetadata(typedMuxMetadata);
     if (isCompactionRequest) {
       this.clearContextBudgetState();
-      this.continuousCompactor.reset("compaction-request");
+      this.contextController.reset("compaction-request");
     }
 
     // Internal callers can force Copilot billing attribution for non-user turns
@@ -5334,47 +5275,6 @@ export class AgentSession {
         return Ok(undefined);
       }
 
-      const providersConfigForCompaction = this.getProvidersConfigSafe();
-      // Recover before measuring pressure so the old pre-swap usage cannot force another fold.
-      if (await this.recoverCompaction()) this.clearUsageState();
-      const compactionResult = this.compactionMonitor.checkBeforeSend({
-        model: modelForStream,
-        usage: this.getUsageState(),
-        use1MContext: this.is1MContextEnabledForModel(
-          modelForStream,
-          optionsForStream,
-          providersConfigForCompaction
-        ),
-        providersConfig: providersConfigForCompaction,
-        openaiWireFormat: optionsForStream.providerOptions?.openai?.wireFormat,
-      });
-
-      const continuousContext = this.getContinuousCompactionContext(
-        modelForStream,
-        optionsForStream,
-        compactionBaseOptionsForRoutedTurn != null
-      );
-      if (!continuousContext.enabled) this.continuousCompactor.reset("disabled");
-      const continuousResult = continuousContext.enabled
-        ? await this.observeCompaction(compactionResult.usagePercentage, {
-            ...continuousContext,
-            phase: "on-send",
-          })
-        : "none";
-      if (continuousResult === "applied") this.clearUsageState();
-      if (await cancelBeforeAcceptance()) return Ok(undefined);
-
-      // A staged fold needs no compact turn. Without one, the experiment waits
-      // until the force threshold; the legacy path retains its on-send threshold.
-      //
-      // Skill-routed sends compact only when the content genuinely risks
-      // overrunning the routed model's window: applying the threshold (or the
-      // experiment's force bar) to the (smaller) routed window would let a
-      // one-off cheap-skill invocation force an unrequested, irreversible,
-      // workspace-wide compaction of a session far under its own model's
-      // limit. The headroom accounts for the pending turn (new message,
-      // attachments, skill snapshot), which the recorded usage doesn't
-      // include yet.
       // The recorded usage excludes the pending turn, and a routed window can
       // be far smaller than the workspace model's: size what this send adds
       // — the prompt, the invoked skill's body (bounded like its snapshot)
@@ -5409,92 +5309,46 @@ export class AgentSession {
               use1MContext: this.is1MContextEnabledForModel(
                 modelForStream,
                 optionsForStream,
-                providersConfigForCompaction
+                this.getProvidersConfigSafe()
               ),
-              providersConfig: providersConfigForCompaction,
+              providersConfig: this.getProvidersConfigSafe(),
               openaiWireFormat: optionsForStream.providerOptions?.openai?.wireFormat,
             })
           : 0;
-      const routedSendNearsWindow =
-        compactionResult.usagePercentage + routedPendingPercent >=
-        100 - ROUTED_SEND_COMPACTION_HEADROOM_PERCENT;
-      const shouldCompactBeforeSend =
-        this.compactionMonitor.getThreshold() < 1 &&
-        (continuousContext.enabled
-          ? continuousResult === "fallback" &&
-            (skillModelOverride != null
-              ? routedSendNearsWindow
-              : compactionResult.shouldForceCompact)
-          : skillModelOverride != null
-            ? routedSendNearsWindow
-            : compactionResult.usagePercentage >= compactionResult.thresholdPercentage);
-      // A new boundary would hide the summary needed to retire scoped Stop debt.
-      // Keep ordinary input flowing, but defer legacy compaction until cleanup succeeds.
-      // An explicit replacement instead publishes its witness before compaction can hide debt.
-      if (
-        shouldCompactBeforeSend &&
-        (manualReplacement || automaticReplacement || !(await this.compactionRecoveryBlocked()))
-      ) {
-        this.continuousCompactor.reset("legacy-fallback");
-        const followUpFileParts = effectiveFileParts?.map((part) => ({
-          url: part.url,
-          mediaType: part.mediaType,
-          filename: part.filename,
-        }));
-
-        // A monitor-wake continuation of an open delegated turn is about to be
-        // consumed by compaction; capture the correlation from pre-compaction
-        // history now, because the correlated queue-cut assistant will be
-        // hidden behind the new boundary when the follow-up dispatches.
-        let inheritedWorkspaceTurnMetadata:
-          | Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
-          | undefined;
-        if (typedMuxMetadata?.type === "bash-monitor-wake") {
-          const preCompactionHistory = await this.historyService.getHistoryFromLatestBoundary(
-            this.workspaceId
-          );
-          if (preCompactionHistory.success) {
-            inheritedWorkspaceTurnMetadata = inheritOpenWorkspaceTurnMetadata(
-              preCompactionHistory.data
-            );
-          }
-        }
-
+      const preparation = await this.contextController.beforeSend({
+        messageText: message,
+        options: optionsForStream,
+        modelForStream,
+        fileParts: effectiveFileParts,
+        agentInitiated,
+        goalKind,
+        goalId: internal?.goalId,
+        muxMetadata: typedMuxMetadata,
         // Pre-routing options/model: the deferred follow-up re-enters
         // sendMessage with the same skill metadata and re-resolves routing at
         // dispatch time. Persisting the routed model here would pin a stale
         // decision — if the binding is gone by dispatch, the user's prompt
         // would stream on the routed model with no routing decision behind it.
-        const followUpContent = this.buildAutoCompactionFollowUp({
-          messageText: message,
-          options: preRoutingOptions,
-          modelForStream: preRoutingOptions.model,
-          fileParts: followUpFileParts,
-          agentInitiated,
-          goalKind,
-          goalId: internal?.goalId,
-          muxMetadata: typedMuxMetadata,
-          workspaceTurnMetadata: inheritedWorkspaceTurnMetadata,
-        });
-
-        // Waterfall hook point: lets registered middleware (e.g. refinement
-        // journaling) run before context is compacted away. No-op when empty.
-        await eventSpine.run("compaction.prepare", {
-          workspaceId: this.workspaceId,
-          reason: "on-send",
-        });
-
-        const autoCompactionRequest = this.buildAutoCompactionRequest({
-          followUpContent,
-          // The compaction request must run on the model able to read the full
-          // history — usually the user's pre-routing model, or the routed model
-          // when the class routes UP to a larger window. The deferred follow-up
-          // re-enters sendMessage with the same skill metadata and re-routes
-          // itself either way.
-          baseOptions: compactionBaseOptionsForRoutedTurn ?? preRoutingOptions,
-          reason: "on-send",
-        });
-
+        followUpOptions: preRoutingOptions,
+        ...(skillModelOverride != null
+          ? {
+              routed: {
+                pendingPercent: routedPendingPercent,
+                // The compaction request must run on the model able to read the
+                // full history — usually the user's pre-routing model, or the
+                // routed model when the class routes UP to a larger window. The
+                // deferred follow-up re-enters sendMessage with the same skill
+                // metadata and re-routes itself either way.
+                compactionBaseOptions: compactionBaseOptionsForRoutedTurn ?? preRoutingOptions,
+              },
+            }
+          : {}),
+        replacement: manualReplacement || automaticReplacement,
+        cancelBeforeAcceptance,
+      });
+      if (preparation.kind === "cancelled") return Ok(undefined);
+      if (preparation.kind === "compact-first") {
+        const autoCompactionRequest = preparation.request;
         // The pricing gate above validated the ROUTED model, but the
         // compaction request may inherit the pre-routing ambient model (the
         // larger-window pick): for a budgeted goal that model must be priced
@@ -5528,16 +5382,6 @@ export class AgentSession {
             return Err(compactionPricingGate.error);
           }
         }
-
-        // RLM keep-recent floor: stamp on-send auto-compaction requests with
-        // the durable tail-start sequence. No-op when RLM is off.
-        if (autoCompactionRequest.metadata.type === "compaction-request") {
-          autoCompactionRequest.metadata = await this.withKeepRecentTailStamp(
-            autoCompactionRequest.metadata,
-            optionsForStream
-          );
-        }
-
         autoCompactionMessage = createMuxMessage(
           createUserMessageId(),
           "user",
@@ -5597,7 +5441,7 @@ export class AgentSession {
         this.emitChatEvent({
           type: "auto-compaction-triggered",
           reason: "on-send",
-          usagePercent: Math.round(compactionResult.usagePercentage),
+          usagePercent: preparation.usagePercent,
         });
 
         modelForStream = autoCompactionRequest.sendOptions.model;
@@ -5621,6 +5465,13 @@ export class AgentSession {
     if (this.coordinator.admissionBlocked || isAdmissionStale()) {
       return refuseBeforeAcceptance(
         createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
+      );
+    }
+    // Stop-cascade barrier: a send that passed WorkspaceService's entry check during preflight
+    // must still not become an admitted turn while the workspace's stop latch is held.
+    if (this.isStopInProgress()) {
+      return refuseBeforeAcceptance(
+        createUnknownSendMessageError(WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE)
       );
     }
     // Still pre-persist: a row appended now would read as a dispatched turn on the next startup
@@ -5975,7 +5826,7 @@ export class AgentSession {
         contextBudgetPrefix[0].metadata.muxMetadata.final === true;
       if (
         flushPrefix &&
-        (this.pendingRollover == null || this.compactionMonitor.getThreshold() >= 1) &&
+        (this.pendingRollover == null || this.contextController.autoCompactionThreshold >= 1) &&
         userMessage.metadata?.muxMetadata?.contextBudgetFlush === true
       ) {
         optionsForStream = this.degradeFlushEntryToContinuation(userMessage, optionsForStream);
@@ -6131,15 +5982,23 @@ export class AgentSession {
       (internal?.onContextWindowRollover ?? this.onContextWindowRollover)?.();
       await clearPendingBranchSummary(this.workspaceId);
     } else if (tokenBudgetActive) {
-      this.contextBudgetWarningClaimed ||=
-        contextBudgetPrefix.length > 0 ||
-        userMessage.metadata?.muxMetadata?.type === "context-budget-warning";
+      const published = [...contextBudgetPrefix, userMessage];
+      this.contextBudgetWarningClaimed ||= published.some(
+        (row) =>
+          row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+          row.metadata.muxMetadata.handoff !== true
+      );
+      this.contextBudgetHandoffClaimed ||= published.some(
+        (row) =>
+          row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+          row.metadata.muxMetadata.handoff === true
+      );
       this.contextBudgetFlushClaimed ||= contextBudgetPrefix.some(
         (row) =>
           row.metadata?.muxMetadata?.type === "context-budget-warning" &&
           row.metadata.muxMetadata.final === true
       );
-      this.pendingBudgetWarning = undefined;
+      this.pendingBudgetPrompt = undefined;
     }
 
     // Rollover clears old tracking before append; register only the snapshot that
@@ -6345,8 +6204,12 @@ export class AgentSession {
     // normally impossible since mutations refuse while sends are in
     // preflight (r42), but kept for paths that bypass WorkspaceService
     // entry accounting.
-    if (this.coordinator.admissionBlocked || isAdmissionStale()) {
-      const error = createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
+    if (this.coordinator.admissionBlocked || isAdmissionStale() || this.isStopInProgress()) {
+      const error = createUnknownSendMessageError(
+        this.isStopInProgress()
+          ? WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE
+          : CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE
+      );
       // The turn was already accepted (rows durable, onAccepted ran):
       // internal callers like the terminal-attention outbox mark state
       // delivered in onAccepted and rely on the accepted pre-stream failure
@@ -6394,6 +6257,7 @@ export class AgentSession {
       );
     }
     const preparedTurn = admission.turnId;
+    attempt.admissionStopEpoch ??= this.getStopEpoch();
 
     internal?.onTurnAdmissionCommitted?.();
 
@@ -6686,6 +6550,10 @@ export class AgentSession {
     ) {
       return Ok({ started: false });
     }
+    // Stop-cascade barrier: a resume is a stream-starting entry point like a send.
+    if (this.isStopInProgress()) {
+      return Err(createUnknownSendMessageError(WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE));
+    }
 
     const attempt: PreparationAttempt = {
       intent: "resume",
@@ -6714,6 +6582,7 @@ export class AgentSession {
       const preparedTurn = admission.turnId;
       // A resumed attempt becomes the latest live resume request as soon as we
       // accept its options, even if startup fails before the stream fully begins.
+      attempt.admissionStopEpoch = this.getStopEpoch();
       this.setAutoRetryResumeState(
         optionsForStream,
         internal?.agentInitiated,
@@ -6781,9 +6650,7 @@ export class AgentSession {
 
   setAutoCompactionThreshold(threshold: number): void {
     this.assertNotDisposed("setAutoCompactionThreshold");
-    const previous = this.compactionMonitor.getThreshold();
-    this.compactionMonitor.setThreshold(threshold);
-    if (previous !== threshold) this.continuousCompactor.reset("threshold-changed");
+    this.contextController.setAutoCompactionThreshold(threshold);
   }
 
   private getUsageState(): AutoCompactionUsageState | undefined {
@@ -6980,26 +6847,12 @@ export class AgentSession {
   /** Prevent cached usage from auto-compacting a rewritten context. */
   clearUsageState(): void {
     this.clearContextBudgetState();
-    this.continuousCompactor.reset("context-changed");
+    this.contextController.reset("context-changed");
     this.lastUsageState = undefined;
   }
 
   private isTokenBudgetActive(options?: SendMessageOptions): boolean {
-    const enabled = (id: ExperimentId) =>
-      typeof this.aiService.isExperimentEnabled === "function" &&
-      this.aiService.isExperimentEnabled(id);
-    if (!(options?.experiments?.tokenBudget ?? enabled(EXPERIMENT_IDS.TOKEN_BUDGET))) return false;
-    if (
-      (options?.experiments?.continuousCompaction ??
-        enabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION)) ||
-      this.isRlmCompactionEnabled(options)
-    ) {
-      log.debug("Token-budget rollover yields to continuous/RLM compaction", {
-        workspaceId: this.workspaceId,
-      });
-      return false;
-    }
-    return !isCompactionRequestMetadata(options?.muxMetadata);
+    return this.contextController.isTokenBudgetActive(options);
   }
 
   /**
@@ -7045,13 +6898,17 @@ export class AgentSession {
     this.contextBudgetGeneration += 1;
     this.pendingRollover = undefined;
     this.pendingRolloverSnapshot = undefined;
-    this.pendingBudgetWarning = undefined;
+    this.pendingBudgetPrompt = undefined;
     this.contextBudgetWarningClaimed = false;
+    this.contextBudgetHandoffClaimed = false;
     this.contextBudgetFlushClaimed = false;
     this.contextBudgetMemoryWritable = undefined;
     this.contextBudgetHistoryAvailable = false;
     this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_CONTINUE_DEDUPE_KEY);
     this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_WARNING_DEDUPE_KEY);
+    // This removal does not publish the queue on its own; a cut continuation dropped here must
+    // still reach its deferred owner.
+    if (this.settleWithdrawnQueueCutReceipts()) this.emitQueuedMessageChanged();
   }
 
   /** Shared with manual reset, but only context-scoped state: tasks, costs and goal consent survive. */
@@ -7063,7 +6920,7 @@ export class AgentSession {
     this.retryManager.cancel();
     this.setAutoRetryResumeState(undefined);
     this.lastUsageState = undefined;
-    this.continuousCompactor.reset("context-changed");
+    this.contextController.reset("settings-changed");
     this.clearFileState();
     this.memoryContextByModelString.clear();
     if (!options?.deferCarryoverDiscard) await this.discardContextResetCarryover();
@@ -7182,6 +7039,40 @@ export class AgentSession {
     return isSessionHistoryDisabled(resolved.data.effectiveToolPolicy) ? blocked : Ok(undefined);
   }
 
+  private async resolveContextBudgetAdvisoryPermissions(
+    options: SendMessageOptions
+  ): Promise<
+    | Pick<
+        Parameters<typeof createContextBudgetWarning>[0],
+        "memoryWritable" | "sessionHistoryAvailable" | "newContextAvailable"
+      >
+    | undefined
+  > {
+    // A queued send may switch agents, policies, or experiments after the previous step settled.
+    // Resolve the dispatching turn once; an inconclusive lookup must not claim an optional advisory.
+    const resolved = await this.resolveAgentForBudgetChecks(options);
+    if (!resolved.success) return undefined;
+    const allowed = applyToolPolicyToNames(
+      ["memory", "session_history", "new_context"],
+      resolved.data.effectiveToolPolicy
+    );
+    const memoryEnabled =
+      options.experiments?.memory ?? this.aiService.isExperimentEnabled(EXPERIMENT_IDS.MEMORY);
+    return {
+      memoryWritable:
+        memoryEnabled &&
+        allowed.includes("memory") &&
+        resolveMemoryAccessPolicy({
+          planLike: resolved.data.agentIsPlanLike,
+          editingCapable: isExecLikeEditingCapableInResolvedChain(
+            resolved.data.agentInheritanceChain
+          ),
+        }).workspace === "readwrite",
+      sessionHistoryAvailable: allowed.includes("session_history"),
+      newContextAvailable: allowed.includes("new_context"),
+    };
+  }
+
   private async resolveAgentForBudgetChecks(
     options: SendMessageOptions | undefined
   ): Promise<Result<AgentResolutionResult, SendMessageError>> {
@@ -7281,7 +7172,7 @@ export class AgentSession {
     if (
       !context ||
       context.contextBudgetRetried ||
-      this.compactionMonitor.getThreshold() >= 1 ||
+      this.contextController.autoCompactionThreshold >= 1 ||
       this.coordinator.admissionBlocked ||
       this.coordinator.editBlocked(editReservation?.id) ||
       this.coordinator.disposed ||
@@ -7569,6 +7460,7 @@ export class AgentSession {
         message: "Full request preparation is unavailable; use /compact or restart.",
       });
     const cache = new Map<string, CachedMemoryContext>();
+    const cacheGeneration = this.memoryContextGeneration;
     // Admission must not pause the goal yet, but the pinned tools must match the later manual pause.
     let prospectiveGoalStatusForToolAvailability: StreamMessageOptions["prospectiveGoalStatusForToolAvailability"];
     if (manualIntervention && this.workspaceGoalService) {
@@ -7666,7 +7558,7 @@ export class AgentSession {
         hasQueuedMessages: this.hasQueuedMessages.bind(this),
         getQueuedInputStopCause: this.getQueuedInputStopCause.bind(this),
         contextBudgetRolloverAvailable:
-          this.isTokenBudgetActive(options) && this.compactionMonitor.getThreshold() < 1,
+          this.isTokenBudgetActive(options) && this.contextController.autoCompactionThreshold < 1,
         onStepSettled: (step) => this.onContextBudgetStepSettled(step),
         requestAssemblySnapshot: snapshot,
       });
@@ -7688,7 +7580,14 @@ export class AgentSession {
         : prepared;
     return Ok({
       start: (startOptions) => {
-        this.memoryContextByModelString = cache;
+        // A shared-notebook write by another tree session while this
+        // candidate was prepared invalidated the installed map only; the
+        // staged one is then unavoidably stale for this request and must
+        // not be reused by later turns.
+        this.memoryContextByModelString =
+          cacheGeneration === this.memoryContextGeneration
+            ? cache
+            : new Map<string, CachedMemoryContext>();
         return prepared.data.start(startOptions);
       },
       [Symbol.asyncDispose]: () => prepared.data[Symbol.asyncDispose](),
@@ -7757,10 +7656,16 @@ export class AgentSession {
       this.clearContextBudgetState();
     }
     this.contextBudgetWarningClaimed = history.data.some(
-      (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
+      (row) =>
+        row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+        row.metadata.muxMetadata.handoff !== true
     );
-    // `||=`: the in-memory claim set at offer time must survive a read that runs before the
-    // final row is durable.
+    this.contextBudgetHandoffClaimed = history.data.some(
+      (row) =>
+        row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+        row.metadata.muxMetadata.handoff === true
+    );
+    // Retain legacy flush recovery; new windows no longer offer a final flush.
     this.contextBudgetFlushClaimed ||= history.data.some(
       (row) =>
         row.metadata?.muxMetadata?.type === "context-budget-warning" &&
@@ -7832,26 +7737,34 @@ export class AgentSession {
           budgetModel
         )
       : 0;
-    const decision: StepBudgetEvaluation = knownLimit
-      ? evaluateStepBudget({
-          contextTokens: contextTokens + newRequestTokens,
-          outputTokens: tokenCount(lastAssistant?.metadata?.contextUsage?.outputTokens) ?? 0,
-          ...estimateLastStepToolResults(lastAssistant),
-          modelContextLimit: maxTokens,
-          threshold: this.compactionMonitor.getThreshold(),
-          warningEmitted: this.contextBudgetWarningClaimed,
-        })
-      : {
-          decision: "continue",
-          flushOpportunity: true,
-          projected: contextTokens + newRequestTokens,
-          hardCeiling: undefined,
-        };
+    // Dispatch must screen the same dense tool outputs as settlement, including after restart.
+    const toolResultTokens = knownLimit
+      ? await estimateToolResultTokensForModel(getLastStepToolResults(lastAssistant), budgetModel)
+      : 0;
+    const evaluateBudget = (): StepBudgetEvaluation =>
+      knownLimit
+        ? evaluateStepBudget({
+            contextTokens: contextTokens + newRequestTokens,
+            outputTokens: tokenCount(lastAssistant?.metadata?.contextUsage?.outputTokens) ?? 0,
+            ...estimateLastStepToolResults(lastAssistant),
+            toolResultTokens,
+            modelContextLimit: maxTokens,
+            threshold: this.contextController.autoCompactionThreshold,
+            warningEmitted: this.contextBudgetWarningClaimed,
+            handoffRequested: this.contextBudgetHandoffClaimed,
+          })
+        : {
+            decision: "continue",
+            flushOpportunity: true,
+            projected: contextTokens + newRequestTokens,
+            hardCeiling: undefined,
+          };
+    const decision = evaluateBudget();
     // The queued flush entry must be recognized before the rollover logic below, which
     // `pendingRollover` would otherwise pre-empt. Re-check the headroom and the tool gates
     // with on-send numbers; degrade to an ordinary continuation when any no longer holds.
     if (userMessage.metadata?.muxMetadata?.contextBudgetFlush === true) {
-      const rolloverEnabled = this.compactionMonitor.getThreshold() < 1;
+      const rolloverEnabled = this.contextController.autoCompactionThreshold < 1;
       // The hard ceiling reserves OUTPUT_RESERVE_TOKENS for the step's output; a model whose
       // inherent thinking minimum needs a larger flush cap must find that extra room too. A
       // refusal may hand the flush to a fallback model with its own (possibly higher) minimum,
@@ -7895,7 +7808,7 @@ export class AgentSession {
         admitted?.success &&
         this.contextBudgetGeneration === generation &&
         this.pendingRollover != null &&
-        this.compactionMonitor.getThreshold() < 1
+        this.contextController.autoCompactionThreshold < 1
       ) {
         // Keep pendingRollover and pin this admitted snapshot: the promised reset must not be
         // invalidated by registry changes that happen during the flush turn itself. The flush
@@ -7920,7 +7833,7 @@ export class AgentSession {
       userMessage.parts = [{ type: "text", text: "Continue" }];
       const { contextBudgetFlush: _dropped, ...rest } = userMessage.metadata.muxMetadata;
       userMessage.metadata.muxMetadata = rest;
-      if (this.compactionMonitor.getThreshold() >= 1) {
+      if (this.contextController.autoCompactionThreshold >= 1) {
         // Rollover was disabled after the pair was queued: drop the paired rollover entry and
         // the stale claims so nothing seals the window if rollover is re-enabled later, and a
         // later genuine rollover may offer the flush this turn never delivered.
@@ -7930,7 +7843,7 @@ export class AgentSession {
           this.emitQueuedMessageChanged();
       }
     }
-    if (this.pendingRollover != null && this.compactionMonitor.getThreshold() >= 1) {
+    if (this.pendingRollover != null && this.contextController.autoCompactionThreshold >= 1) {
       // Rollover was disabled after the intent was recorded (e.g. during a flush turn that
       // ended without a settled tool step): a stale intent must not seal a later, unrelated
       // send once rollover is re-enabled.
@@ -7949,7 +7862,7 @@ export class AgentSession {
       hasUnconsumedNewContextRequest(history.data) &&
       (await this.checkContextBudgetHistoryAccess(options)).success;
     const shouldRollover =
-      this.compactionMonitor.getThreshold() < 1 &&
+      this.contextController.autoCompactionThreshold < 1 &&
       (this.pendingRollover != null || decision.decision === "rollover" || modelRequested);
     const rollover: AgentSession["pendingRollover"] =
       shouldRollover && hasRolloverEligibleMessages(history.data)
@@ -7962,10 +7875,7 @@ export class AgentSession {
             flushOpportunity: decision.flushOpportunity,
             contextTokens: decision.projected,
             maxTokens: recordedLimit,
-            budgetTokens: getContextBudgetRolloverPoint(
-              recordedLimit,
-              this.compactionMonitor.getThreshold()
-            ),
+            budgetTokens: getContextBudgetHardCeiling(recordedLimit),
           })
         : undefined;
     // Recovery access is required only when sealing old context, not for a
@@ -7989,6 +7899,7 @@ export class AgentSession {
       const captured = pinned ? Ok(pinned) : await this.captureRolloverRequestAssembly();
       if (!captured.success) return captured;
       this.pendingRollover = rollover;
+      this.pendingBudgetPrompt = undefined;
       userMessage.metadata = {
         ...userMessage.metadata,
         muxMetadata: {
@@ -8010,30 +7921,40 @@ export class AgentSession {
       this.pendingRollover = undefined;
     }
     if (userMessage.metadata?.muxMetadata?.type === "context-budget-warning") {
-      this.pendingBudgetWarning = undefined;
+      this.pendingBudgetPrompt = undefined;
       return Ok({ prefix: [] });
     }
-    if (
-      !this.contextBudgetWarningClaimed &&
-      this.contextBudgetMemoryWritable !== undefined &&
-      this.compactionMonitor.getThreshold() < 1 &&
-      (this.pendingBudgetWarning != null || decision.decision === "warn")
-    ) {
-      return Ok({
-        prefix: [
-          createContextBudgetWarning({
-            contextTokens: decision.projected,
-            maxTokens: recordedLimit,
-            budgetTokens: getContextBudgetRolloverPoint(
-              recordedLimit,
-              this.compactionMonitor.getThreshold()
-            ),
-            memoryWritable: this.contextBudgetMemoryWritable,
-            sessionHistoryAvailable:
-              this.contextBudgetHistoryAvailable && !isSessionHistoryDisabled(options.toolPolicy),
-          }),
-        ],
-      });
+    // Advisory capabilities come from the dispatching agent, policy and experiments, so the first
+    // send after a restart (where no step has settled yet, and a text-only reply never settles
+    // one) still publishes its single advisory instead of staying silent until the ceiling.
+    if (knownLimit && this.isTokenBudgetActive(options)) {
+      const generation = this.contextBudgetGeneration;
+      const permissions = await this.resolveContextBudgetAdvisoryPermissions(options);
+      // Pending intent only owns the queued Continue. Recompute after awaits: a slider or policy
+      // edit may upgrade, downgrade, or omit the row, and nothing is claimed until publication.
+      const advisory = evaluateBudget();
+      if (
+        permissions &&
+        generation === this.contextBudgetGeneration &&
+        this.isTokenBudgetActive(options) &&
+        (advisory.decision === "warn" || advisory.decision === "handoff")
+      ) {
+        return Ok({
+          prefix: [
+            createContextBudgetWarning({
+              contextTokens: advisory.projected,
+              maxTokens: recordedLimit,
+              budgetTokens: getContextBudgetHardCeiling(recordedLimit),
+              handoffTokens: getContextBudgetHandoffPoint(
+                recordedLimit,
+                this.contextController.autoCompactionThreshold
+              ),
+              handoff: advisory.decision === "handoff",
+              ...permissions,
+            }),
+          ],
+        });
+      }
     }
     return Ok({ prefix: [] });
   }
@@ -8048,8 +7969,8 @@ export class AgentSession {
     muxMetadata: MuxMessageMetadata;
     goalKind?: GoalSyntheticMessageKind;
     goalId?: string;
-  }): void {
-    this.messageQueue.addOnce(
+  }): string | undefined {
+    const queued = this.messageQueue.addOnce(
       args.text,
       {
         ...args.options,
@@ -8075,11 +7996,11 @@ export class AgentSession {
         goalId: args.goalId,
       }
     );
+    // addOnce keys are unique in the queue, so this resolves the exact entry just added.
+    return queued ? this.messageQueue.getEntryIdByDedupeKey(args.dedupeKey) : undefined;
   }
 
-  private async onContextBudgetStepSettled(
-    step: SettledStepBudget
-  ): Promise<"continue" | "warn" | "rollover" | "block"> {
+  private async onContextBudgetStepSettled(step: SettledStepBudget): Promise<SettledStepOutcome> {
     const context = this.activeStreamContext;
     const generation = this.contextBudgetGeneration;
     if (!context?.options || !this.isTokenBudgetActive(context.options)) {
@@ -8091,9 +8012,9 @@ export class AgentSession {
       // outcome (WorkspaceTurnManager defers while a same-turn continuation is pending).
       if (context?.contextBudgetFlushTurn === true) {
         this.dropContextBudgetIntent();
-        return "rollover";
+        return this.flushTurnRolloverOutcome();
       }
-      return "continue";
+      return { decision: "continue" };
     }
     // Fallbacks rebuild this callback's model binding; never use the requested primary's limit.
     context.modelString = step.model;
@@ -8109,7 +8030,7 @@ export class AgentSession {
       context.providersConfig ?? null,
       { openaiWireFormat: context.options?.providerOptions?.openai?.wireFormat }
     );
-    const threshold = this.compactionMonitor.getThreshold();
+    const threshold = this.contextController.autoCompactionThreshold;
     const contextTokens = usage
       ? usage.input.tokens + usage.cached.tokens + usage.cacheCreate.tokens
       : 0;
@@ -8126,7 +8047,7 @@ export class AgentSession {
     if (!knownLimit) {
       log.warn("Token budget has no known model context limit", { model: step.model });
       // Budget evaluation is impossible, but an explicit request needs no limit to be honored.
-      if (!modelRequested) return "continue";
+      if (!modelRequested) return { decision: "continue" };
     }
     const decision: StepBudgetEvaluation = knownLimit
       ? evaluateStepBudget({
@@ -8138,6 +8059,7 @@ export class AgentSession {
           modelContextLimit: maxTokens,
           threshold,
           warningEmitted: this.contextBudgetWarningClaimed,
+          handoffRequested: this.contextBudgetHandoffClaimed,
         })
       : {
           decision: "continue",
@@ -8149,44 +8071,33 @@ export class AgentSession {
     // recorded as the observed usage so the row stays valid for display and downgrade parsing.
     const recordedLimit = knownLimit ? maxTokens : Math.max(1, contextTokens);
     // "block" only exists at threshold 100%, where requests are not offered and never honored.
-    if (decision.decision === "block") return "block";
+    if (decision.decision === "block") return { decision: "block" };
     if (context.contextBudgetFlushTurn === true) {
-      if (this.compactionMonitor.getThreshold() >= 1) {
+      if (this.contextController.autoCompactionThreshold >= 1) {
         // Rollover was disabled while the flush ran: nothing may seal this window, so drop the
         // stale intent. The paired "Continue" is kept on purpose: with the intent gone it
         // dispatches as an ordinary continuation of the interrupted work in this window, and a
         // delegated turn must not record the notes-only flush finish as the task's outcome
         // (WorkspaceTurnManager defers finalization while a same-turn continuation is pending).
         this.dropContextBudgetIntent();
-        return "rollover";
+        return this.flushTurnRolloverOutcome();
       }
       // A flush turn is bounded to one provider step even when the step no longer crosses the
       // threshold (larger model after a restart): stopping here lets the queued rollover
       // continuation seal the window.
-      if (decision.decision === "continue") return "rollover";
+      if (decision.decision !== "rollover") return this.flushTurnRolloverOutcome();
     }
     // A model request is honored like a budget rollover (continuation queued after every sibling
     // settled) so the model never re-executes side effects; the persisted tool result doubles as
     // the durable receipt that prepareRolloverRequest recovers after a restart.
-    if (decision.decision === "continue" && !modelRequested) return "continue";
-    let offerFlush = false;
+    if (decision.decision === "continue" && !modelRequested) return { decision: "continue" };
     if (decision.decision === "rollover" || modelRequested) {
       const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (!history.success) throw new Error(history.error);
       if (this.activeStreamContext !== context || this.contextBudgetGeneration !== generation)
-        return "continue";
-      // Offer one final notes flush before sealing when a writing step still fits and the
-      // reset that follows can actually be admitted (session_history available). A model that
-      // asked for the reset itself has already had its chance to write notes.
-      offerFlush =
-        !modelRequested &&
-        decision.decision === "rollover" &&
-        this.pendingRollover == null &&
-        !this.contextBudgetFlushClaimed &&
-        decision.flushOpportunity &&
-        step.memoryWritable &&
-        step.sessionHistoryAvailable &&
-        this.messageQueue.isEmpty();
+        return { decision: "continue" };
+      // The usable ceiling is the only forced boundary; there is no new final-flush offer.
+      this.pendingBudgetPrompt = undefined;
       this.pendingRollover ??= {
         type: "context-window-rollover",
         rolloverId: randomUUID(),
@@ -8196,11 +8107,14 @@ export class AgentSession {
         flushOpportunity: decision.flushOpportunity,
         contextTokens: decision.projected,
         maxTokens: recordedLimit,
-        budgetTokens: getContextBudgetRolloverPoint(recordedLimit, threshold),
+        budgetTokens: getContextBudgetHardCeiling(recordedLimit),
       };
     } else {
-      this.contextBudgetWarningClaimed = true;
-      this.pendingBudgetWarning = true;
+      assert(
+        decision.decision === "warn" || decision.decision === "handoff",
+        "Expected a budget advisory"
+      );
+      this.pendingBudgetPrompt = decision.decision;
     }
     // Keep the continuation's delegated-turn/goal attribution; the warning
     // itself is a separate durable prefix row when this entry dispatches.
@@ -8209,47 +8123,54 @@ export class AgentSession {
     const { fileParts: _fileParts, ...streamOptions } = context.options as SendMessageOptions & {
       fileParts?: unknown;
     };
-    // SECURITY: the flush turn is a hidden, automatically dispatched step running on a
-    // transcript that may already contain injected tool output. The request builder derives
-    // its memory-only tool ceiling, pinned notes path, and disabled hooks/PTC from the
-    // `contextBudgetFlush` flag, independent of these send options.
-    const enqueue = (text: string, dedupeKey: string, flush: boolean) =>
-      this.enqueueContextBudgetContinuation({
+    // Capture the exact successor before publishing the queue so handoff stops retain
+    // upstream queue-cut attribution without creating a final-flush pair.
+    let continuationEntryId: string | undefined;
+    if (this.messageQueue.isEmpty()) {
+      continuationEntryId = this.enqueueContextBudgetContinuation({
         admissionCapture: context.admissionCapture,
-        text,
-        dedupeKey,
+        text: "Continue",
+        dedupeKey:
+          this.pendingBudgetPrompt != null
+            ? CONTEXT_WARNING_DEDUPE_KEY
+            : CONTEXT_CONTINUE_DEDUPE_KEY,
         options: streamOptions,
         model: step.model,
         muxMetadata: {
           ...(context.workspaceTurnMetadata ?? { type: "normal" }),
           contextBudgetContinuation: true,
-          ...(flush ? { contextBudgetFlush: true as const } : {}),
         },
         goalKind: context.goalKind,
         goalId: context.goalId,
       });
-    if (offerFlush) {
-      assert(
-        !this.messageQueue.hasDedupeKey(CONTEXT_WARNING_DEDUPE_KEY) &&
-          !this.messageQueue.hasDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY),
-        "flush offer requires no pending budget continuation"
-      );
-      this.contextBudgetFlushClaimed = true;
-      // Entry 1 is the flush turn (hidden trigger text; the visible prefix carries the prompt).
-      // Entry 2 is the unconditional rollover; its tool-end dispatch also bounds the flush
-      // turn to a single provider step.
-      enqueue("Flush context notes now.", CONTEXT_WARNING_DEDUPE_KEY, true);
-      enqueue("Continue", CONTEXT_CONTINUE_DEDUPE_KEY, false);
-      this.emitQueuedMessageChanged();
-    } else if (this.messageQueue.isEmpty()) {
-      enqueue(
-        "Continue",
-        decision.decision === "warn" ? CONTEXT_WARNING_DEDUPE_KEY : CONTEXT_CONTINUE_DEDUPE_KEY,
-        false
-      );
+      this.registerQueueCutReceipt(continuationEntryId);
       this.emitQueuedMessageChanged();
     }
-    return modelRequested ? "rollover" : decision.decision;
+    // Nothing enqueued (unrelated input already queued): the stop designates no successor.
+    return {
+      decision: modelRequested
+        ? "rollover"
+        : decision.decision === "handoff"
+          ? "warn"
+          : decision.decision,
+      ...(continuationEntryId != null ? { continuationEntryId } : {}),
+    };
+  }
+
+  /**
+   * A flush turn ends after one step for the rollover entry enqueued alongside it. That paired
+   * entry (not whatever else may lead the queue) is the successor; if it was already dropped
+   * (degraded flush, cleared queue) the stop designates none.
+   */
+  private flushTurnRolloverOutcome(): SettledStepOutcome {
+    const continuationEntryId = this.messageQueue.getEntryIdByDedupeKey(
+      CONTEXT_CONTINUE_DEDUPE_KEY
+    );
+    this.registerQueueCutReceipt(continuationEntryId);
+    return {
+      decision: "rollover",
+      ...(continuationEntryId != null ? { continuationEntryId } : {}),
+    };
   }
 
   /**
@@ -8451,57 +8372,6 @@ export class AgentSession {
     }
   }
 
-  private buildAutoCompactionFollowUp(params: {
-    messageText: string;
-    options: SendMessageOptions;
-    modelForStream: string;
-    fileParts?: FilePart[];
-    agentInitiated?: boolean;
-    goalKind?: GoalSyntheticMessageKind;
-    goalId?: string;
-    muxMetadata?: MuxMessageMetadata;
-    workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
-    /** The interrupted stream ran with a routed consent gate (see CompactionFollowUpRequest). */
-    routedProjectConsent?: boolean;
-  }): CompactionFollowUpRequest {
-    const followUp: CompactionFollowUpRequest = {
-      text: params.messageText,
-      model: params.modelForStream,
-      agentId: params.options.agentId,
-      ...pickPreservedSendOptions(params.options),
-    };
-
-    if (params.agentInitiated === true) {
-      followUp.agentInitiated = true;
-    }
-
-    if (params.goalKind != null) {
-      followUp.goalKind = params.goalKind;
-    }
-
-    if (params.goalId != null) {
-      followUp.goalId = params.goalId;
-    }
-
-    if (params.fileParts && params.fileParts.length > 0) {
-      followUp.fileParts = params.fileParts;
-    }
-
-    if (params.muxMetadata) {
-      followUp.muxMetadata = params.muxMetadata;
-    }
-
-    if (params.workspaceTurnMetadata) {
-      followUp.workspaceTurnMetadata = params.workspaceTurnMetadata;
-    }
-
-    if (params.routedProjectConsent === true) {
-      followUp.routedProjectConsent = true;
-    }
-
-    return followUp;
-  }
-
   /**
    * Startup recovery dispatches through this session's internal send path, which bypasses
    * WorkspaceService.sendMessage's archived guard, so an archive that lands while a recovery
@@ -8585,30 +8455,14 @@ export class AgentSession {
    * when history cannot be read (self-healing: compaction proceeds without a
    * tail), or when the tail clamps away entirely.
    */
-  private async computeKeepRecentTailStamp(
+  private computeKeepRecentTailStamp(
     options: SendMessageOptions | undefined
   ): Promise<{ startHistorySequence: number } | undefined> {
-    if (!this.isRlmCompactionEnabled(options)) {
-      return undefined;
-    }
-
-    const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
-    if (!historyResult.success) {
-      return undefined;
-    }
-
-    const messages = historyResult.data;
-    const startIndex = selectKeepRecentTailStartIndex(messages, RLM_KEEP_RECENT_FLOOR_TOKENS);
-    if (startIndex === -1) {
-      return undefined;
-    }
-
-    const startHistorySequence = messages[startIndex].metadata?.historySequence;
-    assert(
-      isNonNegativeInteger(startHistorySequence),
-      "keep-recent tail selector must only pick rows with a valid historySequence"
+    return computeKeepRecentTailStamp(
+      this.historyService,
+      this.workspaceId,
+      this.isRlmCompactionEnabled(options)
     );
-    return { startHistorySequence };
   }
 
   /** Stamp a compaction-request metadata payload with the keep-recent tail (no-op when RLM is off). */
@@ -8713,445 +8567,68 @@ export class AgentSession {
     };
   }
 
-  private async buildContinuousCompactionAttachments(head: MuxMessage[]) {
-    const pending = await this.compactionHandler.peekPendingState();
-    const warm = await this.compactionHandler.peekCarryoverState();
-    return this.buildAttachmentsFromContext({
-      diffs: [...(pending?.diffs ?? []), ...extractEditedFileDiffs(head)],
-      loadedSkills: mergeLoadedSkillSnapshots([
-        ...(warm?.loadedSkills ?? []),
-        ...(pending?.loadedSkills ?? []),
-        ...extractLoadedSkillSnapshotsFromMessages(head),
-      ]),
-      readFilePaths: mergeReadFilePaths(warm?.readFiles ?? [], [
-        ...(pending?.readFiles ?? []),
-        ...extractReadFilePaths(head),
-      ]),
-      reportsCompletedBeforeMs: Date.now(),
-    });
-  }
-
-  private getContinuousCompactionContext(
-    model: string,
-    options?: SendMessageOptions,
-    routedTurn = false
-  ): SessionCompactionContext {
-    const providersConfig = this.getProvidersConfigSafe();
-    const enabled =
-      options?.experiments?.continuousCompaction ??
-      (typeof this.aiService.isExperimentEnabled === "function" &&
-        this.aiService.isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION));
-    return {
-      enabled:
-        enabled &&
-        this.compactionMonitor.getThreshold() < 1 &&
-        !this.coordinator.disposed &&
-        !this.coordinator.closing &&
-        !this.continuousCompactionAbandoned &&
-        !this.coordinator.admissionBlocked &&
-        !this.coordinator.editReserved &&
-        !this.isWorkspaceArchivedOnDisk(),
-      model,
-      contextWindowTokens:
-        getEffectiveContextLimit(
-          model,
-          this.is1MContextEnabledForModel(model, options, providersConfig),
-          providersConfig
-        ) ?? 0,
-      thresholdPercent: this.compactionMonitor.getThreshold() * 100,
-      systemMessageTokens:
-        this.streamManager.getStreamInfo(this.workspaceId)?.initialMetadata?.systemMessageTokens ??
-        this.lastSystemMessageTokens,
-      sendOptions: options,
-      routedTurn,
-    };
-  }
-
-  private async observeContinuousCompactionAtStreamEnd(
-    model: string,
-    options?: SendMessageOptions,
-    routedTurn = false
+  private async sendCompactionRequest(
+    request: ContextDispatchRequest,
+    continuation: CompactionContinuation
   ): Promise<void> {
-    // fastApply waits for this handler to reach IDLE; waiting on its latch here
-    // (or re-entering it from the generated Continue send) would deadlock.
-    if (
-      this.midStreamCompactionPending ||
-      this.continuousCompactor.isApplying() ||
-      this.coordinator.editBlocked()
-    )
-      return;
-    try {
-      const context = this.getContinuousCompactionContext(model, options, routedTurn);
-      if (!context.enabled && !this.continuousCompactor.hasConsumedSwap()) {
-        this.continuousCompactor.reset("disabled");
-        return;
-      }
-      const usage = this.compactionMonitor.checkBeforeSend({
-        model,
-        usage: this.getUsageState(),
-        use1MContext: this.is1MContextEnabledForModel(
-          model,
-          options,
-          this.getProvidersConfigSafe()
+    const streamContext = continuation.stream;
+    const sendResult = await this.sendMessage(request.messageText, request.sendOptions, {
+      acceptanceOrigin: "automatic",
+      // Continue the captured turn, never acquire a newer Stop frontier.
+      readCompactionAdmission: () =>
+        Promise.resolve(
+          streamContext.admissionCapture
+            ? Ok(streamContext.admissionCapture)
+            : Err("Continuation has no original admission frontier.")
         ),
-        providersConfig: this.getProvidersConfigSafe(),
-      });
-      const result = await this.observeCompaction(usage.usagePercentage, {
-        ...context,
-        phase: "stream-end",
-      });
-      if (result === "applied") this.clearUsageState();
-    } catch (error) {
-      await this.recoverContinuousCompactionFailure(error);
-    }
-  }
-
-  private async recoverContinuousCompactionFailure(
-    error: unknown,
-    ownsObservation = false
-  ): Promise<void> {
-    log.warn(
-      "[continuous-compaction] observation failed; preserving durable recovery state",
-      error
-    );
-    try {
-      // An invalidated prepareStep waits for abort. If failure preceded the stop,
-      // release that wait without resetting the consumed journal or saved follow-up.
-      if (
-        (!ownsObservation && this.midStreamCompactionPending) ||
-        !this.streamManager.isStreaming(this.workspaceId) ||
-        this.streamManager.getPrefixSwapState?.(this.workspaceId) !== "invalidated"
-      )
-        return;
-      const result = await this.streamManager.stopStream(this.workspaceId, {
-        abortReason: "system",
-      });
-      if (!result.success) log.warn("[continuous-compaction] recovery stop failed", result.error);
-    } catch (stopError) {
-      log.warn("[continuous-compaction] recovery stop failed", stopError);
-    }
-  }
-
-  private async waitForContinuousCompactionObservation(): Promise<void> {
-    while (this.continuousCompactionObservation) await this.continuousCompactionObservation;
-  }
-
-  private async runContinuousCompactionObservation<T>(
-    observe: (token: CompactionToken) => Promise<T>
-  ): Promise<T | undefined> {
-    if (this.coordinator.closing) return undefined;
-    // Own the actual apply and its continuation; the compactor separately owns detached eager work.
-    using _execution = this.coordinator.enterExecution();
-    if (this.continuousCompactionObservation) {
-      await this.continuousCompactionObservation;
-      return undefined;
-    }
-    const token = this.coordinator.beginCompactionObservation("continuous");
-    if (token == null) return undefined;
-    let finish!: () => void;
-    const observation = new Promise<void>((resolve) => {
-      finish = resolve;
+      admissionStale: continuation.admissionStale,
+      synthetic: true,
+      agentInitiated: request.agentInitiated,
+      goalKind: request.goalKind,
+      goalId: request.goalId,
+      // Whether it compacts or simply continues, the replacement reads the
+      // routed stream's project content (possibly on the class model): it
+      // keeps verifying that stream's consent at startup, at dispatch and per
+      // step, like the legacy mid-stream compaction request does.
+      inheritedConsentRejection: streamContext.routedConsentRejection,
     });
-    this.continuousCompactionObservation = observation;
-    try {
-      return await observe(token);
-    } catch (error) {
-      await this.recoverContinuousCompactionFailure(error, true);
-      return undefined;
-    } finally {
-      // Reserve through dispatch and cleanup, not just the compactor's apply latch.
-      // Waiters/duplicate invalidations never own or clear these flags.
-      if (this.continuousCompactionObservation === observation) {
-        this.coordinator.finishCompactionObservation(token);
-        this.continuousCompactionObservation = null;
-        try {
-          this.drainQueuedMessagesIfIdle();
-        } catch (error) {
-          log.warn("[continuous-compaction] queued drain failed", error);
-        }
-      }
-      finish();
-    }
-  }
-
-  private async interruptForContinuousCompaction(
-    apply: (pendingFollowUp?: CompactionFollowUpRequest) => Promise<boolean>
-  ): Promise<boolean> {
-    const context = this.activeStreamContext;
-    const observation = this.coordinator.compactionIntent.observation;
-    if (
-      observation?.kind !== "continuous" ||
-      this.midStreamCompactionPending ||
-      !context?.options ||
-      this.coordinator.disposed ||
-      this.coordinator.closing
-    ) {
-      return false;
-    }
-    this.coordinator.setCompactionStage(observation.token, "stopping");
-    const stopped = await this.streamManager.stopStream(this.workspaceId, {
-      abortReason: "system",
-    });
-    if (!stopped.success) return false;
-    this.coordinator.setCompactionStage(observation.token, "stopped");
-    await this.waitForIdle();
-    if (
-      this.coordinator.disposed ||
-      this.coordinator.closing ||
-      this.continuousCompactionAbandoned ||
-      this.isWorkspaceArchivedOnDisk()
-    )
-      return false;
-    const followUp = this.buildContinuousCompactionFollowUp(context);
-    // observe owns the apply latch. Its caller dispatches this continuation only
-    // after observe returns, so the resumed send can observe normally.
-    return apply(followUp);
-  }
-
-  private buildContinuousCompactionFollowUp(
-    context: NonNullable<AgentSession["activeStreamContext"]>
-  ): CompactionFollowUpRequest {
-    assert(context.options, "Continuous compaction requires the interrupted send options");
-    const followUp = this.buildAutoCompactionFollowUp({
-      messageText: "Continue",
-      modelForStream: context.modelString,
-      options: context.options,
-      agentInitiated: context.agentInitiated,
-      goalKind: context.goalKind,
-      goalId: context.goalId,
-      muxMetadata: context.workspaceTurnMetadata,
-      // The continuation streams on the routed options with the folded
-      // history (tail copies, post-compaction attachments): it inherits the
-      // stream's consent obligation, durably — the fast-apply dispatch or a
-      // post-restart recovery reads it back from the summary row.
-      routedProjectConsent: context.routedConsentRejection != null,
-    });
-    followUp.dispatchOptions = { ...followUp.dispatchOptions, source: "internal-resume" };
-    return followUp;
-  }
-
-  private async finishContinuousCompaction(
-    applied: boolean,
-    context: NonNullable<AgentSession["activeStreamContext"]>,
-    token: CompactionToken
-  ): Promise<void> {
-    assert(
-      !this.continuousCompactor.isApplying(),
-      "Continue must dispatch after the apply latch clears"
-    );
-    const observation = this.coordinator.compactionIntent.observation;
-    if (observation?.token !== token || observation.stage !== "stopped" || !context.options) return;
-    // A consumed journal is an outstanding durable obligation, not a failed
-    // speculative summary. Leave it retryable instead of resetting into legacy compaction.
-    if (!applied && this.continuousCompactor.hasConsumedSwap()) return;
-    if (!applied) {
-      const followUp = this.buildContinuousCompactionFollowUp(context);
-      // The completed step can outgrow the staged tail budget during stop.
-      // We already interrupted the turn, so recover using its captured context
-      // rather than relying on activeStreamContext (cleared by stream-abort).
-      if (
-        this.continuousCompactionAbandoned ||
-        this.coordinator.disposed ||
-        this.coordinator.closing ||
-        this.isWorkspaceArchivedOnDisk() ||
-        this.coordinator.admissionBlocked
-      )
-        return;
-      const pressure = this.compactionMonitor.checkBeforeSend({
-        model: context.modelString,
-        usage: this.getUsageState(),
-        use1MContext: this.is1MContextEnabledForModel(
-          context.modelString,
-          context.options,
-          context.providersConfig
-        ),
-        providersConfig: context.providersConfig,
-      });
-      if (pressure.shouldForceCompact) {
-        await eventSpine.run("compaction.prepare", {
-          workspaceId: this.workspaceId,
-          reason: "mid-stream",
-        });
-      }
-      const fallback = pressure.shouldForceCompact
-        ? this.buildAutoCompactionRequest({
-            baseOptions: context.options,
-            followUpContent: followUp,
-            reason: "mid-stream",
-          })
-        : undefined;
-      this.continuousCompactor.reset("failed-fast-apply");
-      const sent = await this.sendMessage(
-        fallback?.messageText ?? followUp.text,
-        fallback ? { ...fallback.sendOptions, muxMetadata: fallback.metadata } : context.options,
-        {
-          acceptanceOrigin: "automatic",
-          // This continues the original stream and cannot acquire a newer Stop frontier.
-          readCompactionAdmission: () =>
-            Promise.resolve(
-              context.admissionCapture
-                ? Ok(context.admissionCapture)
-                : Err("Continuation has no original admission frontier.")
-            ),
-          synthetic: true,
-          agentInitiated: fallback?.agentInitiated ?? context.agentInitiated,
-          goalKind: fallback ? undefined : context.goalKind,
-          goalId: fallback ? undefined : context.goalId,
-          admissionStale: () => this.continuousCompactionAbandoned,
-          // Whether it compacts or simply continues, the replacement reads the
-          // routed stream's project content (possibly on the class model): it
-          // keeps verifying that stream's consent like the legacy mid-stream
-          // compaction request does.
-          inheritedConsentRejection: context.routedConsentRejection,
-        }
-      );
-      if (!sent.success && !sent.failureHandled && !this.continuousCompactionAbandoned) {
-        this.emitChatEvent(createStreamErrorMessage(buildStreamErrorEventData(sent.error)));
-      }
+    if (continuation.admissionStale()) return;
+    if (continuation.failureDisposition === "continuous-fallback") {
+      if (!sendResult.success && !sendResult.failureHandled)
+        this.emitChatEvent(createStreamErrorMessage(buildStreamErrorEventData(sendResult.error)));
       return;
     }
-    this.lastUsageState = undefined;
-    const summaryId = this.pendingCompactionFollowUpSummaryId;
-    await this.dispatchPendingFollowUp(
-      summaryId ?? undefined,
-      () => this.continuousCompactionAbandoned,
-      false,
-      // The stream's own gate is still in hand here; the persisted
-      // routedProjectConsent flag covers dispatches that are not.
-      context.routedConsentRejection
-    );
-    if (this.pendingCompactionFollowUpSummaryId === summaryId)
-      this.coordinator.recordCompactionSummary(null);
-  }
-
-  private async interruptForCompaction(): Promise<void> {
-    if (this.midStreamCompactionPending || this.coordinator.closing) {
-      return;
-    }
-    using _execution = this.coordinator.enterExecution();
-    const admissionStale = this.captureCompactionAdmission("automatic");
-
-    const streamContext = this.activeStreamContext;
-    if (!streamContext?.modelString || !streamContext.options) {
-      return;
-    }
-
-    const interruptedUserMessageId = this.activeStreamUserMessageId;
-    this.continuousCompactor.reset("legacy-fallback");
-
-    const token = this.coordinator.beginCompactionObservation("legacy");
-    if (token == null) return;
-    this.coordinator.setCompactionStage(token, "stopping");
-    try {
-      const stopResult = await this.streamManager.stopStream(this.workspaceId, {
-        abortReason: "system",
-      });
-      if (!stopResult.success) {
-        log.warn("Failed to stop stream for mid-stream compaction", {
-          workspaceId: this.workspaceId,
-          error: stopResult.error,
-        });
-        return;
-      }
-
-      await this.waitForIdle();
-      if (this.coordinator.disposed || admissionStale()) {
-        return;
-      }
-
-      const followUpContent = this.buildAutoCompactionFollowUp({
-        // Keep mid-stream auto-compaction on the shared default sentinel so
-        // buildCompactionMessageText can hide the internal resume marker.
-        messageText: "Continue",
-        options: streamContext.options,
-        agentInitiated: streamContext.agentInitiated,
-        goalKind: streamContext.goalKind,
-        goalId: streamContext.goalId,
-        modelForStream: streamContext.modelString,
-        muxMetadata: streamContext.workspaceTurnMetadata,
-        // The post-compaction "Continue" streams on the routed options and can
-        // still carry the routed turn's project content (tail copies,
-        // post-compaction skill attachments): it inherits the obligation.
-        routedProjectConsent: streamContext.routedConsentRejection != null,
-      });
-      // Waterfall hook point: see the on-send compaction.prepare run above.
-      await eventSpine.run("compaction.prepare", {
+    if (!sendResult.success) {
+      log.warn("Failed to dispatch mid-stream compaction request", {
         workspaceId: this.workspaceId,
-        reason: "mid-stream",
+        error: sendResult.error,
       });
 
-      if (admissionStale()) return;
-      const autoCompactionRequest = this.buildAutoCompactionRequest({
-        followUpContent,
-        // Pre-routing options when the stream was skill-routed: the compaction
-        // request must never inherit a routed small model (it has to read the
-        // full uncompacted history) — mirrors the on-send compaction site.
-        baseOptions: streamContext.compactionBaseOptions ?? streamContext.options,
-        reason: "mid-stream",
-      });
+      const failureType = sendResult.error.type;
+      const handledByNestedSend = sendResult.failureHandled === true;
 
-      const sendResult = await this.sendMessage(
-        autoCompactionRequest.messageText,
-        {
-          ...autoCompactionRequest.sendOptions,
-          muxMetadata: autoCompactionRequest.metadata,
-        },
-        {
-          acceptanceOrigin: "automatic",
-          // This continues the original stream and cannot acquire a newer Stop frontier.
-          readCompactionAdmission: () =>
-            Promise.resolve(
-              streamContext.admissionCapture
-                ? Ok(streamContext.admissionCapture)
-                : Err("Continuation has no original admission frontier.")
-            ),
-          admissionStale,
-          synthetic: true,
-          agentInitiated: autoCompactionRequest.agentInitiated,
-          // The replacement reads the routed stream's project snapshot
-          // (possibly on the class model): it keeps verifying that stream's
-          // consent at startup, at dispatch and per step.
-          inheritedConsentRejection: streamContext.routedConsentRejection,
-        }
-      );
-      if (admissionStale()) return;
-      if (!sendResult.success) {
-        log.warn("Failed to dispatch mid-stream compaction request", {
-          workspaceId: this.workspaceId,
-          error: sendResult.error,
+      if (!handledByNestedSend) {
+        await this.handleStreamFailureForAutoRetry({
+          type: failureType,
+          message: this.extractRetryFailureMessage(sendResult.error),
         });
-
-        const failureType = sendResult.error.type;
-        const handledByNestedSend = sendResult.failureHandled === true;
-
-        if (!handledByNestedSend) {
-          await this.handleStreamFailureForAutoRetry({
-            type: failureType,
-            message: this.extractRetryFailureMessage(sendResult.error),
-          });
-          await this.updateStartupAutoRetryAbandonFromFailure(
-            failureType,
-            interruptedUserMessageId,
-            this.extractRetryFailureMessage(sendResult.error)
-          );
-        }
-
-        if (
-          !handledByNestedSend ||
-          failureType === "runtime_not_ready" ||
-          failureType === "runtime_start_failed"
-        ) {
-          // Mid-stream compaction already interrupted the original turn. Surface the
-          // nested dispatch failure so the user gets an explicit retry/error affordance.
-          const streamError = buildStreamErrorEventData(sendResult.error);
-          this.emitChatEvent(createStreamErrorMessage(streamError));
-        }
+        await this.updateStartupAutoRetryAbandonFromFailure(
+          failureType,
+          continuation.interruptedUserMessageId,
+          this.extractRetryFailureMessage(sendResult.error)
+        );
       }
-    } finally {
-      this.coordinator.finishCompactionObservation(token);
-      // Preflight drains deferred to this pending compaction have no other retry: if the
-      // compaction request never became a turn, release the queue now (no-op when it did).
-      this.drainQueuedMessagesIfIdle();
+
+      if (
+        !handledByNestedSend ||
+        failureType === "runtime_not_ready" ||
+        failureType === "runtime_start_failed"
+      ) {
+        // Mid-stream compaction already interrupted the original turn. Surface the
+        // nested dispatch failure so the user gets an explicit retry/error affordance.
+        const streamError = buildStreamErrorEventData(sendResult.error);
+        this.emitChatEvent(createStreamErrorMessage(streamError));
+      }
     }
   }
 
@@ -9204,7 +8681,7 @@ export class AgentSession {
     this.compactionStopGeneration++;
     this.pendingResumeIntent?.abort();
     this.coordinator.abandonCompaction();
-    this.continuousCompactor.reset("user-interrupt");
+    this.contextController.reset("user-interrupt");
     // cancel installs the blocking debt synchronously, before interruption or storage awaits.
     try {
       await this.compactionCancellation.cancel({
@@ -9295,22 +8772,6 @@ export class AgentSession {
   private async compactionRecoveryBlocked(): Promise<boolean> {
     const record = await this.readCompactionCancellation();
     return this.compactionCancellation.blocksRecovery || record !== null;
-  }
-
-  private async recoverCompaction(): Promise<boolean> {
-    const generation = this.compactionStopGeneration;
-    return (
-      !(await this.compactionRecoveryBlocked()) &&
-      generation === this.compactionStopGeneration &&
-      this.continuousCompactor.recover()
-    );
-  }
-
-  private async observeCompaction(...args: Parameters<ContinuousCompactor["observe"]>) {
-    const generation = this.compactionStopGeneration;
-    if ((await this.compactionRecoveryBlocked()) || generation !== this.compactionStopGeneration)
-      return "none" as const;
-    return this.continuousCompactor.observe(...args);
   }
 
   async interruptStream(options?: {
@@ -9452,10 +8913,7 @@ export class AgentSession {
     // a future boundary, so neither joins policy here.
     const interruptedPolicy = this.coordinator.captureInterruptSettlement(options?.soft);
     this.clearContextBudgetState();
-    if (options?.abandonPartial || this.midStreamCompactionPending) {
-      this.coordinator.abandonCompaction();
-      this.continuousCompactor.reset("user-interrupt");
-    }
+    this.contextController.onUserInterrupt({ abandonPartial: options?.abandonPartial === true });
 
     // Explicit user interruption should immediately stop any pending auto-retry loop.
     this.retryManager.cancel();
@@ -9660,7 +9118,7 @@ export class AgentSession {
     let completionTransferred = false;
     try {
       // Reset per-stream flags (used for retries / crash-safe bookkeeping).
-      this.compactionMonitor.resetForNewStream();
+      this.contextController.onStreamStarting();
       this.clearLiveUsageState();
       this.pendingPostCompactionStateToAcknowledge = null;
       this.activeStreamHadAnyDelta = false;
@@ -9822,8 +9280,15 @@ export class AgentSession {
       // prepareContextBudgetSend), never the live registry.
       let resumedFlushSnapshot: RequestAssemblySnapshot | undefined;
       if (this.isTokenBudgetActive(options)) {
-        this.contextBudgetWarningClaimed ||= historyResult.data.some(
-          (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
+        this.contextBudgetWarningClaimed = historyResult.data.some(
+          (row) =>
+            row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+            row.metadata.muxMetadata.handoff !== true
+        );
+        this.contextBudgetHandoffClaimed = historyResult.data.some(
+          (row) =>
+            row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+            row.metadata.muxMetadata.handoff === true
         );
         // A resumed final-flush turn must not offer a second flush in the same window.
         this.contextBudgetFlushClaimed ||= historyResult.data.some(
@@ -9846,7 +9311,7 @@ export class AgentSession {
           flushMuxMetadata?.contextBudgetFlush === true &&
           finalRow?.type === "context-budget-warning" &&
           this.pendingRollover == null &&
-          this.compactionMonitor.getThreshold() < 1
+          this.contextController.autoCompactionThreshold < 1
         ) {
           // The promised reset needs the same admission as any rollover; surface a failure
           // now (as the reset itself would) instead of resuming a flush that cannot be sealed.
@@ -10185,9 +9650,15 @@ export class AgentSession {
         return await fail(createUnknownSendMessageError(getErrorMessage(error)));
       }
       if (isStreamStartAborted()) return Ok(undefined);
+      // Provider-start fence closes over the epoch captured at this turn's admission (never
+      // refreshed here, so a prepared candidate cannot launder a stop that happened meanwhile).
+      const admissionStopEpoch = preparation?.admissionStopEpoch ?? this.getStopEpoch();
+      const stopFence = () =>
+        !this.isStopInProgress() && this.getStopEpoch() === admissionStopEpoch;
       const streamResult = await startRequest({
         assertAdmissionCurrent,
         withAdmissionCurrent,
+        stopFence,
         messages: requestMessages,
         preDispatchConsentGate,
         workspaceId: this.workspaceId,
@@ -10248,7 +9719,7 @@ export class AgentSession {
         hasQueuedMessages: this.hasQueuedMessages.bind(this),
         getQueuedInputStopCause: this.getQueuedInputStopCause.bind(this),
         contextBudgetRolloverAvailable:
-          this.isTokenBudgetActive(options) && this.compactionMonitor.getThreshold() < 1,
+          this.isTokenBudgetActive(options) && this.contextController.autoCompactionThreshold < 1,
         requestAssemblySnapshot: requestAssemblySnapshot ?? resumedFlushSnapshot,
         // A flush turn stays bounded to one step even when token-budget mode was disabled
         // after its trigger was persisted (the callback then only stops it).
@@ -10404,7 +9875,7 @@ export class AgentSession {
   }
 
   private async clearFailedAssistantMessage(messageId: string, reason: string): Promise<void> {
-    this.continuousCompactor.reset("delete-message");
+    this.contextController.reset("delete-message");
     const [partialResult, deleteMessageResult] = await Promise.all([
       this.historyService.deletePartial(this.workspaceId),
       this.historyService.deleteMessage(this.workspaceId, messageId),
@@ -10715,7 +10186,10 @@ export class AgentSession {
 
     // The post-compaction context is likely the culprit; discard it so we don't loop.
     try {
-      await this.compactionHandler.discardPendingState("context_exceeded", pendingState);
+      await this.contextController.transitionalCompactionHandler.discardPendingState(
+        "context_exceeded",
+        pendingState
+      );
       this.onPostCompactionStateChange?.();
     } catch (error) {
       log.warn("Failed to discard pending post-compaction state", {
@@ -11144,6 +10618,8 @@ export class AgentSession {
     operation = this.coordinator.operationId
   ): Promise<void> {
     const turn = this.coordinator.turnId;
+    // A delivered handle that aborted before its stream registered never streams either.
+    this.settleAdmittedQueueCutReceipts(turn, "prestream-failed");
     log.debug("Forwarding stream-abort without phase transition (not in STREAMING)", {
       workspaceId: this.workspaceId,
       turnPhase: this.coordinator.phase,
@@ -11249,12 +10725,16 @@ export class AgentSession {
       this.setTerminalStreamLifecycle("interrupted", { abortReason });
       this.activeCompactionRequest = undefined;
       this.resetActiveStreamState();
-      if (!hadCompactionRequest && activeModelForAbort && !this.continuousCompactionAbandoned) {
-        await this.observeContinuousCompactionAtStreamEnd(
-          activeModelForAbort,
-          activeOptionsForAbort,
-          activeRoutedForAbort
-        );
+      if (
+        !hadCompactionRequest &&
+        activeModelForAbort &&
+        !this.coordinator.compactionIntent.abandoned
+      ) {
+        await this.contextController.onStreamSettled({
+          model: activeModelForAbort,
+          options: activeOptionsForAbort,
+          routedTurn: activeRoutedForAbort,
+        });
         if (
           !this.coordinator.isCurrentTurn(turn) ||
           !this.coordinator.isCurrentOperation(operation)
@@ -11282,7 +10762,7 @@ export class AgentSession {
       this.emitChatEvent(payload);
       const dispatchedQueuedMessage =
         !this.midStreamCompactionPending &&
-        !this.continuousCompactor.isApplying() &&
+        !this.contextController.isApplying() &&
         this.dispatchQueuedProviderToolEndMessageAfterAbort(abortReason);
       if (!dispatchedQueuedMessage) {
         this.coordinator.finishTurn(turn);
@@ -11381,7 +10861,21 @@ export class AgentSession {
       });
       this.clearLiveUsageState();
 
-      const handled = await this.compactionHandler.handleCompletion(
+      // Await report bookkeeping before compaction can remove its receipts. A storage
+      // failure must not discard successful-turn accounting or strand queued input; the
+      // pending wake remains retryable, even if recovery must conservatively deliver it.
+      try {
+        await this.onBeforeTurnCompletion?.();
+      } catch (error) {
+        log.warn("Response bookkeeping failed", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
+      if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
+        return;
+
+      const handled = await this.contextController.compaction.handleCompletion(
         streamEndPayload,
         completedCompactionRequest?.id,
         () =>
@@ -11414,7 +10908,9 @@ export class AgentSession {
           if (this.pendingPostCompactionStateToAcknowledge === pendingStateToAcknowledge)
             this.pendingPostCompactionStateToAcknowledge = null;
           try {
-            await this.compactionHandler.ackPendingStateConsumed(pendingStateToAcknowledge);
+            await this.contextController.compaction.ackPendingStateConsumed(
+              pendingStateToAcknowledge
+            );
             if (
               !this.coordinator.isCurrentTurn(turn) ||
               !this.coordinator.isCurrentOperation(operation)
@@ -11449,11 +10945,11 @@ export class AgentSession {
       // so the next turn doesn't get its state clobbered by our cleanup.
       this.resetActiveStreamState();
       if (!handled && !completedCompactionRequest) {
-        await this.observeContinuousCompactionAtStreamEnd(
-          streamEndPayload.metadata.model,
-          activeStreamOptions,
-          activeStreamRouted
-        );
+        await this.contextController.onStreamSettled({
+          model: streamEndPayload.metadata.model,
+          options: activeStreamOptions,
+          routedTurn: activeStreamRouted,
+        });
         if (
           !this.coordinator.isCurrentTurn(turn) ||
           !this.coordinator.isCurrentOperation(operation)
@@ -11481,7 +10977,7 @@ export class AgentSession {
       // P2: if an edit is waiting, skip the queue flush so the edit truncates first.
       const hadQueuedMessages = this.hasPendingManualFollowUp();
       const continuousApplyPending =
-        this.midStreamCompactionPending || this.continuousCompactor.isApplying();
+        this.midStreamCompactionPending || this.contextController.isApplying();
       if (this.coordinator.editBlocked() || continuousApplyPending) {
         this.queuedProviderToolEndAbortInFlight = false;
         // Clear the queued-message signal while the edit flow owns the next dispatch.
@@ -11701,41 +11197,8 @@ export class AgentSession {
     });
     forward("reasoning-end", (payload) => this.emitChatEvent(payload));
     forward("prefix-swap-invalidated", async (payload) => {
-      try {
-        if (
-          payload.type !== "prefix-swap-invalidated" ||
-          payload.messageId !== this.streamManager.getStreamInfo(this.workspaceId)?.messageId
-        )
-          return;
-        // Wait for the entire owning observer, including its follow-up dispatch.
-        await this.waitForContinuousCompactionObservation();
-        await this.continuousCompactor.waitForIdle();
-        await this.waitForContinuousCompactionObservation();
-        const context = this.activeStreamContext;
-        if (
-          !context ||
-          this.continuousCompactionObserving ||
-          this.midStreamCompactionPending ||
-          payload.messageId !== this.streamManager.getStreamInfo(this.workspaceId)?.messageId ||
-          !this.streamManager.isStreaming(this.workspaceId)
-        )
-          return;
-        await this.runContinuousCompactionObservation(async (token) => {
-          const result = await this.observeCompaction(0, {
-            ...this.getContinuousCompactionContext(
-              context.modelString,
-              context.options,
-              context.compactionBaseOptions != null
-            ),
-            phase: "mid-stream",
-          });
-          // The observation's finally settles the pending window only after this dispatches the
-          // continuation; settling earlier would let an idle waiter race the follow-up send.
-          await this.finishContinuousCompaction(result === "applied", context, token);
-        });
-      } catch (error) {
-        await this.recoverContinuousCompactionFailure(error);
-      }
+      if (payload.type === "prefix-swap-invalidated")
+        await this.contextController.onPrefixSwapInvalidated(payload.messageId);
     });
 
     forward("usage-delta", async (payload) => {
@@ -11770,79 +11233,12 @@ export class AgentSession {
         agentInitiated: this.activeStreamContext?.agentInitiated,
       });
 
-      // Never recurse compaction while we're already running a compaction request.
-      if (
-        this.activeCompactionRequest ||
-        this.midStreamCompactionPending ||
-        this.continuousCompactionObserving ||
-        this.isTokenBudgetActive(this.activeStreamContext?.options)
-      ) {
-        return;
-      }
-
-      const streamContext = this.activeStreamContext;
-      const streamOptions = streamContext?.options;
-      if (streamContext?.modelString !== modelForUsage) return;
-      const continuousContext = this.getContinuousCompactionContext(
+      await this.contextController.onUsage({
         modelForUsage,
-        streamOptions,
-        streamContext?.compactionBaseOptions != null
-      );
-      const usagePercent =
-        continuousContext.contextWindowTokens > 0
-          ? ((payload.usage.inputTokens ?? payload.usage.cachedInputTokens ?? 0) /
-              continuousContext.contextWindowTokens) *
-            100
-          : 0;
-      if (!continuousContext.enabled) this.continuousCompactor.reset("disabled");
-      const consumedSwapPending = this.continuousCompactor.hasConsumedSwap();
-      let continuousResult: "none" | "applied" | "fallback" = "none";
-      if (continuousContext.enabled || consumedSwapPending) {
-        // One usage handler owns the eventual resume; observe itself shares its
-        // latch result, which must not dispatch the continuation twice.
-        const observed = await this.runContinuousCompactionObservation(async (token) => {
-          const result = await this.observeCompaction(usagePercent, {
-            ...continuousContext,
-            phase: "mid-stream",
-          });
-          if (this.midStreamCompactionPending) {
-            await this.finishContinuousCompaction(result === "applied", streamContext, token);
-            return undefined;
-          }
-          if (result === "applied") this.clearUsageState();
-          return result;
-        });
-        if (observed === undefined) return;
-        continuousResult = observed;
-      }
-      if (
-        continuousResult === "applied" ||
-        ((continuousContext.enabled || consumedSwapPending) && continuousResult !== "fallback")
-      )
-        return;
-      if (this.activeStreamContext !== streamContext) return;
-      const shouldInterruptForCompaction = this.compactionMonitor.checkMidStream({
-        model: modelForUsage,
         usage: payload.usage,
-        use1MContext: this.is1MContextEnabledForModel(
-          modelForUsage,
-          streamOptions,
-          streamContext?.providersConfig ?? null
-        ),
-        providersConfig: streamContext?.providersConfig ?? null,
-        openaiWireFormat: streamOptions?.providerOptions?.openai?.wireFormat,
-        // A routed turn (compactionBaseOptions set) uses the routed-send
-        // policy mid-stream too: the ordinary threshold+buffer against the
-        // (usually smaller) routed window would immediately force the exact
-        // workspace-wide compaction the pre-send band declined to run.
-        ...(streamContext?.compactionBaseOptions != null
-          ? { forceThresholdPercentOverride: 100 - ROUTED_SEND_COMPACTION_HEADROOM_PERCENT }
-          : {}),
+        stream: this.activeStreamContext,
+        isCompactionRequest: this.activeCompactionRequest != null,
       });
-
-      if (shouldInterruptForCompaction) {
-        await this.interruptForCompaction();
-      }
     });
     forward("stream-abort", (payload) => {
       if (payload.type !== "stream-abort") return;
@@ -12024,7 +11420,7 @@ export class AgentSession {
    */
   async discardAutoRetryForContextMutation(): Promise<Result<void>> {
     this.clearContextBudgetState();
-    this.continuousCompactor.reset("context-mutation");
+    this.contextController.reset("context-mutation");
     this.retryManager.cancel();
     this.setAutoRetryResumeState(undefined);
     const deleteResult = await this.historyService.deletePartial(this.workspaceId);
@@ -12051,7 +11447,7 @@ export class AgentSession {
    * check.
    */
   holdTurnAdmission(): Disposable {
-    this.continuousCompactor.reset("context-mutation");
+    this.contextController.reset("context-refresh");
     return this.coordinator.reserve("admission");
   }
 
@@ -12282,6 +11678,7 @@ export class AgentSession {
   getQueuedInputStopCause(): QueuedInputStopCause | undefined {
     const candidate = this.messageQueue.getNextQueueCutCandidate();
     if (candidate?.dispatchMode !== "tool-end") return undefined;
+    this.registerQueueCutReceipt(candidate.entryId);
     return {
       kind: "queued-input",
       entryId: candidate.entryId,
@@ -12292,6 +11689,105 @@ export class AgentSession {
           : candidate.muxMetadata
       ),
     };
+  }
+
+  getQueueCutReceipt(entryId: string): QueueCutReceipt | undefined {
+    return this.queueCutReceipts.get(entryId);
+  }
+
+  /** The coordinator turn (TurnId) currently owning this session; receipts key successors by it. */
+  getTurnGeneration(): symbol {
+    return this.coordinator.turnId;
+  }
+
+  /** The admitted generation while a turn is preparing/streaming/completing; undefined when idle. */
+  getActiveTurnGeneration(): symbol | undefined {
+    return this.coordinator.phase === "idle" ? undefined : this.coordinator.turnId;
+  }
+
+  /** Termination releases every receipt regardless of its release rule. */
+  clearQueueCutReceipts(): void {
+    this.queueCutReceipts.clear();
+  }
+
+  markQueueCutSourceHandled(entryId: string): void {
+    const receipt = this.queueCutReceipts.get(entryId);
+    if (receipt == null) return;
+    receipt.sourceHandled = true;
+    this.releaseQueueCutReceiptIfSettled(entryId);
+  }
+
+  /** Consume-once: true only for the caller that flipped `disposed` (see QueueCutReceipt). */
+  disposeQueueCut(entryId: string): boolean {
+    const receipt = this.queueCutReceipts.get(entryId);
+    if (receipt == null || receipt.disposed) return false;
+    receipt.disposed = true;
+    this.releaseQueueCutReceiptIfSettled(entryId);
+    return true;
+  }
+
+  /** Idempotent for the same entry: a repeated selection keeps the original source turn. */
+  private registerQueueCutReceipt(entryId: string | undefined): void {
+    if (entryId == null || this.queueCutReceipts.has(entryId)) return;
+    this.queueCutReceipts.set(entryId, {
+      sourceTurnGeneration: this.coordinator.turnId,
+      successor: "pending",
+      sourceHandled: false,
+      disposed: false,
+    });
+  }
+
+  /**
+   * Deleting on `disposed` alone would let a source handler arriving after the failure
+   * notification miss the consumed marker and recover a second time; deleting on `streaming`
+   * alone would hide the transfer from a late source handler the same way.
+   */
+  private releaseQueueCutReceiptIfSettled(entryId: string): void {
+    const receipt = this.queueCutReceipts.get(entryId);
+    if (receipt?.sourceHandled && (receipt.disposed || receipt.successor === "streaming")) {
+      this.queueCutReceipts.delete(entryId);
+    }
+  }
+
+  /** Pending successors whose entry left the queue without being dispatched were withdrawn. */
+  private settleWithdrawnQueueCutReceipts(): boolean {
+    let changed = false;
+    for (const [entryId, receipt] of this.queueCutReceipts) {
+      if (receipt.successor !== "pending" || this.messageQueue.hasEntry(entryId)) continue;
+      receipt.successor = "canceled";
+      changed = true;
+    }
+    return changed;
+  }
+
+  /** The attempt's dispatched cut entry was admitted but will never stream. */
+  private recordQueueCutSuccessorPreStreamFailure(attempt: PreparationAttempt): void {
+    const entryId = attempt.queueCutEntryId;
+    if (entryId == null) return;
+    const receipt = this.queueCutReceipts.get(entryId);
+    if (typeof receipt?.successor !== "object") return;
+    receipt.successor = "prestream-failed";
+    this.releaseQueueCutReceiptIfSettled(entryId);
+    this.emitQueuedMessageChanged();
+  }
+
+  /** Successors admitted under `turnGeneration` reach `streaming` or fail before it. */
+  private settleAdmittedQueueCutReceipts(
+    turnGeneration: TurnId,
+    outcome: "streaming" | "prestream-failed"
+  ): void {
+    let changed = false;
+    for (const [entryId, receipt] of this.queueCutReceipts) {
+      if (
+        typeof receipt.successor !== "object" ||
+        receipt.successor.turnGeneration !== turnGeneration
+      )
+        continue;
+      receipt.successor = outcome;
+      changed = true;
+      this.releaseQueueCutReceiptIfSettled(entryId);
+    }
+    if (changed) this.emitQueuedMessageChanged();
   }
 
   /** Pending work only: withdrawn (aborted) entries still occupy the queue but never start a turn. */
@@ -12577,6 +12073,9 @@ export class AgentSession {
   }
 
   private emitQueuedMessageChanged(): void {
+    // Every queue mutation publishes here, so successor withdrawal is recorded before observers
+    // (TaskService deferral reconciliation) read the receipt for this notification.
+    this.settleWithdrawnQueueCutReceipts();
     this.emitChatEvent({
       type: "queued-message-changed",
       workspaceId: this.workspaceId,
@@ -12635,6 +12134,9 @@ export class AgentSession {
       this.midStreamCompactionPending
     )
       return;
+    // Stop-cascade barrier: hold queued entries (do not dequeue or consume them) while the
+    // workspace's stop latch is held; the cascade's single clearQueue owns their removal.
+    if (this.isStopInProgress()) return;
     using _dispatch = this.coordinator.enterExecution();
     const candidate = this.messageQueue.peekNext();
     if (candidate == null) {
@@ -12665,11 +12167,19 @@ export class AgentSession {
       );
       if (admission.status !== "admitted") return Ok(undefined);
       const preparedTurn = admission.turnId;
+      attempt.admissionStopEpoch = this.getStopEpoch();
       // PREPARING observers can clear/reorder the head without retiring its owner. Never
       // consume a replacement entry or notify callbacks already handled by queue removal.
       if (this.messageQueue.peekNext()?.identity !== candidate.identity) return Ok(undefined);
       attempt.queued = true;
-      const { message, options, internal, enqueuedAtMs } = this.messageQueue.dequeueNext();
+      const { entryId, message, options, internal, enqueuedAtMs } = this.messageQueue.dequeueNext();
+      // Admission transfers the cut to this turn; streamStarted or this attempt's failure
+      // settlement records the outcome (see QueueCutReceipt).
+      const receipt = entryId != null ? this.queueCutReceipts.get(entryId) : undefined;
+      if (receipt?.successor === "pending") {
+        receipt.successor = { kind: "admitted", turnGeneration: preparedTurn };
+        attempt.queueCutEntryId = entryId;
+      }
       this.preparingQueuedInput = { attempt, read: candidate.inputForRestore };
       attempt.acceptanceOrigin = internal?.acceptanceOrigin ?? "manual";
       attempt.onFailure = internal?.onAcceptedPreStreamFailure;
@@ -13438,10 +12948,11 @@ export class AgentSession {
       !hasActiveNonCompletingTurn
     ) {
       const turn = this.coordinator.turnId;
-      const rollbackResult = await this.compactionHandler.rollbackHeartbeatContextResetBoundary(
-        summaryMessage,
-        () => this.coordinator.turnId === turn
-      );
+      const rollbackResult =
+        await this.contextController.compaction.rollbackHeartbeatContextResetBoundary(
+          summaryMessage,
+          () => this.coordinator.turnId === turn
+        );
       if (!rollbackResult.success) {
         throw new Error(`Failed to rollback heartbeat reset boundary: ${rollbackResult.error}`);
       }
@@ -13516,7 +13027,7 @@ export class AgentSession {
     this.pendingPostCompactionStateToAcknowledge = null;
     // The destructive history operation already fenced its captured context under the locks.
     // Retire compatible old bytes for downgrades; preserve newer publications and unknown schemas.
-    await this.compactionHandler.discardPendingStateDurably("context-boundary");
+    await this.contextController.compaction.discardPendingStateDurably("context-boundary");
     this.onPostCompactionStateChange?.();
   }
 
@@ -13578,6 +13089,7 @@ export class AgentSession {
       return cached.context ?? undefined;
     }
 
+    const generation = this.memoryContextGeneration;
     // Guard for test mocks that may not implement buildMemorySessionContext.
     const context =
       typeof this.aiService.buildMemorySessionContext === "function"
@@ -13587,14 +13099,17 @@ export class AgentSession {
             excludeProjectSkillContent,
           })
         : null;
-    cache.set(modelString, {
-      context,
-      includesHotMemories: includeHotMemories,
-      tokenBudgetActive,
-      memoryEnabled,
-      hotSetEnabled,
-      excludesProjectSkillContent: excludeProjectSkillContent,
-    });
+    // Invalidated mid-build: serve this snapshot once, do not cache it.
+    if (generation === this.memoryContextGeneration) {
+      cache.set(modelString, {
+        context,
+        includesHotMemories: includeHotMemories,
+        tokenBudgetActive,
+        memoryEnabled,
+        hotSetEnabled,
+        excludesProjectSkillContent: excludeProjectSkillContent,
+      });
+    }
     return context ?? undefined;
   }
 
@@ -13611,7 +13126,7 @@ export class AgentSession {
     includeReadFiles: boolean
   ): Promise<PostCompactionAttachment[] | null> {
     // Check if compaction just occurred (immediate injection with cached post-compaction state)
-    const pendingState = await this.compactionHandler.peekPendingState();
+    const pendingState = await this.contextController.compaction.peekPendingState();
     if (pendingState !== null) {
       this.pendingPostCompactionStateToAcknowledge = pendingState;
       this.compactionOccurred = true;
@@ -13639,7 +13154,7 @@ export class AgentSession {
 
     // Check cooldown for subsequent injections (re-read from current history)
     if (this.compactionOccurred && this.turnsSinceLastAttachment >= TURNS_BETWEEN_ATTACHMENTS) {
-      const warm = await this.compactionHandler.peekCarryoverState();
+      const warm = await this.contextController.compaction.peekCarryoverState();
       this.pendingPostCompactionStateToAcknowledge = warm;
       this.turnsSinceLastAttachment = 0;
       return this.generatePostCompactionAttachments(includeReadFiles, warm);
@@ -15131,7 +14646,7 @@ export class AgentSession {
     }
 
     const turn = this.coordinator.turnId;
-    const result = await this.compactionHandler.appendHeartbeatContextResetBoundary({
+    const result = await this.contextController.compaction.appendHeartbeatContextResetBoundary({
       boundaryText: params.boundaryText,
       pendingFollowUp: params.pendingFollowUp,
       publication: { generation: captured.data.generation },
@@ -15163,7 +14678,7 @@ export class AgentSession {
    * Returns paths that will be reinjected, or null if no pending compaction.
    */
   async getPendingTrackedFilePaths(): Promise<string[] | null> {
-    return this.compactionHandler.peekCachedFilePaths();
+    return this.contextController.compaction.peekCachedFilePaths();
   }
 
   private assertNotDisposed(operation: string): void {

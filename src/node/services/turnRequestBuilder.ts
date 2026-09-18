@@ -1,4 +1,5 @@
 import { stepMessagesCarryProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
+import { withExecutionScope } from "./tools/withExecutionScope";
 import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/common/utils/shell";
@@ -311,6 +312,8 @@ export interface StreamMessageOptions {
   /** Revalidate recorded admission after asynchronous startup, without acquiring new authority. */
   assertAdmissionCurrent?: () => Promise<void>;
   withAdmissionCurrent?: (construct: () => void) => Promise<void>;
+  /** See TurnExecutionOptions.stopFence; captured at the turn's admission by the session. */
+  stopFence?: () => boolean;
   /** Tool names that should be delegated back to ACP clients for this request. */
   delegatedToolNames?: string[];
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
@@ -2202,6 +2205,9 @@ export class TurnRequestBuilder {
     // stay scoped to this specific assistant turn. The placeholder is appended to history below
     // (after the abort check).
     const assistantMessageId = createAssistantMessageId();
+    // Bind ownership before cached MCP tools are captured by the PTC bridge.
+    // A queued invocation must keep this turn's identity after a replacement starts.
+    const executionScope = { workspaceId, messageId: assistantMessageId, token: streamToken };
     const allowLegacyInvalidWorkflowAgentOutputSchema =
       await this.dependencies.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
     // Share creation-time provider/pricing snapshots for both headless tools.
@@ -2463,7 +2469,7 @@ export class TurnRequestBuilder {
     };
     const emitNestedPtcToolEvent = (event: PTCEventWithParent) => {
       if (event.type === "tool-call-start" || event.type === "tool-call-end") {
-        this.dependencies.streamManager.emitNestedToolEvent(workspaceId, assistantMessageId, event);
+        this.dependencies.streamManager.emitNestedToolEvent(executionScope, event);
       }
     };
     const kernelFileLoader = createKernelFileLoader({
@@ -2527,7 +2533,11 @@ export class TurnRequestBuilder {
           // a PTC program taints the live provenance before the evaluation's
           // later sinks run, not only at onStepMessages.
           allTools: observeProjectSkillContentInToolOutputs(
-            this.dependencies.wrapToolsForDelegation(workspaceId, allTools, delegatedToolNames),
+            this.dependencies.wrapToolsForDelegation(
+              workspaceId,
+              withExecutionScope(allTools, executionScope),
+              delegatedToolNames
+            ),
             () => {
               liveProjectTaint.carries = true;
             }
@@ -3289,6 +3299,7 @@ export class TurnRequestBuilder {
         maxOutputTokens,
         toolPolicy: effectiveToolPolicy,
         providedStreamToken: streamToken,
+        executionScope,
         hasQueuedMessages,
         getQueuedInputStopCause,
         onStepSettled,

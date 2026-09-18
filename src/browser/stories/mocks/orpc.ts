@@ -41,7 +41,7 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 import type { NameGenerationError } from "@/common/types/errors";
 import type { Secret } from "@/common/types/secrets";
-import type { MCPHttpServerInfo, MCPServerInfo } from "@/common/types/mcp";
+import type { MCPHttpServerInfo, MCPServerIdentity, MCPServerInfo } from "@/common/types/mcp";
 import type {
   AgentPluginInstallPreview,
   AgentPluginListItem,
@@ -270,11 +270,10 @@ export interface MockORPCClientOptions {
       toolAllowlist?: Record<string, string[]>;
     }
   >;
-  /** MCP test results - maps server name to tools list or error */
-  mcpTestResults?: Map<
-    string,
-    { success: true; tools: string[] } | { success: false; error: string }
-  >;
+  /** MCP test results - maps server name to tools list (optionally with serverInfo) or error */
+  mcpTestResults?: Map<string, MockMcpTestResult>;
+  /** Session icon registry for mcp.icon - maps iconRef to a PNG data URL (unknown refs resolve null) */
+  mcpIcons?: Map<string, string>;
   /** Custom listBranches implementation (for testing non-git repos) */
   listBranches?: (input: {
     projectPath: string;
@@ -362,7 +361,9 @@ interface MockMcpOverrides {
   toolAllowlist?: Record<string, string[]>;
 }
 
-type MockMcpTestResult = { success: true; tools: string[] } | { success: false; error: string };
+type MockMcpTestResult =
+  | { success: true; tools: string[]; serverInfo?: MCPServerIdentity; icon?: string }
+  | { success: false; error: string };
 
 /**
  * Creates a mock ORPC client for Storybook.
@@ -411,6 +412,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcpServers = new Map<string, MockMcpServers>(),
     mcpOverrides = new Map<string, MockMcpOverrides>(),
     mcpTestResults = new Map<string, MockMcpTestResult>(),
+    mcpIcons = new Map<string, string>(),
     mcpOauthAuthStatus = new Map<string, MCPOAuthAuthStatus>(),
     userPreferences: initialUserPreferences,
     taskSettings: initialTaskSettings,
@@ -1238,6 +1240,13 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         // Default: return empty tools.
         return Promise.resolve({ success: true, tools: [] });
       },
+      icon: (input: { iconRef: string }) => Promise.resolve(mcpIcons.get(input.iconRef) ?? null),
+      icons: (input: { iconRefs: string[] }) =>
+        Promise.resolve(
+          Object.fromEntries(
+            input.iconRefs.map((iconRef) => [iconRef, mcpIcons.get(iconRef) ?? null])
+          )
+        ),
       setEnabled: (input: { name: string; enabled: boolean }) => {
         const server = globalMcpServersState[input.name];
         if (server) {

@@ -878,6 +878,9 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         budgetTokens: number;
         /** Final pre-rollover flush prompt (absent on the advance warning). */
         final?: true;
+        /** Agent-led handoff request; old builds can still display it as a warning. */
+        handoff?: true;
+        handoffTokens?: number;
       }
     | {
         type: "compaction-request";
@@ -941,6 +944,14 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         type: "bash-monitor-wake";
         /** One entry per wake record in the prompt, in prompt order. */
         records: BashMonitorWakeDisplayRecord[];
+        /**
+         * Present when the wake reactivates an inactive sub-agent (reported or interrupted,
+         * no live continuation): the fresh parent-owned continuation the woken turn runs
+         * under. The row keeps its wake type, which the wake reconciler reads as proof of
+         * delivery, so the turn correlation rides here instead of on a separate
+         * workspace-turn-task row.
+         */
+        workspaceTurn?: WorkspaceTurnTaskCorrelation;
       }
     | {
         type: "goal-pause-boundary";
@@ -1080,9 +1091,10 @@ export interface WorkspaceTurnTaskCorrelation {
 /**
  * Parse untyped muxMetadata (from persisted history or live stream info) into a
  * workspace-turn correlation. Returns null unless the value is a well-formed
- * "workspace-turn-task" marker — callers use this to attribute a workspace's active
- * stream to a specific delegated turn (e.g. archive interruption must not stop a user
- * stream that replaced an ended delegated stream).
+ * "workspace-turn-task" marker, or a "bash-monitor-wake" marker carrying one (a wake
+ * that reactivated an inactive sub-agent). Callers use this to attribute a workspace's
+ * active stream to a specific delegated turn (e.g. archive interruption must not stop a
+ * user stream that replaced an ended delegated stream).
  */
 export function parseWorkspaceTurnTaskCorrelation(
   muxMetadata: unknown
@@ -1090,10 +1102,17 @@ export function parseWorkspaceTurnTaskCorrelation(
   if (typeof muxMetadata !== "object" || muxMetadata == null || Array.isArray(muxMetadata)) {
     return null;
   }
-  const data = muxMetadata as Record<string, unknown>;
-  if (data.type !== "workspace-turn-task") {
+  const marker = muxMetadata as Record<string, unknown>;
+  const source =
+    marker.type === "workspace-turn-task"
+      ? marker
+      : marker.type === "bash-monitor-wake"
+        ? marker.workspaceTurn
+        : null;
+  if (typeof source !== "object" || source == null || Array.isArray(source)) {
     return null;
   }
+  const data = source as Record<string, unknown>;
   const taskHandleId = typeof data.taskHandleId === "string" ? data.taskHandleId.trim() : "";
   const ownerWorkspaceId =
     typeof data.ownerWorkspaceId === "string" ? data.ownerWorkspaceId.trim() : "";
@@ -1536,6 +1555,8 @@ export type DisplayedMessage =
         maxTokens: number;
         /** Final pre-rollover flush prompt rather than the advance warning. */
         final: boolean;
+        /** Agent-led handoff request rather than the advance warning. */
+        handoff: boolean;
       };
     }
   | {
@@ -1596,6 +1617,8 @@ export type DisplayedMessage =
       executionStartedAt?: number;
       /** Durable workflow run attachment recovered from partial history. */
       workflowRun?: MuxToolPart["workflowRun"];
+      /** Host-authored MCP identity frozen for this call (display only, never relabeled). */
+      mcpServer?: MuxToolPart["mcpServer"];
       // Nested tool calls for code_execution (from PTC streaming or reconstructed from result)
       // input is optional to mirror NestedToolCallSchema: zero-arg kernel calls
       // persist without an input key.
@@ -1609,6 +1632,8 @@ export type DisplayedMessage =
         timestamp?: number;
         /** Durable run identity for nested workflow tool calls (see NestedToolCallSchema). */
         workflowRun?: MuxToolPart["workflowRun"];
+        /** Frozen MCP identity captured for this nested call (see NestedToolCallSchema). */
+        mcpServer?: MuxToolPart["mcpServer"];
       }>;
     }
   | {
@@ -1648,6 +1673,7 @@ export type DisplayedMessage =
       type: "compaction-boundary";
       id: string; // Display ID for UI/React keys
       historySequence: number; // Sequence of the compaction summary this boundary belongs to
+      timestamp?: number;
       boundaryKind?: ContextBoundaryKind;
       /** Distinguishes automatic rollover from a manual reset without changing boundary semantics. */
       contextWindowRollover?: true;

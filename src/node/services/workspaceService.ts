@@ -1,5 +1,6 @@
 import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { messagesCarryProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
+import type { ContextManagementService } from "./contextManagement/contextManagementService";
 import type { CompactionReplacementCapture } from "./compactionCancellation";
 import type { RestartBlocker } from "@/common/orpc/types";
 import { CompactionPendingState } from "./compactionPendingState";
@@ -24,6 +25,7 @@ import {
 import * as fsPromises from "fs/promises";
 import writeFileAtomic from "write-file-atomic";
 import assert from "@/common/utils/assert";
+import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
@@ -92,7 +94,7 @@ import {
   type NodeAgentDefinitionContext,
 } from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
 import { targetWorkspaceBucketToLayer } from "@/common/types/agentAiSettings";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { lookupMinThinkingLevelOverride } from "@/common/utils/thinking/policy";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
 import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
 import {
@@ -135,8 +137,20 @@ import {
   startAbandonedBranchSummaryInBackground,
 } from "@/node/services/branchSummary";
 import {
+  pinDescendantWorkspaceMemoryOwners,
+  resolveWorkspaceMemoryOwnerId,
+} from "@/node/services/memoryWorkspaceOwner";
+import type { MemoryService } from "@/node/services/memoryService";
+/** Narrow MemoryService surface removal needs for the shared-memory handover. */
+type SharedWorkspaceMemoryStoreForRemoval = Pick<
+  MemoryService,
+  "adoptLegacyPrivateStoreForRemoval"
+>;
+import {
   healRemovalTombstonesForRegisteredWorkspaces,
   removeSessionDirUnderMemoryLocks,
+  sealSubAgentForRemovalUnderMemoryLocks,
+  SharedMemoryRemovalAbortedError,
   refineApplyLockPath,
   rollbackRemovalTombstoneIfOwned,
   startRemovalTombstoneLease,
@@ -147,7 +161,10 @@ import {
   ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME,
   ADDITIONAL_SYSTEM_CONTEXT_FILENAME,
 } from "@/node/services/additionalSystemContext";
-import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
+import {
+  generateWorkspaceIdentity,
+  type NameGenerationCandidate,
+} from "@/node/services/workspaceTitleGenerator";
 import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
 import type { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
@@ -351,12 +368,14 @@ import {
   normalizeArchiveUntrackedPaths,
   type AgentTaskIntegration,
   type ArchiveWorkspaceOptions,
+  type QueueCutReceipt,
   type SendMessageInternalOptions,
   type TurnAcceptanceOrigin,
   type WorkspaceHost,
   type WorkspaceLiveActivity,
 } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import { WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE } from "@/constants/agentMessaging";
 import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
@@ -410,6 +429,23 @@ const ORPHAN_SESSION_DIR_GRACE_MS = 24 * 60 * 60 * 1000;
 
 // Upper bound on startup .code-workspace reconciliation (see initialize()).
 const STARTUP_CODE_WORKSPACE_SYNC_TIMEOUT_MS = 10_000;
+
+/**
+ * Cap on transient startup-recovery AgentSessions alive at once (see initialize()). Each
+ * session registers ~20 listeners on the shared AIService, so an unbounded burst over every
+ * active workspace trips MaxListenersExceededWarning and pins N sessions' worth of heap
+ * during launch; recovery is best-effort background work with no latency requirement.
+ */
+export const STARTUP_RECOVERY_CONCURRENCY = 8;
+
+interface ActiveWorkflowRunIdsOptions {
+  /**
+   * Install the shared Set for an ARCHIVED workspace too. Only workflow status events need
+   * that (so later events accumulate without a disk scan); read paths leave dormant
+   * workspaces out of the cache. See resolveActiveWorkflowRunIds.
+   */
+  installDormant?: boolean;
+}
 
 /**
  * Base name used when /new auto-generates a branch name. Numbered suffixes
@@ -1721,6 +1757,8 @@ export interface WorkspaceServiceEvents {
   activity: (event: { workspaceId: string; activity: WorkspaceActivitySnapshot | null }) => void;
   /** Request an incremental analytics ingest outside the stream-end path. */
   analyticsIngest: (event: { workspaceId: string }) => void;
+  /** An admitted session turn generation ended for good (see TurnAdmissionHost). */
+  "workspace-turn-settled": (event: { workspaceId: string; turnGeneration: symbol }) => void;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
@@ -1882,6 +1920,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   // Startup recovery may need a short-lived session even before the workspace is opened.
   // Promote only sessions that keep retry/stream activity alive after the initial check.
   private readonly transientStartupRecoverySessions = new Map<string, AgentSession>();
+  private readonly startupRecoverySemaphore = new AsyncSemaphore(STARTUP_RECOVERY_CONCURRENCY);
   private readonly sessionSubscriptions = new Map<
     string,
     { chat: () => void; metadata: () => void }
@@ -1893,6 +1932,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly pendingBashMonitorWakeIdleWaitsByOwner = new Map<string, Promise<void>>();
   /** The wake send in flight per owner (at most one: dispatch runs under the history lock). */
   private readonly inFlightBashMonitorWakeSendsByOwner = new Map<string, Promise<unknown>>();
+  /**
+   * Innermost of the task locks: held under the task-tree lock (removal) and the task event
+   * lock (a wake reactivating an inactive sub-agent). Never acquire either while holding it.
+   */
   private readonly bashMonitorHistoryLocks = new MutexMap<string>();
   private readonly bashMonitorRecoveryPromise: Promise<void>;
   private readonly pendingBashMonitorPersistenceByWorkspace = new Map<string, Set<Promise<void>>>();
@@ -2390,6 +2433,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     private readonly config: Config,
     private readonly historyService: HistoryService,
     private readonly aiService: AIService,
+    private readonly contextManagement: ContextManagementService,
     private readonly initStateManager: InitStateManager,
     private readonly extensionMetadata: ExtensionMetadataService,
     private readonly backgroundProcessManager: BackgroundProcessManager,
@@ -2656,99 +2700,190 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private async dispatchBashMonitorWake(
     dispatch: BashMonitorWakeDispatch
   ): Promise<BashMonitorWakeDispatchOutcome> {
-    return this.bashMonitorHistoryLocks.withLock(dispatch.ownerWorkspaceId, async () => {
-      const ownerWorkspaceId = dispatch.ownerWorkspaceId;
-      const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), ownerWorkspaceId);
-      if (entry == null) {
-        await dispatch.onAccepted();
-        this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
-        return "in-flight";
-      }
-      // sendMessage refuses archived workspaces and no session exists to wait on, so an after-idle
-      // retry would spin; the wake stays owed and unarchive reconciles it.
-      if (
-        this.archivingWorkspaces.has(ownerWorkspaceId) ||
-        isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
-      ) {
-        return "deferred";
-      }
-      const hasPendingTurn = this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId);
-      // Pending mid-stream compaction counts as turn work: the session reads idle between the
-      // stopped stream and its compaction request, which the session sends directly.
-      const hasSessionBackedBusyState =
-        this.sessions.get(ownerWorkspaceId)?.hasActiveOrPendingTurnWork() === true;
-      const hasAiServiceStream = this.aiService.isStreaming(ownerWorkspaceId);
-      // Cancelable attention must not cut a turn that can consume it in its current tool call.
-      // Keep it outside the queue so later manual tool-end input cannot be held behind it.
-      if (hasPendingTurn || hasSessionBackedBusyState) {
-        this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
-        return "deferred";
-      }
-      if (hasAiServiceStream) {
-        return "deferred";
-      }
-      // Retained Stop waits for manual replacement; an already-idle retry would spin.
-      if (await this.sessions.get(ownerWorkspaceId)?.isAutomaticSendBlocked()) return "deferred";
-      const sendOptions =
-        (await this.getDelegatedTurnContinuationSendOptions(ownerWorkspaceId)) ??
-        (await this.getWorkflowContinuationSendOptions(ownerWorkspaceId));
-      if (sendOptions == null) {
-        log.debug("Bash monitor wake has no send options; leaving pending", { ownerWorkspaceId });
-        return "deferred";
-      }
+    const ownerWorkspaceId = dispatch.ownerWorkspaceId;
+    const gate = await this.bashMonitorHistoryLocks.withLock(ownerWorkspaceId, () =>
+      this.gateBashMonitorWake(dispatch)
+    );
+    if (typeof gate === "string") return gate;
 
+    // A wake aimed at an inactive sub-agent runs as a fresh parent-owned continuation (see
+    // AgentTaskIntegration.reactivateInactiveAgentTaskFromBashMonitorWake). Decided outside the
+    // history lock: the reactivation takes the task's event lock and createWorkspaceTurn's
+    // lifecycle locks, while workspace removal nests task-tree -> history. The wake's own send
+    // re-enters the history lock exactly like a plain wake, and the row keeps its wake type with
+    // the continuation's correlation embedded.
+    let continuationOutcome: BashMonitorWakeDispatchOutcome | undefined;
+    let reactivation: Result<void, string> | null = null;
+    if (
+      typeof this.agentTaskIntegration?.reactivateInactiveAgentTaskFromBashMonitorWake ===
+      "function"
+    ) {
+      try {
+        reactivation =
+          await this.agentTaskIntegration.reactivateInactiveAgentTaskFromBashMonitorWake(
+            ownerWorkspaceId,
+            dispatch.prompt,
+            async (workspaceId, message, options, internal) => {
+              assert(
+                workspaceId === ownerWorkspaceId,
+                "bash monitor wake continuation must target the woken workspace"
+              );
+              const correlation = parseWorkspaceTurnTaskCorrelation(options.muxMetadata);
+              const sent = await this.bashMonitorHistoryLocks.withLock(ownerWorkspaceId, () =>
+                this.sendBashMonitorWake(
+                  dispatch,
+                  message,
+                  {
+                    ...options,
+                    muxMetadata:
+                      correlation != null
+                        ? { ...dispatch.muxMetadata, workspaceTurn: correlation }
+                        : dispatch.muxMetadata,
+                  },
+                  internal
+                )
+              );
+              continuationOutcome = sent.outcome;
+              return sent.result;
+            }
+          );
+      } catch (error: unknown) {
+        reactivation = Err(getErrorMessage(error));
+      }
+    }
+    // The continuation's send ran (even if the handle bookkeeping after it threw): its turn owns
+    // the wake now.
+    if (continuationOutcome != null) return continuationOutcome;
+    if (reactivation != null && !reactivation.success) {
+      // Never lose the wake: fall back to today's plain synthetic turn.
+      log.warn("Bash monitor wake could not reactivate the inactive sub-agent; sending plainly", {
+        ownerWorkspaceId,
+        error: reactivation.error,
+      });
+    }
+
+    return this.bashMonitorHistoryLocks.withLock(ownerWorkspaceId, async () => {
       // Withdrawal during send-option resolution must not enter preflight or persist settings.
       if (dispatch.cancelSignal.aborted) return "deferred";
-
-      let accepted = false;
-      const send = this.sendMessage(
-        ownerWorkspaceId,
-        dispatch.prompt,
-        {
-          ...sendOptions,
-          muxMetadata: dispatch.muxMetadata,
-        },
-        {
-          acceptanceOrigin: "automatic",
-          skipAutoResumeReset: true,
-          synthetic: true,
-          agentInitiated: true,
-          requireIdle: true,
-          cancelSignal: dispatch.cancelSignal,
-          withdrawAcceptedOnCancel: true,
-          onAccepted: async () => {
-            accepted = true;
-            await dispatch.onAccepted();
-            this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
-          },
-          onAcceptedPreStreamFailure: async () => {
-            if (accepted) await dispatch.onAccepted();
-          },
-          onCanceled: async () => {
-            if (!accepted) {
-              await dispatch.onDeferred();
-              this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId);
-            }
-          },
-        }
-      );
-      // Published so a hard Stop that withdraws this wake can join it (see interruptStream).
-      this.inFlightBashMonitorWakeSendsByOwner.set(ownerWorkspaceId, send);
-      let sendResult: Awaited<typeof send>;
-      try {
-        sendResult = await send;
-      } finally {
-        if (this.inFlightBashMonitorWakeSendsByOwner.get(ownerWorkspaceId) === send) {
-          this.inFlightBashMonitorWakeSendsByOwner.delete(ownerWorkspaceId);
-        }
-      }
-      if (!sendResult.success && !accepted) {
-        if (await this.sessions.get(ownerWorkspaceId)?.isAutomaticSendBlocked()) return "deferred";
-        this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
-        return "deferred";
-      }
-      return "in-flight";
+      const sent = await this.sendBashMonitorWake(dispatch, dispatch.prompt, {
+        ...gate.sendOptions,
+        muxMetadata: dispatch.muxMetadata,
+      });
+      return sent.outcome;
     });
+  }
+
+  /** Idle/eligibility checks for a wake dispatch; runs under the owner's history lock. */
+  private async gateBashMonitorWake(
+    dispatch: BashMonitorWakeDispatch
+  ): Promise<BashMonitorWakeDispatchOutcome | { sendOptions: SendMessageOptions }> {
+    const ownerWorkspaceId = dispatch.ownerWorkspaceId;
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), ownerWorkspaceId);
+    if (entry == null) {
+      await dispatch.onAccepted();
+      this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
+      return "in-flight";
+    }
+    // sendMessage refuses archived workspaces and no session exists to wait on, so an after-idle
+    // retry would spin; the wake stays owed and unarchive reconciles it.
+    if (
+      this.archivingWorkspaces.has(ownerWorkspaceId) ||
+      isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
+    ) {
+      return "deferred";
+    }
+    const hasPendingTurn = this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId);
+    // Pending mid-stream compaction counts as turn work: the session reads idle between the
+    // stopped stream and its compaction request, which the session sends directly.
+    const hasSessionBackedBusyState =
+      this.sessions.get(ownerWorkspaceId)?.hasActiveOrPendingTurnWork() === true;
+    const hasAiServiceStream = this.aiService.isStreaming(ownerWorkspaceId);
+    // Cancelable attention must not cut a turn that can consume it in its current tool call.
+    // Keep it outside the queue so later manual tool-end input cannot be held behind it.
+    if (hasPendingTurn || hasSessionBackedBusyState) {
+      this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
+      return "deferred";
+    }
+    if (hasAiServiceStream) {
+      return "deferred";
+    }
+    // Retained Stop waits for manual replacement; an already-idle retry would spin.
+    if (await this.sessions.get(ownerWorkspaceId)?.isAutomaticSendBlocked()) return "deferred";
+    const sendOptions =
+      (await this.getDelegatedTurnContinuationSendOptions(ownerWorkspaceId)) ??
+      (await this.getWorkflowContinuationSendOptions(ownerWorkspaceId));
+    if (sendOptions == null) {
+      log.debug("Bash monitor wake has no send options; leaving pending", { ownerWorkspaceId });
+      return "deferred";
+    }
+    // Withdrawal during send-option resolution must not enter preflight or persist settings.
+    if (dispatch.cancelSignal.aborted) return "deferred";
+    return { sendOptions };
+  }
+
+  /**
+   * The wake's send itself; runs under the owner's history lock. `internal` carries a
+   * continuation's own handle callbacks (createWorkspaceTurn), which run before the wake's
+   * acceptance bookkeeping so a turn canceled before stream start never acknowledges the wake.
+   */
+  private async sendBashMonitorWake(
+    dispatch: BashMonitorWakeDispatch,
+    message: string,
+    options: SendMessageOptions,
+    internal?: SendMessageInternalOptions
+  ): Promise<{
+    outcome: BashMonitorWakeDispatchOutcome;
+    /** The wake's own send result (the turn host's contract carries the acceptance details). */
+    result: Awaited<ReturnType<WorkspaceService["sendMessage"]>>;
+  }> {
+    const ownerWorkspaceId = dispatch.ownerWorkspaceId;
+    let accepted = false;
+    const send = this.sendMessage(ownerWorkspaceId, message, options, {
+      acceptanceOrigin: "automatic",
+      agentInitiated: true,
+      ...internal,
+      // A wake never queues (see gateBashMonitorWake), even when the continuation found the
+      // workspace busy after the gate: the failed send defers the wake and retries after idle.
+      requireIdle: true,
+      skipAutoResumeReset: true,
+      synthetic: true,
+      cancelSignal: dispatch.cancelSignal,
+      withdrawAcceptedOnCancel: true,
+      onAccepted: async () => {
+        await internal?.onAccepted?.();
+        accepted = true;
+        await dispatch.onAccepted();
+        this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
+      },
+      onAcceptedPreStreamFailure: async (error) => {
+        await internal?.onAcceptedPreStreamFailure?.(error);
+        if (accepted) await dispatch.onAccepted();
+      },
+      onCanceled: async (reason) => {
+        await internal?.onCanceled?.(reason);
+        if (!accepted) {
+          await dispatch.onDeferred();
+          this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId);
+        }
+      },
+    });
+    // Published so a hard Stop that withdraws this wake can join it (see interruptStream).
+    this.inFlightBashMonitorWakeSendsByOwner.set(ownerWorkspaceId, send);
+    let result: Awaited<typeof send>;
+    try {
+      result = await send;
+    } finally {
+      if (this.inFlightBashMonitorWakeSendsByOwner.get(ownerWorkspaceId) === send) {
+        this.inFlightBashMonitorWakeSendsByOwner.delete(ownerWorkspaceId);
+      }
+    }
+    if (!result.success && !accepted) {
+      if (!(await this.sessions.get(ownerWorkspaceId)?.isAutomaticSendBlocked())) {
+        this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
+      }
+      return { outcome: "deferred", result };
+    }
+    return { outcome: "in-flight", result };
   }
 
   private readonly policyService?: PolicyService;
@@ -2764,7 +2899,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     triggerInBackground(workspaceId: string, trigger: "compaction" | "archive"): void;
     triggerHarvestThenSweepInBackground(metadata: CompactionCompletionMetadata): void;
     cancelInFlightConsolidation(workspaceId: string): Promise<void>;
+    releaseRemovalCancellation(workspaceId: string): void;
+    finalizeHarvestsForRemoval(workspaceId: string): Promise<void>;
   };
+  /** Narrow MemoryService surface for removal's shared-memory handover; wired by coreServices. */
+  private sharedWorkspaceMemoryStore?: SharedWorkspaceMemoryStoreForRemoval;
   private worktreeArchiveSnapshotService?: WorktreeArchiveSnapshotLifecycleService;
   private agentTaskIntegration?: AgentTaskIntegration;
   private workspaceGoalService?: WorkspaceGoalService;
@@ -3246,8 +3385,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     triggerInBackground(workspaceId: string, trigger: "compaction" | "archive"): void;
     triggerHarvestThenSweepInBackground(metadata: CompactionCompletionMetadata): void;
     cancelInFlightConsolidation(workspaceId: string): Promise<void>;
+    releaseRemovalCancellation(workspaceId: string): void;
+    finalizeHarvestsForRemoval(workspaceId: string): Promise<void>;
   }): void {
     this.memoryConsolidationService = service;
+  }
+
+  setSharedWorkspaceMemoryStore(store: SharedWorkspaceMemoryStoreForRemoval): void {
+    this.sharedWorkspaceMemoryStore = store;
   }
 
   setWorkspaceLifecycleHooks(hooks: WorkspaceLifecycleHooks): void {
@@ -3555,12 +3700,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       await this.cleanupOrphanScratchWorkdirs().catch((error: unknown) => {
         log.debug("Failed to clean orphaned scratch workdirs", { error });
       });
-      const allMetadata = await this.config.getAllWorkspaceMetadata();
+      const allMetadata = await this.config.getAllWorkspaceMetadata({ probeCheckouts: false });
       await this.cleanupOrphanSessionDirs(allMetadata).catch((error: unknown) => {
         log.debug("Failed to clean orphaned session directories", { error });
-      });
-      await this.cleanupArchivedDevToolsLogs(allMetadata).catch((error: unknown) => {
-        log.debug("Failed to clean archived workspace DevTools logs", { error });
       });
       let scheduledCount = 0;
       let skippedTaskCount = 0;
@@ -3812,8 +3954,20 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return activeRunIds;
   }
 
-  private async getActiveWorkflowRunIds(workspaceId: string): Promise<Set<string>> {
-    const activeRunIds = await this.resolveActiveWorkflowRunIds(workspaceId);
+  private async getActiveWorkflowRunIds(
+    workspaceId: string,
+    options?: ActiveWorkflowRunIdsOptions
+  ): Promise<Set<string>> {
+    let activeRunIds = await this.resolveActiveWorkflowRunIds(workspaceId, options);
+    // Converge on the installed cache: a dormant (archived) read resolves a DETACHED empty
+    // Set, and a workflow event can install and populate the shared one in the microtask
+    // gap above. Returning the detached copy would let an authoritative list response that
+    // lands after the event clear the activity the event just delivered to the renderer.
+    // (Same applies to the pathological detached disk probe in resolve's fallback.)
+    const installed = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
+    if (installed != null && installed !== activeRunIds) {
+      activeRunIds = installed;
+    }
     if (
       activeRunIds.size > 0 &&
       // Installation re-check in THIS continuation: an eviction (removal, or
@@ -3830,7 +3984,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return activeRunIds;
   }
 
-  private async resolveActiveWorkflowRunIds(workspaceId: string): Promise<Set<string>> {
+  private async resolveActiveWorkflowRunIds(
+    workspaceId: string,
+    options?: ActiveWorkflowRunIdsOptions
+  ): Promise<Set<string>> {
     assert(workspaceId.length > 0, "getActiveWorkflowRunIds requires workspaceId");
     // Bounded retry: evictWorkspaceActivityCaches (removal, or a tombstone
     // lifted for re-registration) can race an in-flight bootstrap. A waiter
@@ -3849,6 +4006,25 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           continue;
         }
         return cached;
+      }
+
+      const workspace = findWorkspaceEntry(
+        this.config.loadConfigOrDefault(),
+        workspaceId
+      )?.workspace;
+      // Archived stores are dormant until unarchive invalidates this cache. Live workflow
+      // events still update the shared Set without scanning archived session directories,
+      // so only the event path installs one: read paths (the activity list walks every
+      // config-known id) would otherwise fill this map with an empty Set per archived
+      // workspace, thousands on long-lived deployments, that nothing ever reads back.
+      // The detached result is provisional: getActiveWorkflowRunIds swaps in the shared
+      // Set if an event installed one before the caller's continuation ran.
+      if (workspace && isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
+        const activeRunIds = new Set<string>();
+        if (options?.installDormant === true) {
+          this.activeWorkflowRunIdsByWorkspace.set(workspaceId, activeRunIds);
+        }
+        return activeRunIds;
       }
 
       // Install the shared Set before awaiting disk so parallel workflow status events
@@ -3887,7 +4063,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // idle revived workspace emits fabricated zero-count entries forever.
     let detachedSize = 0;
     for (let attempt = 0; attempt < 3; attempt++) {
-      const activeRunIds = await this.getActiveWorkflowRunIds(event.workspaceId);
+      const activeRunIds = await this.getActiveWorkflowRunIds(event.workspaceId, {
+        installDormant: true,
+      });
       if (isActiveWorkflowRunStatus(event.status)) {
         activeRunIds.add(event.runId);
       } else {
@@ -4435,6 +4613,48 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     for (const session of this.sessions.values()) session.beginShutdown();
   }
 
+  /**
+   * Sub-agents share their task-tree owner's /memories/workspace store, so a
+   * workspace-scope write by one tree member stales the cached memory context
+   * of every live session in that tree, not just the acting one (which already
+   * clears its own cache on tool-call-end). `isAffected` decides membership.
+   */
+  invalidateMemoryContextWhere(isAffected: (workspaceId: string) => boolean): void {
+    // Startup-recovery sessions are live too and may be promoted with their cache.
+    for (const registry of [this.sessions, this.transientStartupRecoverySessions]) {
+      for (const [workspaceId, session] of registry) {
+        if (isAffected(workspaceId)) session.invalidateMemoryContext();
+      }
+    }
+  }
+
+  /**
+   * Removal's in-lock shared-memory handover (see removeSessionDirUnderMemoryLocks
+   * `beforeTombstone`): the legacy-notebook adoption delta pass, run while
+   * the owner-store lock is held so nothing can land after it. Throws to
+   * abort the removal unless `force` accepts the loss.
+   */
+  private async lockedSharedMemoryHandover(
+    workspaceId: string,
+    ownerWorkspaceId: string,
+    force: boolean
+  ): Promise<void> {
+    try {
+      await this.sharedWorkspaceMemoryStore?.adoptLegacyPrivateStoreForRemoval(
+        workspaceId,
+        ownerWorkspaceId,
+        { locksHeld: true }
+      );
+    } catch (error) {
+      if (!force) throw error;
+      log.warn("Forced removal: locked shared-memory handover to the owner failed", {
+        workspaceId,
+        ownerWorkspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
   /** Transfer destructive cleanup out of a callback that still owns a session lease. */
   deferWorkspaceCleanup(run: () => Promise<void>): void {
     this.trackWorkspaceCleanup(run).catch((error: unknown) =>
@@ -4464,21 +4684,81 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return;
     }
 
+    // Still fire-and-forget through the cleanup tracker (shutdown awaits it); the permit only
+    // bounds how many transient sessions exist at once (see STARTUP_RECOVERY_CONCURRENCY).
     this.deferWorkspaceCleanup(async () => {
+      const slot = await this.startupRecoverySemaphore.acquire();
+      // Disposal of a non-promoted session, when withStartupSession queued one.
+      let disposal: Promise<void> | undefined;
       try {
-        await this.withStartupSession(trimmed, (session) => session.runStartupRecovery(metadata));
+        // Waited-for recoveries would otherwise each throw from createSession after
+        // beginShutdown() has already swept the transient registry.
+        if (this.shuttingDown) return;
+        // The permit wait is a window in which the user can archive or remove this workspace.
+        // Archive disposes only sessions that already exist, and the session's own archived
+        // guard covers just the auto-retry step and treats a removed entry as live, so an
+        // interrupted turn could otherwise resume in a workspace the user just put away.
+        // Re-read the registry (memoized per config snapshot, so this is one build per edit)
+        // and hand recovery the current metadata rather than the scheduling-time copy.
+        let current = metadata;
+        let registry: FrontendWorkspaceMetadata[] | undefined;
+        try {
+          registry = await this.config.getAllWorkspaceMetadata({
+            throwOnError: true,
+            probeCheckouts: false,
+          });
+        } catch (error) {
+          // Unreadable config must not silently cancel every queued chat's recovery; fall back
+          // to the scheduling-time snapshot and let the session's dispatch-time guards decide.
+          log.debug("Startup recovery revalidation failed; using scheduling-time metadata", {
+            workspaceId: trimmed,
+            error: getErrorMessage(error),
+          });
+        }
+        if (registry !== undefined) {
+          current = registry.find((entry) => entry.id === trimmed);
+          if (
+            current === undefined ||
+            isWorkspaceArchived(current.archivedAt, current.unarchivedAt)
+          ) {
+            log.debug("Skipping startup recovery: workspace archived or removed while queued", {
+              workspaceId: trimmed,
+            });
+            return;
+          }
+        }
+        await this.withStartupSession(
+          trimmed,
+          (session) => session.runStartupRecovery(current),
+          (settled) => {
+            disposal = settled;
+          }
+        );
       } catch (error) {
         log.warn("Failed to run startup recovery for workspace", {
           workspaceId: trimmed,
           error: getErrorMessage(error),
         });
+      } finally {
+        // AgentSession.dispose detaches its AIService listeners only after its awaited cleanup
+        // settles, so releasing on recovery completion would let the next admitted session
+        // overlap with an undisposed one and stack past the cap. A promoted session is live by
+        // design and queues no disposal, so its slot frees immediately. The tracked promise
+        // never rejects (trackWorkspaceCleanup logs failures).
+        if (disposal !== undefined) await disposal;
+        slot.release();
       }
     });
   }
 
+  /**
+   * `onDisposal` receives the tracked disposal promise when the session is NOT promoted, so a
+   * caller that budgets live sessions can wait for teardown without owning the session.
+   */
   private async withStartupSession<T>(
     workspaceId: string,
-    run: (session: AgentSession) => Promise<T>
+    run: (session: AgentSession) => Promise<T>,
+    onDisposal?: (settled: Promise<void>) => void
   ): Promise<T> {
     workspaceId = workspaceId.trim();
     assert(workspaceId.length > 0, "workspaceId must not be empty");
@@ -4502,7 +4782,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // physical read cannot block startup or make a later caller adopt a closing session.
       if (this.transientStartupRecoverySessions.get(workspaceId) === session) {
         this.transientStartupRecoverySessions.delete(workspaceId);
-        this.deferWorkspaceCleanup(() => session.dispose());
+        const settled = this.trackWorkspaceCleanup(() => session.dispose());
+        onDisposal?.(settled);
       }
     }
   }
@@ -4510,6 +4791,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private createSession(workspaceId: string): AgentSession {
     if (this.shuttingDown) throw new Error("Server is shutting down");
     return new AgentSession({
+      contextManagement: this.contextManagement,
       effectRunner: this.effectRunner,
       appFiberScope: this.appFiberScope,
       workspaceId,
@@ -4561,6 +4843,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // is released at its queue/session handoff so a follow-up dispatched
       // from within that turn does not veto itself.
       hasExternalSendPreflight: () => this.hasSessionInvisiblePreflight(workspaceId),
+      isStopInProgress: () =>
+        this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true,
+      getStopEpoch: () => this.agentTaskIntegration?.getWorkspaceStopEpoch(workspaceId) ?? 0,
+      onBeforeTurnCompletion: async () => {
+        await this.agentTaskIntegration?.acknowledgeAgentReports(workspaceId);
+      },
+      onTurnSettled: (turnGeneration) =>
+        this.emit("workspace-turn-settled", { workspaceId, turnGeneration }),
     });
   }
 
@@ -5099,39 +5389,45 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * handles new archives; this retroactively heals workspaces archived before that
    * cleanup existed (debug logs routinely dwarf all other session data).
    */
-  private async cleanupArchivedDevToolsLogs(
-    allMetadata: FrontendWorkspaceMetadata[]
-  ): Promise<void> {
-    if (!this.devToolsService) {
+  async cleanupArchivedDevToolsLogs(options?: { signal?: AbortSignal }): Promise<void> {
+    if (!this.devToolsService || options?.signal?.aborted) {
       return;
     }
 
     const devToolsService = this.devToolsService;
-    for (const metadata of allMetadata) {
-      if (!isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) continue;
-      try {
-        // archive() already removed the log for most archived workspaces, so gate the fresh config
-        // read below on there being something to delete: a per-workspace reload for every archived
-        // entry would scale this sweep with (archived workspaces x config size).
-        if (!(await devToolsService.hasWorkspaceData(metadata.id))) continue;
-        // This sweep can run while the server is serving clients. Unarchive runs under the same
-        // lock, so re-checking the live config inside it means a workspace unarchived since
-        // `allMetadata` was read keeps the logs it has produced since.
-        await this.withTaskTreeLifecycleLock(metadata.id, async () => {
-          const live = findWorkspaceEntry(
-            this.config.loadConfigOrDefault(),
-            metadata.id
-          )?.workspace;
-          if (live == null || !isWorkspaceArchived(live.archivedAt, live.unarchivedAt)) return;
-          await devToolsService.removeWorkspaceData(metadata.id);
-        });
-      } catch (error: unknown) {
-        log.debug("Failed to remove DevTools log for archived workspace", {
-          workspaceId: metadata.id,
-          error,
-        });
-      }
-    }
+    const allMetadata = await this.config.getAllWorkspaceMetadata({ probeCheckouts: false });
+    const archived = allMetadata.filter((metadata) =>
+      isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)
+    );
+    await this.effectRunner.runPromise(
+      Effect.forEach(
+        archived,
+        (metadata) =>
+          Effect.promise(async () => {
+            if (options?.signal?.aborted) return;
+            try {
+              if (!(await devToolsService.hasWorkspaceData(metadata.id))) return;
+              // Unarchive shares this lock, so a revived workspace keeps its new logs.
+              await this.withTaskTreeLifecycleLock(metadata.id, async () => {
+                if (options?.signal?.aborted) return;
+                const live = findWorkspaceEntry(
+                  this.config.loadConfigOrDefault(),
+                  metadata.id
+                )?.workspace;
+                if (live == null || !isWorkspaceArchived(live.archivedAt, live.unarchivedAt))
+                  return;
+                await devToolsService.removeWorkspaceData(metadata.id);
+              });
+            } catch (error: unknown) {
+              log.debug("Failed to remove DevTools log for archived workspace", {
+                workspaceId: metadata.id,
+                error,
+              });
+            }
+          }),
+        { concurrency: 16, discard: true }
+      )
+    );
   }
 
   async createScratch(title?: string): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>> {
@@ -6103,6 +6399,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     this.removingWorkspaces.add(workspaceId);
     let timelineClosed = false;
     let removedFromConfig = false;
+    // Set once this attempt published the durable removal tombstone (sealed
+    // sub-agent handover, or the session-dir teardown). If the removal then
+    // ends with the workspace STILL REGISTERED — a refused checkout deletion,
+    // a later teardown step throwing, deregistration failing — the marker is
+    // rolled back in the finally (ownership-checked, r66): left in place it
+    // would refuse every later memory access and removal retry of a
+    // workspace that still exists. Only a completed deregistration keeps it.
+    let tombstonePublished = false;
+    // r66: identifies THIS removal attempt in the durable tombstone so the
+    // compensating rollback below cannot delete a concurrent backend
+    // attempt's marker.
+    const removalAttemptId = crypto.randomUUID();
+    // Sub-agents: the tombstone was published (with the final shared-memory
+    // handover) BEFORE the checkout deletion; an abort between the two rolls
+    // it back so the intact workspace stays usable.
+    let sealedForRemoval = false;
 
     // If this workspace is mid-init, cancel the fire-and-forget init work (postCreateSetup,
     // sync/checkout, .xum/init hook, etc.) so removal doesn't leave orphaned background work.
@@ -6140,6 +6452,17 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
       }
+      // r65: keep renewing the removal tombstone's mtime until this removal
+      // settles so a foreign backend's startup self-heal cannot mistake a
+      // merely SLOW removal (a hung runtime deletion or MCP server close) for
+      // crash residue and delete the marker while removal is live — a healed
+      // marker would readmit child writes after the final shared-memory
+      // handover (sealSubAgentForRemovalUnderMemoryLocks). Held from before the
+      // earliest publish point: ticks against a not-yet-published marker are
+      // swallowed ENOENTs, as are ticks after a rollback deleted it, and
+      // disposal at scope exit (after deregistration or its rollback) is safe
+      // since a late renewal of a retained terminal marker is meaningless.
+      using _tombstoneLease = startRemovalTombstoneLease(this.config.rootDir, workspaceId);
       // Forced removals too (routine task cleanup uses force): proceeding
       // while a stalled writer still owns the lock would let it resume after
       // the deletion and recreate the removed path. The acquisition is
@@ -6177,10 +6500,64 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
       // Raw terminal listeners may enqueue timing writes; join those before rollup/removal.
       await this.sessionTimingService?.waitForIdle(workspaceId);
+      const sessionDir = path.join(this.config.sessionsDir, workspaceId);
 
       let parentWorkspaceId: string | null = null;
+      // Memory owner resolved while the workspace was still fully registered
+      // (metadata path); reused for the destructive step below.
+      let verifiedSharedMemoryOwnerId: string | null = null;
       let childTaskModelString: string | undefined;
       let childTaskThinkingLevel: ThinkingLevel | undefined;
+
+      // Shared workspace memory (sub-agents write into their task-tree
+      // owner's store): pin the owner on surviving descendants FIRST — their
+      // parent chain is about to lose this node — verified by reading the
+      // config back because Config swallows write failures. A topology-only
+      // edit from the persisted config, so it runs whether or not this
+      // workspace's metadata can still be built (the phantom-cleanup path
+      // below removes the config entry all the same, and a child left with a
+      // dangling parent and no pin would silently fall back to a private
+      // notebook). Failing to pin aborts the removal unless forced. The
+      // owner is resolved from a STRICT config read: a lenient read of an
+      // unreadable or malformed config.json yields an empty topology, which
+      // would name this workspace its own owner and silently skip both the
+      // pinning and the shared-memory handover below — a destructive
+      // decision taken from fallback state. Strict, the failure lands in
+      // this catch: a non-forced removal aborts (retryable), a forced one
+      // proceeds with the loss logged.
+      let sharedMemoryOwnerId = workspaceId;
+      try {
+        sharedMemoryOwnerId = resolveWorkspaceMemoryOwnerId(
+          this.config.loadConfigOrDefault({ throwOnError: true }),
+          workspaceId
+        );
+        verifiedSharedMemoryOwnerId = sharedMemoryOwnerId;
+        if (sharedMemoryOwnerId !== workspaceId) {
+          let pinnedOwners = new Map<string, string>();
+          await this.config.editConfig((cfg) => {
+            pinnedOwners = pinDescendantWorkspaceMemoryOwners(cfg, workspaceId);
+            return cfg;
+          });
+          const persisted = this.config.loadConfigOrDefault();
+          for (const [id, owner] of pinnedOwners) {
+            const entry = findWorkspaceEntry(persisted, id);
+            if (entry?.workspace.memoryOwnerWorkspaceId !== owner) {
+              throw new Error(`memory owner pin for descendant ${id} did not persist`);
+            }
+          }
+        }
+      } catch (error) {
+        if (!force) {
+          return Err(
+            `Failed to pin the shared memory owner on this sub-agent's descendants (${getErrorMessage(error)}); the workspace was left intact — retry the removal, or force it`
+          );
+        }
+        log.warn("Forced removal: could not pin the shared memory owner on descendants", {
+          workspaceId,
+          sharedMemoryOwnerId,
+          error: getErrorMessage(error),
+        });
+      }
 
       const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
       if (metadataResult.success) {
@@ -6247,6 +6624,59 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         await this.memoryConsolidationService?.cancelInFlightConsolidation(workspaceId);
         await clearPendingBranchSummary(workspaceId);
         await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
+
+        // Shared workspace memory, BEFORE any destructive step — so a failure
+        // leaves a fully intact, retryable workspace: fold this workspace's
+        // pre-sharing private notebook into the owner's store (the owner pin
+        // on surviving descendants was applied above). A second, delta pass
+        // runs under the removal locks below so a note that lands in between
+        // is captured too; that late pass only has the few notes written
+        // since this one, keeping the fallible work at the point of no return
+        // minimal.
+        if (sharedMemoryOwnerId !== workspaceId) {
+          try {
+            // A pre-sharing build kept this child's notebook in its OWN
+            // session dir (<sessionsDir>/<child>/memory); access-time adoption
+            // may never have run for a child removed right after the upgrade,
+            // and the deletion below would take those notes with it.
+            await this.sharedWorkspaceMemoryStore?.adoptLegacyPrivateStoreForRemoval(
+              workspaceId,
+              sharedMemoryOwnerId
+            );
+          } catch (error) {
+            if (!force) {
+              return Err(
+                `Failed to hand this sub-agent's shared workspace memory over to its owner (${getErrorMessage(error)}); the workspace was left intact — retry the removal`
+              );
+            }
+            log.warn("Forced removal: shared-memory handover to the owner failed", {
+              workspaceId,
+              sharedMemoryOwnerId,
+              error: getErrorMessage(error),
+            });
+          }
+          // Final handover + tombstone under the removal locks, BEFORE the
+          // checkout is deleted (sealSubAgentForRemovalUnderMemoryLocks): a
+          // late legacy note the owner store cannot take must abort while the
+          // checkout still exists, and once sealed no backend can add
+          // another (they honor the tombstone at their commit points), so the
+          // session-dir deletion after runtime deletion has nothing fallible
+          // left. `force` accepts the loss of notes the handover cannot place.
+          await sealSubAgentForRemovalUnderMemoryLocks({
+            rootDir: this.config.rootDir,
+            sessionDir,
+            workspaceId,
+            attemptId: removalAttemptId,
+            sharedWorkspaceMemorySessionDir: path.join(
+              this.config.sessionsDir,
+              sharedMemoryOwnerId
+            ),
+            beforeTombstone: () =>
+              this.lockedSharedMemoryHandover(workspaceId, sharedMemoryOwnerId, force),
+          });
+          sealedForRemoval = true;
+          tombstonePublished = true;
+        }
 
         if (isMultiProject(metadata)) {
           const projects = getProjects(metadata);
@@ -6593,11 +7023,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       );
 
       // Remove session data
-      const sessionDir = path.join(this.config.sessionsDir, workspaceId);
-      // r66: identifies THIS removal attempt in the durable tombstone so the
-      // compensating rollback below cannot delete a concurrent backend
-      // attempt's marker.
-      const removalAttemptId = crypto.randomUUID();
       try {
         if (parentWorkspaceId) {
           try {
@@ -6627,32 +7052,55 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // directory. Fail-closed on a wedged writer: the catch below keeps
         // the directory as a recoverable orphan instead of deleting it out
         // from under a live commit.
+        // A sub-agent's workspace notes live in its task-tree owner's store:
+        // hold that store's lock too, so a child mutation admitted under the
+        // owner key cannot commit after this tombstone. The workspace is
+        // still registered here, so its parent chain resolves.
+        const memoryOwnerId =
+          verifiedSharedMemoryOwnerId ??
+          resolveWorkspaceMemoryOwnerId(this.config.loadConfigOrDefault(), workspaceId);
+        const ownerSessionDir =
+          memoryOwnerId === workspaceId
+            ? undefined
+            : path.join(this.config.sessionsDir, memoryOwnerId);
         await removeSessionDirUnderMemoryLocks({
           rootDir: this.config.rootDir,
           sessionDir,
           workspaceId,
           attemptId: removalAttemptId,
+          sharedWorkspaceMemorySessionDir: ownerSessionDir,
+          tombstoneSealed: sealedForRemoval,
+          // Sealed above (metadata path): handover done and tombstone
+          // published under these locks already. Otherwise (phantom,
+          // metadata-less path) the handover runs here, inside the locks
+          // and right before the tombstone. Throws → removal aborts,
+          // session intact.
+          beforeTombstone:
+            ownerSessionDir === undefined || sealedForRemoval
+              ? undefined
+              : () => this.lockedSharedMemoryHandover(workspaceId, memoryOwnerId, force),
         });
+        tombstonePublished = true;
       } catch (error) {
         // r63: without a durable tombstone the retained orphan stays
         // writable by foreign backends forever — abort the removal (the
         // workspace stays registered and retryable) instead of proceeding
         // to deregistration below.
-        if (error instanceof TombstoneNotDurableError) {
+        if (
+          error instanceof TombstoneNotDurableError ||
+          error instanceof SharedMemoryRemovalAbortedError
+        ) {
+          // No durable tombstone was published (the locked handover or the
+          // tombstone write itself failed): the workspace stays registered
+          // with its session directory intact, so the consolidation teardown
+          // gate is lifted again in the finally like any pre-commit abort.
           throw error;
         }
+        // Orphan path (r62): the directory was retained but the tombstone
+        // is durable, and deregistration proceeds below.
+        tombstonePublished = true;
         log.error(`Failed to remove session directory for ${workspaceId}:`, error);
       }
-      // r65: the tombstone is durable here (both the locked path and the
-      // orphan fallback published it). Keep renewing its mtime until this
-      // removal settles so a foreign backend's startup self-heal cannot
-      // mistake a merely SLOW removal (e.g. a hung MCP server close below)
-      // for crash residue and delete the marker while removal is live.
-      // Disposal at scope exit (after deregistration or its rollback) is
-      // safe: a late renewal of a retained terminal marker is meaningless,
-      // and utimes on a rolled-back (deleted) marker is a swallowed ENOENT.
-      using _tombstoneLease = startRemovalTombstoneLease(this.config.rootDir, workspaceId);
-
       // The on-disk devtools.jsonl died with the session directory above; also drop any
       // in-memory DevTools state so stale runs cannot outlive the workspace.
       try {
@@ -6732,6 +7180,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
       removedFromConfig = true;
       this.autoTitlingWorkspaces.delete(workspaceId);
+      // Only once the workspace is deregistered (and its session, with the
+      // transcript, gone) are the retryable harvest records truly
+      // unrecoverable; an aborted removal must leave them retryable.
+      // Best-effort: the removal is committed, so a sidecar failure here
+      // must not turn it into an error (the metadata event below still fires).
+      try {
+        await this.memoryConsolidationService?.finalizeHarvestsForRemoval(workspaceId);
+      } catch (error) {
+        log.warn("Failed to finalize harvest records after workspace removal", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
 
       // Deregistration succeeded: drop the workspace's activity/status entry
       // so extensionMetadata.json stays bounded (stale entries were
@@ -6764,6 +7225,30 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const message = getErrorMessage(error);
       return Err(`Failed to remove workspace: ${message}`);
     } finally {
+      if (!removedFromConfig) {
+        // The workspace is still registered (a refused checkout deletion, a
+        // teardown step that threw, deregistration that failed): lift this
+        // attempt's tombstone again (ownership-checked, r66) so it stays
+        // usable, and the consolidation teardown gate with it.
+        if (tombstonePublished) {
+          try {
+            await rollbackRemovalTombstoneIfOwned({
+              rootDir: this.config.rootDir,
+              sessionDir: path.join(this.config.sessionsDir, workspaceId),
+              workspaceId,
+              attemptId: removalAttemptId,
+              workspaceStillRegistered: () => this.config.findWorkspace(workspaceId) != null,
+            });
+          } catch (rollbackError) {
+            log.error(
+              "Failed to roll back the removal tombstone after an aborted removal; " +
+                "the startup self-heal will reclaim it",
+              { workspaceId, rollbackError }
+            );
+          }
+        }
+        this.memoryConsolidationService?.releaseRemovalCancellation(workspaceId);
+      }
       if (releaseOverridesLock !== undefined) {
         try {
           await releaseOverridesLock();
@@ -6854,9 +7339,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return this.enrichFrontendMetadata(metadata);
   }
 
-  async list(): Promise<FrontendWorkspaceMetadata[]> {
+  async list(
+    archived: "all" | "active" | "archived" = "all"
+  ): Promise<FrontendWorkspaceMetadata[]> {
     try {
-      const workspaces = await this.config.getAllWorkspaceMetadata();
+      const workspaces = await this.config.getAllWorkspaceMetadata({ archived });
       return this.filterVisibleWorkspaceMetadata(workspaces).map((workspace) =>
         this.enrichFrontendMetadata(workspace)
       );
@@ -6867,10 +7354,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   async listByArchivedStatus(archived: boolean): Promise<FrontendWorkspaceMetadata[]> {
-    const workspaces = await this.list();
-    return workspaces.filter(
-      (workspace) => isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) === archived
-    );
+    return this.list(archived ? "archived" : "active");
   }
 
   // Devcontainer Docker labels are keyed by the exact host worktree path from startup, so stop/status
@@ -7857,53 +8341,84 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
-   * Candidate list for "small model" callers (title + AI sidebar status).
-   * Global preferences first, then any workspace-configured model so a
-   * custom-model workspace still works when global preferences are
-   * unavailable. Public so AgentStatusService can share the precedence.
+   * Ordered naming candidates shared by every naming path (pre-creation,
+   * fork auto-title, regenerate title). The user's configured `name_workspace`
+   * settings (workspace bucket, then agent defaults) lead with their thinking
+   * level; the hardcoded small-model fallbacks come next, then any
+   * workspace-configured models and caller-supplied fallbacks (e.g. the model
+   * selected for a workspace that does not exist yet) so a custom-model setup
+   * still works when the preferred providers are unavailable.
    */
-  public async getWorkspaceTitleModelCandidates(workspaceId: string): Promise<string[]> {
-    const candidates: string[] = [];
-    const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
-    const metadata = metadataResult.success ? metadataResult.data : undefined;
+  public async getWorkspaceNamingCandidates(
+    workspaceId: string | undefined,
+    extraFallbackModels: string[] = []
+  ): Promise<NameGenerationCandidate[]> {
+    const metadataResult = workspaceId
+      ? await this.aiService.getWorkspaceMetadata(workspaceId)
+      : undefined;
+    const metadata = metadataResult?.success ? metadataResult.data : undefined;
 
-    // A configured name_workspace model (workspace bucket, then agent
-    // defaults) leads the candidate list. Model-only: this runtime ignores
-    // thinking and reasoning parameters. Defensive config read: tests
-    // construct the service with partial Config mocks.
-    let agentAiDefaults: AgentAiDefaults | undefined;
+    // Defensive config read: tests construct the service with partial Config mocks.
+    let cfg: Pick<ProjectsConfig, "agentAiDefaults" | "defaultModel" | "minThinkingLevelByModel">;
     try {
-      agentAiDefaults = this.config.loadConfigOrDefault().agentAiDefaults;
+      cfg = this.config.loadConfigOrDefault();
     } catch {
-      agentAiDefaults = undefined;
+      cfg = {};
     }
     const nameBucket = metadata?.aiSettingsByAgent?.name_workspace;
+    // The workspace's active model (selected agent first; legacy settings can be
+    // stale once per-agent settings exist), or the caller's models for a workspace
+    // that does not exist yet.
+    const activeModels = metadata
+      ? deriveSideChannelModelCandidates(metadata)
+      : extraFallbackModels;
     const resolved = resolveAgentAiSettings({
       targetAgentId: "name_workspace",
       profile: "interactive",
-      agentAiDefaults,
-      targetWorkspaceSettings: nameBucket ? { model: nameBucket.model } : undefined,
+      agentAiDefaults: cfg.agentAiDefaults,
+      targetWorkspaceSettings: nameBucket
+        ? { model: nameBucket.model, thinkingLevel: nameBucket.thinkingLevel }
+        : undefined,
+      // A thinking-only naming override inherits the model the user actually
+      // works with (active workspace/caller model, then the configured app
+      // default), not the built-in constant.
+      fallbacks: activeModels.map((model) => ({ model })),
+      defaultModel: cfg.defaultModel,
+      minThinkingLevelByModel: cfg.minThinkingLevelByModel,
     });
-    if (resolved.sources.model.tier !== "default") {
-      candidates.push(resolved.selected.model);
-    }
-    for (const preferred of NAME_GEN_PREFERRED_MODELS) {
-      if (!candidates.includes(preferred)) {
-        candidates.push(preferred);
-      }
-    }
-    if (!metadata) {
-      return candidates;
-    }
 
-    const fallbackModels = [
-      metadata.aiSettings?.model,
-      ...Object.values(metadata.aiSettingsByAgent ?? {}).map((settings) => settings.model),
-    ];
-    for (const model of fallbackModels) {
-      if (model && !candidates.includes(model)) {
-        candidates.push(model);
+    const candidates: NameGenerationCandidate[] = [];
+    const withFloor = (model: string, thinkingLevel?: ThinkingLevel): NameGenerationCandidate => {
+      const minThinkingLevel = lookupMinThinkingLevelOverride(cfg.minThinkingLevelByModel, model);
+      return {
+        model,
+        ...(thinkingLevel !== undefined && { thinkingLevel }),
+        ...(minThinkingLevel !== undefined && { minThinkingLevel }),
+      };
+    };
+    const modelTier = resolved.sources.model.tier;
+    const explicitNamingModel = modelTier !== "fallback" && modelTier !== "default";
+    if (explicitNamingModel || resolved.sources.thinkingLevel.tier !== "default") {
+      // Only explicit naming settings lead. Thinking-only overrides count (the
+      // model then inherits); an inherited model alone does not, so an unset
+      // naming agent keeps the hardcoded small models first. Selected (not
+      // effective) thinking: the generator clamps against the creation-time
+      // route/config receipt rather than this resolver's view.
+      candidates.push(withFloor(resolved.selected.model, resolved.selected.thinkingLevel));
+    }
+    const pushFallback = (model: string | undefined) => {
+      if (model && !candidates.some((candidate) => candidate.model === model)) {
+        candidates.push(withFloor(model));
       }
+    };
+    for (const preferred of NAME_GEN_PREFERRED_MODELS) {
+      pushFallback(preferred);
+    }
+    for (const model of activeModels) {
+      pushFallback(model);
+    }
+    for (const model of extraFallbackModels) {
+      pushFallback(model);
     }
 
     return candidates;
@@ -7932,6 +8447,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       });
   }
 
+  /**
+   * Model-only view of getWorkspaceNamingCandidates for "small model" callers
+   * whose runtime ignores thinking (AI sidebar status). Public so
+   * AgentStatusService can share the precedence.
+   */
+  public async getWorkspaceTitleModelCandidates(workspaceId: string): Promise<string[]> {
+    const candidates = await this.getWorkspaceNamingCandidates(workspaceId);
+    return candidates.map((candidate) => candidate.model);
+  }
+
   private async maybeRunPendingAutoTitleFromMessage(
     workspaceId: string,
     message: string
@@ -7942,7 +8467,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
 
     try {
-      const candidates = await this.getWorkspaceTitleModelCandidates(workspaceId);
+      const candidates = await this.getWorkspaceNamingCandidates(workspaceId);
       const result = await generateWorkspaceIdentity(trimmedMessage, candidates, this.aiService);
       if (result.success) {
         const persistResult = await this.updateWorkspaceTitleState(workspaceId, {
@@ -8301,7 +8826,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const { conversationContext, latestUserText } =
       buildWorkspaceTitleConversationContext(contextTurns);
 
-    const candidates = await this.getWorkspaceTitleModelCandidates(workspaceId);
+    const candidates = await this.getWorkspaceNamingCandidates(workspaceId);
 
     const result = await generateWorkspaceIdentity(
       firstUserText,
@@ -9529,6 +10054,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (!didUnarchive) {
         return Ok(undefined);
       }
+
+      this.activeWorkflowRunIdsByWorkspace.delete(workspaceId);
+      this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
 
       // Emit updated metadata
       const allMetadata = await this.config.getAllWorkspaceMetadata();
@@ -11474,6 +12002,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           raw: CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE,
         });
       }
+      // Stop-cascade barrier (before queueing or starting): nothing may feed a workspace whose
+      // stop latch is held; the session re-checks at admission for sends already in preflight.
+      if (this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true) {
+        log.debug("sendMessage blocked: a stop is in progress", { workspaceId });
+        return Err({ type: "unknown", raw: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE });
+      }
       const dedupeKey = internal?.queueDedupeKey;
       if (dedupeKey && this.sessions.get(workspaceId)?.hasQueuedDedupeKey(dedupeKey)) {
         return Ok(undefined);
@@ -11999,13 +12533,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           Promise.resolve(undefined)
         );
       }
-      if (internal?.admissionStale == null) {
+      const continuationSendState = getContinuationSendState();
+      // WTM-correlated sends already own their attempt and execution mirror. A second manual
+      // rescue would replace that ownership, defeating rollback when admission is refused.
+      // Use the dispatched correlation: a downgraded continuation still needs ordinary rescue.
+      if (
+        internal?.admissionStale == null &&
+        parseWorkspaceTurnTaskCorrelation(continuationSendState.options.muxMetadata) == null
+      ) {
         previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
         resumedInterruptedTask =
           (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
       }
 
-      const continuationSendState = getContinuationSendState();
       const onAcceptedPreStreamFailure = async (error: SendMessageError) => {
         if (resumedInterruptedTask && normalizedOptions?.editMessageId) {
           try {
@@ -12222,6 +12762,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           type: "unknown",
           raw: "Workspace is being archived. Unarchive it before resuming.",
         });
+      }
+      if (this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true) {
+        log.debug("resumeStream blocked: a stop is in progress", { workspaceId });
+        return Err({ type: "unknown", raw: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE });
       }
       {
         const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
@@ -12647,6 +13191,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
 
         if (!allowQueueDispatch && (stopAdmission() || session.closingSignal.aborted)) return false;
+
+        // The cascade above persisted every descendant's terminal status (each keeps its own
+        // retained stop latch until it settles), so this workspace's hard-interrupt latch has
+        // done its job. Release it BEFORE the user's send-now: queued dispatch honors the stop
+        // barrier and would otherwise hold the very entry the user asked to send, with nothing
+        // left to drain it after the finally. A failed cascade keeps the latch until the finally.
+        if (allowQueueDispatch && descendantsSettled) {
+          releaseHardStopLatch?.();
+          releaseHardStopLatch = undefined;
+        }
 
         // Handle queued messages based on option
         if (allowQueueDispatch && options?.sendQueuedImmediately) {
@@ -13124,6 +13678,52 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   getQueueCutCutter(workspaceId: string): QueueCutCutter | undefined {
     const session = this.sessions.get(workspaceId.trim());
     return session?.getQueueCutCutter();
+  }
+
+  getTurnGeneration(workspaceId: string): symbol | undefined {
+    return this.sessions.get(workspaceId.trim())?.getTurnGeneration();
+  }
+
+  clearQueueCutReceipts(workspaceId: string): void {
+    this.sessions.get(workspaceId.trim())?.clearQueueCutReceipts();
+  }
+
+  /** See AgentSession queue-cut receipts (QueueCutReceipt). */
+  getQueueCutReceipt(workspaceId: string, entryId: string): QueueCutReceipt | undefined {
+    return this.sessions.get(workspaceId.trim())?.getQueueCutReceipt(entryId);
+  }
+
+  markQueueCutSourceHandled(workspaceId: string, entryId: string): void {
+    this.sessions.get(workspaceId.trim())?.markQueueCutSourceHandled(entryId);
+  }
+
+  disposeQueueCut(workspaceId: string, entryId: string): boolean {
+    return this.sessions.get(workspaceId.trim())?.disposeQueueCut(entryId) ?? false;
+  }
+
+  onQueuedMessageChanged(listener: (workspaceId: string) => void): () => void {
+    const handler = (payload: { workspaceId: string; message: WorkspaceChatMessage }) => {
+      if (payload.message.type === "queued-message-changed") listener(payload.workspaceId);
+    };
+    this.on("chat", handler);
+    return () => {
+      this.off("chat", handler);
+    };
+  }
+
+  getActiveTurnGeneration(workspaceId: string): symbol | undefined {
+    return this.sessions.get(workspaceId.trim())?.getActiveTurnGeneration();
+  }
+
+  onWorkspaceTurnSettled(
+    listener: (workspaceId: string, turnGeneration: symbol) => void
+  ): () => void {
+    const handler = (payload: { workspaceId: string; turnGeneration: symbol }) =>
+      listener(payload.workspaceId, payload.turnGeneration);
+    this.on("workspace-turn-settled", handler);
+    return () => {
+      this.off("workspace-turn-settled", handler);
+    };
   }
 
   /** See AgentSession.getStoppablePreparingWorkspaceTurn. */
@@ -14009,9 +14609,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private async enumerateAuthoritativeWorkspaceIds(): Promise<Set<string>> {
     const legacyAliasIds = new Set<string>();
     const ids = new Set(
-      (await this.config.getAllWorkspaceMetadata({ throwOnError: true, legacyAliasIds })).map(
-        (metadata) => metadata.id
-      )
+      (
+        await this.config.getAllWorkspaceMetadata({
+          throwOnError: true,
+          legacyAliasIds,
+          probeCheckouts: false,
+        })
+      ).map((metadata) => metadata.id)
     );
     for (const aliasId of legacyAliasIds) {
       ids.add(aliasId);
@@ -14043,8 +14647,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   /**
    * Returns the config-known workspace ids captured during the prune so the
    * first activity bootstrap can reuse them for scoping —
-   * getAllWorkspaceMetadata walks every workspace with per-workspace disk
-   * probes, which large deployments should not pay twice in the
+   * getAllWorkspaceMetadata walks every workspace, so avoid repeating that work during
    * latency-sensitive bootstrap. `knownIds` is the FULL raw-plus-normalized
    * union the prune spared from deletion: scoping to anything narrower (the
    * normalized view alone) would drop raw-registered ids the normalized
@@ -14941,6 +15544,40 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
               activityById[workspaceId] = merged;
             }
           }
+        }
+      }
+      // LAST step, no awaits below: converge every scoped row on the live workflow-run cache.
+      // Rows were built from a per-id copy of the Set inside Promise.all, and the archived
+      // read path resolves a DETACHED empty Set (installing one per idle archived workspace
+      // is the memory cost this list avoids). A workflow event landing during the awaits
+      // above installs or mutates the shared Set after that copy was taken, and an
+      // authoritative response built from the copy would clear the run the event just
+      // delivered to the renderer. Removed ids cannot re-enter: eviction deletes their
+      // cache entry and the local tombstone is re-checked.
+      for (const workspaceId of new Set([...workspaceIds, ...Object.keys(activityById)])) {
+        const installed = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
+        if (installed == null) continue;
+        const row = activityById[workspaceId];
+        if (row != null) {
+          activityById[workspaceId] = mergeActiveWorkflowRuns(row, installed);
+          continue;
+        }
+        if (
+          installed.size === 0 ||
+          !workspaceIds.has(workspaceId) ||
+          this.extensionMetadata.isWorkspaceDeleted(workspaceId)
+        ) {
+          continue;
+        }
+        const merged = this.mergeCurrentActiveBashMonitorCount(
+          workspaceId,
+          mergeActiveWorkflowRuns(
+            this.overlayPendingGoal(workspaceId, snapshots.get(workspaceId) ?? null),
+            installed
+          )
+        );
+        if (merged != null) {
+          activityById[workspaceId] = merged;
         }
       }
       return activityById;
