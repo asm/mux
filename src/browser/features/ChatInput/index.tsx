@@ -47,8 +47,15 @@ import {
   useAdditionalSystemContextHydrated,
   useAdditionalSystemContextSnapshot,
 } from "@/browser/utils/additionalSystemContextStore";
-import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
-import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
+import {
+  useAutoRoutingSelection,
+  useSendMessageOptions,
+} from "@/browser/hooks/useSendMessageOptions";
+import {
+  leaveAutoRoutingForAgentSwitch,
+  setWorkspaceModelWithOrigin,
+  setWorkspaceThinkingLevelWithOrigin,
+} from "@/browser/utils/modelChange";
 import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
 import {
   getModelKey,
@@ -587,8 +594,17 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Get current send message options from shared hook (must be at component top level)
   // For creation variant, use project-scoped key; for workspace, use workspace ID
-  const sendMessageOptions = useSendMessageOptions(
-    variant === "workspace" ? props.workspaceId : getProjectScopeId(creationParentProjectPath)
+  const sendOptionsScopeId =
+    variant === "workspace" ? props.workspaceId : getProjectScopeId(creationParentProjectPath);
+  const sendMessageOptions = useSendMessageOptions(sendOptionsScopeId);
+  const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
+  const [autoModelRoutingActive, setAutoModelRoutingActive] = useAutoRoutingSelection(
+    sendOptionsScopeId,
+    "model"
+  );
+  const [autoThinkingLevelActive, setAutoThinkingLevelActive] = useAutoRoutingSelection(
+    sendOptionsScopeId,
+    "thinkingLevel"
   );
   const composerSuggestions = useComposerSuggestions({
     input,
@@ -674,6 +690,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       }
 
       ensureModelInSettings(selectedModel); // Ensure model exists in Settings
+      // A concrete pick (selector, /model, or the cycle shortcut) always leaves Auto.
+      setAutoModelRoutingActive(false);
 
       if (onModelChange) {
         // Notify parent of model change (for context switch warning + persisted model metadata).
@@ -712,6 +730,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       ensureModelInSettings,
       providersConfig,
       onModelChange,
+      setAutoModelRoutingActive,
       thinkingLevel,
       reasoningMode,
       variant,
@@ -1041,12 +1060,19 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
     });
 
+    if (isExplicitAgentSwitch) {
+      leaveAutoRoutingForAgentSwitch(scopeId);
+    }
     if (existingModel !== resolvedModel) {
       setWorkspaceModelWithOrigin(scopeId, resolvedModel, isExplicitAgentSwitch ? "agent" : "sync");
     }
 
     if (existingThinking !== resolvedThinking) {
-      updatePersistedState(thinkingKey, resolvedThinking);
+      setWorkspaceThinkingLevelWithOrigin(
+        scopeId,
+        resolvedThinking,
+        isExplicitAgentSwitch ? "agent" : "sync"
+      );
     }
 
     if (existingReasoning !== resolvedReasoning) {
@@ -2923,6 +2949,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       hiddenModels={hiddenModelsForSelector}
                       onOpenSettings={() => open("models")}
                       className="h-full max-w-[8rem] min-w-0"
+                      autoRouting={
+                        autoModelRoutingEnabled
+                          ? {
+                              active: autoModelRoutingActive,
+                              onSelect: () => setAutoModelRoutingActive(true),
+                            }
+                          : undefined
+                      }
                       tooltipExtraContent={
                         <>
                           <strong>Click to edit</strong>
@@ -2952,7 +2986,17 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       className="flex shrink-0 items-center"
                       data-component="ThinkingSelectorGroup"
                     >
-                      <ThinkingSelector modelString={baseModel} />
+                      <ThinkingSelector
+                        modelString={baseModel}
+                        autoRouting={
+                          autoModelRoutingEnabled
+                            ? {
+                                active: autoThinkingLevelActive,
+                                onSelect: () => setAutoThinkingLevelActive(true),
+                              }
+                            : undefined
+                        }
+                      />
                     </div>
                   </div>
 
