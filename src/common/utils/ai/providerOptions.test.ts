@@ -208,6 +208,14 @@ describe("buildProviderOptions - Anthropic", () => {
       expect(buildProviderOptions("anthropic:claude-mythos-5-1", "off")).toEqual({
         anthropic: { ...baseAnthropicOptions, effort: "low" },
       });
+      // Opus 5.5 rejects disabled thinking too (breaking change from Opus 5, which
+      // keeps `{ type: "disabled" }` in the native-xhigh loop above).
+      expect(buildProviderOptions("anthropic:claude-opus-5-5", "off")).toEqual({
+        anthropic: { ...baseAnthropicOptions, effort: "low" },
+      });
+      expect(
+        anthropicProviderOptions(buildProviderOptions("anthropic:claude-opus-5-5", "xhigh"))
+      ).toMatchObject({ thinking: { type: "adaptive", display: "summarized" }, effort: "xhigh" });
     });
   });
 
