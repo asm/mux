@@ -52,6 +52,8 @@ import type {
 } from "@/common/types/stream";
 import { log } from "./log";
 import type { SessionUsageService } from "./sessionUsageService";
+import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
+import type { SendMessageError } from "@/common/types/errors";
 import type {
   StreamManager,
   TurnCompletion,
@@ -3006,6 +3008,199 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(options).toMatchObject({ openai: { reasoningMode: "pro" } });
     }
   );
+
+  it.each([
+    {
+      modelId: "openai.gpt-5.6-sol",
+      origin: "openai" as const,
+      toolsModelString: "openai:openai.gpt-5.6-sol",
+      openaiWireFormat: "responses",
+    },
+    {
+      modelId: "anthropic.claude-sonnet-5",
+      origin: "anthropic" as const,
+      toolsModelString: "anthropic:anthropic.claude-sonnet-5",
+      openaiWireFormat: undefined,
+    },
+  ])(
+    "assembles tools for the model's wire on a bedrock-typed Coder instance: $modelId",
+    async (testCase) => {
+      using xumHome = new DisposableTempDir("ai-service-coder-bedrock-wire");
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = "workspace-coder-bedrock-wire";
+      const harness = createHarness(
+        xumHome.path,
+        createLocalWorkspaceMetadata(workspaceId, projectPath)
+      );
+      const model = `coder:bedrock-mantle-us-east-1/${testCase.modelId}`;
+      // The factory's wire snapshot for a Mantle instance: OpenAI-namespaced
+      // models are created as provider.responses(), so tool assembly must key
+      // on the Responses wire rather than the instance type's Anthropic default.
+      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+      spyOn(factory, "resolveAndCreateModel").mockResolvedValue({
+        success: true,
+        data: {
+          model: Object.create(null) as LanguageModel,
+          effectiveModelString: model,
+          canonicalModelString: model,
+          canonicalProviderName: "coder",
+          canonicalModelId: model.slice("coder:".length),
+          wireProviderName: testCase.origin,
+          routeProvider: "coder",
+          routedThroughGateway: false,
+          coderWire: {
+            origin: testCase.origin,
+            modelId: testCase.modelId,
+            providerType: "bedrock",
+          },
+        },
+      });
+
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("latest-user", "user", "continue")],
+        workspaceId,
+        modelString: model,
+        thinkingLevel: "medium",
+      });
+
+      expect(result.success).toBe(true);
+      const toolsCall = harness.getToolsForModelSpy.mock.calls[0];
+      if (!toolsCall) throw new Error("Expected getToolsForModel call");
+      expect(toolsCall[0]).toBe(testCase.toolsModelString);
+      expect(toolsCall[1].openaiWireFormat).toBe(testCase.openaiWireFormat);
+    }
+  );
+
+  describe("Auto-routed tier model that cannot be built", () => {
+    const TIER_MODEL = "openai:gpt-5.2";
+    const COMPOSER_MODEL = "anthropic:claude-sonnet-4-5";
+    const routedRecord: AutoModelRoutingRecord = {
+      requestedFallbackModel: COMPOSER_MODEL,
+      tierId: "hard",
+      tierLabel: "Hard",
+      model: TIER_MODEL,
+      thinkingLevel: "xhigh",
+      status: "routed",
+    };
+    const tierModelDenied: SendMessageError = {
+      type: "policy_denied",
+      message: "Model openai:gpt-5.2 is blocked by provider policy",
+    };
+
+    async function streamWithFailingModels(
+      failing: Set<string>,
+      record: AutoModelRoutingRecord = routedRecord,
+      thinkingLevel = record.thinkingLevel
+    ) {
+      const xumHome = new DisposableTempDir("ai-service-auto-routing-fallback");
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = "workspace-auto-routing-fallback";
+      const harness = createHarness(
+        xumHome.path,
+        createLocalWorkspaceMetadata(workspaceId, projectPath),
+        { useRequestedModelString: true }
+      );
+      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+      const requestedModels: string[] = [];
+      spyOn(factory, "resolveAndCreateModel").mockImplementation((requested) => {
+        requestedModels.push(requested);
+        if (failing.has(requested)) {
+          return Promise.resolve({ success: false, error: tierModelDenied });
+        }
+        return Promise.resolve({
+          success: true,
+          data: {
+            model: Object.create(null) as LanguageModel,
+            effectiveModelString: requested,
+            canonicalModelString: requested,
+            canonicalProviderName: providerNameFromModelString(requested),
+            canonicalModelId: modelIdFromModelString(requested),
+            wireProviderName: providerNameFromModelString(requested),
+            routedThroughGateway: false,
+          },
+        });
+      });
+
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("latest-user", "user", "refactor the scheduler")],
+        workspaceId,
+        modelString: record.model,
+        thinkingLevel,
+        autoModelRouting: record,
+      });
+      return {
+        result,
+        harness,
+        requestedModels,
+        [Symbol.dispose]: () => xumHome[Symbol.dispose](),
+      };
+    }
+
+    it("runs on the composer's model and records the factory's verdict", async () => {
+      using run = await streamWithFailingModels(new Set([TIER_MODEL]));
+      expect(run.result.success).toBe(true);
+      expect(run.requestedModels).toEqual([TIER_MODEL, COMPOSER_MODEL]);
+      expect(run.harness.startStreamCalls).toHaveLength(1);
+      const startStream = run.harness.startStreamCalls[0];
+      expect(startStream.modelString).toBe(COMPOSER_MODEL);
+      // The tier's xhigh is above the composer model's ceiling; the record follows the clamp.
+      expect(startStream.thinkingLevel).toBe("high");
+      expect(initialMetadataFromStartStreamCall(startStream).autoModelRouting).toEqual({
+        ...routedRecord,
+        model: COMPOSER_MODEL,
+        thinkingLevel: "high",
+        status: "fallback",
+        reason: tierModelDenied.message,
+      });
+    });
+
+    it("surfaces the composer model's own failure when neither model can be built", async () => {
+      using run = await streamWithFailingModels(new Set([TIER_MODEL, COMPOSER_MODEL]));
+      expect(run.result).toEqual({ success: false, error: tierModelDenied });
+      expect(run.requestedModels).toEqual([TIER_MODEL, COMPOSER_MODEL]);
+      expect(run.harness.startStreamCalls).toHaveLength(0);
+    });
+
+    it.each<AutoModelRoutingRecord>([
+      // A record that already ran on the composer's model has nothing to fall back to.
+      { ...routedRecord, model: COMPOSER_MODEL },
+      { ...routedRecord, model: COMPOSER_MODEL, status: "fallback", reason: "unpriced" },
+    ])("does not retry a record that is not a live routed swap (%j)", async (record) => {
+      using run = await streamWithFailingModels(new Set([record.model]), record);
+      expect(run.result).toEqual({ success: false, error: tierModelDenied });
+      expect(run.requestedModels).toEqual([record.model]);
+    });
+
+    it("records the level the request runs at, not the raw tier value, when Auto set it", async () => {
+      // An attachment fallback upstream already reverted the model and clamped the level the
+      // session sends; the record still carries the tier's raw level until it is assembled here.
+      const reverted: AutoModelRoutingRecord = {
+        ...routedRecord,
+        model: COMPOSER_MODEL,
+        status: "fallback",
+        reason: "Model openai:gpt-5.2 does not support image input.",
+      };
+      using run = await streamWithFailingModels(new Set(), reverted, "high");
+      expect(run.result.success).toBe(true);
+      const startStream = run.harness.startStreamCalls[0];
+      expect(startStream.thinkingLevel).toBe("high");
+      expect(initialMetadataFromStartStreamCall(startStream).autoModelRouting).toEqual({
+        ...reverted,
+        thinkingLevel: "high",
+      });
+    });
+
+    it("passes a record without a routed thinking level through untouched", async () => {
+      const { thinkingLevel: _tierLevel, ...composerLevel } = routedRecord;
+      using run = await streamWithFailingModels(new Set(), composerLevel, "low");
+      expect(run.result.success).toBe(true);
+      expect(
+        initialMetadataFromStartStreamCall(run.harness.startStreamCalls[0]).autoModelRouting
+      ).toEqual(composerLevel);
+    });
+  });
 
   it("freezes advisor tool-call snapshots at the tool-call boundary", async () => {
     using xumHome = new DisposableTempDir("ai-service-advisor-step-snapshot-boundary");

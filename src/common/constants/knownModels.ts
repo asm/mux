@@ -59,15 +59,16 @@ const MODEL_DEFINITIONS = {
     // approximate counting; real usage can run ~1.0-1.3x higher.
     tokenizerOverride: "anthropic/claude-opus-4.5",
   },
-  // Claude Opus 5 - released July 24, 2026. Successor to Opus 4.8 at the same pricing
-  // ($5/M input, $25/M output). API id `claude-opus-5`; Opus 4.8 stays usable as the
-  // custom model string `anthropic:claude-opus-4-8`.
+  // Claude Opus 5.5 - released September 22, 2026, successor to Opus 5. $4/M input,
+  // $20/M output, 20% below Opus 5. API id `claude-opus-5-5`; Opus 5 stays usable
+  // as the custom model string `anthropic:claude-opus-5`. Unlike Opus 5, thinking
+  // cannot be disabled (see anthropicRejectsDisabledThinking).
   OPUS: {
     provider: "anthropic",
-    providerModelId: "claude-opus-5",
+    providerModelId: "claude-opus-5-5",
     aliases: ["opus"],
     warm: true,
-    // Opus 5 uses the newer Opus 4.7+ tokenizer (~30% more tokens for the same text),
+    // Opus 5.5 uses the newer Opus 4.7+ tokenizer (~30% more tokens for the same text),
     // which isn't published upstream; reuse Opus 4.5 for approximate counting. Real
     // usage can run ~1.0-1.3x higher than this estimate (same situation as FABLE above).
     tokenizerOverride: "anthropic/claude-opus-4.5",
@@ -211,18 +212,20 @@ const MODEL_DEFINITIONS = {
     aliases: ["gemini-flash"],
     tokenizerOverride: "google/gemini-2.5-pro",
   },
-  // Grok 4.6 - xAI's frontier coding and agentic model, released August 12, 2026.
-  // Supersedes Grok 4.5 at the same headline price; Grok 4.5 remains usable as the
-  // custom model string `xai:grok-4.5`.
-  GROK_46: {
+  // Grok 4.7 - xAI's frontier coding and knowledge-work model, released September 21,
+  // 2026. Supersedes Grok 4.6 at identical pricing and specs ($2/M in, $6/M out, 500K
+  // context, native xhigh); Grok 4.6 remains usable as the custom model string
+  // `xai:grok-4.6`. The Grok 4.7 Fast variant is Cursor/Grok Build-only (not on the
+  // public xAI API), so it is intentionally not listed.
+  GROK_47: {
     provider: "xai",
-    providerModelId: "grok-4.6",
-    aliases: ["grok", "grok-4.6"],
+    providerModelId: "grok-4.7",
+    aliases: ["grok", "grok-4.7"],
   },
   // DeepSeek V4 Pro is the flagship V4 tier (1.6T total / 49B active params, 1M context,
   // 384K max output). Bare `deepseek` alias points here per the convention that the
   // shortest alias tracks each provider's flagship model (mirrors `gemini` → Gemini Pro,
-  // `grok` → Grok 4.6).
+  // `grok` → Grok 4.7).
   DEEPSEEK_V4_PRO: {
     provider: "deepseek",
     providerModelId: "deepseek-v4-pro",
@@ -316,6 +319,7 @@ export const MODEL_ABBREVIATIONS: Record<string, string> = Object.fromEntries(
 const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "anthropic:claude-fable-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-mythos-5": "anthropic/claude-opus-4.5",
+  "anthropic:claude-opus-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
 };
 

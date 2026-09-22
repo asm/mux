@@ -524,6 +524,7 @@ function appendAssistantTextRow(
       message.metadata?.routedThroughGateway
     ),
     modelFallback: message.metadata?.modelFallback,
+    autoModelRouting: message.metadata?.autoModelRouting,
     mode: message.metadata?.mode,
     agentId: message.metadata?.agentId ?? message.metadata?.mode,
     timestamp: part.timestamp ?? options.baseTimestamp,
@@ -601,7 +602,15 @@ function reconstructCodeExecutionNestedCalls(part: DynamicToolPart): NestedToolC
       input: record.args,
       output,
       ...(kernelFailure ? { failed: true } : {}),
-      state: "output-available",
+      // Compaction deliberately omits results. Reuse the neutral redacted state
+      // instead of making communication cards report a missing-result failure.
+      // ok:true only means the tool ran, not that a message was delivered.
+      state:
+        output === undefined &&
+        typeof record.ok === "boolean" &&
+        (record.toolName === "task_send_message" || record.toolName === "agent_report")
+          ? "output-redacted"
+          : "output-available",
       timestamp: part.timestamp,
     });
   }

@@ -1,7 +1,12 @@
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import type { ChatAttachment } from "./ChatAttachments";
 import { chatAttachmentsToFileParts } from "@/browser/utils/attachmentsHandling";
-import type { FilePart, SendMessageOptions, ProvidersConfigMap } from "@/common/orpc/types";
+import type {
+  FilePart,
+  HistoryEditPrecondition,
+  SendMessageOptions,
+  ProvidersConfigMap,
+} from "@/common/orpc/types";
 import {
   prepareUserMessageForSend,
   type AgentSkillReference,
@@ -26,6 +31,8 @@ interface PrepareMessagePayloadInput {
   reviews?: ReviewNoteDataForDisplay[];
   reviewIds: string[];
   editMessageId?: string;
+  /** Required with editMessageId: the RPC refuses an unfenced UI edit. */
+  historyEditPrecondition?: HistoryEditPrecondition;
   baseMetadata?: MuxMessageMetadata;
   agentSkillRefs: AgentSkillReference[];
   mcpPromptRefs: MCPPromptReference[];
@@ -141,9 +148,13 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
       ...(oneShotModelOverride ? { model: oneShotModelOverride } : {}),
       ...(thinkingOverride ? { thinkingLevel: thinkingOverride } : {}),
       ...(oneShotOverride ? { skipAiSettingsPersistence: true } : {}),
-      // Only a model-carrying one-shot bypasses class routing; a thinking-only
-      // override (/+2 /skill) layers on top of routing.
-      ...(oneShotModelOverride ? { skipSkillModelRouting: true } : {}),
+      // A one-shot command is the user's explicit choice for this turn, per
+      // dimension: a model one-shot pins the model (bypassing both skill class
+      // routing and model Auto routing) and a thinking override pins the level,
+      // so a thinking-only command (`/+2 hello`, `/+2 /skill`) leaves model
+      // routing — class or Auto — to decide the turn's model.
+      ...(oneShotModelOverride ? { skipSkillModelRouting: true, autoModelRouting: false } : {}),
+      ...(thinkingOverride ? { autoThinkingLevel: false } : {}),
       // Numeric thinking is model-relative and thinkingOverride above was
       // resolved client-side. A routable skill send may stream on a different
       // (class) model, and an explicit one-shot model's ladder depends on
@@ -166,6 +177,9 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
         : {}),
       additionalSystemInstructions,
       editMessageId: input.editMessageId,
+      ...(input.editMessageId && input.historyEditPrecondition
+        ? { historyEditPrecondition: input.historyEditPrecondition }
+        : {}),
       fileParts: sendFileParts,
       muxMetadata: metadata,
     },

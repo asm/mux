@@ -23,6 +23,16 @@ describe("Known Models Integration", () => {
     }
   });
 
+  test("opus alias tracks Opus 5.5 and retired ids keep tokenizer overrides", () => {
+    expect(MODEL_ABBREVIATIONS.opus).toBe("anthropic:claude-opus-5-5");
+    expect(KNOWN_MODELS.OPUS.id).toBe("anthropic:claude-opus-5-5");
+    // Exact-id lookup for retired-but-documented custom model strings must keep
+    // resolving to the Opus 4.5 approximation instead of falling back (with a
+    // warning) to the generic per-provider tokenizer.
+    expect(TOKENIZER_MODEL_OVERRIDES["anthropic:claude-opus-5"]).toBe("anthropic/claude-opus-4.5");
+    expect(TOKENIZER_MODEL_OVERRIDES[KNOWN_MODELS.OPUS.id]).toBe("anthropic/claude-opus-4.5");
+  });
+
   test("gemini-flash resolves to the stable Gemini 3.8 Flash model", () => {
     expect(MODEL_ABBREVIATIONS["gemini-flash"]).toBe("google:gemini-3.8-flash");
   });
@@ -52,14 +62,15 @@ describe("Known Models Integration", () => {
     expect(TOKENIZER_MODEL_OVERRIDES["openai:gpt-6-astra"]).toBe("openai/gpt-5");
   });
 
-  test("grok aliases resolve only to Grok 4.6 in the curated registry", () => {
-    expect(MODEL_ABBREVIATIONS.grok).toBe("xai:grok-4.6");
-    expect(MODEL_ABBREVIATIONS["grok-4.6"]).toBe("xai:grok-4.6");
+  test("grok aliases resolve only to Grok 4.7 in the curated registry", () => {
+    expect(MODEL_ABBREVIATIONS.grok).toBe("xai:grok-4.7");
+    expect(MODEL_ABBREVIATIONS["grok-4.7"]).toBe("xai:grok-4.7");
+    expect(MODEL_ABBREVIATIONS["grok-4.6"]).toBeUndefined();
     expect(MODEL_ABBREVIATIONS["grok-4.5"]).toBeUndefined();
     expect(MODEL_ABBREVIATIONS["grok-4.1"]).toBeUndefined();
     expect(MODEL_ABBREVIATIONS["grok-code"]).toBeUndefined();
     expect(Object.values(KNOWN_MODELS).filter((model) => model.provider === "xai")).toEqual([
-      KNOWN_MODELS.GROK_46,
+      KNOWN_MODELS.GROK_47,
     ]);
   });
 

@@ -51,6 +51,7 @@ import { PlatformPaths } from "@/common/utils/paths";
 import {
   partitionWorkspacesByAge,
   buildSortedWorkspacesFlat,
+  findMostRecentlyCreatedWorkspace,
   partitionWorkspacesBySection,
   formatDaysThreshold,
   AGE_THRESHOLDS_DAYS,
@@ -198,6 +199,7 @@ export type { WorkspaceSelection } from "../AgentListItem/AgentListItem";
  */
 interface WorkspaceAttentionSignal {
   isWorking: boolean;
+  hasActiveBashMonitor: boolean;
   awaitingUserQuestion: boolean;
   hasSystemError: boolean;
   activeWorkflowRunIdsKey: string;
@@ -219,6 +221,7 @@ function getWorkspaceAttentionSignal(
       !sidebarState.awaitingUserQuestion;
     return {
       isWorking,
+      hasActiveBashMonitor: sidebarState.activeBashMonitorCount > 0,
       awaitingUserQuestion: sidebarState.awaitingUserQuestion,
       activeWorkflowRunIdsKey: (sidebarState.activeWorkflowRunIds ?? []).join("\u0000"),
       hasSystemError: sidebarState.lastAbortReason?.reason === "system",
@@ -239,6 +242,7 @@ function didWorkspaceAttentionSignalChange(
   return (
     prev.activeWorkflowRunIdsKey !== next.activeWorkflowRunIdsKey ||
     prev.isWorking !== next.isWorking ||
+    prev.hasActiveBashMonitor !== next.hasActiveBashMonitor ||
     prev.awaitingUserQuestion !== next.awaitingUserQuestion ||
     prev.hasSystemError !== next.hasSystemError
   );
@@ -1040,6 +1044,35 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     handleAddWorkspace(SCRATCH_PROJECT_CONFIG_KEY);
   }, [handleAddWorkspace, setExpandedProjectsArray]);
 
+  // Open a sibling draft in the same project and section as `meta`. Shared by
+  // Ctrl+N and the flat-mode "New chat" button.
+  // Resolve the effective section ID exactly the way the renderer does:
+  // honor the workspace's own subProjectPath when it still exists, otherwise
+  // inherit from the parent workspace. This keeps the draft in lockstep with
+  // the visible section and avoids forwarding deleted sub-project paths that
+  // workspace.create would reject.
+  // Scratch chats are bucketed under the scratch config key while their
+  // projectPath is the app-managed workdir, so the bucket lookup below misses
+  // them; check kind first.
+  // useCallback is required here, not for memoization: the keydown useEffect
+  // lists this handler as a dependency and react-hooks/exhaustive-deps rejects
+  // a plain function there.
+  const handleAddSiblingWorkspace = useCallback(
+    (meta: FrontendWorkspaceMetadata) => {
+      if (meta.kind === "scratch") {
+        handleAddScratchWorkspace();
+        return;
+      }
+      const projectWorkspaces = sortedWorkspacesByProject.get(meta.projectPath) ?? [];
+      const byId = new Map(projectWorkspaces.map((m) => [m.id, m]));
+      const validSectionIds = new Set(
+        getSubProjectsForParent(meta.projectPath, userProjects).map(([subPath]) => subPath)
+      );
+      handleAddWorkspace(meta.projectPath, resolveEffectiveSectionId(meta, byId, validSectionIds));
+    },
+    [handleAddScratchWorkspace, handleAddWorkspace, sortedWorkspacesByProject, userProjects]
+  );
+
   const toggleSection = (projectPath: string, sectionId: string) => {
     const key = getSectionExpandedKey(projectPath, sectionId);
     setExpandedSections((prev) => ({
@@ -1750,6 +1783,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     const signal = getWorkspaceAttentionSignal(workspaceStore, workspaceId);
     return signal?.isWorking === true;
   };
+  const hasActiveBashMonitor = (workspaceId: string): boolean =>
+    getWorkspaceAttentionSignal(workspaceStore, workspaceId)?.hasActiveBashMonitor === true;
   const getActiveWorkflowRunIds = (workspaceId: string): readonly string[] => {
     try {
       return workspaceStore.getWorkspaceSidebarState(workspaceId).activeWorkflowRunIds ?? [];
@@ -1806,13 +1841,13 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const visibleFlatWorkspaces = filterVisibleAgentRows(
     flatRowsForDisplay,
     expandedCompletedParentIds,
-    { isWorkspaceLiveActive }
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
   );
   const flatRowMetaByWorkspaceId = computeAgentRowRenderMeta(
     flatRowsForDisplay,
     flatDepthByWorkspaceId,
     expandedCompletedParentIds,
-    { isWorkspaceLiveActive }
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
   );
   // Pinned-at-the-top invariant vs drafts: pinned roots (their subtrees stay
   // adjacent and never age out) render as their own segment above the draft
@@ -1838,6 +1873,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     // mounted across step gaps (mirrors the grouped per-project seeding).
     for (const key of collectActiveWorkflowGroupKeys(flatRowsForDisplay, {
       isWorkspaceLiveActive,
+      hasActiveBashMonitor,
     })) {
       sessionActiveTaskGroupKeysRef.current.add(key);
     }
@@ -1862,11 +1898,12 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     workflowRunNamesRef.current.get(runId)?.name;
   const delegatedActivityByWorkspaceId = computeDelegatedActivityByWorkspaceId(
     allSidebarWorkspaces,
-    { isWorkspaceLiveActive }
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
   );
   const subAgentsSummaryByWorkspaceId = hideSubAgentRows
     ? computeSubAgentsSummaryByWorkspaceId(allSidebarWorkspaces, {
         isWorkspaceLiveActive,
+        hasActiveBashMonitor,
         getActiveWorkflowRunIds,
         getWorkflowRunName,
       })
@@ -1919,13 +1956,13 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const visibleScratchWorkspaces = filterVisibleAgentRows(
     scratchRowsForDisplay,
     expandedCompletedParentIds,
-    { isWorkspaceLiveActive }
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
   );
   const scratchRowMetaByWorkspaceId = computeAgentRowRenderMeta(
     scratchRowsForDisplay,
     scratchDepthByWorkspaceId,
     expandedCompletedParentIds,
-    { isWorkspaceLiveActive }
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
   );
   const isScratchSectionExpanded = expandedProjectsList.includes(SCRATCH_SIDEBAR_SECTION_ID);
   const scratchDrafts = (workspaceDraftsByProject[SCRATCH_PROJECT_CONFIG_KEY] ?? [])
@@ -1945,13 +1982,13 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const visibleMultiProjectWorkspaces = filterVisibleAgentRows(
     multiProjectRowsForDisplay,
     expandedCompletedParentIds,
-    { isWorkspaceLiveActive }
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
   );
   const multiProjectRowMetaByWorkspaceId = computeAgentRowRenderMeta(
     multiProjectRowsForDisplay,
     multiProjectDepthByWorkspaceId,
     expandedCompletedParentIds,
-    { isWorkspaceLiveActive }
+    { isWorkspaceLiveActive, hasActiveBashMonitor }
   );
   const isMultiProjectSectionExpanded = expandedProjectsList.includes(
     MULTI_PROJECT_SIDEBAR_SECTION_ID
@@ -2093,33 +2130,12 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       // target from the live sidebar metadata before opening a sibling draft.
       if (matchesKeybind(e, KEYBINDS.NEW_WORKSPACE) && selectedWorkspace) {
         e.preventDefault();
-        // Resolve the effective section ID exactly the way the renderer does:
-        // honor the workspace's own subProjectPath when it still exists,
-        // otherwise inherit from the parent workspace. This keeps Ctrl+N in
-        // lockstep with the visible section and avoids forwarding deleted
-        // sub-project paths that workspace.create would reject.
-        // Scratch chats are bucketed under the scratch config key while their
-        // selection projectPath is the app-managed workdir, so the bucket
-        // lookup below misses them; check kind via the store by ID first.
-        if (
-          workspaceStore.getWorkspaceMetadata(selectedWorkspace.workspaceId)?.kind === "scratch"
-        ) {
-          handleAddScratchWorkspace();
-          return;
+        const meta = workspaceStore.getWorkspaceMetadata(selectedWorkspace.workspaceId);
+        if (meta) {
+          handleAddSiblingWorkspace(meta);
+        } else {
+          handleAddWorkspace(selectedWorkspace.projectPath);
         }
-        const projectWorkspaces =
-          sortedWorkspacesByProject.get(selectedWorkspace.projectPath) ?? [];
-        const byId = new Map(projectWorkspaces.map((m) => [m.id, m]));
-        const meta = byId.get(selectedWorkspace.workspaceId);
-        const validSectionIds = new Set(
-          getSubProjectsForParent(selectedWorkspace.projectPath, userProjects).map(
-            ([subPath]) => subPath
-          )
-        );
-        const subProjectPath = meta
-          ? resolveEffectiveSectionId(meta, byId, validSectionIds)
-          : undefined;
-        handleAddWorkspace(selectedWorkspace.projectPath, subProjectPath);
       } else if (matchesKeybind(e, KEYBINDS.ARCHIVE_WORKSPACE) && selectedWorkspace) {
         e.preventDefault();
         void handleArchiveWorkspace(selectedWorkspace.workspaceId);
@@ -2151,13 +2167,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   }, [
     closeProjectContextMenu,
     selectedWorkspace,
-    handleAddScratchWorkspace,
+    handleAddSiblingWorkspace,
     handleAddWorkspace,
     handleArchiveWorkspace,
     setWorkspacePinned,
     movePinnedWorkspace,
-    sortedWorkspacesByProject,
-    userProjects,
     workspaceStore,
   ]);
 
@@ -2230,6 +2244,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       allRows: allRowsForTaskGroupCoalescing,
       selectedWorkspaceId: selectedWorkspace?.workspaceId,
       isWorkspaceLiveActive,
+      hasActiveBashMonitor,
     });
 
     for (const group of taskGroups.groupsByStorageKey.values()) {
@@ -2316,6 +2331,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         depth: baseRowMeta.depth,
         isRunning: isSidebarSubAgentRunning(workspace, {
           isWorkspaceLiveActive,
+          hasActiveBashMonitor,
         }),
         baseMeta: baseRowMeta,
       });
@@ -2355,6 +2371,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         headerMeta,
         headerDepth: headerMeta.depth,
         isWorkspaceLiveActive,
+        hasActiveBashMonitor,
       })) {
         memberMetaByWorkspaceId.set(memberId, memberMeta);
       }
@@ -2580,10 +2597,28 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     );
   };
 
+  // Default the flat-mode "New chat" to the project of the chat the user
+  // created most recently; fall back to Scratch only when that chat is a
+  // scratch chat or there are no chats. The target is defined by creation
+  // time alone, not by what currently renders: unsent drafts and sub-agent
+  // children are not user-created chats, and render-time filters (hidden
+  // sub-agents, collapsed age tiers, draft promotion) do not change the answer.
+  const handleAddFlatWorkspace = () => {
+    const recentWorkspace = findMostRecentlyCreatedWorkspace(
+      excludeSubAgentRows(flatWorkspaces),
+      workspaceRecency
+    );
+    if (recentWorkspace) {
+      handleAddSiblingWorkspace(recentWorkspace);
+    } else {
+      handleAddScratchWorkspace();
+    }
+  };
+
   const flatSidebarContent = (
     <div className="py-1">
       <button
-        onClick={handleAddScratchWorkspace}
+        onClick={handleAddFlatWorkspace}
         className="text-secondary hover:bg-hover mx-2 mb-1 flex w-[calc(100%-1rem)] cursor-pointer items-center gap-1.5 rounded px-2 py-1.5 text-left text-xs"
       >
         <Plus className="h-3.5 w-3.5" />
@@ -3314,20 +3349,20 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                 // momentarily terminal (no flash-out between sequential steps).
                                 for (const key of collectActiveWorkflowGroupKeys(
                                   workspacesForNormalRendering,
-                                  { isWorkspaceLiveActive }
+                                  { isWorkspaceLiveActive, hasActiveBashMonitor }
                                 )) {
                                   sessionActiveTaskGroupKeysRef.current.add(key);
                                 }
                                 const visibleWorkspacesForNormalRendering = filterVisibleAgentRows(
                                   workspacesForNormalRendering,
                                   expandedCompletedParentIds,
-                                  { isWorkspaceLiveActive }
+                                  { isWorkspaceLiveActive, hasActiveBashMonitor }
                                 );
                                 const baseRowMetaByWorkspaceId = computeAgentRowRenderMeta(
                                   workspacesForNormalRendering,
                                   depthByWorkspaceId,
                                   expandedCompletedParentIds,
-                                  { isWorkspaceLiveActive }
+                                  { isWorkspaceLiveActive, hasActiveBashMonitor }
                                 );
                                 const sortedDrafts = draftsForProject
                                   .slice()

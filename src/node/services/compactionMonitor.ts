@@ -1,8 +1,5 @@
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
-import {
-  DEFAULT_AUTO_COMPACTION_THRESHOLD,
-  FORCE_COMPACTION_BUFFER_PERCENT,
-} from "@/common/constants/ui";
+import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import assert from "@/common/utils/assert";
 import {
@@ -26,6 +23,8 @@ export type CompactionStatusEvent =
 
 interface CheckBeforeSendParams {
   model: string | null;
+  /** Threshold fraction resolved by the caller for this decision (`1` = disabled). */
+  threshold: number;
   usage: AutoCompactionUsageState | undefined;
   use1MContext: boolean;
   providersConfig: ProvidersConfigMap | null;
@@ -35,6 +34,8 @@ interface CheckBeforeSendParams {
 
 interface CheckMidStreamParams {
   model: string;
+  /** Threshold fraction resolved by the caller for this decision (`1` = disabled). */
+  threshold: number;
   usage: LanguageModelV2Usage;
   use1MContext: boolean;
   providersConfig: ProvidersConfigMap | null;
@@ -51,9 +52,12 @@ interface CheckMidStreamParams {
 
 /**
  * Tracks context-window pressure and decides when auto-compaction should trigger.
+ *
+ * The monitor holds no threshold of its own: the caller resolves it from the persisted user
+ * preferences once per decision (see `resolveAutoCompactionThreshold`) so a slider change is
+ * honored by the next decision without any RPC push or per-session cache.
  */
 export class CompactionMonitor {
-  private threshold = DEFAULT_AUTO_COMPACTION_THRESHOLD;
   private hasTriggeredForCurrentStream = false;
 
   constructor(
@@ -76,12 +80,13 @@ export class CompactionMonitor {
       params !== null && params !== undefined,
       "CompactionMonitor.checkBeforeSend requires params"
     );
+    this.assertThreshold(params.threshold);
 
     return checkAutoCompaction(
       params.usage,
       params.model,
       params.use1MContext,
-      this.threshold,
+      params.threshold,
       undefined,
       params.providersConfig,
       { openaiWireFormat: params.openaiWireFormat }
@@ -101,13 +106,14 @@ export class CompactionMonitor {
       params.model.trim().length > 0,
       "CompactionMonitor.checkMidStream requires a non-empty model"
     );
+    this.assertThreshold(params.threshold);
 
     if (this.hasTriggeredForCurrentStream) {
       return false;
     }
 
     // Threshold 1.0 means auto-compaction is disabled.
-    if (this.threshold >= 1) {
+    if (params.threshold >= 1) {
       return false;
     }
 
@@ -135,7 +141,7 @@ export class CompactionMonitor {
     const usagePercent = (usageTokens / contextLimit) * 100;
     const forceThresholdPercent =
       params.forceThresholdPercentOverride ??
-      this.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT;
+      params.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT;
 
     if (usagePercent < forceThresholdPercent) {
       return false;
@@ -154,7 +160,7 @@ export class CompactionMonitor {
     this.hasTriggeredForCurrentStream = false;
   }
 
-  setThreshold(threshold: number): void {
+  private assertThreshold(threshold: number): void {
     assert(
       Number.isFinite(threshold),
       `CompactionMonitor(${this.workspaceId}): threshold must be finite`
@@ -163,10 +169,5 @@ export class CompactionMonitor {
       threshold > 0 && threshold <= 1,
       `CompactionMonitor(${this.workspaceId}): invalid threshold ${threshold}`
     );
-    this.threshold = threshold;
-  }
-
-  getThreshold(): number {
-    return this.threshold;
   }
 }

@@ -1,5 +1,7 @@
-import { expect, test, mock } from "bun:test";
+import { describe, expect, test, mock, spyOn } from "bun:test";
 import { buildCoreSources } from "./sources";
+import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import type { ProjectConfig } from "@/node/config";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
@@ -109,6 +111,53 @@ interface ToastEventDetail {
 const getActions = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) =>
   mk(over).flatMap((source) => source());
 
+describe("Auto routing palette actions", () => {
+  const ids = [
+    CommandIds.toggleAutoRouting("model"),
+    CommandIds.toggleAutoRouting("thinkingLevel"),
+  ];
+
+  test("appear only while the experiment is on, for the workspace and the creation composer", () => {
+    const wired = {
+      getAutoRouting: () => false,
+      onSetAutoRouting: () => undefined,
+    };
+    const off = getActions({ ...wired, autoModelRoutingEnabled: false }).map((a) => a.id);
+    expect(off).not.toContain(ids[0]);
+    expect(off).not.toContain(ids[1]);
+
+    const on = getActions({ ...wired, autoModelRoutingEnabled: true }).map((a) => a.id);
+    expect(on).toContain(ids[0]);
+    expect(on).toContain(ids[1]);
+
+    const creation = getActions({
+      ...wired,
+      autoModelRoutingEnabled: true,
+      selectedWorkspace: null,
+      creationScopeId: "project:/repo/b",
+    }).map((a) => a.id);
+    expect(creation).toContain(ids[0]);
+    expect(creation).toContain(ids[1]);
+  });
+
+  test("each action flips its own dimension for the composer's scope", () => {
+    const onSetAutoRouting = mock(
+      (_scopeId: string, _dimension: "model" | "thinkingLevel", _active: boolean) => undefined
+    );
+    const actions = getActions({
+      autoModelRoutingEnabled: true,
+      getAutoRouting: (_scopeId, dimension) => dimension === "model",
+      onSetAutoRouting,
+    });
+    void actions.find((a) => a.id === ids[0])?.run();
+    void actions.find((a) => a.id === ids[1])?.run();
+    expect(onSetAutoRouting.mock.calls).toEqual([
+      ["w1", "model", false],
+      ["w1", "thinkingLevel", true],
+    ]);
+  });
+});
+
 const workspaceApi = (workspace: Record<string, unknown>) =>
   ({
     workspace: {
@@ -152,11 +201,19 @@ const collectCommandEvents = () => {
   };
 };
 
-async function withTestWindow<T>(fn: () => Promise<T> | T): Promise<T> {
+async function withTestWindow<T>(
+  fn: () => Promise<T> | T,
+  options: { transcriptCaughtUp?: boolean } = {}
+): Promise<T> {
   const testWindow = new GlobalWindow();
   const originalWindow = globalThis.window;
   const originalDocument = globalThis.document;
   const originalCustomEvent = globalThis.CustomEvent;
+  // History-mutating chat actions read the transcript barrier from the singleton store at
+  // dispatch time; pin it instead of replaying an onChat subscription for the palette tests.
+  const barrierSpy = spyOn(workspaceStore, "isWorkspaceTranscriptCaughtUp").mockReturnValue(
+    options.transcriptCaughtUp ?? true
+  );
 
   globalThis.window = testWindow as unknown as Window & typeof globalThis;
   globalThis.document = testWindow.document as unknown as Document;
@@ -168,6 +225,7 @@ async function withTestWindow<T>(fn: () => Promise<T> | T): Promise<T> {
   try {
     return await fn();
   } finally {
+    barrierSpy.mockRestore();
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
     globalThis.CustomEvent = originalCustomEvent;
@@ -211,6 +269,52 @@ test("chat commands include separate reset context and clear history actions", a
     await Promise.resolve(clearAction.run());
     expect(truncateHistory).toHaveBeenCalledWith({ workspaceId: "w1", percentage: 1.0 });
   });
+});
+
+test("reset context and history truncation refuse while the transcript is not caught up", async () => {
+  await withTestWindow(
+    async () => {
+      const resetContext = mock(() =>
+        Promise.resolve({ success: true as const, data: "reset" as const })
+      );
+      const truncateHistory = mock(() =>
+        Promise.resolve({ success: true as const, data: undefined })
+      );
+      const actions = getActions({ api: workspaceApi({ resetContext, truncateHistory }) });
+      const guarded = actions.filter(
+        (action) =>
+          action.title === "Reset Context, Preserve History" ||
+          action.title === "Clear History" ||
+          action.title.startsWith("Truncate History to ")
+      );
+      expect(guarded.length).toBe(5);
+
+      for (const action of guarded) {
+        const events = collectCommandEvents();
+        try {
+          let thrown: unknown;
+          try {
+            await Promise.resolve(action.run());
+          } catch (error) {
+            thrown = error;
+          }
+          expect(thrown).toBeInstanceOf(Error);
+          expect(thrown instanceof Error ? thrown.message : undefined).toBe(
+            TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE
+          );
+          expect(events.receivedToasts).toEqual([
+            { type: "error", message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE },
+          ]);
+          expect(events.clearEvents).toEqual([]);
+        } finally {
+          events.dispose();
+        }
+      }
+      expect(resetContext).not.toHaveBeenCalled();
+      expect(truncateHistory).not.toHaveBeenCalled();
+    },
+    { transcriptCaughtUp: false }
+  );
 });
 
 test("reset context command dispatches composer and toast outcomes", async () => {
@@ -724,6 +828,7 @@ function makeWorkspaceState(goal: WorkspaceState["goal"]): WorkspaceState {
     awaitingUserQuestion: false,
     loading: false,
     isTranscriptCaughtUp: true,
+    transcriptReplayFailed: false,
     isHydratingTranscript: false,
     isTranscriptStale: false,
     hasOlderHistory: false,

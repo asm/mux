@@ -4,7 +4,7 @@ import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useRouting } from "@/browser/hooks/useRouting";
-import { useWorkspaceState } from "@/browser/stores/WorkspaceStore";
+import { useWorkspaceState, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import {
   formatCompactionCommandLine,
   getFollowUpContentText,
@@ -339,6 +339,13 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
         return;
       }
 
+      // The edit fence is captured at the user's click; a `history-changed` refusal falls
+      // through the existing failure path (command inserted into the composer), no auto-retry.
+      const historyEditPrecondition = workspaceStore.captureHistoryEditPrecondition(
+        props.workspaceId,
+        source.id
+      );
+
       // For compaction recovery (retrying a failed /compact), preserve the original settings.
       // The nested follow-up content is already in the correct format.
       if (source.compactionRequest) {
@@ -353,6 +360,7 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
           maxOutputTokens,
           followUpContent: nestedFollowUp,
           editMessageId: source.id,
+          historyEditPrecondition,
         });
 
         if (!result.success) {
@@ -393,6 +401,7 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
         model: compactionSuggestion.modelId,
         followUpContent,
         editMessageId: source.id,
+        historyEditPrecondition,
       });
 
       if (!result.success) {
@@ -448,6 +457,11 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
         model: compactionSuggestion?.modelId,
         followUpContent,
         editMessageId: triggerUserMessage.id,
+        // Captured at the trigger; a `history-changed` refusal just reports false (no retry).
+        historyEditPrecondition: workspaceStore.captureHistoryEditPrecondition(
+          props.workspaceId,
+          triggerUserMessage.id
+        ),
       });
 
       if (!result.success) {

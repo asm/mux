@@ -9,6 +9,7 @@ import { StreamErrorTypeSchema } from "./errors";
 import {
   FilePartSchema,
   ModelFallbackRecordSchema,
+  AutoModelRoutingRecordSchema,
   MuxMessageSchema,
   MuxReasoningPartSchema,
   MuxTextPartSchema,
@@ -81,6 +82,15 @@ export const CaughtUpMessageSchema = z.object({
   type: z.literal("caught-up"),
   /** Which replay strategy the server actually used. */
   replay: z.enum(["full", "since", "live"]).optional(),
+  /**
+   * Whether the history read/emission this caught-up closes succeeded. `caught-up` is sent
+   * from a `finally` so clients never hang, which means it must say whether the transcript
+   * it closes is authoritative: only a `complete` full/since replay may open the client's
+   * mutation barrier (send/edit/clear). `failed` = the history read returned an error or
+   * emission threw; queue/retry snapshots still precede it. Required on purpose: an absent
+   * field must never read as success.
+   */
+  historyReplayStatus: z.enum(["complete", "failed"]),
   /**
    * Present only when the client requested since-mode and the server downgraded to
    * full replay. Silent downgrades defeat incremental reconnects, so this must stay
@@ -179,6 +189,9 @@ export const StreamStartEventSchema = z.object({
     }),
   routedThroughGateway: z.boolean().optional(),
   routeProvider: z.string().optional(),
+  autoModelRouting: AutoModelRoutingRecordSchema.optional().meta({
+    description: "Auto-model-routing provenance, present when the turn was routed by difficulty",
+  }),
   historySequence: z.number().meta({
     description: "Backend assigns global message ordering",
   }),
@@ -266,6 +279,8 @@ export const StreamEndEventSchema = z.object({
       routeProvider: z.string().optional(),
       // Present when a fallback model answered after the requested model refused.
       modelFallback: ModelFallbackRecordSchema.optional(),
+      // Present when the composer's Auto entry routed this turn.
+      autoModelRouting: AutoModelRoutingRecordSchema.optional(),
       // Total usage across all steps (for cost calculation)
       usage: LanguageModelV2UsageSchema.optional(),
       // Last step's usage only (for context window display - inputTokens = current context size)
@@ -855,9 +870,51 @@ export const ExperimentsSchema = z.preprocess(
  */
 export const GoalInterventionPolicySchema = z.enum(["steer", "pause"]);
 
+/**
+ * Content evidence for the range an edit deletes: from the first committed row at or after the
+ * truncation target (the edited row or the synthetic snapshot rows immediately preceding it,
+ * see `getEditTruncateTargetFromMessages`) through the newest committed row, as the client
+ * held it when editing began. The backend recomputes the same evidence over its own view of
+ * history, under the history write lock, and refuses with `history-changed` on any difference
+ * (missing rows, extra rows, rewritten rows, a different range start or a different newest row).
+ */
+export const HistoryEditPreconditionSchema = z.object({
+  editMessageId: z.string().min(1),
+  rangeStartMessageId: z.string().min(1),
+  rangeStartHistorySequence: z.number().int().nonnegative(),
+  newestMessageId: z.string().min(1),
+  newestHistorySequence: z.number().int().nonnegative(),
+  rangeRowCount: z.number().int().positive(),
+  rangeFingerprint: z.string().min(1),
+});
+
+/**
+ * Every edit send must say how it is fenced: UI edits carry `historyEditPrecondition`;
+ * programmatic callers (debug CLI) opt out explicitly with `unfencedEdit`. Checked at the
+ * sendMessage RPC boundary (see api.ts) because `.pick`/`.extend` consumers of this schema
+ * must keep a plain object shape.
+ */
+export function hasExactlyOneEditFence(options: {
+  editMessageId?: string;
+  historyEditPrecondition?: unknown;
+  unfencedEdit?: boolean;
+}): boolean {
+  if (!options.editMessageId) return true;
+  const fenced = options.historyEditPrecondition !== undefined;
+  const unfenced = options.unfencedEdit === true;
+  return fenced !== unfenced;
+}
+
+export const EDIT_FENCE_REQUIRED_MESSAGE =
+  "editMessageId requires exactly one of historyEditPrecondition or unfencedEdit";
+
 // SendMessage options
 export const SendMessageOptionsSchema = z.object({
   editMessageId: z.string().optional(),
+  /** See {@link HistoryEditPreconditionSchema}; required for UI edits. */
+  historyEditPrecondition: HistoryEditPreconditionSchema.optional(),
+  /** Programmatic edit without content evidence (debug CLI). Mutually exclusive with the above. */
+  unfencedEdit: z.boolean().optional(),
   thinkingLevel: ThinkingLevelSchema.optional(),
   /** OpenAI reasoning mode (pro toggle); inert for models without pro-mode support. */
   reasoningMode: OpenAIReasoningModeSchema.optional(),
@@ -904,6 +961,19 @@ export const SendMessageOptionsSchema = z.object({
    */
   oneShotThinkingIndex: z.number().int().min(0).optional(),
   experiments: ExperimentsSchema.optional(),
+  /**
+   * Composer model set to "Auto" (auto-model-routing experiment): classify the prompt's
+   * difficulty and run on the matching tier's model. `model` stays the concrete
+   * composer model and doubles as the fallback; the backend strips this flag from the
+   * resolved options so retries and resumes never re-classify.
+   */
+  autoModelRouting: z.boolean().optional(),
+  /**
+   * Composer thinking level set to "Auto": the same classification picks the tier's
+   * thinking level. Independent of `autoModelRouting`; `thinkingLevel` stays the
+   * composer's concrete level and doubles as the fallback.
+   */
+  autoThinkingLevel: z.boolean().optional(),
   /**
    * When true, workspace-specific agent definitions are disabled.
    * Only built-in and global agents are loaded. Useful for "unbricking" when

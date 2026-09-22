@@ -32,6 +32,11 @@ import {
   sanitizeModelFallbacks,
 } from "@/common/utils/ai/modelFallbacks";
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
+import {
+  getDefaultAutoModelRoutingConfig,
+  normalizeAutoModelRoutingConfig,
+  type AutoModelRoutingConfigInput,
+} from "@/common/types/autoModelRouting";
 import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
 import { SettingsBackupSchema } from "@/common/config/schemas/settingsBackup";
 import {
@@ -68,6 +73,7 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 import { PlatformPaths } from "@/common/utils/paths";
+import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import {
   HEARTBEAT_CONTEXT_MODE_VALUES,
   HEARTBEAT_DEFAULT_INTERVAL_MS,
@@ -1904,6 +1910,11 @@ export class Config {
     }
 
     const modelFallbacks = normalizeModelFallbacks(parsed.modelFallbacks);
+    // Absent stays absent so defaults are not written back to disk until the user edits tiers.
+    const autoModelRouting =
+      parsed.autoModelRouting === undefined
+        ? undefined
+        : normalizeAutoModelRoutingConfig(parsed.autoModelRouting);
 
     const defaultModel = normalizeOptionalModelString(parsed.defaultModel);
     const advisorModelString = parseOptionalNonEmptyString(parsed.advisorModelString);
@@ -2049,6 +2060,7 @@ export class Config {
       routeOverrides,
       minThinkingLevelByModel,
       modelFallbacks,
+      autoModelRouting,
       defaultModel,
       advisorModelString,
       advisorThinkingLevel,
@@ -2241,6 +2253,10 @@ export class Config {
       const skillModelClasses = parseOptionalStringRecord(config.skillModelClasses);
       if (skillModelClasses !== undefined) {
         data.skillModelClasses = skillModelClasses;
+      }
+
+      if (config.autoModelRouting !== undefined) {
+        data.autoModelRouting = normalizeAutoModelRoutingConfig(config.autoModelRouting);
       }
 
       const apiServerBindHost = parseOptionalNonEmptyString(config.apiServerBindHost);
@@ -2554,6 +2570,7 @@ export class Config {
       modelFallbacks: config.modelFallbacks,
       modelClasses: config.modelClasses,
       skillModelClasses: config.skillModelClasses,
+      autoModelRouting: config.autoModelRouting ?? getDefaultAutoModelRoutingConfig(),
       defaultModel: config.defaultModel,
       advisorModelString: config.advisorModelString ?? null,
       advisorThinkingLevel: config.advisorThinkingLevel ?? null,
@@ -2740,6 +2757,11 @@ export class Config {
         "Failed to persist the model class to config.json; the change was not applied."
       );
     }
+  }
+
+  async updateAutoModelRouting(autoModelRouting: AutoModelRoutingConfigInput): Promise<void> {
+    const normalized = normalizeAutoModelRoutingConfig(autoModelRouting);
+    await this.editConfig((config) => ({ ...config, autoModelRouting: normalized }));
   }
 
   async updateModelPreferences(input: {
@@ -3596,6 +3618,10 @@ export class Config {
               aiSettings: workspace.aiSettings,
               heartbeat: normalizeWorkspaceMetadataHeartbeat(workspace.heartbeat, config),
               goalDefaults: workspace.goalDefaults,
+              // Fail closed: a corrupted/blank consent value publishes as absent (off).
+              unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
+                workspace.unrelatedWorkspaceConsent
+              ),
               // Display defaults stay ephemeral: no raw Exec bucket means no saved Exec choice.
               aiSettingsByAgent:
                 workspace.aiSettingsByAgent ??
@@ -3895,6 +3921,9 @@ export class Config {
               aiSettings: workspace.aiSettings,
               heartbeat: workspace.heartbeat,
               goalDefaults: workspace.goalDefaults,
+              unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
+                workspace.unrelatedWorkspaceConsent
+              ),
               aiSettingsByAgent:
                 workspace.aiSettingsByAgent ??
                 (workspace.aiSettings
@@ -3971,6 +4000,9 @@ export class Config {
             aiSettings: workspace.aiSettings,
             heartbeat: workspace.heartbeat,
             goalDefaults: workspace.goalDefaults,
+            unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
+              workspace.unrelatedWorkspaceConsent
+            ),
             aiSettingsByAgent:
               workspace.aiSettingsByAgent ??
               (workspace.aiSettings
@@ -4107,6 +4139,12 @@ export class Config {
         aiSettings: metadata.aiSettings,
         heartbeat: metadata.heartbeat,
         goalDefaults: metadata.goalDefaults,
+        // Carried only when the caller's metadata carries it: create/fork/child paths assemble
+        // metadata without consent, so a new entry never inherits it, while a re-add of an
+        // existing consented entry does not silently revoke it.
+        unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
+          metadata.unrelatedWorkspaceConsent
+        ),
         parentWorkspaceId: metadata.parentWorkspaceId,
         agentType: metadata.agentType,
         agentId: metadata.agentId,

@@ -60,6 +60,7 @@ export class SummarizeStrategy {
         // still carry the routed turn's project content (tail copies,
         // post-compaction skill attachments): it inherits the obligation.
         routedProjectConsent: streamContext.routedConsentRejection != null,
+        autoModelRouting: streamContext.autoModelRouting,
       });
       // Waterfall hook point: see the on-send compaction.prepare run above.
       await eventSpine.run("compaction.prepare", {

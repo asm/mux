@@ -171,6 +171,7 @@ let archivePopoverShowErrorMock = mock(
 );
 
 let interruptibleWorkspaceIds = new Set<string>();
+let monitoredWorkspaceIds = new Set<string>();
 let workspaceStoreSubscriptions = new Map<string, () => void>();
 let activeWorkflowRunIdsByWorkspaceId = new Map<string, string[]>();
 
@@ -183,6 +184,7 @@ function setupProjectSidebarDom(projectPath = "/projects/demo-project") {
     userProjects: new Map([[projectPath, { workspaces: [] }]]),
   });
   interruptibleWorkspaceIds = new Set();
+  monitoredWorkspaceIds = new Set();
   workspaceStoreSubscriptions = new Map();
   activeWorkflowRunIdsByWorkspaceId = new Map();
   installProjectSidebarTestDoubles();
@@ -215,11 +217,8 @@ function renderProjectSidebarForWorkspace(
   );
 }
 
-function useArchiveActions(
-  actions: Pick<
-    ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>,
-    "preflightArchiveWorkspace" | "archiveWorkspace"
-  >
+function mockWorkspaceActions(
+  actions: Partial<ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>>
 ) {
   spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
     () =>
@@ -592,6 +591,7 @@ function installProjectSidebarTestDoubles() {
         getWorkspaceMetadata: () => undefined,
         getWorkspaceSidebarState: (workspaceId: string) => ({
           canInterrupt: interruptibleWorkspaceIds.has(workspaceId),
+          activeBashMonitorCount: monitoredWorkspaceIds.has(workspaceId) ? 1 : 0,
           isStarting: false,
           awaitingUserQuestion: false,
           lastAbortReason: null,
@@ -926,6 +926,140 @@ describe("ProjectSidebar flat chat list", () => {
   const singleProjectRefs = [
     { projectPath: "/projects/demo-project", projectName: "demo-project" },
   ];
+
+  describe("New chat button", () => {
+    const olderDemo = {
+      ...createWorkspace("older-demo", { title: "Older demo chat" }),
+      projects: singleProjectRefs,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    const newerOther = {
+      ...createWorkspace("newer-other", { title: "Newer other chat" }),
+      projects: undefined,
+      projectPath: "/projects/other",
+      projectName: "other",
+      createdAt: "2026-01-02T00:00:00.000Z",
+    };
+
+    function renderFlatSidebar(
+      sortedWorkspacesByProject: Map<string, FrontendWorkspaceMetadata[]>
+    ) {
+      const createWorkspaceDraft = mock(() => undefined);
+      mockWorkspaceActions({ createWorkspaceDraft });
+      const view = render(
+        <ProjectSidebar
+          collapsed={false}
+          onToggleCollapsed={() => undefined}
+          sortedWorkspacesByProject={sortedWorkspacesByProject}
+          workspaceRecency={{}}
+        />
+      );
+      fireEvent.click(view.getByRole("button", { name: "New chat" }));
+      return createWorkspaceDraft;
+    }
+
+    test("targets the project of the most recently created chat", () => {
+      projectContextValue = createProjectContextValue({
+        userProjects: new Map([
+          ["/projects/demo-project", { workspaces: [] }],
+          ["/projects/other", { workspaces: [] }],
+        ]),
+      });
+
+      const createWorkspaceDraft = renderFlatSidebar(
+        new Map([
+          ["/projects/demo-project", [olderDemo]],
+          ["/projects/other", [newerOther]],
+        ])
+      );
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith("/projects/other", undefined);
+    });
+
+    test("ignores a newer sub-agent because it is not a user-created chat", () => {
+      projectContextValue = createProjectContextValue({
+        userProjects: new Map([
+          ["/projects/demo-project", { workspaces: [] }],
+          ["/projects/other", { workspaces: [] }],
+        ]),
+      });
+      const newestChild = {
+        ...createWorkspace("newest-child", {
+          title: "Newest sub-agent",
+          parentWorkspaceId: olderDemo.id,
+        }),
+        projects: singleProjectRefs,
+        createdAt: "2026-01-03T00:00:00.000Z",
+      };
+
+      const createWorkspaceDraft = renderFlatSidebar(
+        new Map([
+          ["/projects/demo-project", [olderDemo, newestChild]],
+          ["/projects/other", [newerOther]],
+        ])
+      );
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith("/projects/other", undefined);
+    });
+
+    test("targets scratch when the most recently created chat is a scratch chat", () => {
+      const scratchPath = "/home/user/.xum/scratch/scratch-newest";
+      const scratch: FrontendWorkspaceMetadata = {
+        kind: "scratch",
+        id: "scratch-newest",
+        name: "scratch-scratch-newest",
+        projectName: "Scratch",
+        projectPath: scratchPath,
+        namedWorkspacePath: scratchPath,
+        createdAt: "2026-01-03T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      };
+
+      const createWorkspaceDraft = renderFlatSidebar(
+        new Map([
+          ["/projects/demo-project", [olderDemo]],
+          [SCRATCH_PROJECT_CONFIG_KEY, [scratch]],
+        ])
+      );
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith(SCRATCH_PROJECT_CONFIG_KEY, undefined);
+    });
+
+    test("targets the sub-project of the most recently created chat", () => {
+      projectContextValue = createProjectContextValue({
+        userProjects: new Map([
+          ["/projects/demo-project", { workspaces: [] }],
+          [
+            "/projects/demo-project/features",
+            { parentProjectPath: "/projects/demo-project", workspaces: [] },
+          ],
+        ]),
+      });
+      const newerInSection = {
+        ...createWorkspace("newer-section", {
+          title: "Newer section chat",
+          subProjectPath: "/projects/demo-project/features",
+        }),
+        projects: singleProjectRefs,
+        createdAt: "2026-01-02T00:00:00.000Z",
+      };
+
+      const createWorkspaceDraft = renderFlatSidebar(
+        new Map([["/projects/demo-project", [olderDemo, newerInSection]]])
+      );
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith(
+        "/projects/demo-project",
+        "/projects/demo-project/features"
+      );
+    });
+
+    test("falls back to scratch when there are no chats", () => {
+      const createWorkspaceDraft = renderFlatSidebar(new Map());
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith(SCRATCH_PROJECT_CONFIG_KEY, undefined);
+    });
+  });
 
   test("filters multi-project rows out of the flat list while the experiment is disabled", () => {
     spyOn(ExperimentsModule, "useExperimentValue").mockImplementation(() => false);
@@ -1427,6 +1561,40 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     expect(view.queryByText("Multi-Project")).toBeNull();
     expect(view.queryByTestId(agentItemTestId("parent"))).toBeNull();
     expect(view.queryByTestId(agentItemTestId("child"))).toBeNull();
+  });
+
+  test("shows a reported child only while its background Bash monitor is armed", () => {
+    const parentWorkspace = createWorkspace("parent");
+    const childWorkspace = {
+      ...createWorkspace("child", { parentWorkspaceId: "parent", taskStatus: "reported" }),
+      taskExecutionStatus: "completed" as const,
+    };
+    // The stream hint stays true throughout, as it can during final-turn teardown.
+    // Arming/retiring a monitor must still trigger a render when isWorking is unchanged.
+    interruptibleWorkspaceIds.add("child");
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([["/projects/demo-project", [parentWorkspace, childWorkspace]]])
+        }
+        workspaceRecency={{}}
+      />
+    );
+    expect(view.queryByTestId(agentItemTestId("child"))).toBeNull();
+    act(() => {
+      monitoredWorkspaceIds.add("child");
+      workspaceStoreSubscriptions.get("child")?.();
+    });
+    expect(view.getByTestId(agentItemTestId("child"))).toBeTruthy();
+    expect(view.getByTestId(agentItemTestId("parent")).dataset.delegatedActive).toBe("1");
+    act(() => {
+      monitoredWorkspaceIds.delete("child");
+      workspaceStoreSubscriptions.get("child")?.();
+    });
+    expect(view.queryByTestId(agentItemTestId("child"))).toBeNull();
+    expect(view.getByTestId(agentItemTestId("parent")).dataset.delegatedActive).toBe("0");
   });
 
   test("keeps inactive persistent children out of the left sidebar", () => {
@@ -2810,7 +2978,7 @@ describe("ProjectSidebar archive confirmations", () => {
       })
     );
 
-    useArchiveActions({ preflightArchiveWorkspace, archiveWorkspace });
+    mockWorkspaceActions({ preflightArchiveWorkspace, archiveWorkspace });
 
     renderProjectSidebarForWorkspace(workspace);
 

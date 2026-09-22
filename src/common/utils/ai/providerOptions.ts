@@ -27,7 +27,7 @@ import {
   ANTHROPIC_THINKING_BUDGETS,
   GEMINI_THINKING_BUDGETS,
   getOpenAIReasoningEffort,
-  isGrok46Model,
+  grokSupportsNativeXhigh,
   isGrokFrontierModel,
   isGlm53Model,
   isKimiK3Model,
@@ -41,6 +41,7 @@ import {
 import { openaiExplicitPromptCachingAvailable } from "@/common/utils/ai/cacheStrategy";
 import { openaiServiceTierAvailable } from "./openaiProviderOptionsAvailability";
 import { openaiProModeAvailable } from "./proMode";
+import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "@/node/services/log";
 import type { MuxMessage } from "@/common/types/message";
@@ -49,7 +50,10 @@ import {
   resolveProviderOptionsNamespaceKey,
   supports1MContext,
 } from "./models";
-import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
+import {
+  bedrockOpenAIModelId,
+  resolveCoderWireCanonicalModel,
+} from "@/common/constants/coderOAuth";
 import {
   customProviderWireOrigin,
   isCustomProviderConfig,
@@ -352,10 +356,15 @@ export function buildProviderOptions(
   // Custom-provider model entries (mappedToModel aliases) live under the raw
   // custom prefix; the wire-remapped identity above is only for namespace and
   // payload-format selection, so metadata must resolve from the raw identity.
+  // Coder strings likewise resolve from the raw identity whenever the instance
+  // type maps them to an upstream model: the wire identity keeps Bedrock's
+  // openai.<model> namespace, which the GPT-5.6/Astra effort matchers miss.
   const rawPrefixForMetadata = modelString.slice(0, Math.max(modelString.indexOf(":"), 0));
-  const metadataModel = isCustomProviderConfig(providersConfig?.[rawPrefixForMetadata])
-    ? modelString
-    : normalizedModel;
+  const metadataModel =
+    isCustomProviderConfig(providersConfig?.[rawPrefixForMetadata]) ||
+    resolveCoderGatewayMetadataModel(modelString, providersConfig) != null
+      ? modelString
+      : normalizedModel;
   const capabilityModel = resolveModelForMetadata(metadataModel, providersConfig ?? null);
   const [, resolvedCapabilityModelName] = capabilityModel.split(":", 2);
   const capModelName = resolvedCapabilityModelName || modelName;
@@ -397,13 +406,14 @@ export function buildProviderOptions(
       const budgetTokens = ANTHROPIC_THINKING_BUDGETS[effectiveThinking];
       // Opus 4.6+ / Sonnet 4.6 / Sonnet 5: adaptive thinking when on, disabled when off
       // Opus 4.5: enabled thinking with budgetTokens ceiling (only when not "off")
-      // Mythos-class (Fable/Mythos) rejects `{ type: "disabled" }`. The thinking policy
+      // Mythos-class (Fable/Mythos) and Opus 5.5 reject `{ type: "disabled" }`. The thinking policy
       // excludes "off" for them and AIService clamps the effective level via
       // resolveEffectiveThinkingLevel, so "off" should not reach here — but if a stray
       // path does, omit `thinking` (API defaults to adaptive) rather than hard-erroring.
       //
       // Opus 5 rejects disabled thinking above high effort. "off" maps to low,
-      // so this branch cannot produce that invalid combination.
+      // so this branch cannot produce that invalid combination. (Opus 5.5 rejects
+      // it at every effort and takes the Mythos-class omit path above.)
       //
       // Native-xhigh models require `thinking.display: "summarized"` to return
       // thinking content on adaptive requests; non-native adaptive models
@@ -503,6 +513,24 @@ export function buildProviderOptions(
           }));
     const truncationMode = openaiTruncationMode ?? "disabled";
     const shouldSendReasoningSummary = supportsOpenAIReasoningSummary(capModelName);
+    // Bedrock Mantle keeps openai.<model> on the wire, which @ai-sdk/openai
+    // does not classify as a reasoning model (it anchors on gpt-*/o* IDs) and
+    // would drop the ENTIRE reasoning object (effort, summary, and pro mode).
+    // Force the classification; Mantle rejects every reasoning.summary value
+    // except "auto" with HTTP 400. Mantle is reachable through two Coder
+    // instance types: bedrock (whose OpenAI-namespaced IDs already select the
+    // Responses wire) and openai (Mantle speaks OpenAI Responses natively).
+    // Key on the wire model ID's namespace, not the instance type alone, so
+    // the real OpenAI upstream on an openai-typed instance keeps the SDK's
+    // own detection and "detailed" summaries.
+    const coderWire =
+      routeProvider === "coder" && modelString.startsWith("coder:")
+        ? resolveCoderWireCanonicalModel(modelString.slice("coder:".length), providersConfig?.coder)
+        : null;
+    const bedrockOpenAIWire =
+      coderWire != null &&
+      (coderWire.providerType === "bedrock" || coderWire.providerType === "openai") &&
+      bedrockOpenAIModelId(coderWire.modelId) != null;
 
     log.debug("buildProviderOptions: OpenAI config", {
       reasoningEffort,
@@ -518,6 +546,7 @@ export function buildProviderOptions(
     const options = {
       openai: {
         parallelToolCalls: true, // Always enable concurrent tool execution
+        ...(bedrockOpenAIWire && { forceReasoning: true }),
         ...(serviceTier != null && { serviceTier }),
         ...(store != null && { store }), // ZDR: pass store flag through to OpenAI SDK
         ...(isResponses && {
@@ -551,7 +580,11 @@ export function buildProviderOptions(
           // reasoning effort is set, so models that reject the parameter must
           // explicitly opt out with null.
           ...(isResponses && {
-            reasoningSummary: shouldSendReasoningSummary ? ("detailed" as const) : null,
+            reasoningSummary: bedrockOpenAIWire
+              ? ("auto" as const)
+              : shouldSendReasoningSummary
+                ? ("detailed" as const)
+                : null,
           }),
           ...(isResponses && {
             // Include reasoning encrypted content to preserve reasoning context across conversation steps
@@ -695,8 +728,8 @@ export function buildProviderOptions(
       ...overrides
     } = muxProviderOptions?.xai ?? {};
     const isGrokFrontier = isGrokFrontierModel(capabilityModel);
-    // Grok 4.6 supports native xhigh effort; Grok 4.5 tops out at high.
-    const topEffort = isGrok46Model(capabilityModel) ? "xhigh" : "high";
+    // Grok 4.6/4.7 support native xhigh effort; Grok 4.5 tops out at high.
+    const topEffort = grokSupportsNativeXhigh(capabilityModel) ? "xhigh" : "high";
     const reasoningEffort: XaiProviderOptions["reasoningEffort"] = isGrokFrontier
       ? effectiveThinking === "xhigh" || effectiveThinking === "max"
         ? topEffort

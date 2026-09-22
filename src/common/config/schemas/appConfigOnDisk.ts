@@ -193,6 +193,18 @@ export const AppConfigOnDiskSchema = z
      * skills the user does not own can be routed without editing them.
      */
     skillModelClasses: z.record(z.string(), z.string()).optional(),
+    /**
+     * Ordered difficulty tiers for the auto-model-routing experiment. Normalized on read
+     * (see normalizeAutoModelRoutingConfig), which heals each tier and field on its own;
+     * absent means the defaults. The document therefore only requires the block's shape:
+     * a hand-edited tier must neither fail the whole document (this schema also validates
+     * unrelated config-tool writes) nor take the valid tiers and evaluator down with it.
+     * `.catch`: anything that is not an object degrades to absent.
+     */
+    autoModelRouting: z
+      .object({ tiers: z.array(z.unknown()).optional(), evaluationModel: z.unknown().optional() })
+      .optional()
+      .catch(undefined),
     defaultModel: z.string().optional(),
     advisorModelString: z.string().optional(),
     advisorThinkingLevel: ThinkingLevelSchema.optional(),

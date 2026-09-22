@@ -52,12 +52,16 @@ function is1MContextEnabledForModel(
 export class ContinuousStrategy {
   readonly continuousCompactor: ContinuousCompactor;
   private continuousCompactionObservation: Promise<void> | null = null;
+  /** Model/threshold last handed to continuous compaction; a persisted change resets it. */
+  private lastThreshold: { model: string; threshold: number } | undefined;
 
   constructor(
     private readonly deps: ContextManagementDependencies,
     private readonly host: SessionContextHost,
     private readonly handler: CompactionHandler,
-    private readonly monitor: CompactionMonitor
+    private readonly monitor: CompactionMonitor,
+    /** Persisted per-model threshold (fraction, `1` = disabled); resolved once per decision. */
+    private readonly resolveThreshold: (model: string) => number
   ) {
     this.continuousCompactor = new ContinuousCompactor({
       workspaceId: this.host.workspaceId,
@@ -183,11 +187,19 @@ export class ContinuousStrategy {
     });
   }
 
+  /**
+   * Builds the context one continuous-compaction decision works against. `threshold` lets a
+   * caller that already resolved this decision's threshold share it; otherwise it is resolved
+   * here. Either way the pair is remembered so a persisted-preference change can reset an
+   * in-flight fold for exactly this model (see `onPersistedThresholdMaybeChanged`).
+   */
   getContinuousCompactionContext(
     model: string,
     options?: SendMessageOptions,
+    threshold: number = this.resolveThreshold(model),
     routedTurn = false
   ): SessionCompactionContext {
+    this.lastThreshold = { model, threshold };
     const providersConfig = this.host.state.providersConfig;
     const selection = resolveContextStrategy({
       experiments: options?.experiments,
@@ -199,7 +211,7 @@ export class ContinuousStrategy {
     return {
       enabled:
         selection.configured === "continuous" &&
-        this.monitor.getThreshold() < 1 &&
+        threshold < 1 &&
         !this.host.coordinator.disposed &&
         !this.host.coordinator.closing &&
         !this.host.coordinator.compactionIntent.abandoned &&
@@ -213,13 +225,23 @@ export class ContinuousStrategy {
           is1MContextEnabledForModel(model, options, providersConfig),
           providersConfig
         ) ?? 0,
-      thresholdPercent: this.monitor.getThreshold() * 100,
+      thresholdPercent: threshold * 100,
       systemMessageTokens:
         this.host.streams.getStreamInfo(this.host.workspaceId)?.initialMetadata
           ?.systemMessageTokens ?? this.host.state.systemMessageTokens,
       sendOptions: options,
       routedTurn,
     };
+  }
+
+  /** Persisted threshold changed: drop a staged fold whose model now has a different threshold. */
+  onPersistedThresholdMaybeChanged(): void {
+    const last = this.lastThreshold;
+    if (!last) return;
+    if (this.resolveThreshold(last.model) !== last.threshold) {
+      this.lastThreshold = undefined;
+      this.continuousCompactor.reset("threshold-changed");
+    }
   }
 
   async observeContinuousCompactionAtStreamEnd(
@@ -236,13 +258,16 @@ export class ContinuousStrategy {
     )
       return;
     try {
-      const context = this.getContinuousCompactionContext(model, options, routedTurn);
+      // One threshold per stream-end decision, shared by the context and the pressure check.
+      const threshold = this.resolveThreshold(model);
+      const context = this.getContinuousCompactionContext(model, options, threshold, routedTurn);
       if (!context.enabled && !this.continuousCompactor.hasConsumedSwap()) {
         this.continuousCompactor.reset("disabled");
         return;
       }
       const usage = this.monitor.checkBeforeSend({
         model,
+        threshold,
         usage: this.host.state.usage,
         use1MContext: is1MContextEnabledForModel(model, options, this.host.state.providersConfig),
         providersConfig: this.host.state.providersConfig,
@@ -373,6 +398,7 @@ export class ContinuousStrategy {
       // stream's consent obligation, durably — the fast-apply dispatch or a
       // post-restart recovery reads it back from the summary row.
       routedProjectConsent: context.routedConsentRejection != null,
+      autoModelRouting: context.autoModelRouting,
     });
     followUp.dispatchOptions = { ...followUp.dispatchOptions, source: "internal-resume" };
     return followUp;
@@ -407,6 +433,7 @@ export class ContinuousStrategy {
         return;
       const pressure = this.monitor.checkBeforeSend({
         model: context.modelString,
+        threshold: this.resolveThreshold(context.modelString),
         usage: this.host.state.usage,
         use1MContext: is1MContextEnabledForModel(
           context.modelString,

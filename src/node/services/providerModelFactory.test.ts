@@ -639,7 +639,7 @@ describe("ProviderModelFactory xAI API selection", () => {
         xai: { apiKey: "xai-test-key" },
       });
 
-      for (const model of ["xai:grok-4.6", "xai:grok-4.5"]) {
+      for (const model of ["xai:grok-4.7", "xai:grok-4.6", "xai:grok-4.5"]) {
         const result = await factory.createModel(model);
 
         expect(result.success).toBe(true);
@@ -3420,6 +3420,33 @@ describe("ProviderModelFactory Coder", () => {
       expect((result.data as { provider?: unknown }).provider).toBe("anthropic.messages");
     });
   });
+
+  it.each([
+    { modelId: "openai.gpt-5.6-sol", provider: "openai.responses" },
+    { modelId: "global.openai.gpt-6-astra", provider: "openai.responses" },
+    { modelId: "anthropic.claude-sonnet-5", provider: "anthropic.messages" },
+  ])(
+    "selects the wire per model on bedrock-type instances: $modelId",
+    async ({ modelId, provider }) => {
+      await withTempConfig(async (config, factory, oauth) => {
+        // Bedrock Mantle serves OpenAI-namespaced models over /v1/responses and
+        // rejects Anthropic-format requests for them; Anthropic models keep
+        // /v1/messages on the same instance.
+        saveCoderConfig(config, {
+          additionalProviders: [{ name: "bedrock-mantle-us-east-1", type: "bedrock" }],
+        });
+        oauth.coderOauthService = stubCoderOauthService();
+
+        const result = await factory.createModel(`coder:bedrock-mantle-us-east-1/${modelId}`);
+        expect(result.success).toBe(true);
+        if (!result.success) {
+          return;
+        }
+        expect((result.data as { modelId?: unknown }).modelId).toBe(modelId);
+        expect((result.data as { provider?: unknown }).provider).toBe(provider);
+      });
+    }
+  );
 
   it("keeps instances named after other direct providers routed through Coder", async () => {
     await withTempConfig(async (config, factory, oauth) => {

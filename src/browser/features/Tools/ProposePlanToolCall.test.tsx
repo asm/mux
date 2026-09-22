@@ -1,7 +1,8 @@
 import type { ComponentProps } from "react";
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 
 import * as APIModule from "@/browser/contexts/API";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
@@ -14,9 +15,11 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import {
   AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
+  getAutoModelRoutingKey,
   getModelKey,
   getPlanContentKey,
   getThinkingLevelKey,
@@ -215,8 +218,8 @@ const noop = () => {
   // intentional noop for tests
 };
 
-function renderToolCall(content: JSX.Element, agentId = "plan") {
-  return render(
+function wrapToolCall(content: JSX.Element, agentId = "plan") {
+  return (
     <AgentProvider
       value={{
         agentId,
@@ -234,6 +237,10 @@ function renderToolCall(content: JSX.Element, agentId = "plan") {
       <TooltipProvider>{content}</TooltipProvider>
     </AgentProvider>
   );
+}
+
+function renderToolCall(content: JSX.Element, agentId = "plan") {
+  return render(wrapToolCall(content, agentId));
 }
 
 type ProposePlanProps = ComponentProps<typeof ProposePlanToolCall>;
@@ -305,6 +312,12 @@ function expectSingleQuoteRoot(view: { container: HTMLElement }, text: string) {
 
 describe("ProposePlanToolCall", () => {
   let cleanupDom: (() => void) | null = null;
+  // Plan sends go through the transcript mutation barrier, which reads the singleton store's
+  // caught-up flag through the exported `workspaceStore` wrapper. Pin it open by default;
+  // barrier tests flip it through this spy. (Spying on the wrapper, not the raw instance,
+  // survives sibling suites that overlay `useWorkspaceStoreRaw` with a Proxy.)
+  let transcriptCaughtUp = true;
+  let barrierSpy: { mockRestore: () => void } | null = null;
 
   afterAll(async () => {
     await restoreProposePlanModuleMocks();
@@ -314,6 +327,10 @@ describe("ProposePlanToolCall", () => {
     startHereCalls = [];
     selectableDiffRendererCalls = [];
     mockApi = null;
+    transcriptCaughtUp = true;
+    barrierSpy = spyOn(workspaceStore, "isWorkspaceTranscriptCaughtUp").mockImplementation(
+      () => transcriptCaughtUp
+    );
     cleanupDom = installDom();
     await installProposePlanModuleMocks();
   });
@@ -321,6 +338,8 @@ describe("ProposePlanToolCall", () => {
   afterEach(async () => {
     cleanup();
     await restoreProposePlanModuleMocks();
+    barrierSpy?.mockRestore();
+    barrierSpy = null;
     mock.restore();
     cleanupDom?.();
     cleanupDom = null;
@@ -498,6 +517,9 @@ describe("ProposePlanToolCall", () => {
     expect(sendMessageCalls[0]?.options.agentId).toBe("exec");
     expect(sendMessageCalls[0]?.options.model).toBe(execModel);
     expect(sendMessageCalls[0]?.options.thinkingLevel).toBe(execThinking);
+    // Both explicit choices opt out of composer Auto, per dimension.
+    expect(sendMessageCalls[0]?.options.autoModelRouting).toBe(false);
+    expect(sendMessageCalls[0]?.options.autoThinkingLevel).toBe(false);
 
     // Clicking Implement should switch the workspace agent to exec.
     //
@@ -518,6 +540,26 @@ describe("ProposePlanToolCall", () => {
       expect(JSON.parse(window.localStorage.getItem(modelKey)!)).toBe(execModel);
       expect(JSON.parse(window.localStorage.getItem(thinkingKey)!)).toBe(execThinking);
     }
+  });
+
+  test("Implement keeps the exec model when the composer has Auto routing selected", async () => {
+    // Same model in plan and exec: the agent switch persists nothing, so only the send can
+    // drop the Auto flag.
+    const execModel = "openai:gpt-5.2";
+    startInPlanMode(WORKSPACE_ID, execModel, "high");
+    updatePersistedState(AGENT_AI_DEFAULTS_KEY, { exec: { modelString: execModel } });
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true);
+    updatePersistedState(getAutoModelRoutingKey(WORKSPACE_ID), true);
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+
+    const view = renderCompletedPlan();
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    expect(sendMessageCalls[0]?.options.model).toBe(execModel);
+    expect(sendMessageCalls[0]?.options.autoModelRouting).not.toBe(true);
   });
 
   test("uses workspace-by-agent override for Implement when exec defaults inherit", async () => {
@@ -597,6 +639,70 @@ describe("ProposePlanToolCall", () => {
     expect(summaryMessage.metadata?.agentId).toBe("plan");
     expect(summaryMessage.parts?.[0]?.text).toContain("*Plan file preserved at:*");
     expect(summaryMessage.parts?.[0]?.text).toContain(PLAN_PATH);
+  });
+
+  test("disables Implement while the transcript is not caught up", async () => {
+    startInPlanMode();
+    transcriptCaughtUp = false;
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+
+    const view = renderCompletedPlan();
+
+    const implement = view.getByRole("button", { name: "Implement" }) as HTMLButtonElement;
+    expect(implement.disabled).toBe(true);
+    fireEvent.click(implement);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sendMessageCalls).toHaveLength(0);
+  });
+
+  test("refuses Implement when the barrier closes before dispatch", async () => {
+    startInPlanMode();
+    const sendMessageCalls: SendMessageArgs[] = [];
+    let configReads = 0;
+    let closeBarrierOnConfigRead = true;
+    mockApi = createMockApi({
+      sendMessage: recordSendMessage(sendMessageCalls),
+    });
+    // The click passes the render-time gate; the transcript stops being current during the
+    // config read that precedes the send, so the dispatch-time re-check must refuse.
+    mockApi.config.getConfig = () => {
+      configReads += 1;
+      if (closeBarrierOnConfigRead) {
+        transcriptCaughtUp = false;
+      }
+      return Promise.resolve(DEFAULT_CONFIG);
+    };
+
+    const planElement = (
+      <ProposePlanToolCall
+        args={{}}
+        workspaceId={WORKSPACE_ID}
+        status="completed"
+        result={{ success: true, planPath: PLAN_PATH, planContent: PLAN_CONTENT }}
+        isLatest
+      />
+    );
+    const view = renderToolCall(planElement);
+    const implement = view.getByRole("button", { name: "Implement" }) as HTMLButtonElement;
+    expect(implement.disabled).toBe(false);
+    fireEvent.click(implement);
+
+    await waitFor(() => expect(configReads).toBe(1));
+    // Let the handler's remaining microtasks settle before asserting nothing was sent.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sendMessageCalls).toHaveLength(0);
+
+    // Control: with the barrier open again the same click path dispatches. The spy flip does
+    // not notify the store, so re-render to re-read the render-time gate.
+    transcriptCaughtUp = true;
+    closeBarrierOnConfigRead = false;
+    view.rerender(wrapToolCall(planElement));
+    const implementAgain = view.getByRole("button", { name: "Implement" }) as HTMLButtonElement;
+    expect(implementAgain.disabled).toBe(false);
+    fireEvent.click(implementAgain);
+    await waitFor(() => expect(sendMessageCalls).toHaveLength(1));
+    expect(sendMessageCalls[0]?.message).toBe("Implement the plan");
   });
 
   test("renders a plan table of contents derived from the plan's markdown headings", () => {

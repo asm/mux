@@ -185,8 +185,6 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       })),
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
-      setThreshold: mock(() => undefined),
-      getThreshold: mock(() => 0.9),
     };
   }
 
@@ -203,8 +201,6 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       })),
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
-      setThreshold: mock(() => undefined),
-      getThreshold: mock(() => 0.85),
     };
   }
 
@@ -504,7 +500,9 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     const { session, streamed } = await createRoutingHarness({
       workspacePath,
       configValues: {
-        modelClasses: { small: "haiku+0", big: "anthropic:claude-opus-5+high" },
+        // Named through the alias table so the assertion tracks whichever
+        // Opus is current rather than a pinned model id.
+        modelClasses: { small: "haiku+0", big: `${KNOWN_MODELS.OPUS.id}+high` },
         skillModelClasses: { done: "big" },
       },
     });

@@ -13,7 +13,7 @@ import { parseToolResult, requireTaskService, requireWorkspaceId } from "./toolU
 /** Routing relation → the target's relation to the sender, as shown in tool results. */
 function targetRelationLabel(
   relation: AgentTreeTargetRelation
-): "descendant" | "ancestor" | "sibling" {
+): "descendant" | "ancestor" | "sibling" | "unrelated" {
   switch (relation) {
     case "target_descendant":
       return "descendant";
@@ -21,6 +21,10 @@ function targetRelationLabel(
       return "ancestor";
     case "peer":
       return "sibling";
+    case "target_unrelated":
+      // Cross-tree target (another root, or a live sub-agent of another tree); the untrusted
+      // envelope path applies, exactly like a sibling, with a turn-end default.
+      return "unrelated";
   }
 }
 
