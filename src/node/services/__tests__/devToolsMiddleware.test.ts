@@ -759,6 +759,41 @@ describe("createDevToolsMiddleware", () => {
       expect(consumeRedactedRequestBody(stepId)).toBeNull();
     });
 
+    it("keeps no body when the provider reaches fetch only after the abort", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const middleware = createDevToolsMiddleware("ws-1", service);
+      const wrapStream = getWrapStream(middleware);
+      const controller = new AbortController();
+      controller.abort();
+      const params = { ...createMockParams(), abortSignal: controller.signal };
+      let captured!: () => void;
+      const fetched = new Promise<void>((resolve) => {
+        captured = resolve;
+      });
+
+      void wrapStream({
+        doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+        doStream: async () => {
+          // An asynchronous provider that only reaches its (abort-ignoring) fetch now.
+          await Promise.resolve();
+          const headers = new Headers();
+          for (const [key, value] of Object.entries(params.headers ?? {})) {
+            if (typeof value === "string") headers.set(key, value);
+          }
+          captureAndStripDevToolsHeader(headers, FAILED_REQUEST_BODY);
+          captured();
+          return new Promise<never>(() => undefined);
+        },
+        params,
+        model: createMockModel(),
+      });
+      await fetched;
+      const stepId = params.headers?.[DEVTOOLS_STEP_ID_HEADER];
+      if (typeof stepId !== "string") throw new Error("Expected an injected step id");
+
+      expect(consumeRedactedRequestBody(stepId)).toBeNull();
+    });
+
     it("records 'Request aborted' on stream cancel", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
       const middleware = createDevToolsMiddleware("ws-1", service);
@@ -836,6 +871,32 @@ describe("createDevToolsMiddleware", () => {
       expect(step?.durationMs).not.toBeNull();
 
       await reader.cancel();
+    });
+
+    it("leaves no closed-step mark behind when a started stream is aborted", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const middleware = createDevToolsMiddleware("ws-1", service);
+      const wrapStream = getWrapStream(middleware);
+      const abortController = new AbortController();
+      const params = { ...createMockParams(), abortSignal: abortController.signal };
+
+      const result = await wrapStream({
+        doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+        doStream: () =>
+          Promise.resolve({ stream: new ReadableStream<LanguageModelV4StreamPart>() }),
+        params,
+        model: createMockModel(),
+      });
+      const stepId = params.headers?.[DEVTOOLS_STEP_ID_HEADER];
+      if (typeof stepId !== "string") throw new Error("Expected an injected step id");
+
+      abortController.abort();
+
+      // The fetch already settled, so the abort must not mark the id closed for good: a
+      // capture under that id is accepted again (a leaked mark would drop it).
+      captureAndStripDevToolsHeader(new Headers({ [DEVTOOLS_STEP_ID_HEADER]: stepId }), "{}");
+      expect(consumeRedactedRequestBody(stepId)).toEqual({});
+      await result.stream.cancel();
     });
 
     it("does not double-finalize when abort fires after normal completion", async () => {
