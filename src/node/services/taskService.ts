@@ -6539,7 +6539,7 @@ export class TaskService implements AgentTaskIntegration {
    * session dir are named after the task id, so no other task can reuse them once the row is gone.
    * Anything short of a confirmed unpublication — no or another owner, a moved row, a lost or
    * unverifiable write — retains everything; the failure is then recorded on the row. Returns
-   * whether the row was unpublished and the checkout reclaimed.
+   * whether the row was unpublished and whether the checkout was actually deleted.
    */
   private async reclaimUnsanitizedTaskCheckout(
     runtime: Runtime,
@@ -6547,7 +6547,7 @@ export class TaskService implements AgentTaskIntegration {
     workspaceName: string,
     taskId: string,
     expectedAttemptId: string | undefined
-  ): Promise<boolean> {
+  ): Promise<{ rowUnpublished: boolean; checkoutRemoved: boolean }> {
     let unpublished = false;
     if (
       expectedAttemptId != null &&
@@ -6581,12 +6581,16 @@ export class TaskService implements AgentTaskIntegration {
       log.warn("Task launch: unsanitized checkout retained (its row is still published)", {
         taskId,
       });
-      return false;
+      return { rowUnpublished: false, checkoutRemoved: false };
     }
-    await this.rollbackFailedTaskCreate(runtime, projectPath, workspaceName, taskId, {
-      rowUnpublished: true,
-    });
-    return true;
+    const { checkoutRemoved } = await this.rollbackFailedTaskCreate(
+      runtime,
+      projectPath,
+      workspaceName,
+      taskId,
+      { rowUnpublished: true }
+    );
+    return { rowUnpublished: true, checkoutRemoved };
   }
 
   private async getExistingMaterializedTaskLaunch(
@@ -7088,19 +7092,23 @@ export class TaskService implements AgentTaskIntegration {
         forkedRuntimeConfig
       );
       if (sanitizeError !== undefined) {
+        // Before any reclaim or init completion: MCP and sends refuse this checkout (#4674).
+        this.initStateManager.markCheckoutUnsanitized(plan.taskId);
         // Reclaim the just-materialized worktree/session before failing the
         // launch: the throw reaches scheduleReservedTaskLaunch, which only
         // marks the task interrupted — without this cleanup the physical
         // checkout would accumulate and collide with later same-name forks.
         let reclaimed = false;
         try {
-          reclaimed = await this.reclaimUnsanitizedTaskCheckout(
-            runtimeForTaskWorkspace,
-            plan.parentMeta.projectPath,
-            plan.workspaceName,
-            plan.taskId,
-            plan.attemptId
-          );
+          reclaimed = (
+            await this.reclaimUnsanitizedTaskCheckout(
+              runtimeForTaskWorkspace,
+              plan.parentMeta.projectPath,
+              plan.workspaceName,
+              plan.taskId,
+              plan.attemptId
+            )
+          ).rowUnpublished;
         } finally {
           // SECURITY: init ends only after the reclaim attempt. Ending it releases every
           // request parked in waitForInit (MCP prompt discovery among them); released while
@@ -8039,6 +8047,8 @@ export class TaskService implements AgentTaskIntegration {
         forkedRuntimeConfig
       );
       if (sanitizeError !== undefined) {
+        // The row stays published with this checkout: MCP and sends refuse it (#4674).
+        this.initStateManager.markCheckoutUnsanitized(taskId);
         await failLaunch(sanitizeError, runtimeForTaskWorkspace, {});
         initLogger.logComplete(-1);
         return Err(sanitizeError);
@@ -10408,7 +10418,8 @@ export class TaskService implements AgentTaskIntegration {
       /** The caller already removed the row (and confirmed it): see reclaimUnsanitizedTaskCheckout. */
       rowUnpublished?: boolean;
     }
-  ): Promise<void> {
+  ): Promise<{ checkoutRemoved: boolean }> {
+    let checkoutRemoved = false;
     let removedFromConfig = options?.rowUnpublished === true;
     try {
       if (!removedFromConfig) {
@@ -10440,6 +10451,7 @@ export class TaskService implements AgentTaskIntegration {
     } else {
       try {
         const deleteResult = await runtime.deleteWorkspace(projectPath, workspaceName, true);
+        checkoutRemoved = deleteResult.success;
         if (!deleteResult.success) {
           log.error("Task.create rollback: failed to delete workspace", {
             taskId,
@@ -10463,6 +10475,7 @@ export class TaskService implements AgentTaskIntegration {
         error: getErrorMessage(error),
       });
     }
+    return { checkoutRemoved };
   }
 
   isForegroundAwaiting(workspaceId: string): boolean {

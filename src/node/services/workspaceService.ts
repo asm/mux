@@ -12338,6 +12338,12 @@ export class WorkspaceService
         });
       }
 
+      // A task checkout left unsanitized by a failed launch (#4674): no turn may start MCP in it.
+      const unsanitized = this.initStateManager.getUnsanitizedCheckoutError(workspaceId);
+      if (unsanitized) {
+        return Err({ type: unsanitized.code, message: unsanitized.message });
+      }
+
       // Archive admission pairing (see archiveUnlocked's refuseLiveUserActivity gate): these
       // checks run in the same synchronous block as the preflightSendCounts increment below,
       // so a send and an archive always observe each other — whichever entry block runs first
@@ -13137,6 +13143,12 @@ export class WorkspaceService
           type: "unknown",
           raw: "Workspace is being deleted. Please wait and try again.",
         });
+      }
+
+      // A task checkout left unsanitized by a failed launch (#4674): no turn may start MCP in it.
+      const unsanitized = this.initStateManager.getUnsanitizedCheckoutError(workspaceId);
+      if (unsanitized) {
+        return Err({ type: unsanitized.code, message: unsanitized.message });
       }
 
       // Archive admission pairing (see archiveUnlocked's refuseLiveUserActivity gate): resume
