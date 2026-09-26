@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { Pencil } from "lucide-react";
 
@@ -12,6 +12,9 @@ import { APIProvider } from "xum/browser/contexts/API";
 import { ThemeProvider } from "xum/browser/contexts/ThemeContext";
 import { ChatHostContextProvider } from "xum/browser/contexts/ChatHostContext";
 import { RouterProvider } from "xum/browser/contexts/RouterContext";
+import { PolicyProvider } from "xum/browser/contexts/PolicyContext";
+import { AgentProvider } from "xum/browser/contexts/AgentContext";
+import { BackgroundBashProvider } from "xum/browser/contexts/BackgroundBashContext";
 import {
   Tooltip,
   TooltipContent,
@@ -35,6 +38,20 @@ import { DisplayedMessageRenderer } from "./DisplayedMessageRenderer";
 import { CHAT_BUFFER_LIMITS } from "./config";
 import { createVscodeOrpcLink } from "./createVscodeOrpcLink";
 import type { VscodeBridge } from "./vscodeBridge";
+
+// Shared chat components need these providers; the webview has no desktop shell to supply them
+// (#4711). PolicyProvider falls back to "no policy" because the bridge rejects policy.* calls (the
+// backend still enforces policy on send). A single AgentProvider covers both the transcript
+// (ProposePlanToolCall) and the composer.
+function WebviewChatProviders(props: { workspaceId: string | undefined; children: ReactNode }) {
+  return (
+    <PolicyProvider>
+      <AgentProvider workspaceId={props.workspaceId}>
+        <TooltipProvider>{props.children}</TooltipProvider>
+      </AgentProvider>
+    </PolicyProvider>
+  );
+}
 
 interface Notice {
   id: string;
@@ -113,6 +130,9 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   const [connectionStatus, setConnectionStatus] = useState<UiConnectionStatus | null>(null);
   const [workspaces, setWorkspaces] = useState<UiWorkspace[]>([]);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(null);
+  // Mirrors the replay's caught-up flag for rendering: the composer stays disabled until the
+  // history replay completes, so a send never acts on a partial transcript.
+  const [transcriptCaughtUp, setTranscriptCaughtUp] = useState(false);
 
   const activeWorkspaceIdRef = useRef<string | null>(null);
   activeWorkspaceIdRef.current = selectedWorkspaceId;
@@ -252,6 +272,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           chatReplayStateRef.current = msg.workspaceId
             ? createChatReplayState(msg.workspaceId)
             : null;
+          setTranscriptCaughtUp(false);
           setDisplayedMessages([]);
           setNotices([]);
 
@@ -273,6 +294,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
             workspace?.unarchivedAt
           );
           chatReplayStateRef.current = createChatReplayState(msg.workspaceId);
+          setTranscriptCaughtUp(false);
           setDisplayedMessages([]);
           setNotices([]);
           jumpToBottomRef.current();
@@ -304,6 +326,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
             if (!replayState || replayState.workspaceId !== msg.workspaceId) {
               replayState = createChatReplayState(msg.workspaceId);
               chatReplayStateRef.current = replayState;
+              setTranscriptCaughtUp(false);
             }
 
             const flushReplayBuffer = () => {
@@ -322,6 +345,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
               replayState.pendingStreamEvents.length = 0;
 
               replayState.caughtUp = true;
+              setTranscriptCaughtUp(true);
               flushDisplayedMessages();
             };
 
@@ -490,6 +514,17 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     bridge.postMessage({ type: "openWorkspace", workspaceId: selectedWorkspaceId });
   };
 
+  // Only the latest propose_plan card fetches its plan from disk (current results omit the
+  // content), matching ChatPane.
+  let latestProposePlanId: string | undefined;
+  for (let i = displayedMessages.length - 1; i >= 0; i--) {
+    const msg = displayedMessages[i];
+    if (msg.type === "tool" && msg.toolName === "propose_plan") {
+      latestProposePlanId = msg.id;
+      break;
+    }
+  }
+
   return (
     // Shared providers (SettingsProvider, settings links in the model selector and tool cards) need
     // a router. The webview renders no routes, so an embedded in-memory router is enough: those
@@ -500,7 +535,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           <SettingsProvider>
             <ProviderOptionsProvider>
               <ThemeProvider forcedTheme="dark">
-                <TooltipProvider>
+                <WebviewChatProviders workspaceId={selectedWorkspaceId ?? undefined}>
                   <div className="flex h-screen flex-col">
                     <div className="border-b border-border bg-background-secondary p-3">
                       <div className="flex items-center gap-2">
@@ -559,12 +594,13 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                     >
                       <div style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}>
                         {selectedWorkspaceId ? (
-                          <>
+                          <BackgroundBashProvider workspaceId={selectedWorkspaceId}>
                             {displayedMessages.map((msg) => (
                               <DisplayedMessageRenderer
                                 key={msg.id}
                                 message={msg}
                                 workspaceId={selectedWorkspaceId}
+                                isLatestProposePlan={msg.id === latestProposePlanId}
                               />
                             ))}
                             <VscodeStreamingBarrier
@@ -572,7 +608,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                               aggregator={aggregatorRef.current}
                               className="mt-3"
                             />
-                          </>
+                          </BackgroundBashProvider>
                         ) : null}
 
                         {notices.map((notice) => (
@@ -609,9 +645,13 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                         <ChatComposer
                           key={selectedWorkspaceId}
                           workspaceId={selectedWorkspaceId}
-                          disabled={!canChat}
+                          disabled={!canChat || !transcriptCaughtUp}
                           disabledReason={
-                            canChat ? undefined : "Chat requires Xum server connection."
+                            !canChat
+                              ? "Chat requires Xum server connection."
+                              : !transcriptCaughtUp
+                                ? "Loading chat history..."
+                                : undefined
                           }
                           aggregator={aggregatorRef.current}
                           onSendComplete={jumpToBottom}
@@ -622,7 +662,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                       )}
                     </div>
                   </div>
-                </TooltipProvider>
+                </WebviewChatProviders>
               </ThemeProvider>
             </ProviderOptionsProvider>
           </SettingsProvider>

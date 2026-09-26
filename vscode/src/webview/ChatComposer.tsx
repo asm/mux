@@ -7,7 +7,7 @@ import { getSendOptionsFromStorage } from "xum/browser/utils/messages/sendOption
 
 import { matchesKeybind, formatKeybind, KEYBINDS } from "xum/browser/utils/ui/keybinds";
 import { useAPI } from "xum/browser/contexts/API";
-import { AgentProvider, useAgent } from "xum/browser/contexts/AgentContext";
+import { useAgent } from "xum/browser/contexts/AgentContext";
 import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
 import { useThinkingLevel } from "xum/browser/hooks/useThinkingLevel";
 import { usePersistedState } from "xum/browser/hooks/usePersistedState";
@@ -225,6 +225,11 @@ function ChatComposerInner(props: {
   };
 
   const onSend = async () => {
+    // Re-check at dispatch: the composer can be disabled (e.g. history replay not caught up)
+    // after the keystroke or click that triggered this send.
+    if (props.disabled) {
+      return;
+    }
     const trimmed = input.trim();
     if (!trimmed) {
       return;
@@ -411,18 +416,17 @@ export function ChatComposer(props: {
   onSendComplete: () => void;
   onNotice: (notice: { level: "info" | "error"; message: string }) => void;
 }): JSX.Element {
+  // AgentProvider is mounted by App so the transcript shares it (#4711).
   return (
-    <AgentProvider workspaceId={props.workspaceId}>
-      <ThinkingProvider workspaceId={props.workspaceId}>
-        <ChatComposerInner
-          workspaceId={props.workspaceId}
-          disabled={props.disabled}
-          disabledReason={props.disabledReason}
-          aggregator={props.aggregator}
-          onSendComplete={props.onSendComplete}
-          onNotice={props.onNotice}
-        />
-      </ThinkingProvider>
-    </AgentProvider>
+    <ThinkingProvider workspaceId={props.workspaceId}>
+      <ChatComposerInner
+        workspaceId={props.workspaceId}
+        disabled={props.disabled}
+        disabledReason={props.disabledReason}
+        aggregator={props.aggregator}
+        onSendComplete={props.onSendComplete}
+        onNotice={props.onNotice}
+      />
+    </ThinkingProvider>
   );
 }
