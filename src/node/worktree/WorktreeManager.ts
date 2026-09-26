@@ -231,7 +231,7 @@ export class WorktreeManager {
         (await this.supportsNativeHookRunner(params.abortSignal));
       if (params.deferMaterialization && nativeHookRunner) {
         await this.persistWorkspaceBranchMapping(projectPath, workspaceName, branchName);
-        return { success: true, workspacePath, pendingMaterialization: pending };
+        return { success: true, workspacePath, pendingMaterialization: pending, createdBranch };
       }
 
       await this.materializeWorkspace(
@@ -250,7 +250,7 @@ export class WorktreeManager {
       );
 
       await this.persistWorkspaceBranchMapping(projectPath, workspaceName, branchName);
-      return { success: true, workspacePath };
+      return { success: true, workspacePath, createdBranch };
     } catch (error) {
       const errorMessage = getErrorMessage(error);
       if (!isAbortError(error, params.abortSignal)) {

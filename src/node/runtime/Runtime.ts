@@ -262,6 +262,8 @@ export interface WorkspaceCreationResult {
   error?: string;
   /** Set when deferMaterialization left populating the checkout to materializeWorkspace(). */
   pendingMaterialization?: PendingMaterialization;
+  /** This creation made the branch, so undoing the creation may delete it (#4745). */
+  createdBranch?: boolean;
 }
 
 /**
