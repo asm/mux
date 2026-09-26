@@ -9,7 +9,6 @@ import { matchesKeybind, formatKeybind, KEYBINDS } from "xum/browser/utils/ui/ke
 import { useAPI } from "xum/browser/contexts/API";
 import { useAgent } from "xum/browser/contexts/AgentContext";
 import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
-import { useThinkingLevel } from "xum/browser/hooks/useThinkingLevel";
 import { usePersistedState } from "xum/browser/hooks/usePersistedState";
 import { useModelsFromSettings } from "xum/browser/hooks/useModelsFromSettings";
 import { normalizeToCanonical } from "xum/common/utils/ai/models";
@@ -27,7 +26,6 @@ import type { AgentId } from "xum/common/types/agentDefinition";
 import { calculateTokenMeterData } from "xum/common/utils/tokens/tokenMeterUtils";
 import { createDisplayUsage } from "xum/common/utils/tokens/displayUsage";
 import type { ChatUsageDisplay } from "xum/common/utils/tokens/usageAggregator";
-import { enforceThinkingPolicy } from "xum/common/utils/thinking/policy";
 import { cn } from "xum/common/lib/utils";
 import { VIM_ENABLED_KEY, getInputKey, getModelKey } from "xum/common/constants/storage";
 
@@ -106,7 +104,6 @@ function ChatComposerInner(props: {
   const api = apiState.api;
 
   const { agentId, setAgentId } = useAgent();
-  const [thinkingLevel] = useThinkingLevel();
 
   const { options: providerOptions } = useProviderOptions();
   const use1M = providerOptions.anthropic?.use1MContext ?? false;
@@ -192,21 +189,8 @@ function ChatComposerInner(props: {
     ensureModelInSettings(canonicalModel);
     setPreferredModel(canonicalModel);
 
-    if (!api) {
-      return;
-    }
-
-    const effectiveThinkingLevel = enforceThinkingPolicy(canonicalModel, thinkingLevel);
-
-    api.workspace
-      .updateAgentAISettings({
-        workspaceId: props.workspaceId,
-        agentId,
-        aiSettings: { model: canonicalModel, thinkingLevel: effectiveThinkingLevel },
-      })
-      .catch(() => {
-        // Best-effort only.
-      });
+    // #4755: the webview never loads the workspace's AI settings, so a model change stays local;
+    // persisting it would also write the webview's unloaded thinking default onto the workspace.
   };
 
   const cycleModels = customModels.length > 0 ? customModels : models;
@@ -262,7 +246,14 @@ function ChatComposerInner(props: {
     }, SEND_MESSAGE_TIMEOUT_MS);
 
     try {
-      const options = getSendOptionsFromStorage(props.workspaceId);
+      const options = {
+        ...getSendOptionsFromStorage(props.workspaceId),
+        // #4755: these options come from webview-local storage, never loaded from the workspace.
+        // Skip persistence so a webview send cannot overwrite the workspace's agent/model/thinking.
+        // The thinking level is sent as selected: the webview does not load the user's configured
+        // per-model minimums, so only the backend can apply the authoritative floor.
+        skipAiSettingsPersistence: true,
+      };
 
       const result = await api.workspace.sendMessage(
         {

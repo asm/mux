@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 
 import { installDom } from "../../../tests/ui/dom";
+import { updatePersistedState } from "xum/browser/hooks/usePersistedState";
+import { getThinkingLevelKey } from "xum/common/constants/storage";
 import { App } from "./App";
 import type { UiWorkspace, WebviewToExtensionMessage } from "./protocol";
 import type { VscodeBridge } from "./vscodeBridge";
@@ -277,5 +279,70 @@ describe("vscode webview workspace selection", () => {
       event: { type: "caught-up" },
     });
     expect(view.container.querySelector("textarea")?.disabled).toBe(false);
+  });
+});
+
+// #4755: the webview never loads the workspace's AI settings, so a send must not persist its local
+// defaults onto the workspace.
+describe("vscode webview AI settings persistence", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  async function renderSelected(): Promise<{
+    bridge: TestBridge;
+    view: ReturnType<typeof render>;
+  }> {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    return { bridge, view };
+  }
+
+  function composerTextarea(view: ReturnType<typeof render>): HTMLTextAreaElement {
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    return textarea;
+  }
+
+  async function sendMessage(
+    bridge: TestBridge,
+    view: ReturnType<typeof render>
+  ): Promise<Record<string, unknown>> {
+    await typeInto(composerTextarea(view), "hello");
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Send message" }));
+      await Promise.resolve();
+    });
+    const sends = bridge.orpcCalls("workspace.sendMessage");
+    expect(sends).toHaveLength(1);
+    const input = sends[0].input as { options?: Record<string, unknown> };
+    if (!input.options) throw new Error("sendMessage carried no options");
+    return input.options;
+  }
+
+  test("sends without persisting AI settings onto the workspace", async () => {
+    const { bridge, view } = await renderSelected();
+    const options = await sendMessage(bridge, view);
+    expect(options.skipAiSettingsPersistence).toBe(true);
+  });
+
+  test("sends the selected thinking level without raising it to a client-side floor", async () => {
+    // The webview only knows built-in minimum levels, not the user's configured ones, so it must
+    // not clamp; the backend applies the authoritative floor to the turn.
+    // "low" is below the default model's built-in minimum (medium), so a client-side clamp would
+    // raise it; it is also not the default, so the test proves the stored choice is what is sent.
+    updatePersistedState(getThinkingLevelKey(WORKSPACE.id), "low");
+    const { bridge, view } = await renderSelected();
+    const options = await sendMessage(bridge, view);
+    expect(options.thinkingLevel).toBe("low");
   });
 });
