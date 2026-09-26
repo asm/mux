@@ -3390,9 +3390,12 @@ export class WorkspaceService
     // Archive admission pairing for terminal startups: create() checks this guard in the same
     // synchronous block as its startup reservation, so whichever of {archive gate, terminal
     // entry} runs first is observed by the other (see archiveUnlocked's refuseLiveUserActivity
-    // gate and TerminalService.create).
-    terminalService.setWorkspaceArchiveGuard((workspaceId) =>
-      this.archivingWorkspaces.has(workspaceId)
+    // gate and TerminalService.create). Removal is covered too (#4478): it closes terminals
+    // before deleting the checkout, so a terminal still starting then must be refused or
+    // closed by TerminalService's post-spawn recheck, as the desktop-session guard does.
+    terminalService.setWorkspaceArchiveGuard(
+      (workspaceId) =>
+        this.archivingWorkspaces.has(workspaceId) || this.removingWorkspaces.has(workspaceId)
     );
   }
 
@@ -6607,6 +6610,17 @@ export class WorkspaceService
           sealedForRemoval = true;
           tombstonePublished = true;
         }
+
+        // #4478: stop this process's users of the checkout BEFORE deleting it. MCP servers,
+        // terminals and background processes run with their cwd inside the checkout; stopping them
+        // only after the deletion (the later calls below, kept for the metadata-less path) left
+        // them running in a deleted tree. Same trade-off as the producer drains above: a
+        // force=false deletion that fails below keeps the workspace with these already stopped,
+        // which is recoverable (MCP servers restart on demand), unlike a process outliving its
+        // checkout.
+        await this.mcpServerManager?.stopServers(workspaceId);
+        this.terminalService?.closeWorkspaceSessions(workspaceId);
+        await this.backgroundProcessManager.cleanup(workspaceId);
 
         if (isMultiProject(metadata)) {
           const projects = getProjects(metadata);
