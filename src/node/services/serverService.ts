@@ -549,8 +549,9 @@ export async function setServerSshHost(
   context: ServerSettingsContext,
   sshHost: string | null | undefined
 ): Promise<void> {
-  context.serverService.setSshHost(sshHost ?? undefined);
+  // Write first (#4444): a rejected write must not leave the in-memory host ahead of disk.
   await context.config.editConfig((config) => ({ ...config, serverSshHost: sshHost ?? undefined }));
+  context.serverService.setSshHost(sshHost ?? undefined);
 }
 
 export function getApiServerStatus(context: ServerSettingsContext) {

@@ -1,9 +1,14 @@
-import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import * as net from "net";
-import { ServerService, computeNetworkBaseUrls, getTailscaleBindHosts } from "./serverService";
+import {
+  ServerService,
+  computeNetworkBaseUrls,
+  getTailscaleBindHosts,
+  setServerSshHost,
+} from "./serverService";
 import type { ORPCContext } from "@/node/orpc/context";
 import { Config } from "@/node/config";
 import { ServerLockDataSchema } from "./serverLockfile";
@@ -416,5 +421,32 @@ describe("computeNetworkBaseUrls", () => {
     expect(computeNetworkBaseUrls({ bindHost: "2001:db8::1", port: 3000 })).toEqual([
       "http://[2001:db8::1]:3000",
     ]);
+  });
+});
+
+describe("server settings writes (#4444)", () => {
+  let tempDir: string;
+  let config: Config;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "server-settings-test-"));
+    config = new Config(tempDir);
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  test("a failed SSH host write leaves the in-memory host unchanged", async () => {
+    const serverService = new ServerService();
+    serverService.setSshHost("old-host");
+    spyOn(config, "editConfig").mockRejectedValueOnce(new Error("EACCES: permission denied"));
+    const context = { config, serverService } as unknown as ORPCContext;
+
+    const error = await setServerSshHost(context, "new-host").catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).toContain("EACCES");
+
+    expect(serverService.getSshHost()).toBe("old-host");
   });
 });
