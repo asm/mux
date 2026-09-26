@@ -383,7 +383,8 @@ type AgentReportFinalizationResult =
         | "invalid_structured_output"
         | "pending_guidance"
         | "terminal_interrupted"
-        | "superseded_attempt";
+        | "superseded_attempt"
+        | "retired_attempt";
       message: string;
     };
 
@@ -3712,9 +3713,11 @@ export class TaskService implements AgentTaskIntegration {
    * only after the report artifact read positively found none: a receipt never outranks a report.
    *
    * Attempt identity: the receipt must name the row's current taskAttemptId. The workflow journal
-   * names only the child task, and every admission of that task rotates the id, so the current
-   * id is the only attempt that can still run; a receipt for an older attempt says nothing about
-   * it. Only the PARENT's receipt copy counts (the copy lineage reads; ancestor copies are fan-out
+   * names only the child task, and every task admission (launch, reawaken, re-drive) rotates the
+   * id, so the current id is the only attempt that can still run; a receipt for an older attempt
+   * says nothing about it. A plain send binds to the current id instead: another backend's turn
+   * can therefore run under an attempt this receipt settled (#4545) — its late report still wins
+   * unless a claim retired the attempt first (publishAgentTaskReport). Only the PARENT's receipt copy counts (the copy lineage reads; ancestor copies are fan-out
    * and never evidence on their own), and it must name that parent. Every read is strict, and
    * the row is re-read after the receipt so an admission landing in between is never missed.
    */
@@ -16199,6 +16202,8 @@ export class TaskService implements AgentTaskIntegration {
       );
       if (finalization.finalized) {
         await this.finalizeTerminationPhaseForReportedTask(workspaceId);
+      } else if (finalization.reason === "retired_attempt") {
+        this.rejectWaiters(workspaceId, new Error(finalization.message));
       }
       return;
     }
@@ -17912,6 +17917,15 @@ export class TaskService implements AgentTaskIntegration {
         message: "The task was re-admitted under another attempt; this report was not published.",
       };
     }
+    if (published === "retired") {
+      // Same attempt, so the stable-id waiters are this attempt's: callers reject them (#4545).
+      return {
+        finalized: false,
+        reason: "retired_attempt",
+        message:
+          "A workflow retired this task attempt and its replacement owns the outcome; this report was not published.",
+      };
+    }
     if (!published) {
       return { finalized: true };
     }
@@ -18064,6 +18078,7 @@ export class TaskService implements AgentTaskIntegration {
       }
     | null
     | "superseded"
+    | "retired"
   > {
     // An unowned stream's decision (see StreamEndDecision) is keyed by the attempt the stream was
     // admitted under when the caller knows it, else by the row as read before this report.
@@ -18072,11 +18087,16 @@ export class TaskService implements AgentTaskIntegration {
         ? (expectedAttemptId ?? latestEntryBeforeReport?.workspace.taskAttemptId)
         : undefined;
     let superseded = false;
+    let retired = false;
     // Notify clients immediately even if we can't delete the workspace yet.
     await this.editWorkspaceEntry(
       childWorkspaceId,
       (ws) => {
-        superseded = rowSupersedes(ws, expectedAttemptId);
+        // A workflow claim retired the attempt (#4545): its replacement owns the step's outcome, so
+        // a late report (another backend's turn bound to the same id) is refused. The claim needs
+        // `interrupted` and this write sets `reported`, so config lets exactly one of them land.
+        retired = ws.taskAttemptRetiredBy != null;
+        superseded = retired || rowSupersedes(ws, expectedAttemptId);
         if (superseded) return;
         ws.taskStatus = "reported";
         ws.reportedAt = getIsoNow();
@@ -18087,7 +18107,9 @@ export class TaskService implements AgentTaskIntegration {
     );
     if (superseded) {
       log.info(
-        "[task-attempt] report not published: its attempt was superseded by another writer",
+        retired
+          ? "[task-attempt] report not published: a workflow claim retired its attempt"
+          : "[task-attempt] report not published: its attempt was superseded by another writer",
         {
           childWorkspaceId,
           attemptId: expectedAttemptId,
@@ -18104,7 +18126,7 @@ export class TaskService implements AgentTaskIntegration {
         ),
         "indeterminate"
       );
-      return "superseded";
+      return retired ? "retired" : "superseded";
     }
     this.clearTaskRecovery(childWorkspaceId);
     // Drop queued incremental updates synchronously with the terminal commit: while they sit at
