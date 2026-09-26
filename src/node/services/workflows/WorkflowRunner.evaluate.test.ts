@@ -10,6 +10,7 @@ import { canRetryWorkflowFromCheckpoint } from "@/common/utils/workflowRetryElig
 import {
   EVALUATION_DEFAULT_TIMEOUT_MS,
   EVALUATION_MAX_ATTEMPTS,
+  EVALUATION_MAX_TIMEOUT_MS,
   EVALUATION_MIN_TIMEOUT_MS,
 } from "@/constants/evaluation";
 import type { EvaluationOutcome } from "@/node/services/evaluation/evaluationOutcome";
@@ -593,6 +594,27 @@ describe("WorkflowRunner evaluate()", () => {
       status: "completed",
       startedAt: "2026-05-29T00:00:00.500Z",
       evaluation: { attempt: 2, selection: { modelString: SENTINEL_MODEL } },
+    });
+  });
+
+  test("resuming re-clamps an out-of-range persisted timeout", async () => {
+    using tmp = new DisposableTempDir("workflow-eval");
+    const store = await createStore(tmp.path);
+    const spec = { id: STEP_ID, title: SENTINEL_TITLE, questions: QUESTIONS };
+    await store.recordStepStarted(RUN_ID, {
+      stepId: STEP_ID,
+      inputHash: hashEvaluationStepInput(spec, STATE),
+      startedAt: "2026-05-29T00:00:00.500Z",
+      evaluation: { ...admissionFor({ attempt: 1 }), timeoutMs: EVALUATION_MAX_TIMEOUT_MS * 10 },
+    });
+    await store.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:01.000Z");
+    const fake = createFakeAdapter();
+
+    await createRunner(store, fake.adapter).run(RUN_ID, { allowResumeFromInterrupted: true });
+
+    expect(await readStep(store)).toMatchObject({
+      status: "completed",
+      evaluation: { attempt: 2, timeoutMs: EVALUATION_MAX_TIMEOUT_MS },
     });
   });
 

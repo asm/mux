@@ -242,7 +242,9 @@ export async function runWorkflowEvaluationStep(
     persisted = admission;
     attempt = persisted.attempt + 1;
   }
-  const timeoutMs = persisted?.timeoutMs ?? clampTimeoutMs(spec.timeoutMs);
+  // Re-clamp a persisted timeout too: a hand-edited or older record must not stretch the
+  // attempt budget past the host's bounds (self-healing, like other persisted state).
+  const timeoutMs = clampTimeoutMs(persisted?.timeoutMs ?? spec.timeoutMs);
   const attemptDeadlineAt = enteredAt + timeoutMs;
   const startedAt = existing?.startedAt ?? clock.nowIso();
 
@@ -327,6 +329,9 @@ export async function runWorkflowEvaluationStep(
     startedAt,
     evaluation: admission,
   });
+  // Deliberately unguarded (#4363 item 5 declined): this append is the last lease-fenced
+  // write before a billable dispatch. Swallowing its rejection could let a runner that just
+  // lost the lease dispatch a duplicate request; failing the run here bills nothing.
   await journal.appendEvent({
     type: "evaluation",
     at: clock.nowIso(),
