@@ -10648,9 +10648,12 @@ export class WorkspaceService
       // handling (stopped below), and so do its own background processes and in-flight one-off
       // commands (#4857; a model-facing archive refuses those itself). Its own init hook was
       // aborted and awaited above, so a lease still held here is a new one and refuses.
+      // #4871: stopping or deleting a dedicated Coder workspace (runBeforeArchive) ends the other
+      // backend's activity in it just the same, so it takes the gate with the same policy.
       if (
         beforeArchiveMetadata != null &&
-        archiveDeletesManagedWorktree(beforeArchiveMetadata, worktreeArchiveBehavior)
+        (archiveDeletesManagedWorktree(beforeArchiveMetadata, worktreeArchiveBehavior) ||
+          stopsDedicatedCoderWorkspace)
       ) {
         const gate = await this.acquireStructuralMutationGate(workspaceId, {
           ignoreKinds: new Set(["turn", "terminal", "editor", "mcp", "exec"]),
@@ -10908,6 +10911,7 @@ export class WorkspaceService
 
   private async unarchiveUnlocked(workspaceId: string): Promise<Result<void>> {
     let releaseMutationGate: (() => Promise<void>) | undefined;
+    let releaseUnarchiveLease: (() => Promise<void>) | undefined;
     try {
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {
@@ -10915,12 +10919,48 @@ export class WorkspaceService
       }
       const { projectPath, workspacePath } = workspace;
 
+      // Already active (e.g. unarchived by the other backend): nothing to commit, so no lease or
+      // gate that could refuse this call or a concurrent mutation.
+      const current = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+      if (current != null && !isWorkspaceArchived(current.archivedAt, current.unarchivedAt)) {
+        return Ok(undefined);
+      }
+
+      const hasSnapshot = () =>
+        findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+          .worktreeArchiveSnapshot != null;
+
+      // #4871: a keep-mode unarchive restores no checkout, so the other backend's ordinary
+      // activity must not refuse it. It must still not mark the workspace active while the other
+      // backend deletes the worktree (or otherwise mutates it) under the gate: a use lease held
+      // from before the commit to the end (through lifecycle startup, e.g. starting a Coder
+      // workspace) either sees that gate (refuse) or is seen by its scan (Dekker ordering in
+      // workspaceUseLeases.ts), where a bare gate probe could race the mutator's archived check.
+      if (!hasSnapshot()) {
+        let unarchiveLease: WorkspaceUseLease;
+        try {
+          unarchiveLease = await workspaceUseLeasesFor(this.config).hold(workspaceId, "unarchive");
+        } catch (error) {
+          return Err(`Cannot unarchive workspace: ${getErrorMessage(error)}`);
+        }
+        releaseUnarchiveLease = () =>
+          unarchiveLease.release().catch((error: unknown) => {
+            log.warn("Failed to release the unarchive use lease", {
+              workspaceId,
+              error: getErrorMessage(error),
+            });
+          });
+        // A snapshot archive the other backend finished before the lease is visible now, and no
+        // new one can start while it is held: restoring that snapshot needs the gate below.
+        if (hasSnapshot()) {
+          await releaseUnarchiveLease();
+          releaseUnarchiveLease = undefined;
+        }
+      }
+
       // #4476: restoring a snapshot rewrites the checkout, so it refuses (before unarchiving)
       // while another backend uses the workspace or its shared sub-agents.
-      if (
-        findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
-          .worktreeArchiveSnapshot != null
-      ) {
+      if (releaseUnarchiveLease == null) {
         // Nothing here stops this backend's own background processes, so they refuse too.
         const gate = await this.acquireStructuralMutationGate(workspaceId, {
           ignoreKinds: new Set(),
@@ -11092,6 +11132,7 @@ export class WorkspaceService
       const message = getErrorMessage(error);
       return Err(`Failed to unarchive workspace: ${message}`);
     } finally {
+      await releaseUnarchiveLease?.();
       await releaseMutationGate?.().catch((error: unknown) => {
         log.warn("Failed to release the mutation gate after unarchive", {
           workspaceId,
