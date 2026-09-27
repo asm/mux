@@ -742,12 +742,18 @@ function normalizePersistedWorkspace(
   const hasMalformedPendingRemoval =
     persisted.pendingRemoval !== undefined &&
     !PendingRemovalSchema.safeParse(persisted.pendingRemoval).success;
+  // Only `true` is meaningful; any other value (hand edit, corruption) reads as absent, so one
+  // bad row cannot fail output validation of the whole project list.
+  const hasMalformedConsentPending =
+    Object.hasOwn(persisted, "unrelatedWorkspaceConsentPending") &&
+    persisted.unrelatedWorkspaceConsentPending !== true;
   if (
     !hasLegacyWorkflowSchedule &&
     !hasBestOf &&
     !hasLegacyPtcExclusive &&
     !hasMalformedTaskAttemptId &&
-    !hasMalformedPendingRemoval
+    !hasMalformedPendingRemoval &&
+    !hasMalformedConsentPending
   ) {
     return workspace;
   }
@@ -756,6 +762,7 @@ function normalizePersistedWorkspace(
   delete nextWorkspace.workflowSchedule;
   if (hasMalformedPendingRemoval) delete nextWorkspace.pendingRemoval;
   if (hasMalformedTaskAttemptId) healMalformedTaskAttemptId(nextWorkspace);
+  if (hasMalformedConsentPending) delete nextWorkspace.unrelatedWorkspaceConsentPending;
 
   if (hasLegacyPtcExclusive) {
     // Spreading the typed field copies ALL persisted keys at runtime —
@@ -4170,7 +4177,9 @@ export class Config {
    */
   async addWorkspace(
     projectPath: string,
-    metadata: WorkspaceMetadata & { namedWorkspacePath?: string }
+    metadata: WorkspaceMetadata & { namedWorkspacePath?: string },
+    /** Written only on a new row, in its registration write (see the schema field). */
+    options: { unrelatedWorkspaceConsentPending?: true } = {}
   ): Promise<void> {
     await this.editConfig((config) => {
       let project = config.projects.get(projectPath);
@@ -4249,10 +4258,16 @@ export class Config {
           taskAttemptRetiredBy: existing.taskAttemptRetiredBy,
           taskTerminalFailure: existing.taskTerminalFailure,
           pendingRemoval: existing.pendingRemoval,
+          unrelatedWorkspaceConsentPending: existing.unrelatedWorkspaceConsentPending,
         };
       } else {
         // Add new workspace
-        project.workspaces.push(workspaceEntry);
+        project.workspaces.push({
+          ...workspaceEntry,
+          ...(options.unrelatedWorkspaceConsentPending === true
+            ? { unrelatedWorkspaceConsentPending: true as const }
+            : {}),
+        });
       }
 
       return config;
