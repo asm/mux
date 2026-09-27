@@ -15,7 +15,7 @@ import { normalizeAgentId } from "xum/common/utils/agentIds";
 import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
 import { usePersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
 import { useModelsFromSettings } from "xum/browser/hooks/useModelsFromSettings";
-import { normalizeToCanonical } from "xum/common/utils/ai/models";
+import { normalizeSelectedModel, normalizeToCanonical } from "xum/common/utils/ai/models";
 import { useProviderOptions } from "xum/browser/hooks/useProviderOptions";
 import { useAutoCompactionSettings } from "xum/browser/hooks/useAutoCompactionSettings";
 
@@ -137,6 +137,7 @@ function ChatComposerInner(props: {
     ensureModelInSettings,
     defaultModel,
     setDefaultModel,
+    isAllowedByPolicyOnActiveRoute,
   } = useModelsFromSettings();
 
   const modelKey = getModelKey(props.workspaceId);
@@ -144,7 +145,23 @@ function ChatComposerInner(props: {
     listener: true,
   });
 
-  const baseModel = normalizeToCanonical(preferredModel);
+  const storedModel = normalizeToCanonical(preferredModel);
+
+  // #4808: the stored model can be one the admin policy excludes (persisted earlier, seeded from the
+  // workspace, or revoked by a policy refresh), and every send with it fails with policy_denied.
+  // Fall back to the first allowed model for display and send, without writing it anywhere: the
+  // webview does not persist AI settings, and the stored choice comes back if the policy allows it
+  // again. With no allowed model in the list, nothing changes and the backend decides. Either way,
+  // a status line says so. The check is route-aware, like the model list, because the backend
+  // enforces policy after routing; it uses the gateway-preserving identity so an explicitly pinned
+  // gateway model is checked on that gateway.
+  // The status line names this identity too, so a denied gateway pin is not shown as its canonical ID.
+  const storedSelection = normalizeSelectedModel(preferredModel);
+  const storedModelAllowed = isAllowedByPolicyOnActiveRoute(storedSelection);
+  const policyFallbackModel = storedModelAllowed
+    ? null
+    : (models.find((model) => isAllowedByPolicyOnActiveRoute(model)) ?? null);
+  const baseModel = storedModelAllowed ? storedModel : (policyFallbackModel ?? storedModel);
 
   const inputKey = getInputKey(props.workspaceId);
   const [input, setInput] = usePersistedState<string>(inputKey, "", { listener: true });
@@ -290,6 +307,8 @@ function ChatComposerInner(props: {
         // The thinking level is sent as selected: the webview does not load the user's configured
         // per-model minimums, so only the backend can apply the authoritative floor.
         skipAiSettingsPersistence: true,
+        // Only when the stored model is policy-excluded; otherwise keep the stored model string.
+        ...(policyFallbackModel ? { model: policyFallbackModel } : {}),
       };
 
       const result = await api.workspace.sendMessage(
@@ -383,6 +402,13 @@ function ChatComposerInner(props: {
       />
 
       <div className="flex flex-col gap-2">
+        {storedModelAllowed ? null : (
+          <div role="status" className="text-content-secondary text-[11px]">
+            {policyFallbackModel
+              ? `Admin policy does not allow ${storedSelection}; using ${policyFallbackModel}.`
+              : `Admin policy does not allow ${storedSelection}. Choose an allowed model.`}
+          </div>
+        )}
         <div className="w-full min-w-0" data-component="ModelSelectorGroup">
           <ModelSelector
             value={baseModel}
