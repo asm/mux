@@ -6,6 +6,8 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { installDom } from "../../../tests/ui/dom";
 import { readPersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
 import { getAgentIdKey, getModelKey, getThinkingLevelKey } from "xum/common/constants/storage";
+import { getAppConfigStore } from "xum/browser/stores/AppConfigStore";
+import { getProvidersConfigStore } from "xum/browser/stores/ProvidersConfigStore";
 import { App } from "./App";
 import type { UiWorkspace, WebviewToExtensionMessage } from "./protocol";
 import type { VscodeBridge } from "./vscodeBridge";
@@ -75,6 +77,15 @@ const WORKSPACE: UiWorkspace = {
   runtimeType: "worktree",
   createdAt: "2026-09-26T00:00:00.000Z",
 };
+
+// ProvidersConfigStore is an app-wide singleton with no reset. A test that loads a providers config
+// clears it through the still-mounted app (refetch answered with null) so later tests start without
+// one.
+async function clearProvidersConfig(bridge: TestBridge): Promise<void> {
+  const refreshed = getProvidersConfigStore().refresh();
+  await bridge.answer("providers.getConfig", null);
+  await refreshed;
+}
 
 async function selectWorkspace(bridge: TestBridge, history: unknown[] = []): Promise<void> {
   await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
@@ -612,6 +623,9 @@ describe("vscode webview policy-excluded model", () => {
     const { bridge, view } = await renderWithPolicy(
       enforcedPolicy([{ id: "openai", allowedModels: ["gpt-5.6-terra"] }])
     );
+    await bridge.answer("providers.getConfig", {
+      openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+    });
 
     expect(view.getByRole("status").textContent).toContain("anthropic:claude-opus-5-5");
     await clickSend(view);
@@ -622,6 +636,7 @@ describe("vscode webview policy-excluded model", () => {
     // Local fallback only: nothing is written, locally or to the workspace.
     expect(readPersistedState(getModelKey(WORKSPACE.id), "")).toBe("anthropic:claude-opus-5-5");
     expect(bridge.orpcCalls("workspace.updateAgentAISettings")).toHaveLength(0);
+    await clearProvidersConfig(bridge);
   });
 
   test("keeps the stored model and says so when the policy allows no listed model", async () => {
@@ -648,5 +663,129 @@ describe("vscode webview policy-excluded model", () => {
       options: Record<string, unknown>;
     };
     expect(input.options.model).toBe("anthropic:claude-opus-5-5");
+  });
+});
+
+// #4766: the webview loads the user's routing and thinking-floor config and the providers config.
+describe("vscode webview app and providers config", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    // The store is an app-wide singleton; drop the floors a test loaded so later tests start clean.
+    getAppConfigStore().updateOptimistically({ minThinkingLevelByModel: undefined });
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("shows the thinking level raised to the user's configured minimum", async () => {
+    // "low" is below both the built-in minimum (MED) and the configured one (HIGH).
+    updatePersistedState(getThinkingLevelKey(WORKSPACE.id), "low");
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    expect(bridge.orpcCalls("config.getConfig")).toHaveLength(1);
+    expect(bridge.orpcCalls("providers.getConfig")).toHaveLength(1);
+
+    await bridge.answer("config.getConfig", {
+      minThinkingLevelByModel: { "anthropic:claude-opus-5-5": "high" },
+    });
+    expect(view.getByText("HIGH")).toBeDefined();
+    expect(view.queryByText("MED")).toBeNull();
+  });
+
+  test("falls back to a policy-allowed model of a configured provider (#4808 review)", async () => {
+    updatePersistedState(getModelKey(WORKSPACE.id), "openai:gpt-5.6-terra");
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    // Anthropic is allowed and listed first, but only Google has credentials.
+    await bridge.answer("policy.get", {
+      source: "governor",
+      status: { state: "enforced" },
+      policy: {
+        policyFormatVersion: "0.1",
+        providerAccess: [
+          { id: "anthropic", allowedModels: null },
+          { id: "google", allowedModels: null },
+        ],
+        mcp: { allowUserDefined: { stdio: true, remote: true } },
+        runtimes: null,
+      },
+    });
+    await bridge.answer("providers.getConfig", {
+      google: { apiKeySet: true, isEnabled: true, isConfigured: true },
+    });
+
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    await typeInto(textarea, "hello");
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Send message" }));
+      await Promise.resolve();
+    });
+    const input = bridge.orpcCalls("workspace.sendMessage")[0].input as {
+      options: Record<string, unknown>;
+    };
+    expect(String(input.options.model)).toStartWith("google:");
+    await clearProvidersConfig(bridge);
+  });
+
+  test("does not pick a fallback before the providers config arrives (#4813 review)", async () => {
+    updatePersistedState(getModelKey(WORKSPACE.id), "openai:gpt-5.6-terra");
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    await bridge.answer("policy.get", {
+      source: "governor",
+      status: { state: "enforced" },
+      policy: {
+        policyFormatVersion: "0.1",
+        providerAccess: [{ id: "anthropic", allowedModels: null }],
+        mcp: { allowUserDefined: { stdio: true, remote: true } },
+        runtimes: null,
+      },
+    });
+    // providers.getConfig is still pending: availability is unknown, so nothing is substituted.
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    await typeInto(textarea, "hello");
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Send message" }));
+      await Promise.resolve();
+    });
+    const input = bridge.orpcCalls("workspace.sendMessage")[0].input as {
+      options: Record<string, unknown>;
+    };
+    expect(input.options.model).toBe("openai:gpt-5.6-terra");
+  });
+
+  test("reloads the config when the connection switches to another server (#4813 review)", async () => {
+    const bridge = new TestBridge();
+    render(<App bridge={bridge} />);
+    await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://a" } });
+    // A refresh against the same server does not refetch.
+    await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://a" } });
+    expect(bridge.orpcCalls("config.getConfig")).toHaveLength(1);
+
+    await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://b" } });
+    expect(bridge.orpcCalls("config.getConfig")).toHaveLength(2);
+    expect(bridge.orpcCalls("providers.getConfig")).toHaveLength(2);
+  });
+
+  test("loads the config again when the connection recovers from file mode", async () => {
+    const bridge = new TestBridge();
+    render(<App bridge={bridge} />);
+    await bridge.emit({ type: "connectionStatus", status: { mode: "file", error: "offline" } });
+    expect(bridge.orpcCalls("config.getConfig")).toHaveLength(0);
+    expect(bridge.orpcCalls("providers.getConfig")).toHaveLength(0);
+
+    await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
+    expect(bridge.orpcCalls("config.getConfig")).toHaveLength(1);
+    expect(bridge.orpcCalls("providers.getConfig")).toHaveLength(1);
   });
 });

@@ -27,6 +27,8 @@ import {
 import { Button } from "xum/browser/components/Button/Button";
 import { matchesKeybind, KEYBINDS } from "xum/browser/utils/ui/keybinds";
 import { readPersistedState } from "xum/browser/hooks/usePersistedState";
+import { getAppConfigStore } from "xum/browser/stores/AppConfigStore";
+import { getProvidersConfigStore } from "xum/browser/stores/ProvidersConfigStore";
 import { VIM_ENABLED_KEY } from "xum/common/constants/storage";
 import { useAutoScroll } from "xum/browser/hooks/useAutoScroll";
 import { applyWorkspaceChatEventToAggregator } from "xum/browser/utils/messages/applyWorkspaceChatEventToAggregator";
@@ -266,6 +268,28 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   pushNoticeRef.current = pushNotice;
 
   const canChat = Boolean(connectionStatus?.mode === "api" && selectedWorkspaceId);
+  // Identifies the server connection: switching servers keeps mode "api" but changes the URL.
+  const apiConnectionKey =
+    connectionStatus?.mode === "api" ? (connectionStatus.baseUrl ?? "api") : null;
+
+  // #4766: the model list, model routing and thinking floors read the shared providers and app
+  // config stores, which the desktop connects in AppLoader. Connect them while the host has a
+  // server connection (it rejects calls in file mode), and reconnect them for each server, so a
+  // recovery or a switch to another server fetches them again. The host
+  // redacts both results (see redactWebviewOrpcResult).
+  useEffect(() => {
+    if (apiConnectionKey === null) {
+      return;
+    }
+    const providersConfigStore = getProvidersConfigStore();
+    const appConfigStore = getAppConfigStore();
+    providersConfigStore.setClient(apiClient);
+    appConfigStore.setClient(apiClient);
+    return () => {
+      providersConfigStore.setClient(null);
+      appConfigStore.setClient(null);
+    };
+  }, [apiClient, apiConnectionKey]);
 
   useEffect(() => {
     const unsubscribe = bridge.onMessage((raw) => {
