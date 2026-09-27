@@ -4543,6 +4543,11 @@ export class AgentSession {
     // small and bounded, so skip on-send compaction for them; mid-stream
     // forcing still protects the context limit.
     const hasPreTurnMessages = (internal?.preTurnMessages?.length ?? 0) > 0;
+    // Any real user turn, edits included, re-arms auto-compaction after one that brought no
+    // relief (#4421). Compaction follow-ups, guidance and wakes are synthetic or agent-initiated.
+    if (!agentInitiated && internal?.synthetic !== true && !isCompactionRequest) {
+      this.contextController.noteUserTurn();
+    }
     if (!tokenBudgetActive && !isCompactionRequest && !editMessageId && !hasPreTurnMessages) {
       // Seed usage state from persisted history on the first send after restart
       // so the compaction monitor can detect context limits even before any live
@@ -8920,6 +8925,7 @@ export class AgentSession {
         this.clearUsageState();
 
         if (completedCompactionRequest?.source === "auto-compaction") {
+          this.contextController.noteAutoCompactionCompleted();
           this.emitChatEvent({
             type: "auto-compaction-completed",
             newUsagePercent: 0,
