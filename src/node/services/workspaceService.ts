@@ -357,6 +357,11 @@ import {
 } from "@/node/services/bashMonitorRegistryStore";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import {
+  getSelfIdentity,
+  judgeHolder,
+  parseProcessIdentity,
+} from "@/node/utils/concurrency/processLiveness";
 import { REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS } from "@/constants/refine";
 import {
   BashMonitorWakeReconciler,
@@ -373,6 +378,7 @@ import {
   type AgentTaskIntegration,
   type ArchiveWorkspaceOptions,
   type QueueCutReceipt,
+  type RemovalAttemptBinding,
   type SendMessageInternalOptions,
   type TurnAcceptanceOrigin,
   type TurnAdmissionToken,
@@ -755,6 +761,20 @@ type WorkspaceServiceMcpOverridesPort = Pick<
   "prunePluginOverrideKeys" | "copyOverridesToForkedCheckout" | "acquireWorkspaceLock"
 >;
 const POST_COMPACTION_METADATA_REFRESH_DEBOUNCE_MS = 100;
+
+/**
+ * Removal-owner tokens of this process's WorkspaceService instances (#4478). A pendingRemoval
+ * marker naming this pid is live only while its instance is listed here: any other same-pid
+ * marker was written by an earlier process that had our pid (judgeHolder's same-pid rule).
+ * Tests run two backends in one process, which this keeps distinct as well.
+ */
+const liveRemovalInstanceIds = new Set<string>();
+
+function registerRemovalInstance(): string {
+  const instanceId = crypto.randomUUID();
+  liveRemovalInstanceIds.add(instanceId);
+  return instanceId;
+}
 
 const DESCENDANT_WORKSPACE_REMOVE_ERROR =
   "This workspace has descendant sub-agent workspaces. Remove those descendants deepest-first before removing their parent.";
@@ -2504,6 +2524,9 @@ export class WorkspaceService
   isRemoving(workspaceId: string): boolean {
     return this.removingWorkspaces.has(workspaceId);
   }
+
+  /** Names this instance in the pendingRemoval markers it writes (see liveRemovalInstanceIds). */
+  private readonly removalInstanceId = registerRemovalInstance();
 
   constructor(
     private readonly config: Config,
@@ -4638,6 +4661,7 @@ export class WorkspaceService
   beginShutdown(): void {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
+    this.retireRemovalInstanceIfIdle();
     // Capture before disposal can remove transient instances from either registry.
     for (const session of [
       ...this.sessions.values(),
@@ -6362,18 +6386,25 @@ export class WorkspaceService
   /**
    * @param options.beforeRemove - evaluated inside the task-tree lifecycle lock; returning false
    *   turns the call into a no-op. Lets callers that screened eligibility outside the lock confirm
-   *   it against live state within the same lock hold that performs the removal.
+   *   it against live state within the same lock hold that performs the removal. Returning
+   *   `{ expectedAttemptId }` binds the removal to the task attempt it confirmed: that lock is
+   *   in-process only, so the removal refuses if another backend rotated the attempt since.
    */
   async remove(
     workspaceId: string,
     force = false,
-    options?: { beforeRemove?: () => Promise<boolean>; acknowledgedDescendantIds?: string[] }
+    options?: {
+      beforeRemove?: () => Promise<boolean | RemovalAttemptBinding>;
+      acknowledgedDescendantIds?: string[];
+    }
   ): Promise<Result<void> & { descendants?: WorkspaceRemovalDescendant[] }> {
     return await this.withTaskTreeLifecycleLock(workspaceId, async () => {
       const operation = async () => {
-        if (options?.beforeRemove != null && !(await options.beforeRemove())) {
+        const decision = options?.beforeRemove == null ? true : await options.beforeRemove();
+        if (decision === false) {
           return Ok(undefined);
         }
+        const binding = decision === true ? undefined : decision;
         const failure = (error: string) => {
           const descendants =
             this.agentTaskIntegration?.listWorkspaceRemovalDescendants(workspaceId);
@@ -6391,7 +6422,7 @@ export class WorkspaceService
               );
             if (!descendantsResult.success) return failure(descendantsResult.error);
           }
-          const result = await this.removeUnlocked(workspaceId, force);
+          const result = await this.removeUnlocked(workspaceId, force, binding);
           return result.success ? result : failure(result.error);
         } catch (error) {
           return failure(getErrorMessage(error));
@@ -6409,11 +6440,93 @@ export class WorkspaceService
    * or that must not acquire it for lock-ordering reasons (e.g. createWorkspaceTurn cleanup runs
    * under the task creation mutex, which the tree lock is ordered before).
    */
-  async removeWhileTaskTreeLocked(workspaceId: string, force = false): Promise<Result<void>> {
-    return await this.removeUnlocked(workspaceId, force);
+  async removeWhileTaskTreeLocked(
+    workspaceId: string,
+    force = false,
+    binding?: RemovalAttemptBinding
+  ): Promise<Result<void>> {
+    return await this.removeUnlocked(workspaceId, force, binding);
   }
 
-  private async removeUnlocked(workspaceId: string, force = false): Promise<Result<void>> {
+  /**
+   * Close admission on the row durably before any destructive effect (#4478). Another backend's
+   * in-process locks cannot see this removal; its task admissions refuse on this marker instead,
+   * and they commit through the same cross-process config lock, so each side sees the other.
+   * Returns the marker's id (undefined when the row is already gone), or an error when the
+   * removal must not proceed: the row moved off the attempt the caller decided on, or another
+   * live (or not provably dead) process holds a marker.
+   */
+  private async claimPendingRemoval(
+    workspaceId: string,
+    binding: RemovalAttemptBinding | undefined
+  ): Promise<Result<string | undefined>> {
+    const removalId = crypto.randomUUID();
+    let outcome: Result<string | undefined> = Ok(undefined);
+    await this.config.editConfig((config) => {
+      const row = findWorkspaceEntry(config, workspaceId)?.workspace;
+      if (row == null) return config;
+      if (binding != null && row.taskAttemptId !== binding.expectedAttemptId) {
+        outcome = Err(
+          `Workspace ${workspaceId} was not removed: it started attempt ` +
+            `${row.taskAttemptId ?? "none"} after the removal was decided.`
+        );
+        return config;
+      }
+      const held = row.pendingRemoval;
+      // This instance's own marker (a removal whose clean-up could not clear it) is retaken.
+      if (held != null && held.instanceId !== this.removalInstanceId) {
+        const verdict = judgeHolder(
+          { pid: held.pid, identity: parseProcessIdentity(held.identity) },
+          liveRemovalInstanceIds.has(held.instanceId)
+        );
+        if (!verdict.dead) {
+          outcome = Err(
+            `Workspace removal is already in progress in Xum process pid ${held.pid} ` +
+              `(${verdict.why}); retry once it finishes.`
+          );
+          return config;
+        }
+        log.info("Taking over the removal marker of a dead Xum process", {
+          workspaceId,
+          pid: held.pid,
+        });
+      }
+      row.pendingRemoval = {
+        removalId,
+        instanceId: this.removalInstanceId,
+        pid: process.pid,
+        identity: { ...getSelfIdentity() },
+        at: new Date().toISOString(),
+      };
+      outcome = Ok(removalId);
+      return config;
+    });
+    return outcome;
+  }
+
+  /** Reopen admission after a removal that left the workspace registered (CAS on the marker). */
+  private async releasePendingRemoval(workspaceId: string, removalId: string): Promise<void> {
+    try {
+      await this.config.editConfig((config) => {
+        const row = findWorkspaceEntry(config, workspaceId)?.workspace;
+        if (row?.pendingRemoval?.removalId === removalId) delete row.pendingRemoval;
+        return config;
+      });
+    } catch (error) {
+      // The marker stays: this instance's next removal retakes it, and any removal takes it over
+      // once this process has exited. Until then task admissions refuse.
+      log.error("Failed to clear the removal marker after an aborted removal", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  private async removeUnlocked(
+    workspaceId: string,
+    force = false,
+    binding?: RemovalAttemptBinding
+  ): Promise<Result<void>> {
     if (this.shuttingDown) return Err("Server is shutting down");
     // Idempotent: if already removing, return success to prevent race conditions
     if (this.removingWorkspaces.has(workspaceId)) {
@@ -6438,6 +6551,8 @@ export class WorkspaceService
     // handover) BEFORE the checkout deletion; an abort between the two rolls
     // it back so the intact workspace stays usable.
     let sealedForRemoval = false;
+    // This removal's pendingRemoval marker, once claimed (see claimPendingRemoval).
+    let pendingRemovalId: string | undefined;
 
     // If this workspace is mid-init, cancel the fire-and-forget init work (postCreateSetup,
     // sync/checkout, .xum/init hook, etc.) so removal doesn't leave orphaned background work.
@@ -6475,6 +6590,9 @@ export class WorkspaceService
       if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
       }
+      const claim = await this.claimPendingRemoval(workspaceId, binding);
+      if (!claim.success) return Err(claim.error);
+      pendingRemovalId = claim.data;
       // r65: keep renewing the removal tombstone's mtime until this removal
       // settles so a foreign backend's startup self-heal cannot mistake a
       // merely SLOW removal (a hung runtime deletion or MCP server close) for
@@ -7176,7 +7294,9 @@ export class WorkspaceService
 
       // Remove from config
       try {
-        await this.config.removeWorkspace(workspaceId);
+        await (pendingRemovalId != null
+          ? this.config.removeWorkspace(workspaceId, { removalId: pendingRemovalId })
+          : this.config.removeWorkspace(workspaceId));
       } catch (error) {
         // r62: the session directory and its durable removal tombstone are
         // already committed above. If deregistration fails here (e.g. the
@@ -7282,6 +7402,9 @@ export class WorkspaceService
           }
         }
         this.memoryConsolidationService?.releaseRemovalCancellation(workspaceId);
+        if (pendingRemovalId != null) {
+          await this.releasePendingRemoval(workspaceId, pendingRemovalId);
+        }
       }
       if (releaseOverridesLock !== undefined) {
         try {
@@ -7297,6 +7420,17 @@ export class WorkspaceService
         hold[Symbol.dispose]();
       }
       this.removingWorkspaces.delete(workspaceId);
+      this.retireRemovalInstanceIfIdle();
+    }
+  }
+
+  /**
+   * A shut-down instance with no removal in flight writes no more markers: drop it from the live
+   * set so a marker it left behind can be taken over by another service in this process.
+   */
+  private retireRemovalInstanceIfIdle(): void {
+    if (this.shuttingDown && this.removingWorkspaces.size === 0) {
+      liveRemovalInstanceIds.delete(this.removalInstanceId);
     }
   }
 

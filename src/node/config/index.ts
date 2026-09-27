@@ -75,6 +75,7 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 import { PlatformPaths } from "@/common/utils/paths";
+import { PendingRemovalSchema } from "@/common/schemas/project";
 import {
   getValidAgentMessageDispatchMode,
   getValidUnrelatedWorkspaceConsent,
@@ -735,17 +736,25 @@ function normalizePersistedWorkspace(
     taskExperiments.programmaticToolCalling !== true;
   const hasMalformedTaskAttemptId =
     persisted.taskAttemptId !== undefined && !isTaskAttemptId(persisted.taskAttemptId);
+  // A malformed removal marker (hand edit, corruption) is dropped rather than kept: every task
+  // admission refuses while one is set, and the removal could not judge its owner, so the
+  // workspace could neither be used nor removed.
+  const hasMalformedPendingRemoval =
+    persisted.pendingRemoval !== undefined &&
+    !PendingRemovalSchema.safeParse(persisted.pendingRemoval).success;
   if (
     !hasLegacyWorkflowSchedule &&
     !hasBestOf &&
     !hasLegacyPtcExclusive &&
-    !hasMalformedTaskAttemptId
+    !hasMalformedTaskAttemptId &&
+    !hasMalformedPendingRemoval
   ) {
     return workspace;
   }
 
   const nextWorkspace = { ...persisted };
   delete nextWorkspace.workflowSchedule;
+  if (hasMalformedPendingRemoval) delete nextWorkspace.pendingRemoval;
   if (hasMalformedTaskAttemptId) healMalformedTaskAttemptId(nextWorkspace);
 
   if (hasLegacyPtcExclusive) {
@@ -4239,6 +4248,7 @@ export class Config {
           taskAttemptUnproven: existing.taskAttemptUnproven,
           taskAttemptRetiredBy: existing.taskAttemptRetiredBy,
           taskTerminalFailure: existing.taskTerminalFailure,
+          pendingRemoval: existing.pendingRemoval,
         };
       } else {
         // Add new workspace
@@ -4253,9 +4263,20 @@ export class Config {
    * Remove a workspace from config.json
    *
    * @param workspaceId ID of the workspace to remove
+   * @param options.removalId - the removal's pendingRemoval marker: the row is removed only while
+   *   it still carries that marker (throws otherwise), so a removal whose marker another backend
+   *   took over cannot deregister the workspace under it.
    */
-  async removeWorkspace(workspaceId: string): Promise<void> {
+  async removeWorkspace(workspaceId: string, options?: { removalId?: string }): Promise<void> {
     await this.editConfig((config) => {
+      if (options?.removalId != null) {
+        const row = [...config.projects.values()]
+          .flatMap((project) => project.workspaces)
+          .find((workspace) => workspace.id === workspaceId);
+        if (row != null && row.pendingRemoval?.removalId !== options.removalId) {
+          throw new Error(`Workspace ${workspaceId} is no longer held by this removal`);
+        }
+      }
       let workspaceFound = false;
 
       for (const [_projectPath, project] of config.projects) {
