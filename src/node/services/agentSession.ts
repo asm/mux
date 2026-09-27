@@ -881,6 +881,13 @@ interface SendMessageInternalOptions {
    */
   admissionStale?: () => boolean;
   /**
+   * Skip on-send compaction for this send (#4721). A durable compaction follow-up keeps only
+   * text + send options, so a synthetic wake's caller restrictions and in-memory guards would be
+   * replayed after the compaction turn even if manual input tightened the policy meanwhile. Such
+   * wakes run as their own turn instead; mid-stream forcing still protects the context limit.
+   */
+  skipOnSendCompaction?: boolean;
+  /**
    * Task-attempt obligation for this send (see TurnAdmissionToken): notified of the coordinator's
    * admission inside the synchronous prepare callback. Its staleness is already composed into
    * `admissionStale` by WorkspaceService.
@@ -4549,7 +4556,13 @@ export class AgentSession {
     if (!agentInitiated && internal?.synthetic !== true && !isCompactionRequest) {
       this.contextController.noteUserTurn();
     }
-    if (!tokenBudgetActive && !isCompactionRequest && !editMessageId && !hasPreTurnMessages) {
+    if (
+      !tokenBudgetActive &&
+      !isCompactionRequest &&
+      !editMessageId &&
+      !hasPreTurnMessages &&
+      internal?.skipOnSendCompaction !== true
+    ) {
       // Seed usage state from persisted history on the first send after restart
       // so the compaction monitor can detect context limits even before any live
       // stream events have populated lastUsageState.
@@ -9528,6 +9541,8 @@ export class AgentSession {
       onPreTurnRowsPersisted?: () => void;
       /** Caller staleness probe re-checked at this entry's dispatch admission. */
       admissionStale?: () => boolean;
+      /** See SendMessageInternalOptions.skipOnSendCompaction. */
+      skipOnSendCompaction?: boolean;
       /** Task-attempt obligation owned by the entry until its dispatch or removal. */
       turnAdmission?: TurnAdmissionToken;
       compactionAdmissionStale?: () => boolean;
