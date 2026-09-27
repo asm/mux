@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import * as fsPromises from "node:fs/promises";
+import * as path from "node:path";
 
 import {
   MAX_STAGED_ATTACHMENT_SIZE_BYTES,
   STAGED_ATTACHMENT_DIR,
   STAGED_ATTACHMENT_DIRS,
+  STAGED_ATTACHMENT_MIRROR_DIR_NAME,
 } from "@/common/constants/stagedAttachments";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
@@ -13,6 +16,8 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { shellQuote } from "@/common/utils/shell";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
+import { log } from "@/node/services/log";
+import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
 import { ensureGitInfoExclude } from "@/node/utils/git/ensureGitInfoExclude";
 
 export interface StagedWorkspaceAttachment {
@@ -32,6 +37,8 @@ export interface DownloadedStagedWorkspaceAttachment {
 export async function stageWorkspaceAttachment(input: {
   runtime: Runtime;
   workspacePath: string;
+  /** Host session dir; receives the durable mirror copy (see STAGED_ATTACHMENT_MIRROR_DIR_NAME). */
+  sessionDir: string;
   filename: string;
   mediaType?: string | null;
   sizeBytes: number;
@@ -39,6 +46,7 @@ export async function stageWorkspaceAttachment(input: {
 }): Promise<Result<StagedWorkspaceAttachment, string>> {
   try {
     assert(input.workspacePath.trim().length > 0, "workspacePath is required");
+    assert(path.isAbsolute(input.sessionDir), "sessionDir must be absolute");
     const mediaType = getSupportedStagedAttachmentMediaType({
       mediaType: input.mediaType,
       filename: input.filename,
@@ -74,8 +82,22 @@ export async function stageWorkspaceAttachment(input: {
 
     const stagedDir = `${STAGED_ATTACHMENT_DIR}/${randomUUID()}`;
     const stagedPath = `${stagedDir}/${filename}`;
-    await input.runtime.ensureDir(`${input.workspacePath}/${stagedDir}`);
-    await writeBytes(input.runtime, `${input.workspacePath}/${stagedPath}`, bytes);
+    const mirrorPath = resolveStagedAttachmentMirrorPath(input.sessionDir, stagedPath);
+    assert(mirrorPath != null, "freshly staged paths must map to a mirror path");
+    // Mirror first: "staged" must imply durable, and a failed checkout write can clean up the
+    // host-local mirror file without a runtime round trip.
+    // Staging can run before the first chat write creates the session dir; keep it private like
+    // HistoryService does instead of letting the mirror create it world-readable.
+    await ensurePrivateDir(input.sessionDir);
+    await fsPromises.mkdir(path.dirname(mirrorPath), { recursive: true, mode: 0o700 });
+    await fsPromises.writeFile(mirrorPath, bytes, { flag: "wx" });
+    try {
+      await input.runtime.ensureDir(`${input.workspacePath}/${stagedDir}`);
+      await writeBytes(input.runtime, `${input.workspacePath}/${stagedPath}`, bytes);
+    } catch (error) {
+      await fsPromises.rm(path.dirname(mirrorPath), { recursive: true, force: true });
+      throw error;
+    }
 
     return Ok({ filename, mediaType, sizeBytes: bytes.byteLength, stagedPath });
   } catch (error) {
@@ -86,6 +108,7 @@ export async function stageWorkspaceAttachment(input: {
 export async function readStagedWorkspaceAttachment(input: {
   runtime: Runtime;
   workspacePath: string;
+  sessionDir: string;
   stagedPath: string;
 }): Promise<Result<DownloadedStagedWorkspaceAttachment, string>> {
   try {
@@ -95,9 +118,20 @@ export async function readStagedWorkspaceAttachment(input: {
       return Err("Invalid staged attachment path.");
     }
 
-    const bytes = await readStreamToBuffer(
-      input.runtime.readFile(`${input.workspacePath}/${stagedPath}`)
-    );
+    // Checkout first keeps today's semantics (download what the workspace holds); the mirror
+    // covers checkouts that lost the git-excluded copy. Legacy uploads have no mirror entry.
+    let bytes: Buffer;
+    try {
+      bytes = await readStreamToBuffer(
+        input.runtime.readFile(`${input.workspacePath}/${stagedPath}`)
+      );
+    } catch (checkoutError) {
+      const mirrorBytes = await readStagedAttachmentMirrorFile(input.sessionDir, stagedPath);
+      if (mirrorBytes == null) {
+        throw checkoutError;
+      }
+      bytes = mirrorBytes;
+    }
     if (bytes.byteLength > MAX_STAGED_ATTACHMENT_SIZE_BYTES) {
       return Err(
         `Attachments larger than ${MAX_STAGED_ATTACHMENT_SIZE_BYTES.toLocaleString()} bytes cannot be staged.`
@@ -180,6 +214,112 @@ export async function copyStagedWorkspaceAttachments(input: {
   }
 }
 
+/**
+ * Recreate checkout copies of mirrored staged attachments after a snapshot restore recreated the
+ * checkout (#3947). Every mirror entry is restored, not only paths the chat references: an upload
+ * can live only in a renderer-persisted draft that is sent after unarchive. Host-local filesystem
+ * only: snapshot restores exist solely for worktree runtimes. Entries staging could not have
+ * produced are skipped rather than failing the unarchive, one entry is held in memory at a time,
+ * and existing files are never overwritten.
+ */
+export async function rehydrateStagedWorkspaceAttachments(input: {
+  runtime: Runtime;
+  workspacePath: string;
+  sessionDir: string;
+}): Promise<Result<{ restored: string[]; skipped: string[] }, string>> {
+  try {
+    assert(path.isAbsolute(input.workspacePath), "workspacePath must be an absolute host path");
+    const restored: string[] = [];
+    const skipped: string[] = [];
+    const candidates: string[] = [];
+    for (const stagedPath of await listStagedAttachmentMirrorPaths(input.sessionDir)) {
+      if (resolveStagedAttachmentMirrorPath(input.sessionDir, stagedPath) == null) {
+        skipped.push(stagedPath);
+      } else {
+        candidates.push(stagedPath);
+      }
+    }
+    if (candidates.length === 0) {
+      return Ok({ restored, skipped });
+    }
+
+    const excludeResult = await ensureGitInfoExclude({
+      runtime: input.runtime,
+      workspacePath: input.workspacePath,
+      relativeDir: STAGED_ATTACHMENT_DIR,
+    });
+    if (excludeResult.status === "failed") {
+      return Err(`Could not mark staged attachments as ignored: ${excludeResult.error}`);
+    }
+
+    // The recreated checkout is repo-controlled: a tracked `.xum` symlink would redirect writes
+    // outside it, so every directory on the way down must be a real directory.
+    const stagingRoot = await ensureRealDirectoryChain(
+      input.workspacePath,
+      STAGED_ATTACHMENT_DIR.split("/")
+    );
+    if (stagingRoot == null) {
+      return Err(`Refusing to restore attachments: ${STAGED_ATTACHMENT_DIR} is not a directory.`);
+    }
+    for (const stagedPath of candidates) {
+      const [id, filename] = stagedPath.slice(STAGED_ATTACHMENT_DIR.length + 1).split("/");
+      try {
+        const bytes = await readStagedAttachmentMirrorFile(input.sessionDir, stagedPath);
+        const entryDir = bytes == null ? null : await ensureRealDirectoryChain(stagingRoot, [id]);
+        if (bytes == null || entryDir == null) {
+          skipped.push(stagedPath);
+          continue;
+        }
+        // wx: never overwrite, and O_EXCL refuses a symlinked leaf.
+        await fsPromises.writeFile(path.join(entryDir, filename), bytes, { flag: "wx" });
+        restored.push(stagedPath);
+      } catch (error) {
+        if (!isErrnoWithCode(error, "EEXIST")) {
+          log.debug("Skipping unrestorable staged attachment mirror entry", {
+            stagedPath,
+            error: getErrorMessage(error),
+          });
+        }
+        skipped.push(stagedPath);
+      }
+    }
+    return Ok({ restored, skipped });
+  } catch (error) {
+    return Err(getErrorMessage(error));
+  }
+}
+
+/**
+ * Copy referenced mirror entries into a fork's session dir. The mirror is supplementary to the
+ * checkout copy the fork already made, so a missing or unreadable entry is skipped instead of
+ * rolling back the fork.
+ */
+export async function copyStagedAttachmentMirrorEntries(input: {
+  sourceSessionDir: string;
+  targetSessionDir: string;
+  stagedPaths: readonly string[];
+}): Promise<void> {
+  for (const stagedPath of input.stagedPaths) {
+    const targetPath = resolveStagedAttachmentMirrorPath(input.targetSessionDir, stagedPath);
+    if (targetPath == null) {
+      continue;
+    }
+    try {
+      const bytes = await readStagedAttachmentMirrorFile(input.sourceSessionDir, stagedPath);
+      if (bytes == null) {
+        continue;
+      }
+      await fsPromises.mkdir(path.dirname(targetPath), { recursive: true });
+      await fsPromises.writeFile(targetPath, bytes, { flag: "w" });
+    } catch (error) {
+      log.warn("Skipping staged attachment mirror entry during fork", {
+        stagedPath,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+}
+
 export function extractStagedAttachmentPathsFromText(text: string): string[] {
   const paths = new Set<string>();
   const pattern = /`(?<path>\.(?:xum|mux)\/user-attachments\/[^`]+)`/gu;
@@ -233,6 +373,116 @@ function normalizeReadableStagedPath(stagedPath: string): string | null {
     return null;
   }
   return normalized;
+}
+
+const STAGED_ATTACHMENT_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+
+/**
+ * Map a canonical staged path (`<STAGED_ATTACHMENT_DIR>/<uuid>/<filename>`) to its mirror file.
+ * Returns null for anything staging could not have produced: legacy `.mux` paths (never
+ * mirrored), non-UUID directories, nested segments, or names that sanitizing would change.
+ */
+function resolveStagedAttachmentMirrorPath(sessionDir: string, stagedPath: string): string | null {
+  const normalized = normalizeReadableStagedPath(stagedPath);
+  if (!normalized?.startsWith(`${STAGED_ATTACHMENT_DIR}/`)) {
+    return null;
+  }
+  const segments = normalized.slice(STAGED_ATTACHMENT_DIR.length + 1).split("/");
+  if (segments.length !== 2) {
+    return null;
+  }
+  const [id, filename] = segments;
+  if (!STAGED_ATTACHMENT_ID_PATTERN.test(id) || sanitizeStagedFilename(filename) !== filename) {
+    return null;
+  }
+  return path.join(sessionDir, STAGED_ATTACHMENT_MIRROR_DIR_NAME, id, filename);
+}
+
+/** Read a mirror entry, or null when it is absent, not a regular file, or over the size cap. */
+async function readStagedAttachmentMirrorFile(
+  sessionDir: string,
+  stagedPath: string
+): Promise<Buffer | null> {
+  const mirrorPath = resolveStagedAttachmentMirrorPath(sessionDir, stagedPath);
+  if (mirrorPath == null) {
+    return null;
+  }
+  try {
+    const stat = await fsPromises.lstat(mirrorPath);
+    if (!stat.isFile() || stat.size > MAX_STAGED_ATTACHMENT_SIZE_BYTES) {
+      return null;
+    }
+    return await fsPromises.readFile(mirrorPath);
+  } catch (error) {
+    if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+/** List mirror entries as canonical staged paths (`<dir>/<id>/<name>`); unvalidated. */
+async function listStagedAttachmentMirrorPaths(sessionDir: string): Promise<string[]> {
+  const mirrorRoot = path.join(sessionDir, STAGED_ATTACHMENT_MIRROR_DIR_NAME);
+  let ids: string[];
+  try {
+    ids = await fsPromises.readdir(mirrorRoot);
+  } catch (error) {
+    if (isErrnoWithCode(error, "ENOENT")) {
+      return [];
+    }
+    throw error;
+  }
+  const stagedPaths: string[] = [];
+  for (const id of ids.sort()) {
+    const entryDir = path.join(mirrorRoot, id);
+    let names: string[];
+    try {
+      names = (await fsPromises.lstat(entryDir)).isDirectory()
+        ? await fsPromises.readdir(entryDir)
+        : [];
+    } catch (error) {
+      // One damaged entry (EACCES, EIO, ...) must not hide its valid siblings.
+      log.debug("Skipping unreadable staged attachment mirror entry", {
+        entryDir,
+        error: getErrorMessage(error),
+      });
+      names = [];
+    }
+    if (names.length === 0) {
+      // Reported as skipped: it fails resolveStagedAttachmentMirrorPath's two-segment shape.
+      stagedPaths.push(`${STAGED_ATTACHMENT_DIR}/${id}`);
+      continue;
+    }
+    for (const name of names.sort()) {
+      stagedPaths.push(`${STAGED_ATTACHMENT_DIR}/${id}/${name}`);
+    }
+  }
+  return stagedPaths;
+}
+
+/** Create/verify `root/segments...` as real directories (no symlinks); null if one is not. */
+async function ensureRealDirectoryChain(
+  root: string,
+  segments: readonly string[]
+): Promise<string | null> {
+  let current = root;
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    try {
+      await fsPromises.mkdir(current);
+    } catch (error) {
+      if (!isErrnoWithCode(error, "EEXIST")) {
+        throw error;
+      }
+    }
+    const stat = await fsPromises.lstat(current);
+    if (!stat.isDirectory()) {
+      return null;
+    }
+  }
+  return current;
 }
 
 function normalizeStagedAttachmentPaths(stagedPaths: readonly string[]): string[] {

@@ -183,9 +183,11 @@ import { removeManagedGitWorktree } from "@/node/worktree/removeManagedGitWorktr
 import { managedRootsByProject, syncProjectCodeWorkspace } from "@/node/worktree/codeWorkspaceSync";
 
 import {
+  copyStagedAttachmentMirrorEntries,
   copyStagedWorkspaceAttachments,
   extractStagedAttachmentPathsFromText,
   readStagedWorkspaceAttachment,
+  rehydrateStagedWorkspaceAttachments,
   stageWorkspaceAttachment,
   type DownloadedStagedWorkspaceAttachment,
   type StagedWorkspaceAttachment,
@@ -10717,6 +10719,9 @@ export class WorkspaceService
           }
           return Err(restoreResult.error);
         }
+        if (restoreResult.data === "restored") {
+          await this.rehydrateStagedAttachmentsAfterSnapshotRestore(workspaceId, hookMetadata);
+        }
       }
 
       // Restoration succeeded, so the unarchive is final from here: monitor attention held while
@@ -11888,6 +11893,12 @@ export class WorkspaceService
           if (!copyStagedAttachmentsResult.success) {
             throw new Error(copyStagedAttachmentsResult.error);
           }
+          // The fork needs its own durable copies so its snapshot archives keep them (#3947).
+          await copyStagedAttachmentMirrorEntries({
+            sourceSessionDir: path.join(this.config.sessionsDir, sourceWorkspaceId),
+            targetSessionDir: newSessionDir,
+            stagedPaths: referencedStagedAttachmentPaths,
+          });
         }
 
         // Forks inherit chat history, but their cost ledger must start fresh.
@@ -12630,6 +12641,44 @@ export class WorkspaceService
     return this.acquirePreflightAdmission(this.preflightMcpPromptDiscoveryCounts, workspaceId);
   }
 
+  /**
+   * Snapshot archives capture only git-visible state, so the git-excluded staging dir is gone once
+   * restore recreates the checkout (#3947). Put back every mirrored upload, including ones only a
+   * persisted draft references. Best-effort: the restored checkout is already live, and downloads fall back
+   * to the mirror anyway. Uploads staged before the mirror existed have no copy and stay lost.
+   */
+  private async rehydrateStagedAttachmentsAfterSnapshotRestore(
+    workspaceId: string,
+    metadata: WorkspaceMetadata
+  ): Promise<void> {
+    // restoreSnapshotAfterUnarchive only restores worktree runtimes, whose checkout is host-local.
+    assert(isWorktreeRuntime(metadata.runtimeConfig), "snapshot restores are worktree-only");
+    try {
+      const { runtime, workspacePath } = createRuntimeContextForWorkspace(metadata);
+      const result = await rehydrateStagedWorkspaceAttachments({
+        runtime,
+        workspacePath,
+        sessionDir: path.join(this.config.sessionsDir, workspaceId),
+      });
+      if (!result.success) {
+        log.warn("Failed to restore staged attachments after snapshot restore", {
+          workspaceId,
+          error: result.error,
+        });
+      } else if (result.data.skipped.length > 0) {
+        log.debug("Skipped staged attachments without a restorable mirror copy", {
+          workspaceId,
+          skipped: result.data.skipped,
+        });
+      }
+    } catch (error) {
+      log.warn("Failed to restore staged attachments after snapshot restore", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
   async stageAttachment(input: {
     workspaceId: string;
     filename: string;
@@ -12641,6 +12690,10 @@ export class WorkspaceService
     // writes into the checkout, so an archive must not capture/remove it mid-upload.
     if (this.archivingWorkspaces.has(input.workspaceId)) {
       return Err("Workspace is being archived. Unarchive it before attaching files.");
+    }
+    // Staging also writes the session-dir mirror; a removal in progress is deleting that dir.
+    if (this.removingWorkspaces.has(input.workspaceId)) {
+      return Err("Workspace is being removed.");
     }
     using _preflightStaging = this.acquirePreflightAdmission(
       this.preflightStagingCounts,
@@ -12664,6 +12717,7 @@ export class WorkspaceService
     return stageWorkspaceAttachment({
       runtime,
       workspacePath,
+      sessionDir: path.join(this.config.sessionsDir, input.workspaceId),
       filename: input.filename,
       mediaType: input.mediaType,
       sizeBytes: input.sizeBytes,
@@ -12701,6 +12755,7 @@ export class WorkspaceService
     return readStagedWorkspaceAttachment({
       runtime,
       workspacePath,
+      sessionDir: path.join(this.config.sessionsDir, input.workspaceId),
       stagedPath: input.stagedPath,
     });
   }
