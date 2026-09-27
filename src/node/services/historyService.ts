@@ -2342,6 +2342,12 @@ export class HistoryService {
     workspaceId: string,
     beforeHistorySequence: number
   ): Promise<boolean> {
+    // No non-negative sequence is below 0. Replay of an uncompacted chat usually
+    // starts at sequence 0, so this skips parsing the whole file (#4655).
+    if (beforeHistorySequence === 0) {
+      return false;
+    }
+
     let hasOlder = false;
     const visitor = (messages: MuxMessage[]): boolean | void => {
       for (const message of messages) {
@@ -2357,9 +2363,35 @@ export class HistoryService {
       }
     };
 
-    const completed = await this.iterateBackward(this.getChatHistoryPath(workspaceId), visitor);
-    if (completed && !hasOlder) {
-      await this.iterateBackward(this.getChatArchivePath(workspaceId), visitor);
+    // Order does not change this existence check, only its cost. The archive's
+    // newest rows are usually already older than the replayed active epoch, so
+    // its last chunk answers; chat.jsonl rows are mostly >= the replay's oldest
+    // sequence and would be parsed in full before reaching the archive.
+    // An unreadable archive must not fail a check that chat.jsonl alone answers
+    // (reading chat.jsonl first never opened the archive then), so its error is
+    // rethrown only when chat.jsonl has no older row either.
+    let archiveError: Error | undefined;
+    const scanArchive = async () => {
+      archiveError = undefined;
+      try {
+        await this.iterateBackward(this.getChatArchivePath(workspaceId), visitor);
+      } catch (error) {
+        archiveError = error instanceof Error ? error : new Error(String(error));
+      }
+    };
+    await scanArchive();
+    if (!hasOlder) {
+      await this.iterateBackward(this.getChatHistoryPath(workspaceId), visitor);
+    }
+    // A rotation by another backend can move an older row out of chat.jsonl after
+    // the archive read above. Rotation appends the sealed prefix to the archive
+    // before it rewrites chat.jsonl, so reading the archive once more after
+    // chat.jsonl sees that row. Only a "no" answer pays for the second read.
+    if (!hasOlder) {
+      await scanArchive();
+    }
+    if (!hasOlder && archiveError !== undefined) {
+      throw archiveError;
     }
 
     return hasOlder;

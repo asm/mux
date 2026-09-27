@@ -3064,6 +3064,142 @@ describe("HistoryService", () => {
     });
   });
 
+  describe("hasHistoryBeforeSequence", () => {
+    // Existence check over chat-archive.jsonl ∪ chat.jsonl, independent of read order.
+    const workspaceId = "ws-has-older";
+    const row = (id: string, historySequence?: number) =>
+      messageLine(workspaceId, createMuxMessage(id, "user", id, { historySequence }));
+    const malformed = "{not json";
+
+    it.each<{
+      name: string;
+      bound: number;
+      archive: string[] | null;
+      chat: string[];
+      expected: boolean;
+    }>([
+      {
+        name: "bound 0 is false even with sequence-0 and unsequenced rows in both files",
+        bound: 0,
+        archive: [row("a0", 0), row("a-unsequenced")],
+        chat: [row("c0", 0), row("c-unsequenced"), row("c1", 1)],
+        expected: false,
+      },
+      {
+        name: "older row only in the archive",
+        bound: 5,
+        archive: [row("a1", 1)],
+        chat: [row("c5", 5), row("c6", 6)],
+        expected: true,
+      },
+      {
+        name: "older row only in chat.jsonl without an archive file",
+        bound: 5,
+        archive: null,
+        chat: [row("c3", 3), row("c5", 5)],
+        expected: true,
+      },
+      {
+        name: "archive holds no smaller sequence, so chat.jsonl is still checked",
+        bound: 5,
+        archive: [row("a5", 5), row("a-unsequenced"), malformed, row("a7", 7)],
+        chat: [row("c4", 4), row("c6", 6)],
+        expected: true,
+      },
+      {
+        name: "no smaller sequence anywhere (equal sequences do not count)",
+        bound: 5,
+        archive: [row("a5", 5), row("a-unsequenced")],
+        chat: [row("c5", 5), row("c6", 6)],
+        expected: false,
+      },
+      {
+        name: "malformed and unsequenced rows are ignored",
+        bound: 5,
+        archive: null,
+        chat: [malformed, row("c-unsequenced"), row("c5", 5)],
+        expected: false,
+      },
+      {
+        name: "malformed and unsequenced rows newer than an older row do not stop the walk",
+        bound: 5,
+        archive: [row("a-unsequenced"), malformed],
+        chat: [row("c2", 2), malformed, row("c-unsequenced"), row("c5", 5)],
+        expected: true,
+      },
+    ])("$name", async ({ bound, archive, chat, expected }) => {
+      await writeHistoryLines(config, workspaceId, chat);
+      if (archive) {
+        await fs.writeFile(
+          path.join(config.sessionsDir, workspaceId, "chat-archive.jsonl"),
+          archive.join("\n") + "\n"
+        );
+      }
+
+      expect(await service.hasHistoryBeforeSequence(workspaceId, bound)).toBe(expected);
+    });
+  });
+
+  describe("hasHistoryBeforeSequence during a concurrent rotation", () => {
+    it("finds an older row that moves from chat.jsonl into the archive between the reads", async () => {
+      const workspaceId = "ws-has-older-rotating";
+      const row = (id: string, historySequence: number) =>
+        messageLine(workspaceId, createMuxMessage(id, "user", id, { historySequence }));
+      const workspaceDir = path.join(config.sessionsDir, workspaceId);
+      const archivePath = path.join(workspaceDir, "chat-archive.jsonl");
+      const chatPath = path.join(workspaceDir, "chat.jsonl");
+      await writeHistoryLines(config, workspaceId, [row("c3", 3), row("c5", 5)]);
+      await fs.writeFile(archivePath, `${row("a7", 7)}\n`);
+
+      // Simulate another backend's rotation right after the archive was read: append the
+      // sealed row to the archive first, then rewrite chat.jsonl without it (rotation order).
+      const stat = fs.stat;
+      let archiveReads = 0;
+      const spy = spyOn(fs, "stat").mockImplementation((async (
+        ...args: Parameters<typeof fs.stat>
+      ) => {
+        if (args[0] === archivePath) archiveReads++;
+        if (args[0] === chatPath && archiveReads === 1) {
+          await fs.appendFile(archivePath, `${row("c3", 3)}\n`);
+          await fs.writeFile(chatPath, `${row("c5", 5)}\n`);
+        }
+        return stat(...args);
+      }) as typeof fs.stat);
+      try {
+        expect(await service.hasHistoryBeforeSequence(workspaceId, 5)).toBe(true);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
+  describe("hasHistoryBeforeSequence with an unreadable archive", () => {
+    // A directory in place of chat-archive.jsonl makes every archive read fail (EISDIR).
+    const workspaceId = "ws-has-older-bad-archive";
+    const row = (id: string, historySequence: number) =>
+      messageLine(workspaceId, createMuxMessage(id, "user", id, { historySequence }));
+
+    it("still answers from chat.jsonl when it holds an older row", async () => {
+      await writeHistoryLines(config, workspaceId, [row("c3", 3), row("c5", 5)]);
+      await fs.mkdir(path.join(config.sessionsDir, workspaceId, "chat-archive.jsonl"));
+
+      expect(await service.hasHistoryBeforeSequence(workspaceId, 5)).toBe(true);
+    });
+
+    it("fails when chat.jsonl cannot answer without the archive", async () => {
+      await writeHistoryLines(config, workspaceId, [row("c5", 5), row("c6", 6)]);
+      await fs.mkdir(path.join(config.sessionsDir, workspaceId, "chat-archive.jsonl"));
+
+      let rejected = false;
+      try {
+        await service.hasHistoryBeforeSequence(workspaceId, 5);
+      } catch {
+        rejected = true;
+      }
+      expect(rejected).toBe(true);
+    });
+  });
+
   describe("getMessagesForCompactionEpoch", () => {
     it("returns evidence rows between the previous boundary and the new summary", async () => {
       const workspaceId = "ws-compaction-epoch";
