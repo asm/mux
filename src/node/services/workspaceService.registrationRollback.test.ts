@@ -67,6 +67,13 @@ function worktreePaths(repoPath: string): string[] {
     .sort();
 }
 
+/** Creates `branch` one commit ahead of HEAD, so only `git branch -D` would delete it. */
+function branchWithOwnCommit(repoPath: string, branch: string): string {
+  const tip = git(repoPath, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", `${branch} work`);
+  git(repoPath, "branch", branch, tip);
+  return tip;
+}
+
 async function exists(p: string): Promise<boolean> {
   return fs.access(p).then(
     () => true,
@@ -344,5 +351,49 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     expect(result.success ? "" : result.error).toContain("EACCES");
     // Unreadable is not proof the entry is gone, so nothing is deleted.
     expect(worktreePaths(projectPath).map((p) => path.basename(p))).toContain("feature-c");
+  });
+
+  // #4775 item 7: MultiProjectRuntime.deleteWorkspace must forward keepBranch to every project.
+  const createMultiSource = async () => {
+    const source = await service.createMultiProject(projects(), "multi-src", "main", undefined, {
+      type: "worktree",
+      srcBaseDir,
+    });
+    if (!source.success) throw new Error(source.error);
+    return source.data.id;
+  };
+
+  test("multi-project fork keeps an existing branch and removes the ones it made", async () => {
+    const sourceId = await createMultiSource();
+    const tip = branchWithOwnCommit(projectPath, "multi-fork");
+
+    await expectFailsWithSaveError(() => service.fork(sourceId, "multi-fork"));
+    expect(git(projectPath, "rev-parse", "multi-fork")).toBe(tip);
+    // A branch left behind would make a retry reuse its stale tip.
+    expect(git(otherProjectPath, "branch", "--list", "multi-fork")).toBe("");
+    for (const repo of [projectPath, otherProjectPath]) {
+      expect(worktreePaths(repo).map((p) => path.basename(p))).not.toContain("multi-fork");
+    }
+  });
+
+  test("multi-project fork that fails in a later project keeps the earlier existing branch", async () => {
+    const sourceId = await createMultiSource();
+    // Merged into main, so even the non-forced `git branch -d` of the orchestrator rollback deletes it.
+    git(projectPath, "branch", "multi-busy");
+    const tip = git(projectPath, "rev-parse", "multi-busy");
+    // Checked out elsewhere in the second project, so that project's fork fails after the first's.
+    git(
+      otherProjectPath,
+      "worktree",
+      "add",
+      path.join(harness.rootDir, "busy"),
+      "-b",
+      "multi-busy"
+    );
+
+    const result = await service.fork(sourceId, "multi-busy");
+    expect(result.success ? "" : result.error).toContain("Failed to fork project other");
+    expect(git(projectPath, "rev-parse", "multi-busy")).toBe(tip);
+    expect(worktreePaths(projectPath).map((p) => path.basename(p))).not.toContain("multi-busy");
   });
 });
