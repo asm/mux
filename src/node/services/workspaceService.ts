@@ -248,6 +248,10 @@ import {
 import { getFollowUpContentText } from "@/browser/utils/compaction/format";
 import { stripStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import {
+  STAGED_ATTACHMENT_MIRROR_DIR_NAME,
+  STAGED_ATTACHMENT_REHYDRATE_PENDING_FILE_NAME,
+} from "@/common/constants/stagedAttachments";
+import {
   isActiveWorkflowRunStatus,
   isNestedWorkflowRun,
   type WorkflowRunRecord,
@@ -471,6 +475,7 @@ const ORPHAN_SESSION_DIR_GRACE_MS = 24 * 60 * 60 * 1000;
 
 // Upper bound on startup .code-workspace reconciliation (see initialize()).
 const STARTUP_CODE_WORKSPACE_SYNC_TIMEOUT_MS = 10_000;
+const STARTUP_STAGED_ATTACHMENT_RECOVERY_TIMEOUT_MS = 10_000;
 
 /**
  * Cap on transient startup-recovery AgentSessions alive at once (see initialize()). Each
@@ -3882,6 +3887,19 @@ export class WorkspaceService
       await this.cleanupOrphanSessionDirs(allMetadata).catch((error: unknown) => {
         log.debug("Failed to clean orphaned session directories", { error });
       });
+      // Before chat recovery below, so a resumed turn already finds its attachments. Capped like
+      // the .code-workspace sync: a stalled volume must not delay recovery; past the deadline the
+      // sweep keeps running in the background and never rejects.
+      await raceWithAbortAndTimeout(
+        this.recoverPendingStagedAttachmentRehydration(allMetadata, options?.signal).catch(
+          (error: unknown) => {
+            log.warn("Failed to recover pending staged attachment rehydration", {
+              error: getErrorMessage(error),
+            });
+          }
+        ),
+        { signal: options?.signal, timeoutMs: STARTUP_STAGED_ATTACHMENT_RECOVERY_TIMEOUT_MS }
+      );
       let scheduledCount = 0;
       let skippedTaskCount = 0;
       let skippedArchivedCount = 0;
@@ -10978,6 +10996,9 @@ export class WorkspaceService
       }
 
       if (this.worktreeArchiveSnapshotService && hookMetadata) {
+        // Durable before restore can recreate the checkout: a crash before rehydration finishes
+        // leaves the workspace unarchived, so only the startup sweep can finish the job (#4850).
+        await this.markStagedAttachmentRehydrationPending(workspaceId, hookMetadata);
         const restoreResult =
           await this.worktreeArchiveSnapshotService.restoreSnapshotAfterUnarchive({
             workspaceId,
@@ -10988,6 +11009,8 @@ export class WorkspaceService
             workspaceId,
             error: restoreResult.error,
           });
+          // The workspace goes back to archived; the next unarchive marks it again.
+          await this.clearStagedAttachmentRehydrationPending(workspaceId);
           if (persistedUnarchivedAt) {
             // Best effort (#4748): a failed rollback must not replace the restore error, and the
             // UI still needs what disk now says.
@@ -11018,6 +11041,8 @@ export class WorkspaceService
         }
         if (restoreResult.data === "restored") {
           await this.rehydrateStagedAttachmentsAfterSnapshotRestore(workspaceId, hookMetadata);
+        } else {
+          await this.clearStagedAttachmentRehydrationPending(workspaceId);
         }
       }
 
@@ -12221,6 +12246,22 @@ export class WorkspaceService
             targetSessionDir: newSessionDir,
             stagedPaths: referencedStagedAttachmentPaths,
           });
+          // #4850: a source checkout that lost its copy leaves only the mirror. Host-local worktree
+          // forks get the checkout copy from it through the guarded rehydration (real directories
+          // only, never overwrites, so copies made above win). Best-effort like the mirror copy.
+          if (isWorktreeRuntime(forkedRuntimeConfig)) {
+            const rehydrated = await rehydrateStagedWorkspaceAttachments({
+              runtime: targetRuntime,
+              workspacePath: targetWorkspacePath,
+              sessionDir: newSessionDir,
+            });
+            if (!rehydrated.success) {
+              log.warn("Failed to materialize mirrored staged attachments in fork", {
+                workspaceId: newWorkspaceId,
+                error: rehydrated.error,
+              });
+            }
+          }
         }
 
         // Forks inherit chat history, but their cost ledger must start fresh.
@@ -12992,16 +13033,28 @@ export class WorkspaceService
         sessionDir: path.join(this.config.sessionsDir, workspaceId),
       });
       if (!result.success) {
+        // The pending marker stays, so the startup sweep retries.
         log.warn("Failed to restore staged attachments after snapshot restore", {
           workspaceId,
           error: result.error,
         });
-      } else if (result.data.skipped.length > 0) {
+        return;
+      }
+      if (result.data.skipped.length > 0) {
         log.debug("Skipped staged attachments without a restorable mirror copy", {
           workspaceId,
           skipped: result.data.skipped,
         });
       }
+      if (result.data.failed.length > 0) {
+        // Possibly transient (EACCES, ENOSPC): keep the marker so the next startup retries.
+        log.warn("Failed to restore some staged attachments after snapshot restore", {
+          workspaceId,
+          failed: result.data.failed,
+        });
+        return;
+      }
+      await this.clearStagedAttachmentRehydrationPending(workspaceId);
     } catch (error) {
       log.warn("Failed to restore staged attachments after snapshot restore", {
         workspaceId,
@@ -13054,6 +13107,97 @@ export class WorkspaceService
       log.warn("Failed to backfill staged attachment mirror before snapshot archive", {
         workspaceId,
         error: getErrorMessage(error),
+      });
+    }
+  }
+
+  private getStagedAttachmentRehydrationMarkerPath(workspaceId: string): string {
+    return path.join(
+      this.config.sessionsDir,
+      workspaceId,
+      STAGED_ATTACHMENT_REHYDRATE_PENDING_FILE_NAME
+    );
+  }
+
+  /**
+   * Record that a snapshot restore may recreate the checkout before rehydration runs (#4850).
+   * Only worktree workspaces with a mirror need it. Best-effort: without the marker a crash in
+   * that window behaves as before (downloads still fall back to the mirror).
+   */
+  private async markStagedAttachmentRehydrationPending(
+    workspaceId: string,
+    metadata: WorkspaceMetadata
+  ): Promise<void> {
+    // Without a pending snapshot, restore leaves the checkout untouched; a marker there would make
+    // a crash look like a recreated checkout and resurrect deliberately deleted uploads.
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    if (!isWorktreeRuntime(metadata.runtimeConfig) || entry?.worktreeArchiveSnapshot == null) {
+      return;
+    }
+    const sessionDir = path.join(this.config.sessionsDir, workspaceId);
+    try {
+      const mirrorRoot = await fsPromises.lstat(
+        path.join(sessionDir, STAGED_ATTACHMENT_MIRROR_DIR_NAME)
+      );
+      if (!mirrorRoot.isDirectory()) {
+        return;
+      }
+      await fsPromises.writeFile(this.getStagedAttachmentRehydrationMarkerPath(workspaceId), "");
+    } catch (error) {
+      if (!isErrnoWithCode(error, "ENOENT")) {
+        log.warn("Failed to mark staged attachment rehydration as pending", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
+    }
+  }
+
+  private async clearStagedAttachmentRehydrationPending(workspaceId: string): Promise<void> {
+    try {
+      await fsPromises.rm(this.getStagedAttachmentRehydrationMarkerPath(workspaceId), {
+        force: true,
+      });
+    } catch (error) {
+      log.warn("Failed to clear the staged attachment rehydration marker", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  /**
+   * Startup recovery for #4850: finish rehydration for unarchived worktree workspaces whose
+   * pending marker survived a crash. Rehydration never overwrites, so a repeat is harmless.
+   * A marker is the trigger, rather than rehydrating on every start, so uploads deleted from
+   * the checkout on purpose are not brought back.
+   */
+  private async recoverPendingStagedAttachmentRehydration(
+    allMetadata: readonly WorkspaceMetadata[],
+    signal?: AbortSignal
+  ): Promise<void> {
+    for (const metadata of allMetadata) {
+      if (signal?.aborted === true) {
+        return;
+      }
+      if (!isWorktreeRuntime(metadata.runtimeConfig)) {
+        continue;
+      }
+      // Only a regular file counts: anything else is corrupted state that clearing cannot remove,
+      // and treating it as pending would re-run rehydration on every start.
+      const marker = await fsPromises
+        .lstat(this.getStagedAttachmentRehydrationMarkerPath(metadata.id))
+        .catch(() => null);
+      if (marker?.isFile() !== true) {
+        continue;
+      }
+      // Unarchive shares this lock, so it cannot interleave with a live restore.
+      await this.withTaskTreeLifecycleLock(metadata.id, async () => {
+        const live = findWorkspaceEntry(this.config.loadConfigOrDefault(), metadata.id)?.workspace;
+        if (live == null || isWorkspaceArchived(live.archivedAt, live.unarchivedAt)) {
+          return;
+        }
+        await this.rehydrateStagedAttachmentsAfterSnapshotRestore(metadata.id, metadata);
       });
     }
   }
