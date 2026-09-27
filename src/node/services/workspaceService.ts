@@ -8740,8 +8740,17 @@ export class WorkspaceService
         });
       });
 
-      // Rename plan file if it exists (uses workspace name, not ID)
-      await movePlanFile(runtimeForPlanFile, oldName, newName, oldMetadata.projectName);
+      // Rename plan file if it exists (uses workspace name, not ID). The checkout and config are
+      // already renamed, so a failed move (e.g. an unreachable SSH host) must not skip the
+      // metadata updates below; it is reported once they are done (#4826). movePlanFile never
+      // deletes the source on failure, so the plan stays at its old name.
+      let planMoveError: string | undefined;
+      try {
+        await movePlanFile(runtimeForPlanFile, oldName, newName, oldMetadata.projectName);
+      } catch (error: unknown) {
+        planMoveError = getErrorMessage(error);
+        log.warn("Failed to move plan file after rename", { workspaceId, error: planMoveError });
+      }
 
       const allMetadataUpdated = await this.config.getAllWorkspaceMetadata();
       const updatedMetadata = allMetadataUpdated.find((m) => m.id === workspaceId);
@@ -8771,6 +8780,13 @@ export class WorkspaceService
 
       await this.syncCodeWorkspaceFiles(updatedMetadata);
 
+      if (planMoveError !== undefined) {
+        // Retrying this rename is a no-op (the name already matches), but renaming back to the old
+        // name finds the plan there again: movePlanFile skips a missing source.
+        return Err(
+          `Workspace renamed to "${newName}", but its plan file could not be moved from "${oldName}": ${planMoveError}. The plan is still under the old name; rename the workspace back to "${oldName}" to use it again.`
+        );
+      }
       return Ok({ newWorkspaceId: workspaceId });
     } catch (error) {
       const message = getErrorMessage(error);
@@ -11803,7 +11819,23 @@ export class WorkspaceService
         // Persist an explicit empty usage file so later reads do not rebuild
         // historical costs from the copied messages.
         await resetForkedSessionUsage(this.sessionUsageService, newWorkspaceId, newSessionDir);
+
+        // Copy plan file using explicit source/target runtimes for cross-runtime safety. Inside
+        // this try: a plan the source runtime could not read (or the target could not store)
+        // fails the fork through the same cleanup, instead of a fork missing its plan (#4826).
+        await copyPlanFileAcrossRuntimes(
+          freshSourceRuntime,
+          targetRuntime,
+          sourceMetadata.name,
+          sourceWorkspaceId,
+          resolvedName,
+          projectName
+        );
       } catch (copyError) {
+        // Same ordering as abortForkRegistration below: background init still runs against this
+        // checkout, so abort it and AWAIT termination before deleting the worktree.
+        initAbortController.abort();
+        await initSettled;
         const forkTrusted = projectConfig.trusted ?? false;
         await targetRuntime.deleteWorkspace(
           foundProjectPath,
@@ -11814,25 +11846,12 @@ export class WorkspaceService
           // An explicit fork name can reuse an existing branch; never delete that (#4775).
           { keepBranch: forkCreatedBranch !== true }
         );
-        try {
-          await fsPromises.rm(newSessionDir, { recursive: true, force: true });
-        } catch (cleanupError) {
-          log.error(`Failed to clean up session dir ${newSessionDir}:`, cleanupError);
-        }
-        initLogger.logComplete(-1);
+        // No config entry exists yet, so the creation-state cleanup owns everything else: the
+        // registered session, in-memory and persisted init state, and the session dir.
+        await this.discardCreationState(newWorkspaceId, initAbortController, true);
         const message = getErrorMessage(copyError);
         return Err(`Failed to copy fork state: ${message}`);
       }
-
-      // Copy plan file using explicit source/target runtimes for cross-runtime safety.
-      await copyPlanFileAcrossRuntimes(
-        freshSourceRuntime,
-        targetRuntime,
-        sourceMetadata.name,
-        sourceWorkspaceId,
-        resolvedName,
-        projectName
-      );
 
       if (sourceRuntimeConfigUpdate) {
         await this.config.updateWorkspaceMetadata(sourceWorkspaceId, {
