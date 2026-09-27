@@ -118,6 +118,7 @@ describe("SSH2Transport.spawnRemoteProcess", () => {
           // Simulate ssh2 never invoking the exec callback.
         },
       }),
+      openChannels: 0,
     } as never);
 
     const reportFailureSpy = spyOn(ssh2ConnectionPool, "reportFailure");
@@ -166,6 +167,7 @@ describe("SSH2Transport.spawnRemoteProcess", () => {
     const channel = new FakeClientChannel();
     acquireConnectionSpy.mockResolvedValue({
       client: createFakeClient(channel),
+      openChannels: 0,
     } as never);
 
     const transport = new SSH2Transport({ host: "remote.example.com" });
@@ -183,6 +185,7 @@ describe("SSH2Transport.spawnRemoteProcess", () => {
     const channel = new FakeClientChannel({ includeStderr: true });
     acquireConnectionSpy.mockResolvedValue({
       client: createFakeClient(channel),
+      openChannels: 0,
     } as never);
 
     const transport = new SSH2Transport({ host: "remote.example.com" });
@@ -193,6 +196,40 @@ describe("SSH2Transport.spawnRemoteProcess", () => {
     channel.finish(7);
 
     expect(await stderrPromise).toBe("err\n");
+  });
+});
+
+describe("SSH2 pool channel tracking (#4876)", () => {
+  // ssh2 parses a whole TCP chunk synchronously: for an instant command the
+  // open callback and the channel's close can both fire before an `await`
+  // continuation runs. Tracking must already be attached, or the pooled
+  // connection counts a channel that never closes and is never idle-closed.
+  test("counts a channel that closes right after its open callback as closed", async () => {
+    const execChannel = new FakeClientChannel();
+    const shellChannel = new FakeClientChannel();
+    const entry = {
+      openChannels: 0,
+      client: Object.assign(new EventEmitter(), {
+        exec(_command: string, callback: (err?: Error, stream?: FakeClientChannel) => void) {
+          callback(undefined, execChannel);
+          execChannel.emit("close", 0, null);
+        },
+        shell(_options: unknown, callback: (err?: Error, stream?: FakeClientChannel) => void) {
+          callback(undefined, shellChannel);
+          shellChannel.emit("close");
+        },
+      }),
+    };
+    const spy = spyOn(ssh2ConnectionPool, "acquireConnection").mockResolvedValue(entry as never);
+    try {
+      const transport = new SSH2Transport({ host: "remote.example.com" });
+      await transport.spawnRemoteProcess("true", {});
+      expect(entry.openChannels).toBe(0);
+      await transport.createPtySession({ workspacePath: "/remote", cols: 80, rows: 24 });
+      expect(entry.openChannels).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

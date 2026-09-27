@@ -298,12 +298,12 @@ export class SSH2Transport implements SSHTransport {
     const connectTimeoutSec =
       options.timeout !== undefined ? Math.min(Math.ceil(options.timeout), 15) : 15;
 
-    let client;
+    let entry;
     try {
-      ({ client } = await ssh2ConnectionPool.acquireConnection(this.config, {
+      entry = await ssh2ConnectionPool.acquireConnection(this.config, {
         abortSignal: options.abortSignal,
         timeoutMs: connectTimeoutSec * 1000,
-      }));
+      });
     } catch (error) {
       // An abort (e.g. while waiting out a backoff) is not a transport failure.
       throw new RuntimeErrorClass(
@@ -313,6 +313,7 @@ export class SSH2Transport implements SSHTransport {
       );
     }
 
+    const { client } = entry;
     watchForConnectionClose(client);
 
     try {
@@ -371,6 +372,9 @@ export class SSH2Transport implements SSHTransport {
             finish(() => reject(new Error("SSH2 exec did not return a stream")));
             return;
           }
+          // Track inside the callback: ssh2 can emit this channel's close in
+          // the same tick, before an await continuation would run (#4876).
+          ssh2ConnectionPool.trackChannel(this.config, entry, stream);
           finish(() => resolve(stream));
         };
 
@@ -410,9 +414,9 @@ export class SSH2Transport implements SSHTransport {
   }
 
   async createPtySession(params: PtySessionParams): Promise<PtyHandle> {
-    const { client } = await ssh2ConnectionPool.acquireConnection(this.config, { maxWaitMs: 0 });
+    const entry = await ssh2ConnectionPool.acquireConnection(this.config, { maxWaitMs: 0 });
     const channel = await new Promise<ClientChannel>((resolve, reject) => {
-      client.shell(
+      entry.client.shell(
         {
           term: "xterm-256color",
           cols: params.cols,
@@ -427,6 +431,8 @@ export class SSH2Transport implements SSHTransport {
             reject(new Error("SSH2 shell did not return a stream"));
             return;
           }
+          // Same-tick close is possible here too (see spawnRemoteProcess).
+          ssh2ConnectionPool.trackChannel(this.config, entry, stream);
           resolve(stream);
         }
       );
