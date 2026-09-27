@@ -35,13 +35,22 @@ const SEND_MESSAGE_TIMEOUT_MS = 30_000;
  * Simple agent toggle for VS Code extension (no agent discovery).
  * Just toggles between Exec and Plan agents.
  */
-function SimpleAgentToggle(props: { agentId: AgentId; onChange: (agentId: AgentId) => void }) {
+function SimpleAgentToggle(props: {
+  agentId: AgentId;
+  onChange: (agentId: AgentId) => void;
+  /** Sub-agent workspaces keep the agent they were created with (#4738). */
+  disabled: boolean;
+}) {
   const isPlan = props.agentId === "plan";
+  // Seeded workspace settings can name a custom agent (e.g. a sub-agent's "explore"); show it as
+  // is rather than mislabeling it as Exec.
+  const label = isPlan ? "Plan" : props.agentId === "exec" ? "Exec" : props.agentId;
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <button
           type="button"
+          disabled={props.disabled}
           onClick={() => props.onChange(isPlan ? "exec" : "plan")}
           className={cn(
             "rounded-sm px-1.5 py-0.5 text-[11px] font-medium transition-all duration-150",
@@ -50,7 +59,7 @@ function SimpleAgentToggle(props: { agentId: AgentId; onChange: (agentId: AgentI
               : "bg-exec-mode text-white hover:bg-exec-mode-hover"
           )}
         >
-          {isPlan ? "Plan" : "Exec"}
+          {label}
         </button>
       </TooltipTrigger>
       <TooltipContent align="center">
@@ -103,7 +112,7 @@ function ChatComposerInner(props: {
   const apiState = useAPI();
   const api = apiState.api;
 
-  const { agentId, setAgentId } = useAgent();
+  const { agentId, setAgentId, isAgentSelectionLocked } = useAgent();
 
   const { options: providerOptions } = useProviderOptions();
   const use1M = providerOptions.anthropic?.use1MContext ?? false;
@@ -189,8 +198,8 @@ function ChatComposerInner(props: {
     ensureModelInSettings(canonicalModel);
     setPreferredModel(canonicalModel);
 
-    // #4755: the webview never loads the workspace's AI settings, so a model change stays local;
-    // persisting it would also write the webview's unloaded thinking default onto the workspace.
+    // #4755: a model change stays local. Persisting from the webview would need the desktop's
+    // selection-intent, gateway-route and write-ordering handling, so it stays off (#4778 review).
   };
 
   const cycleModels = customModels.length > 0 ? customModels : models;
@@ -248,8 +257,10 @@ function ChatComposerInner(props: {
     try {
       const options = {
         ...getSendOptionsFromStorage(props.workspaceId),
-        // #4755: these options come from webview-local storage, never loaded from the workspace.
-        // Skip persistence so a webview send cannot overwrite the workspace's agent/model/thinking.
+        // The effective agent: for a sub-agent workspace, the locked agent (#4738), not a local pick.
+        agentId,
+        // #4755: never persist from the webview. Even with the workspace's settings seeded (#4738),
+        // saving needs the desktop's selection-intent/gateway-route handling (#4778 review).
         // The thinking level is sent as selected: the webview does not load the user's configured
         // per-model minimums, so only the backend can apply the authoritative floor.
         skipAiSettingsPersistence: true,
@@ -369,7 +380,11 @@ function ChatComposerInner(props: {
               data={contextUsageData}
               autoCompaction={autoCompactionSettings}
             />
-            <SimpleAgentToggle agentId={agentId} onChange={setAgentId} />
+            <SimpleAgentToggle
+              agentId={agentId}
+              onChange={setAgentId}
+              disabled={isAgentSelectionLocked === true}
+            />
 
             <Tooltip>
               <TooltipTrigger asChild>
