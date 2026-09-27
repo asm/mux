@@ -3257,23 +3257,25 @@ export class WorkspaceService
   private async rollbackUnsanitizedWorkspaceRegistration(workspaceId: string): Promise<boolean> {
     for (let attempt = 0; attempt < 2; attempt++) {
       await this.config.removeWorkspace(workspaceId).catch(() => undefined);
-      // Strict: a lenient read of an unreadable file returns an empty default, which would
-      // falsely prove the entry gone and license deleting its checkout (#4775).
-      let stillPresent = true;
-      try {
-        const persisted = this.config.loadConfigOrDefault({ throwOnError: true });
-        stillPresent = Array.from(persisted.projects.values()).some((project) =>
-          project.workspaces.some((workspace) => workspace.id === workspaceId)
-        );
-      } catch {
-        // Not provably gone.
-      }
-      if (!stillPresent) {
+      if (this.isRegistrationProvablyGone(workspaceId)) {
         return true;
       }
     }
     log.error(`Failed to roll back workspace ${workspaceId} after its creation aborted`);
     return false;
+  }
+
+  private isRegistrationProvablyGone(workspaceId: string): boolean {
+    // Strict: a lenient read of an unreadable file returns an empty default, which would
+    // falsely prove the entry gone and license deleting its checkout (#4775).
+    try {
+      const persisted = this.config.loadConfigOrDefault({ throwOnError: true });
+      return !Array.from(persisted.projects.values()).some((project) =>
+        project.workspaces.some((workspace) => workspace.id === workspaceId)
+      );
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -3374,6 +3376,32 @@ export class WorkspaceService
     // file leaks another unreachable session for the process lifetime.
     await this.discardCreationState(workspaceId, args.initAbortController, rolledBack);
     return rolledBack;
+  }
+
+  /**
+   * #4818: undo the registration of a create()/fork() that failed after its config write and
+   * before publishing the workspace, so the caller is not told creation failed while the workspace
+   * stays listed (and, after the default grant, messageable). `rollback` is the operation's own
+   * abort, which keeps
+   * #4777's rules: only a branch this operation made is deleted, and the checkout only after a
+   * strict read shows the entry gone. Returns the error to report.
+   */
+  private async rollBackFailedRegistration(
+    workspaceId: string,
+    rollback: () => Promise<boolean>,
+    error: string
+  ): Promise<string> {
+    const entryGone = await rollback().catch((rollbackError: unknown) => {
+      logRegistrationRollbackFailure(workspaceId, rollbackError);
+      // A cleanup step after the deregistration can throw too.
+      return this.isRegistrationProvablyGone(workspaceId);
+    });
+    if (!entryGone) {
+      return `${error} Additionally, the half-created workspace registration could not be rolled back; remove workspace ${workspaceId} manually before retrying.`;
+    }
+    // Setup may already have written activity (fork's goal inheritance, for example).
+    await this.discardExtensionMetadataEntry(workspaceId);
+    return error;
   }
 
   /**
@@ -5652,6 +5680,8 @@ export class WorkspaceService
     // True once a retained owner (the deferred checkout's settlement) finalizes the pending
     // default; otherwise the finally below does (#4455).
     let pendingDefaultHandedOff = false;
+    // Set while a failure must undo this creation's registration (#4818).
+    let rollBackRegistration: (() => Promise<boolean>) | undefined;
 
     try {
       let finalBranchName = resolvedBranchName;
@@ -5818,10 +5848,8 @@ export class WorkspaceService
           return config;
         });
         const registeredRuntime: Runtime = runtime;
-        await registration.catch(async (error: unknown) => {
-          // #4745: nothing references this checkout yet; undo the creation, then fail with the
-          // write's own error.
-          await this.abortUnsanitizedCreation({
+        const abortRegistration = () =>
+          this.abortUnsanitizedCreation({
             workspaceId,
             runtime: registeredRuntime,
             runtimeConfig: finalRuntimeConfig,
@@ -5833,17 +5861,21 @@ export class WorkspaceService
             // is safe only on a branch this creation made.
             checkout:
               createResult!.createdBranch === true ? "force-delete" : "force-delete-keep-branch",
-          }).catch((rollbackError: unknown) =>
+          });
+        await registration.catch(async (error: unknown) => {
+          // #4745: nothing references this checkout yet; undo the creation, then fail with the
+          // write's own error.
+          await abortRegistration().catch((rollbackError: unknown) =>
             logRegistrationRollbackFailure(workspaceId, rollbackError)
           );
           throw error;
         });
+        rollBackRegistration = abortRegistration;
 
         const allMetadata = await this.config.getAllWorkspaceMetadata();
         completeMetadata = allMetadata.find((m) => m.id === workspaceId);
         if (!completeMetadata) {
-          initLogger.logComplete(-1);
-          return Err("Failed to retrieve workspace metadata");
+          throw new Error("Failed to retrieve workspace metadata");
         }
 
         // The checkout being registered may already hold plugin enables no
@@ -5862,6 +5894,7 @@ export class WorkspaceService
             createResult!.workspacePath
           );
           if (sanitizeError !== undefined) {
+            rollBackRegistration = undefined;
             const rolledBack = await this.abortUnsanitizedCreation({
               workspaceId,
               runtime,
@@ -5879,6 +5912,10 @@ export class WorkspaceService
             );
           }
         }
+        // Publication starts here (the consent grant, then the announcement below): once other
+        // task trees or the UI can reach the workspace, a forced rollback could delete it under
+        // them, so the steps from here on must not fail.
+        rollBackRegistration = undefined;
         if (defaultConsent !== "after-setup") {
           // Off until the caller finalizes the mark, or for good (see the option).
         } else if (pendingMaterialization !== undefined) {
@@ -5906,10 +5943,9 @@ export class WorkspaceService
 
       session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
 
-      // Background init: run postCreateSetup (if present) then initWorkspace
-      const secrets = await secretsToRecord(
-        this.secretsStore.getEffectiveSecrets(owningProjectPath)
-      );
+      // Background init: run postCreateSetup (if present) then initWorkspace. It reuses the
+      // secrets read before the checkout: a second, fallible read here would come after
+      // publication (#4818).
       // Background init: postCreateSetup (provisioning) + initWorkspace (sync/checkout/hook)
       //
       // If the user cancelled creation while create() was still in flight, avoid spawning
@@ -5921,7 +5957,7 @@ export class WorkspaceService
           trunkBranch: normalizedTrunkBranch,
           workspacePath: createResult!.workspacePath,
           initLogger,
-          env: secrets,
+          env: createEnv,
           abortSignal: initAbortController.signal,
           trusted: projectConfig.trusted ?? false,
         };
@@ -5960,8 +5996,12 @@ export class WorkspaceService
       return Ok({ metadata: this.enrichFrontendMetadata(completeMetadata) });
     } catch (error) {
       initLogger.logComplete(-1);
-      const message = getErrorMessage(error);
-      return Err(`Failed to create workspace: ${message}`);
+      const message = `Failed to create workspace: ${getErrorMessage(error)}`;
+      return Err(
+        rollBackRegistration
+          ? await this.rollBackFailedRegistration(workspaceId, rollBackRegistration, message)
+          : message
+      );
     } finally {
       // Fail closed (#4455): one finalization for every exit that did not hand the pending default
       // to the deferred checkout's settlement. That covers an Err after registration and a deferred
@@ -11506,6 +11546,8 @@ export class WorkspaceService
     );
     // Set once the fork's ID exists; the finally below finalizes its pending default (#4455).
     let forkWorkspaceId: string | undefined;
+    // Set while a failure must undo this fork's registration (#4818).
+    let rollBackForkRegistration: (() => Promise<boolean>) | undefined;
     try {
       const sourceMetadataResult = await this.aiService.getWorkspaceMetadata(sourceWorkspaceId);
       if (!sourceMetadataResult.success) {
@@ -11983,12 +12025,14 @@ export class WorkspaceService
             );
             throw error;
           });
+        rollBackForkRegistration = abortForkRegistration;
         if (forkIsHostLocalCheckout) {
           const sanitizeError = await this.sanitizeStalePluginOverridesForNewWorkspace(
             newWorkspaceId,
             workspacePath
           );
           if (sanitizeError !== undefined) {
+            rollBackForkRegistration = undefined;
             const rolledBack = await abortForkRegistration();
             initLogger.logComplete(-1);
             return Err(
@@ -12041,6 +12085,10 @@ export class WorkspaceService
           ...(this.sessionUsageService ? { sessionUsageService: this.sessionUsageService } : {}),
         });
       }
+      // The background summary writes into this fork's session from here, so a rollback would
+      // race it; the remaining steps do not throw (the grant fails closed, code-workspace sync
+      // never throws).
+      rollBackForkRegistration = undefined;
 
       // A fork is a new root workspace: opted in with its OWN generation (the metadata above
       // never copies the source's, so revoking one cannot be bypassed through the other). Granted
@@ -12059,8 +12107,16 @@ export class WorkspaceService
       eventSpine.emit("workspace.created", { workspaceId: newWorkspaceId });
       return Ok({ metadata: enrichedMetadata, projectPath: foundProjectPath });
     } catch (error) {
-      const message = getErrorMessage(error);
-      return Err(`Failed to fork workspace: ${message}`);
+      const message = `Failed to fork workspace: ${getErrorMessage(error)}`;
+      return Err(
+        rollBackForkRegistration && forkWorkspaceId != null
+          ? await this.rollBackFailedRegistration(
+              forkWorkspaceId,
+              rollBackForkRegistration,
+              message
+            )
+          : message
+      );
     } finally {
       // Fail closed (#4455): a fork that fails after registering its row must not leave the
       // default pending on it. A no-op once the grant consumed the mark or a rollback removed the row.
