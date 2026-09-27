@@ -4,6 +4,7 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { APICallError } from "ai";
 import { Experimental_EvaluationMockModelV4 } from "ai/test";
 import type {
+  JSONValue,
   Experimental_EvaluationModelV4,
   Experimental_EvaluationModelV4Answer,
   Experimental_EvaluationModelV4CallOptions,
@@ -469,6 +470,37 @@ describe("EvaluationService.evaluate billed usage on rejected answers (#4728)", 
     ).model;
     expect(inner?.specificationVersion).toBe("v4");
     expect(typeof inner?.doGenerate).toBe("function");
+  });
+});
+
+describe("EvaluationService.evaluate service tier (#4352)", () => {
+  it("keeps a known OpenAI service tier in usage metadata and drops anything else", async () => {
+    const service = makeEvaluationService();
+    const run = async (serviceTier: unknown) => {
+      const { model } = mockModel(() =>
+        Promise.resolve({
+          answers: VALID_ANSWERS,
+          usage: { inputTokens: 10, outputTokens: 2 },
+          providerMetadata: { openai: { reasoningTokens: 1, serviceTier } } as unknown as Record<
+            string,
+            Record<string, JSONValue>
+          >,
+          warnings: [],
+        })
+      );
+      return (await Effect.runPromise(service.evaluate(call(model, QUESTIONS))))
+        .usageProviderMetadata;
+    };
+    expect(await run("priority")).toEqual({
+      openai: { reasoningTokens: 1, serviceTier: "priority" },
+    });
+    // Ultrafast has no published rate, but it must survive so pricing can apply
+    // the unknown-tier (highest published card) rule instead of Standard.
+    expect(await run("ultrafast")).toEqual({
+      openai: { reasoningTokens: 1, serviceTier: "ultrafast" },
+    });
+    expect(await run(SENTINEL)).toEqual({ openai: { reasoningTokens: 1 } });
+    expect(await run(3)).toEqual({ openai: { reasoningTokens: 1 } });
   });
 });
 
