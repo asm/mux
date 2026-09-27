@@ -142,6 +142,11 @@ import {
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import {
+  WorkspaceMutationInProgressError,
+  workspaceUseLeasesFor,
+  type WorkspaceUseLease,
+} from "@/node/services/workspaceUseLeases";
+import {
   coerceOpenAIReasoningMode,
   coerceThinkingLevel,
   type ThinkingLevel,
@@ -970,6 +975,17 @@ export class AgentSession {
   private readonly isStopInProgress: () => boolean;
   private readonly getStopEpoch: () => number;
   private readonly onTurnSettled?: (turnGeneration: symbol) => void;
+  /**
+   * Cross-process evidence that this session's turn uses the workspace (#4476): another backend
+   * on the same Xum root must not rename or remove the checkout meanwhile. Held from the start of
+   * a preparation until the turn is idle with no preparation running, so it spans streaming,
+   * handoff retries and background attempts; released on idle (phaseChanged), after a
+   * preparation that never left idle, and by dispose.
+   */
+  private turnUseLease: Promise<WorkspaceUseLease | Error> | undefined;
+  /** In-flight releases, awaited by dispose (a Set, so settled ones are not retained). */
+  private readonly turnUseLeaseReleases = new Set<Promise<void>>();
+  private activePreparations = 0;
   private readonly onTurnSuperseded?: (previous: symbol, next: symbol) => void;
   /** Last generation observed by phaseChanged and whether it was seen settling to idle. */
   private observedTurn: { id: symbol; idle: boolean } | undefined;
@@ -997,6 +1013,8 @@ export class AgentSession {
       this.activeToolCallIds.clear();
     },
     phaseChanged: (phase, isCurrent) => {
+      // First, before any listener below can throw: the coordinator has already committed idle.
+      if (phase === "idle") this.releaseTurnUseLeaseIfIdle();
       // Lifecycle listeners can synchronously admit or settle a successor. Capture this transition
       // and publish its ownership first, so nested callbacks cannot overwrite or settle that turn.
       const turnId = this.coordinator.turnId;
@@ -1590,6 +1608,8 @@ export class AgentSession {
       .then(async () => {
         cleanupExecution[Symbol.dispose]();
         await cleanup("drain", () => this.coordinator.drain());
+        this.releaseTurnUseLeaseIfIdle();
+        await cleanup("turn use lease", () => Promise.all(this.turnUseLeaseReleases));
         await cleanup("compaction cancellation", () => this.compactionCancellation.flush());
         // Raw bridges stay attached through the attempt fence. Destructive disposal suppresses
         // recovery policy, but still presents its captured terminal exactly once below.
@@ -3609,6 +3629,10 @@ export class AgentSession {
     run: () => Promise<AgentSessionResult<T>>
   ): Promise<AgentSessionResult<T>> {
     using _execution = this.coordinator.enterExecution();
+    this.activePreparations++;
+    // Start (not await) the turn's use lease: preparation keeps its synchronous startup, and
+    // streamWithHistory confirms the lease before the provider can touch the checkout.
+    this.beginTurnUseLease();
     try {
       const result = await run();
       if (!result.success) await this.settlePreparationFailure(attempt, result.error);
@@ -3662,8 +3686,59 @@ export class AgentSession {
           this.coordinator.isCurrentTurn(attempt.owner)
         )
           this.drainQueuedMessagesIfIdle();
+        this.activePreparations--;
+        assert(this.activePreparations >= 0, "turn preparations released more than entered");
+        // A preparation that failed before the turn left idle never publishes idle again.
+        this.releaseTurnUseLeaseIfIdle();
       }
     }
+  }
+
+  /** Start taking this session's turn use lease (idempotent while one is held or pending). */
+  private beginTurnUseLease(): void {
+    // A refusal (or an unexpected lock error) resolves to the error, so a preparation that ends
+    // before streamWithHistory confirms the lease leaves no unhandled rejection.
+    this.turnUseLease ??= workspaceUseLeasesFor(this.config)
+      .hold(this.workspaceId, "turn")
+      .catch((error: unknown) => (error instanceof Error ? error : new Error(String(error))));
+  }
+
+  /**
+   * Confirm the turn use lease before the provider may run tools in the checkout. Returns the
+   * refusal message when a structural mutation (rename, remove) holds the workspace, or when the
+   * lease could not be taken (fail closed).
+   */
+  private async confirmTurnUseLease(): Promise<string | undefined> {
+    this.beginTurnUseLease();
+    const holding = this.turnUseLease;
+    assert(holding != null, "beginTurnUseLease always leaves a pending or held lease");
+    const lease = await holding;
+    if (!(lease instanceof Error)) return undefined;
+    if (this.turnUseLease === holding) this.turnUseLease = undefined;
+    return lease instanceof WorkspaceMutationInProgressError
+      ? lease.message
+      : `Could not record this turn's use of the workspace: ${lease.message}`;
+  }
+
+  /**
+   * Release the turn use lease once nothing of the turn remains. Synchronous callers (the idle
+   * transition) start the release here: its transition lock is FIFO, so a hold by the next turn
+   * queued after it can never be overtaken, and dispose awaits it.
+   */
+  private releaseTurnUseLeaseIfIdle(): void {
+    const lease = this.turnUseLease;
+    if (lease == null || this.activePreparations > 0 || this.coordinator.phase !== "idle") return;
+    this.turnUseLease = undefined;
+    const releasing: Promise<void> = lease
+      .then((held) => (held instanceof Error ? undefined : held.release()))
+      .catch((error: unknown) => {
+        log.warn("Failed to release the workspace turn use lease", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      })
+      .finally(() => this.turnUseLeaseReleases.delete(releasing));
+    this.turnUseLeaseReleases.add(releasing);
   }
 
   private releasePreparationEdit(attempt: PreparationAttempt): void {
@@ -7618,6 +7693,14 @@ export class AgentSession {
         disablePostCompactionAttachments === true || preparedRequest != null
           ? null
           : await this.getPostCompactionAttachmentsIfNeeded(this.isRlmCompactionEnabled(options));
+      if (isStreamStartAborted()) {
+        return Ok(undefined);
+      }
+
+      // #4476: from here the provider can run tools in the checkout, so another backend's rename
+      // or removal must see this turn first (and a running one refuses it).
+      const leaseRefusal = await this.confirmTurnUseLease();
+      if (leaseRefusal != null) return fail(createUnknownSendMessageError(leaseRefusal));
       if (isStreamStartAborted()) {
         return Ok(undefined);
       }

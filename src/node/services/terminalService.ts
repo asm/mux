@@ -24,6 +24,7 @@ import {
 } from "@/node/runtime/runtimeHelpers";
 import { log } from "@/node/services/log";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { workspaceUseLeasesFor, type WorkspaceUseLease } from "@/node/services/workspaceUseLeases";
 import { isCommandAvailable, findAvailableCommand } from "@/node/utils/commandDiscovery";
 import { resolveContainerCli } from "@/node/runtime/containerCli";
 import { sanitizeXumChildEnv } from "@/node/runtime/childProcessEnv";
@@ -67,6 +68,12 @@ export class TerminalService {
   private readonly headlessTerminals = new Map<string, Terminal>();
   private readonly serializeAddons = new Map<string, SerializeAddon>();
   private readonly headlessOnDataDisposables = new Map<string, { dispose: () => void }>();
+  /**
+   * Each session's workspace use lease (#4476): another backend on the same Xum root must not
+   * rename or remove the checkout while a shell runs in it. Released when the PTY exits (close
+   * paths only signal it), and at once when a create fails before any shell was spawned.
+   */
+  private readonly sessionUseLeases = new Map<string, WorkspaceUseLease>();
   private readonly titleChangeDisposables = new Map<string, { dispose: () => void }>();
 
   private shuttingDown = false;
@@ -262,7 +269,16 @@ export class TerminalService {
           `Workspace is being archived: ${params.workspaceId}. Unarchive it before opening a terminal.`
         );
       }
-      return await this.createUnreserved(params, closeEpoch);
+      // Throws while another backend renames or removes the workspace: no shell may start there.
+      const lease = await workspaceUseLeasesFor(this.config).hold(params.workspaceId, "terminal");
+      try {
+        return await this.createUnreserved(params, closeEpoch, lease);
+      } catch (error) {
+        // A spawned PTY's exit releases its lease (the shell may still be running); otherwise no
+        // shell ever started, so release it now.
+        if (![...this.sessionUseLeases.values()].includes(lease)) await lease.release();
+        throw error;
+      }
     } finally {
       const remaining = (this.pendingSessionCreations.get(params.workspaceId) ?? 1) - 1;
       if (remaining <= 0) {
@@ -276,7 +292,8 @@ export class TerminalService {
 
   private async createUnreserved(
     params: TerminalCreateParams,
-    closeEpoch: number
+    closeEpoch: number,
+    lease: WorkspaceUseLease
   ): Promise<TerminalSession> {
     const closedSinceStart = () =>
       (this.startupCloseEpochs.get(params.workspaceId) ?? 0) !== closeEpoch;
@@ -369,9 +386,15 @@ export class TerminalService {
 
       const onExit = (code: number) => {
         if (tempSessionId) {
-          const emitter = this.exitEmitters.get(tempSessionId);
-          emitter?.emit("exit", code);
-          this.cleanup(tempSessionId);
+          const sessionId = tempSessionId;
+          try {
+            const emitter = this.exitEmitters.get(sessionId);
+            emitter?.emit("exit", code);
+            this.cleanup(sessionId);
+          } finally {
+            // The shell has exited: only now may another backend rename or remove its checkout.
+            this.releaseSessionUseLease(sessionId);
+          }
         }
       };
 
@@ -400,6 +423,9 @@ export class TerminalService {
       );
 
       tempSessionId = session.sessionId;
+      // From here the PTY's exit owns the lease: close paths only signal the shell, which can
+      // keep using the checkout until it actually exits.
+      this.sessionUseLeases.set(session.sessionId, lease);
 
       // Post-spawn recheck: a user-driven archive (which force-closes rather than refuses) may
       // have run closeWorkspaceSessions while createSession was awaiting — that close only
@@ -1353,5 +1379,19 @@ export class TerminalService {
     headless?.dispose();
     this.headlessTerminals.delete(sessionId);
     this.serializeAddons.delete(sessionId);
+  }
+
+  private releaseSessionUseLease(sessionId: string): void {
+    const lease = this.sessionUseLeases.get(sessionId);
+    if (lease == null) return;
+    this.sessionUseLeases.delete(sessionId);
+    // Called from the synchronous PTY exit callback. The release enters the lease's FIFO
+    // transition lock synchronously, so a later hold or mutation check always observes it.
+    lease.release().catch((error: unknown) => {
+      log.warn("Failed to release a terminal's workspace use lease", {
+        sessionId,
+        error: getErrorMessage(error),
+      });
+    });
   }
 }
