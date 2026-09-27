@@ -509,6 +509,29 @@ describe("WorkspaceService remove shared-workspace guard", () => {
     }
   });
 
+  // #4760: MCP prompt discovery starts stdio servers in the checkout, so a removal refuses
+  // new discoveries while it runs.
+  test("refuses MCP prompt discovery while a removal runs", async () => {
+    const { createRuntimeSpy } = mockDeleteWorkspace();
+    try {
+      await using harness = await createChildHarness(undefined);
+      let admittedDuringRemoval: Disposable | undefined | "unset" = "unset";
+      harness.service.setMCPServerManager({
+        stopServers: mock((id: string) => {
+          admittedDuringRemoval = harness.service.acquireMcpPromptDiscoveryAdmission(id);
+          return Promise.resolve();
+        }),
+      } as unknown as MCPServerManager);
+
+      const result = await harness.service.remove(workspaceId, true);
+
+      expect(result.success).toBe(true);
+      expect(admittedDuringRemoval).toBeUndefined();
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
   // Inverse direction: removing the PARENT while a live shared child points at its checkout.
   async function createParentHarness(
     childTaskStatus: "running" | "queued" | "reported"

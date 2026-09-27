@@ -12454,9 +12454,12 @@ export class WorkspaceService
    * the counter increment run in one synchronous block, mirroring executeBash: a discovery
    * admitted first holds the archive gate open until the caller disposes the admission, and one
    * entering after the gate armed (or against an archived workspace) is refused with undefined.
+   *
+   * Removal refuses new discoveries too (#4760). A discovery admitted before the removal
+   * started is not joined; that remaining window is tracked as a follow-up.
    */
   acquireMcpPromptDiscoveryAdmission(workspaceId: string): Disposable | undefined {
-    if (this.archivingWorkspaces.has(workspaceId)) {
+    if (this.archivingWorkspaces.has(workspaceId) || this.removingWorkspaces.has(workspaceId)) {
       return undefined;
     }
     const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
