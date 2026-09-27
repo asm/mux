@@ -1,3 +1,4 @@
+import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import {
@@ -643,9 +644,17 @@ export class WorkspaceTurnManager {
     private readonly desktopInputCoordinator = new DesktopInputCoordinator(config)
   ) {
     this.taskHandleStore = new OwnedWorkspaceTurnHandleStore(config, (record) =>
-      this.releaseTurnOwnerLockIfSettled(record)
+      this.afterHandleWrite(record)
     );
   }
+
+  /**
+   * Handles whose target this process created and whose default unrelated-messaging consent is
+   * still to be granted (#4453): added once create() returned Ok, removed at the first terminal
+   * write (see afterHandleWrite). In memory on purpose: a restart empties it, so every later
+   * settlement clears the default instead of granting it.
+   */
+  private readonly creationConsentFinalizers = new Set<string>();
 
   /** Live-owner locks this manager holds, by handle id (see workspaceTurnOwnerLockPath). */
   private readonly turnOwnerLocks = new Map<string, () => Promise<void>>();
@@ -688,11 +697,90 @@ export class WorkspaceTurnManager {
     await release();
   }
 
-  private async releaseTurnOwnerLockIfSettled(
-    record: WorkspaceTurnTaskHandleRecord
-  ): Promise<void> {
-    if (!isActiveWorkspaceTurnTaskStatus(record.status)) {
+  /**
+   * Every handle write lands here. A terminal one finalizes a created target's default consent,
+   * then releases the live-owner lock. Default consent of a delegated target (#4453):
+   *
+   * | Event (any backend)                                  | Action                            |
+   * | ---------------------------------------------------- | --------------------------------- |
+   * | mode "new", not disposable: lock taken, create()     | row written with the pending mark |
+   * | create() Err                                         | create()'s finally clears it      |
+   * | exit before the handle record persists               | creation finalizer clears it      |
+   * | explicit toggle (any backend)                        | the toggle deletes the mark       |
+   * | first terminal write in the creating process         | Set.delete, then grant (mark CAS) |
+   * | any other terminal write (other backend, restart,    | clear                             |
+   * |   stale settlement, later rewrite)                   |                                   |
+   * | the grant's config write fails                       | logged; stays off                 |
+   * | mode "existing" follow-up                            | createdWorkspace false: no hook   |
+   * | disposable target                                    | create() "none": never marked     |
+   * | row pending removal at grant time                    | the grant clears the mark instead |
+   *
+   * The grant needs the mark, so a toggle always wins. Granting only in the creating process
+   * keeps an older build's opt-out (which leaves the mark in place) from being overridden after a
+   * restart. The grant runs after the terminal write and before the reservation is dropped;
+   * consent means reachability, and in-process admission still refuses while it exists.
+   */
+  private async afterHandleWrite(record: WorkspaceTurnTaskHandleRecord): Promise<void> {
+    if (isActiveWorkspaceTurnTaskStatus(record.status)) return;
+    try {
+      if (record.createdWorkspace && !record.disposableWorkspace) {
+        await (this.creationConsentFinalizers.delete(record.handleId)
+          ? this.workspaceService.grantPendingDefaultUnrelatedWorkspaceConsent(record.workspaceId)
+          : this.workspaceService.clearPendingDefaultUnrelatedConsent(record.workspaceId));
+      }
+    } finally {
       await this.releaseTurnOwnerLock(record.handleId);
+    }
+  }
+
+  /**
+   * Startup resolver (#4453): a delegated target whose creator died before settling its creating
+   * turn (crash between create() and the handle record, or between the terminal write and the
+   * grant) keeps its pending mark. Clear such marks; never grant. A handle whose live-owner lock
+   * has a live holder, here or in another backend, is still being created and is left alone.
+   * Never throws: startup must not fail.
+   */
+  async clearOrphanedDelegatedConsentDefaults(): Promise<void> {
+    for (const project of this.config.loadConfigOrDefault().projects.values()) {
+      for (const workspace of project.workspaces) {
+        const tags = workspace.tags ?? {};
+        const handleId = tags[WORKSPACE_TURN_TASK_TAGS.handle] ?? "";
+        const ownerId = tags[WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId] ?? "";
+        const workspaceId = workspace.id;
+        if (workspace.unrelatedWorkspaceConsentPending !== true || workspaceId == null) continue;
+        if (!isWorkspaceTurnTaskId(handleId) || ownerId === "") continue;
+        try {
+          await this.workspaceTurnSettlementLocks.withLock(handleId, async () => {
+            // Checked first: acquireTurnOwnerLock also answers "held" for this manager's own.
+            if (this.turnOwnerLocks.has(handleId) || this.creationConsentFinalizers.has(handleId)) {
+              return;
+            }
+            // Tags are caller-supplied (workspace.create accepts any), so the handle must be real:
+            // its creator locked it before create(), and the lock outlives the creator until the
+            // record settles. Without a lock only a record that created this target counts.
+            const lockPath = workspaceTurnOwnerLockPath(this.config.rootDir, handleId);
+            const locked = await fsPromises.access(lockPath).then(
+              () => true,
+              () => false
+            );
+            if (!locked) {
+              const record = await this.taskHandleStore.getWorkspaceTurn(ownerId, handleId);
+              if (record?.createdWorkspace !== true || record.workspaceId !== workspaceId) return;
+            }
+            if ((await this.acquireTurnOwnerLock(handleId)) !== "held") return;
+            try {
+              await this.workspaceService.clearPendingDefaultUnrelatedConsent(workspaceId);
+            } finally {
+              await this.releaseTurnOwnerLock(handleId);
+            }
+          });
+        } catch (error: unknown) {
+          log.warn("Failed to clear an orphaned delegated consent default", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        }
+      }
     }
   }
 
@@ -1126,6 +1214,19 @@ export class WorkspaceTurnManager {
     let createdWorkspace = false;
     let queuedForExistingWorkspace = false;
     let maySupersedeTaskId: string | undefined;
+    let persistedHandle = false;
+    // Until the handle record persists, this call owns the created target's pending default
+    // (#4453, see afterHandleWrite): every earlier exit clears it and releases the lock.
+    await using _creationFinalizer = {
+      [Symbol.asyncDispose]: async () => {
+        if (persistedHandle) return;
+        this.creationConsentFinalizers.delete(handleId);
+        if (createdWorkspace) {
+          await this.workspaceService.clearPendingDefaultUnrelatedConsent(targetWorkspaceId);
+        }
+        await this.releaseTurnOwnerLock(handleId);
+      },
+    };
 
     if (mode === "fork") {
       return Err('Task.createWorkspaceTurn: workspace.mode="fork" is not supported yet');
@@ -1344,6 +1445,11 @@ export class WorkspaceTurnManager {
       }
       const slot = await ensureParallelSlot();
       if (!slot.success) return Err(slot.error);
+      // Held from before the row exists, so no other backend can settle this handle while its
+      // target carries the pending mark. The id is fresh: only an unreadable lock state refuses.
+      if ((await this.acquireTurnOwnerLock(handleId)) !== "held") {
+        return Err("Task.createWorkspaceTurn: could not take the workspace turn's live-owner lock");
+      }
       const tags = {
         [WORKSPACE_TURN_TASK_TAGS.handle]: handleId,
         [WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId]: ownerWorkspaceId,
@@ -1359,16 +1465,20 @@ export class WorkspaceTurnManager {
         false,
         tags,
         // The agentId validation below reads the target checkout under the task mutex, so
-        // a local worktree must be populated before create() resolves. Delegated targets are
-        // not opted in to unrelated messaging yet: their default needs a finalization point
-        // tied to this turn's lifecycle (#4453).
-        { awaitMaterialization: true, skipDefaultUnrelatedWorkspaceConsent: true }
+        // a local worktree must be populated before create() resolves. The default consent is
+        // granted when this turn settles (afterHandleWrite); disposable targets never get it.
+        {
+          awaitMaterialization: true,
+          defaultUnrelatedConsent:
+            args.workspace?.disposable === true ? "none" : "caller-finalizes",
+        }
       );
       if (!createResult.success) {
         return Err(`Task.createWorkspaceTurn: workspace create failed (${createResult.error})`);
       }
       targetWorkspaceId = createResult.data.metadata.id;
       createdWorkspace = true;
+      if (args.workspace?.disposable !== true) this.creationConsentFinalizers.add(handleId);
       if (requestedAgentId != null && ownerContext != null) {
         // Post-create stage: re-validate against the TARGET checkout — project-local agent
         // definitions can diverge across branches/worktrees, so owner-path resolution is not
@@ -1545,7 +1655,6 @@ export class WorkspaceTurnManager {
       ownerWorkspaceId === targetWorkspaceId
         ? [targetWorkspaceId]
         : [ownerWorkspaceId, targetWorkspaceId].sort();
-    let persistedHandle = false;
     const persisted = await this.withWorkspaceLifecycleLockKeys(
       lifecycleLockKeys,
       async (): Promise<"persisted" | "target_archived" | "owner_archived"> => {
@@ -1588,8 +1697,6 @@ export class WorkspaceTurnManager {
           next: { ...record, status: "error", updatedAt: getIsoNow(), error: persisted.error },
           waiterSettlement: { status: "error", error: new Error(persisted.error) },
         });
-      } else {
-        await this.releaseTurnOwnerLock(handleId);
       }
       return Err(persisted.error);
     }
