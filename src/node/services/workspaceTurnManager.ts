@@ -1212,16 +1212,37 @@ export class WorkspaceTurnManager {
     let targetTaskExperiments: TaskCreateArgs["experiments"];
     let targetIsAgentWorkspace = false;
     let createdWorkspace = false;
+    let createdTargetBranch = false;
     let queuedForExistingWorkspace = false;
     let maySupersedeTaskId: string | undefined;
     let persistedHandle = false;
     // Until the handle record persists, this call owns the created target's pending default
     // (#4453, see afterHandleWrite): every earlier exit clears it and releases the lock.
+    // It also owns the target itself (#4819): no record means the parent never learns its id and a
+    // mode="existing" retry is invalid_scope, so every such exit removes it. It was created moments
+    // ago and its turn never started, so a forced removal is lossless. Bypass the task-tree
+    // lifecycle lock: we hold this.mutex and the established order is tree lock → this.mutex
+    // (createMany), so acquiring the tree lock here would invert it; removeUnlocked stays safe
+    // regardless via its own idempotency guard and fail-closed descendant check.
     await using _creationFinalizer = {
       [Symbol.asyncDispose]: async () => {
         if (persistedHandle) return;
         this.creationConsentFinalizers.delete(handleId);
         if (createdWorkspace) {
+          // Forced removal runs `branch -D`: keep a branch this creation only reused.
+          const cleanup = await this.workspaceService
+            .removeWhileTaskTreeLocked(targetWorkspaceId, true, undefined, {
+              keepBranch: !createdTargetBranch,
+            })
+            .catch((error: unknown) => Err(getErrorMessage(error)));
+          if (!cleanup.success) {
+            log.error("createWorkspaceTurn: failed to remove the workspace of a failed creation", {
+              ownerWorkspaceId,
+              targetWorkspaceId,
+              error: cleanup.error,
+            });
+          }
+          // A no-op once the row is gone; fails closed if the removal did not complete.
           await this.workspaceService.clearPendingDefaultUnrelatedConsent(targetWorkspaceId);
         }
         await this.releaseTurnOwnerLock(handleId);
@@ -1478,6 +1499,7 @@ export class WorkspaceTurnManager {
       }
       targetWorkspaceId = createResult.data.metadata.id;
       createdWorkspace = true;
+      createdTargetBranch = createResult.data.createdBranch === true;
       if (args.workspace?.disposable !== true) this.creationConsentFinalizers.add(handleId);
       if (requestedAgentId != null && ownerContext != null) {
         // Post-create stage: re-validate against the TARGET checkout — project-local agent
@@ -1704,26 +1726,8 @@ export class WorkspaceTurnManager {
       return Err("Task.createWorkspaceTurn: target workspace was archived during turn creation");
     }
     if (persisted === "owner_archived") {
-      // A workspace created in this call has no persisted ownership handle yet, so refusing
-      // here would leak an unmanageable checkout + config entry (the archived owner can never
-      // reach it through the lifecycle API). It was materialized moments ago and its turn never
-      // started, so force-removing it is lossless. Bypass the task-tree lifecycle lock: we hold
-      // this.mutex and the established order is tree lock → this.mutex (createMany), so
-      // acquiring the tree lock here would invert it; removeUnlocked stays safe regardless via
-      // its own idempotency guard and fail-closed descendant check.
-      if (createdWorkspace) {
-        const cleanup = await this.workspaceService.removeWhileTaskTreeLocked(
-          targetWorkspaceId,
-          true
-        );
-        if (!cleanup.success) {
-          log.error("createWorkspaceTurn: failed to clean up workspace after owner archive", {
-            ownerWorkspaceId,
-            targetWorkspaceId,
-            error: cleanup.error,
-          });
-        }
-      }
+      // A workspace created in this call is removed by _creationFinalizer (the archived owner
+      // could never reach it through the lifecycle API).
       return Err("Task.createWorkspaceTurn: owner workspace was archived during turn creation");
     }
     if (agentValidationError != null) {

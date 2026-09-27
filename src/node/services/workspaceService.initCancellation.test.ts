@@ -6,7 +6,7 @@ import path from "path";
 import { Err, Ok } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
-import type { SecretsStore } from "@/node/config";
+import { Config, type SecretsStore } from "@/node/config";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
@@ -612,6 +612,56 @@ describe("WorkspaceService init cancellation", () => {
     }
   });
 
+  // #4819: the abort only signals; deleting under a still-exiting init hook (or a background
+  // SSH materialization) races its writes, so removal waits for the settlement as archive does.
+  test("remove() deletes the checkout only after an aborted init settles", async () => {
+    const workspaceId = "ws-remove-awaits-init";
+    await using harness = await createWorkspaceServiceHarness();
+    const { config, service: workspaceService } = harness;
+    const projectPath = path.join(harness.rootDir, "proj");
+    await config.addWorkspace(projectPath, {
+      id: workspaceId,
+      name: "ws",
+      projectPath,
+      projectName: "proj",
+      runtimeConfig: { type: "local" },
+    });
+    const { deleteWorkspaceMock, createRuntimeSpy } = mockDeleteWorkspace(() =>
+      Promise.resolve({ success: true as const, deletedPath: "/tmp/deleted" })
+    );
+    let settleInit!: () => void;
+    const initAbort = new AbortController();
+    workspaceService.registerExternalBackgroundInit(
+      workspaceId,
+      initAbort,
+      new Promise<void>((resolve) => (settleInit = resolve))
+    );
+
+    try {
+      const removal = workspaceService.remove(workspaceId, true);
+      // Without the wait, the whole removal (deletion included) completes well inside this bound.
+      const settledEarly = await Promise.race([
+        removal.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 500)),
+      ]);
+      expect(settledEarly).toBe(false);
+      expect(initAbort.signal.aborted).toBe(true);
+      // Other backends refuse new work on the durable marker while removal waits.
+      const row = new Config(harness.rootDir)
+        .loadConfigOrDefault()
+        .projects.get(projectPath)
+        ?.workspaces.find((entry) => entry.id === workspaceId);
+      expect(row?.pendingRemoval).toBeDefined();
+      expect(deleteWorkspaceMock).not.toHaveBeenCalled();
+
+      settleInit();
+      expect((await removal).success).toBe(true);
+      expect(deleteWorkspaceMock).toHaveBeenCalledTimes(1);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
   test("remove() calls runtime.deleteWorkspace when force=true", async () => {
     const workspaceId = "ws-remove-runtime-delete";
     await using harness = await createWorkspaceServiceHarness();
@@ -633,7 +683,14 @@ describe("WorkspaceService init cancellation", () => {
       const result = await workspaceService.remove(workspaceId, true);
       expect(result.success).toBe(true);
       // trusted defaults to false (untrusted project), so deleteWorkspace gets (path, name, force, undefined, false)
-      expect(deleteWorkspaceMock).toHaveBeenCalledWith(projectPath, "ws", true, undefined, false);
+      expect(deleteWorkspaceMock).toHaveBeenCalledWith(
+        projectPath,
+        "ws",
+        true,
+        undefined,
+        false,
+        undefined
+      );
       expect(config.findWorkspace(workspaceId)).toBeNull();
     } finally {
       createRuntimeSpy.mockRestore();

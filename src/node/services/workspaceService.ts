@@ -380,6 +380,7 @@ import {
   type ArchiveWorkspaceOptions,
   type QueueCutReceipt,
   type RemovalAttemptBinding,
+  type RemovalCheckoutOptions,
   type SendMessageInternalOptions,
   type TurnAcceptanceOrigin,
   type TurnAdmissionToken,
@@ -5540,7 +5541,7 @@ export class WorkspaceService
        */
       defaultUnrelatedConsent?: "after-setup" | "caller-finalizes" | "none";
     }
-  ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>> {
+  ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; createdBranch?: boolean }>> {
     const defaultConsent = options?.defaultUnrelatedConsent ?? "after-setup";
     // A deferred checkout grants from materializeDeferredCheckout, which would bypass the caller.
     assert(
@@ -5993,7 +5994,11 @@ export class WorkspaceService
       eventSpine.emit("workspace.created", { workspaceId });
       // The caller now owns the pending default (see the option).
       if (defaultConsent === "caller-finalizes") pendingDefaultHandedOff = true;
-      return Ok({ metadata: this.enrichFrontendMetadata(completeMetadata) });
+      return Ok({
+        metadata: this.enrichFrontendMetadata(completeMetadata),
+        // Lets a caller that undoes this creation keep a branch it merely reused (#4819).
+        createdBranch: createResult!.createdBranch === true,
+      });
     } catch (error) {
       initLogger.logComplete(-1);
       const message = `Failed to create workspace: ${getErrorMessage(error)}`;
@@ -6541,9 +6546,10 @@ export class WorkspaceService
   async removeWhileTaskTreeLocked(
     workspaceId: string,
     force = false,
-    binding?: RemovalAttemptBinding
+    binding?: RemovalAttemptBinding,
+    options?: RemovalCheckoutOptions
   ): Promise<Result<void>> {
-    return await this.removeUnlocked(workspaceId, force, binding);
+    return await this.removeUnlocked(workspaceId, force, binding, options);
   }
 
   /**
@@ -6623,7 +6629,8 @@ export class WorkspaceService
   private async removeUnlocked(
     workspaceId: string,
     force = false,
-    binding?: RemovalAttemptBinding
+    binding?: RemovalAttemptBinding,
+    options?: RemovalCheckoutOptions
   ): Promise<Result<void>> {
     if (this.shuttingDown) return Err("Server is shutting down");
     // Idempotent: if already removing, return success to prevent race conditions
@@ -6691,6 +6698,15 @@ export class WorkspaceService
       const claim = await this.claimPendingRemoval(workspaceId, binding);
       if (!claim.success) return Err(claim.error);
       pendingRemovalId = claim.data;
+      // The init abort above only signals: the init hook (or an SSH background materialization)
+      // may still be writing. Wait for its retained settlement before any teardown, as archive
+      // does (#4819: a failed delegated creation removes its target right after create()). Only
+      // now, with local admission held and the durable marker refusing other backends' new work,
+      // so nothing can be admitted during the wait. Never rejects.
+      const initSettlement = this.initSettlementPromises.get(workspaceId);
+      if (initSettlement != null) {
+        await initSettlement;
+      }
       // r65: keep renewing the removal tombstone's mtime until this removal
       // settles so a foreign backend's startup self-heal cannot mistake a
       // merely SLOW removal (a hung runtime deletion or MCP server close) for
@@ -7029,7 +7045,8 @@ export class WorkspaceService
                 metadata.name,
                 force,
                 undefined,
-                projectRemoval.trusted
+                projectRemoval.trusted,
+                options
               );
 
               if (!deleteResult.success) {
@@ -7141,7 +7158,8 @@ export class WorkspaceService
             metadata.name, // use branch name
             force,
             undefined, // abortSignal
-            trusted
+            trusted,
+            options
           );
 
           if (!deleteResult.success) {
