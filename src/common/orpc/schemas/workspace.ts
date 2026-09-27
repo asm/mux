@@ -144,12 +144,12 @@ export function getValidUnrelatedWorkspaceConsent(value: unknown): string | unde
 /**
  * Recipient-side delivery preference for agent messages that arrive while this workspace is busy:
  * messages from sub-agents (upward), sibling tasks, and unrelated workspaces. Parent guidance to
- * a sub-agent and sub-agent reports (agent_report) are not affected. Absent means "tool-end" (deliver after the next tool call), because
+ * a sub-agent is not affected; sub-agent reports follow this preference. Absent means "tool-end" (deliver after the next tool call), because
  * prompt delivery is what lets agents coordinate quickly; "turn-end" holds every such message until
  * the current turn ends, even if the sender asked for tool-end.
  */
 export const AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION =
-  'When agent messages (from sub-agents, sibling tasks, or unrelated workspaces) reach this workspace while it is busy: "tool-end" delivers after the next tool call (default when absent); "turn-end" waits for the current turn to end and overrides a sender\'s tool-end request. Sub-agent reports are not affected.';
+  'When agent messages (from sub-agents, sibling tasks, or unrelated workspaces) reach this workspace while it is busy: "tool-end" delivers after the next tool call (default when absent); "turn-end" waits for the current turn to end and overrides a sender\'s tool-end request. Sub-agent reports follow the same setting.';
 
 export const AgentMessageDispatchModeSchema = z.enum(["tool-end", "turn-end"]);
 export type AgentMessageDispatchMode = z.infer<typeof AgentMessageDispatchModeSchema>;
