@@ -281,7 +281,8 @@ const STOPPED = Symbol("stopped");
  * `visit` sees every delivered row and may request a stop; the stop is honored only right
  * after a readable row that is not the start, where no scan state carries over.
  */
-async function findProviderHistoryStart(
+// Exported for tests: historyScanner.differential.test.ts compares it with the frozen #4655 oracle.
+export async function findProviderHistoryStart(
   handle: fs.FileHandle,
   fileSize: number,
   skip: number,
