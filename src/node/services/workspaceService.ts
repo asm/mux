@@ -8395,6 +8395,8 @@ export class WorkspaceService
       let oldPath: string;
       let newPath: string;
       let runtimeForPlanFile: ReturnType<typeof createRuntime>;
+      // Moves the checkout back when the config rewrite below rejects (#4779).
+      let revertMove: () => Promise<void>;
 
       if (isMultiProject(oldMetadata)) {
         const projects = getProjects(oldMetadata);
@@ -8405,6 +8407,7 @@ export class WorkspaceService
           projectPath: string;
           oldWorkspacePath: string;
           newWorkspacePath: string;
+          branchRenamed: boolean;
         }> = [];
 
         const rollbackRenamedProjects = async (): Promise<void> => {
@@ -8424,7 +8427,8 @@ export class WorkspaceService
                 newName,
                 oldName,
                 undefined,
-                rollbackTrusted
+                rollbackTrusted,
+                { renameBranch: renamedProject.branchRenamed }
               );
 
               if (!rollbackResult.success) {
@@ -8485,6 +8489,7 @@ export class WorkspaceService
             projectPath: project.projectPath,
             oldWorkspacePath: renameResult.oldPath,
             newWorkspacePath: renameResult.newPath,
+            branchRenamed: renameResult.branchRenamed === true,
           });
         }
 
@@ -8502,16 +8507,7 @@ export class WorkspaceService
           newContainerExistedBeforeRename = false;
         }
 
-        try {
-          await containerManager.removeContainer(oldName);
-          await containerManager.createContainer(
-            newName,
-            renamedProjectWorkspaces.map((workspaceEntry) => ({
-              projectName: workspaceEntry.projectName,
-              workspacePath: workspaceEntry.newWorkspacePath,
-            }))
-          );
-        } catch (containerError: unknown) {
+        const revertMultiProjectMove = async (): Promise<void> => {
           await rollbackRenamedProjects();
 
           if (!newContainerExistedBeforeRename) {
@@ -8552,9 +8548,22 @@ export class WorkspaceService
           } catch (recreateErr: unknown) {
             log.error("Failed to recreate old container after rename failure", recreateErr);
           }
+        };
 
+        try {
+          await containerManager.removeContainer(oldName);
+          await containerManager.createContainer(
+            newName,
+            renamedProjectWorkspaces.map((workspaceEntry) => ({
+              projectName: workspaceEntry.projectName,
+              workspacePath: workspaceEntry.newWorkspacePath,
+            }))
+          );
+        } catch (containerError: unknown) {
+          await revertMultiProjectMove();
           return Err(`Failed to recreate container: ${getErrorMessage(containerError)}`);
         }
+        revertMove = revertMultiProjectMove;
 
         // Multi-project tasks/forks stored under a real project must keep their git-root path in
         // config so downstream artifact collection can resolve the owning repo after rename.
@@ -8602,9 +8611,20 @@ export class WorkspaceService
         oldPath = renameResult.oldPath;
         newPath = renameResult.newPath;
         runtimeForPlanFile = runtime;
+        const movedPath = newPath;
+        revertMove = async () => {
+          const revert = await createRuntime(oldMetadata.runtimeConfig, {
+            projectPath: configProjectPath,
+            workspaceName: newName,
+            workspacePath: movedPath,
+          }).renameWorkspace(configProjectPath, newName, oldName, undefined, trusted, {
+            renameBranch: renameResult.branchRenamed === true,
+          });
+          if (!revert.success) logRegistrationRollbackFailure(workspaceId, revert.error);
+        };
       }
 
-      await this.config.editConfig((config) => {
+      const registration = this.config.editConfig((config) => {
         const projectConfig = config.projects.get(configProjectPath);
         if (projectConfig) {
           const workspaceEntry =
@@ -8616,6 +8636,21 @@ export class WorkspaceService
           }
         }
         return config;
+      });
+      await registration.catch(async (error: unknown) => {
+        // #4779: move the checkout back so disk agrees with config, then fail with the write's own
+        // error. Only when a strict read shows the new path did not land; unsure means leave it.
+        try {
+          const persisted = this.config.loadConfigOrDefault({ throwOnError: true });
+          // Name too: a local-runtime rename returns the same path for old and new.
+          const landed = [...persisted.projects.values()].some((project) =>
+            project.workspaces.some((entry) => entry.path === newPath && entry.name === newName)
+          );
+          if (!landed) await revertMove();
+        } catch (rollbackError: unknown) {
+          logRegistrationRollbackFailure(workspaceId, rollbackError);
+        }
+        throw error;
       });
       // Checkout and config agree again: let MCP-settings writers proceed
       // instead of queueing behind plan-file moves and .code-workspace sync.
