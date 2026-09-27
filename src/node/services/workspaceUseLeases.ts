@@ -42,11 +42,12 @@ export class WorkspaceBusyError extends Error {}
 
 export interface WorkspaceMutationGateOptions {
   /**
-   * This backend's own lease kinds that do not block the mutation, because the mutator ends or
-   * tolerates them itself (remove closes its own terminals, for example). Other backends' leases
-   * always block: this backend cannot stop them.
+   * Per workspace, this backend's own lease kinds that do not block the mutation, because the
+   * mutator ends or tolerates them itself (remove closes its own terminals, for example). Keyed by
+   * workspace: a mutator usually ends activity only in the workspace it mutates, not in sub-agents
+   * sharing its checkout. Other backends' leases always block: this backend cannot stop them.
    */
-  ignoreOwnKinds?: ReadonlySet<WorkspaceUseKind>;
+  ignoreOwnKinds?: ReadonlyMap<string, ReadonlySet<WorkspaceUseKind>>;
   /**
    * Background processes leave their own cross-process evidence (spawn records), so the gate asks
    * instead of leasing: true when any runs in the workspace, in this or any other process.
@@ -120,10 +121,41 @@ export class WorkspaceUseLeases {
     options: WorkspaceMutationGateOptions,
     fn: () => Promise<T>
   ): Promise<T> {
-    assert(workspaceIds.length > 0, "withMutationGate requires at least one workspace");
+    const release = await this.acquireMutationGate(workspaceIds, options);
+    try {
+      return await fn();
+    } finally {
+      await release();
+    }
+  }
+
+  /**
+   * withMutationGate() for mutators whose protected section is not one callback (rename and
+   * archive release their other locks in an existing finally): the caller must await the
+   * returned release once the mutation settles.
+   */
+  async acquireMutationGate(
+    workspaceIds: readonly string[],
+    options: WorkspaceMutationGateOptions
+  ): Promise<() => Promise<void>> {
+    assert(workspaceIds.length > 0, "acquireMutationGate requires at least one workspace");
     // Sorted, so two mutators over overlapping sets take the gates in one order.
     const ids = [...new Set(workspaceIds)].sort();
     const releases: Array<() => Promise<void>> = [];
+    // Every gate is released even if one release fails; the first failure is rethrown.
+    const releaseAll = async () => {
+      const results = [];
+      for (const release of [...releases].reverse()) {
+        results.push(
+          await release().then(
+            () => undefined,
+            (error: unknown) => ({ error })
+          )
+        );
+      }
+      const failed = results.find((result) => result != null);
+      if (failed != null) throw failed.error;
+    };
     try {
       for (const id of ids) {
         try {
@@ -149,12 +181,12 @@ export class WorkspaceUseLeases {
       for (const id of ids) {
         await this.transitions.withLock(id, () => this.assertUnused(id, options));
       }
-      return await fn();
-    } finally {
-      for (const release of releases.reverse()) {
-        await release();
-      }
+    } catch (error) {
+      await releaseAll();
+      throw error;
     }
+    let released: Promise<void> | undefined;
+    return () => (released ??= releaseAll());
   }
 
   private async assertUnused(
@@ -163,7 +195,7 @@ export class WorkspaceUseLeases {
   ): Promise<void> {
     // The held entries themselves, so no kind can be left out of the check.
     for (const [kind, file] of this.held.get(workspaceId) ?? []) {
-      if (options.ignoreOwnKinds?.has(kind) === true) continue;
+      if (options.ignoreOwnKinds?.get(workspaceId)?.has(kind) === true) continue;
       if (file.count > 0) {
         throw new WorkspaceBusyError(
           `Workspace ${workspaceId} has a running ${kind} in this Xum process; ` +

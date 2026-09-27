@@ -22,6 +22,9 @@
  * ledgers, send/rename/remove/busy guards, and delegated-turn reservations, so peer admission and
  * instance discovery honor another backend's delegated turn only as a courtesy (the airtight
  * version needs a cross-process admission registry, #4476).
+ * A structural mutation (rename, remove, an archive that deletes the checkout, snapshot restore,
+ * worktree deletion) refuses while another backend has a turn or terminal lease or a host-local
+ * background process in the workspace (#4476, workspaceUseLeases.ts).
  * Driving one workspace or task from two backends at once is unsupported. Under that misuse two
  * guarantees still hold for the attempt-fenced orchestration writes (report publication, settlement
  * receipts, the plan-handoff boundary, task-state transitions): a superseded attempt's writes never
