@@ -31,9 +31,15 @@ import {
 } from "./bashMonitorRegistryStore";
 import type { BashMonitorProcessSnapshot, BashMonitorTailLine } from "./bashMonitorWakeReconciler";
 import { isErrnoWithCode } from "@/node/utils/fs";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 const DEFAULT_BACKGROUND_BASH_TAIL_BYTES = 64_000;
 const MAX_BACKGROUND_BASH_TAIL_BYTES = 1_000_000;
+// Host file lock serializing background spawns per workspace across backends (#4873).
+// A regular file inside the workspace records root: record scanners only read directories.
+const SPAWN_NAME_LOCK_FILENAME = ".spawn-name.lock";
+// Held from the name probe until the new record's meta.json is written (one local spawn).
+const SPAWN_NAME_LOCK_TIMEOUT_MS = 30_000;
 const MONITOR_POLL_INTERVAL_MS_LOCAL = 100;
 const MONITOR_POLL_INTERVAL_MS_REMOTE = 1_000;
 const MONITOR_MAX_PENDING_LINES = 50;
@@ -1456,6 +1462,29 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // why reuse would blind archive gating. Host-local records are probed on the local
     // filesystem with host PID checks; all other layouts (SSH/Coder, Docker, devcontainer)
     // live in the runtime's exec namespace and are probed through the runtime instead.
+    // Cross-process claim (#4873): two backends on one XUM_ROOT (desktop + `xum server`) have
+    // separate in-memory reservations but share the host records root, so both could probe a
+    // name as free and spawn into one directory. Host-local spawns therefore hold a
+    // per-workspace host file lock from the probe below until meta.json records the new
+    // process as running (end of this method), after which every other backend's probe reads
+    // the name as held. Holding it across the whole spawn adds no pre-spawn on-disk state, and
+    // spawnProcess's own failure cleanup runs while no one else can claim the name.
+    let claimLock: AsyncDisposable | null = null;
+    if (spawnRecordsAreHostLocal(runtime)) {
+      try {
+        claimLock = await acquireProcessFileLock({
+          lockPath: nodePath.join(localBgWorkspaceDir(workspaceId), SPAWN_NAME_LOCK_FILENAME),
+          timeoutMs: SPAWN_NAME_LOCK_TIMEOUT_MS,
+          label: "background spawn lock",
+        });
+      } catch (error) {
+        return {
+          success: false,
+          error: `Failed to reserve background process name: ${getErrorMessage(error)}`,
+        };
+      }
+    }
+    await using _claimLock = claimLock;
     if (spawnRecordsAreHostLocal(runtime)) {
       let suffix = 2;
       while (await this.localSpawnDirMayHoldLiveProcess(workspaceId, processId)) {
