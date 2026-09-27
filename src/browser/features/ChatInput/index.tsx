@@ -53,11 +53,14 @@ import {
   useSendMessageOptions,
 } from "@/browser/hooks/useSendMessageOptions";
 import {
-  leaveAutoRoutingForAgentSwitch,
+  applyAutoRoutingOutcome,
   setWorkspaceModelWithOrigin,
   setWorkspaceThinkingLevelWithOrigin,
 } from "@/browser/utils/modelChange";
-import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
+import {
+  resolveAutoRoutingForAgent,
+  resolveWorkspaceAiSettingsForAgent,
+} from "@/browser/utils/workspaceModeAi";
 import {
   getModelKey,
   getReasoningModeKey,
@@ -847,6 +850,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           dynamicWorkflowsEnabled: dynamicWorkflowsExperimentEnabled,
           draftId: props.pendingDraftId,
           userModel: preferredModel,
+          agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
+          autoRoutingEnabled: autoModelRoutingEnabled,
         }
       : {
           // Dummy values for workspace variant (never used)
@@ -1088,6 +1093,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // until WorkspaceModeAISync corrects the workspace.
     const reasoningKey = getReasoningModeKey(scopeId);
     const existingReasoning = readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard");
+    const agentBaseById = new Map(agents.map((agent) => [agent.id, agent.base]));
     const {
       resolvedModel,
       resolvedThinking,
@@ -1099,12 +1105,17 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       existingModel,
       existingThinking,
       existingReasoningMode: existingReasoning,
-      agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
+      agentBaseById,
     });
-
-    if (isExplicitAgentSwitch) {
-      leaveAutoRoutingForAgentSwitch(scopeId);
-    }
+    // Agent resolution in creation scopes uses configured defaults because they keep no
+    // per-agent routing choices or settings buckets.
+    const autoRoutingOutcome = resolveAutoRoutingForAgent({
+      agentId: normalizedAgentId,
+      agentAiDefaults,
+      agentBaseById,
+      explicitSwitch: isExplicitAgentSwitch,
+      experimentEnabled: autoModelRoutingEnabled,
+    });
     if (existingModel !== resolvedModel) {
       setWorkspaceModelWithOrigin(scopeId, resolvedModel, isExplicitAgentSwitch ? "agent" : "sync");
     }
@@ -1120,7 +1131,17 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     if (existingReasoning !== resolvedReasoning) {
       updatePersistedState(reasoningKey, resolvedReasoning);
     }
-  }, [agentAiDefaults, agentId, agents, creationParentProjectPath, defaultModel, variant]);
+
+    applyAutoRoutingOutcome(scopeId, autoRoutingOutcome);
+  }, [
+    agentAiDefaults,
+    agentId,
+    agents,
+    autoModelRoutingEnabled,
+    creationParentProjectPath,
+    defaultModel,
+    variant,
+  ]);
 
   const chatDockColumnWidthClass = useChatDockColumnWidthClass();
 

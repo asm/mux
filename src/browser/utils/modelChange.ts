@@ -1,12 +1,21 @@
 import {
+  getAgentIdKey,
   getAutoModelRoutingKey,
+  getAutoRoutingChoiceByAgentKey,
   getAutoThinkingLevelKey,
   getModelKey,
   getThinkingLevelKey,
 } from "@/common/constants/storage";
 import { modelSelectionEqualityKey } from "@/common/utils/ai/models";
+import { normalizeAgentId } from "@/common/utils/agentIds";
 import type { ThinkingLevel } from "@/common/types/thinking";
-import { readPersistedString, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import {
+  readPersistedState,
+  readPersistedString,
+  updatePersistedState,
+} from "@/browser/hooks/usePersistedState";
+import type { AutoRoutingChoiceByAgent, AutoRoutingOutcome } from "@/browser/utils/workspaceModeAi";
 
 export type ModelChangeOrigin = "user" | "agent" | "sync";
 
@@ -82,28 +91,74 @@ export function setWorkspaceModelWithOrigin(
 ): void {
   recordWorkspaceModelChange(workspaceId, model, origin);
   updatePersistedState(getModelKey(workspaceId), model);
-  // An explicit concrete pick (user or agent, e.g. an accepted plan's model) leaves Auto;
-  // sync-driven mode defaults keep the user's routing choice.
-  if (origin !== "sync") {
+  if (origin === "user") {
+    setAutoRoutingChoice(workspaceId, "model", false);
+  } else if (origin === "agent") {
+    // Clear the previous flag until the caller applies the target agent's resolved routing.
     updatePersistedState(getAutoModelRoutingKey(workspaceId), false);
   }
 }
 
-/**
- * An explicit agent switch applies the agent's concrete model and thinking level, so it leaves
- * both Auto dimensions even when the stored values already match and nothing is rewritten;
- * otherwise the next send would replace the agent's concrete settings with a tier's.
- */
-export function leaveAutoRoutingForAgentSwitch(workspaceId: string): void {
-  updatePersistedState(getAutoModelRoutingKey(workspaceId), false);
-  updatePersistedState(getAutoThinkingLevelKey(workspaceId), false);
+export type AutoRoutingDimension = "model" | "thinkingLevel";
+
+const AUTO_ROUTING_KEY_BY_DIMENSION: Record<AutoRoutingDimension, (scopeId: string) => string> = {
+  model: getAutoModelRoutingKey,
+  thinkingLevel: getAutoThinkingLevelKey,
+};
+
+export function getAutoRoutingKey(scopeId: string, dimension: AutoRoutingDimension): string {
+  return AUTO_ROUTING_KEY_BY_DIMENSION[dimension](scopeId);
 }
 
-/**
- * Thinking counterpart of setWorkspaceModelWithOrigin for agent-resolved levels: an explicit
- * agent switch leaves thinking Auto, otherwise the next send would replace the agent's concrete
- * level with a tier's; sync-driven defaults keep the user's routing choice.
- */
+/** Records workspace routing picks per agent; non-workspace scopes keep only scope-wide Auto. */
+function recordAutoRoutingChoice(
+  scopeId: string,
+  dimension: AutoRoutingDimension,
+  auto: boolean
+): void {
+  if (scopeId.length === 0 || scopeId.startsWith("__")) return;
+  const agentId = normalizeAgentId(
+    readPersistedState<string>(getAgentIdKey(scopeId), WORKSPACE_DEFAULTS.agentId),
+    WORKSPACE_DEFAULTS.agentId
+  );
+  recordAutoRoutingChoiceForAgent(scopeId, agentId, { [dimension]: auto });
+}
+
+export function recordAutoRoutingChoiceForAgent(
+  workspaceId: string,
+  agentId: string,
+  choice: Partial<Record<AutoRoutingDimension, boolean>>
+): void {
+  updatePersistedState<AutoRoutingChoiceByAgent>(
+    getAutoRoutingChoiceByAgentKey(workspaceId),
+    (prev) => {
+      const record: AutoRoutingChoiceByAgent = prev && typeof prev === "object" ? prev : {};
+      return { ...record, [agentId]: { ...record[agentId], ...choice } };
+    },
+    {}
+  );
+}
+
+export function setAutoRoutingChoice(
+  scopeId: string,
+  dimension: AutoRoutingDimension,
+  active: boolean
+): void {
+  updatePersistedState(getAutoRoutingKey(scopeId, dimension), active);
+  recordAutoRoutingChoice(scopeId, dimension, active);
+}
+
+/** Apply after agent-origin writes clear Auto so the target agent's resolved choice wins. */
+export function applyAutoRoutingOutcome(scopeId: string, outcome: AutoRoutingOutcome): void {
+  for (const dimension of ["model", "thinkingLevel"] as const) {
+    const active = outcome[dimension];
+    if (active !== undefined) {
+      updatePersistedState(getAutoRoutingKey(scopeId, dimension), active);
+    }
+  }
+}
+
+/** Agent switches clear Auto before the resolved routing outcome is applied; sync preserves it. */
 export function setWorkspaceThinkingLevelWithOrigin(
   workspaceId: string,
   level: ThinkingLevel,

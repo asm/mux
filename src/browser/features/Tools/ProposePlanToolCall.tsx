@@ -47,18 +47,24 @@ import {
   getModelKey,
   getPlanContentKey,
   getReasoningModeKey,
+  getAutoRoutingChoiceByAgentKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
-import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
+import { applyAutoRoutingOutcome, setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
 import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import {
+  resolveAutoRoutingForAgent,
   resolveWorkspaceAiSettingsForAgent,
+  type AutoRoutingChoiceByAgent,
+  type AutoRoutingOutcome,
   type WorkspaceAISettingsCache,
 } from "@/browser/utils/workspaceModeAi";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
@@ -145,6 +151,7 @@ interface TargetAgentSettings {
   existingModel: string;
   existingThinking: ThinkingLevel;
   existingReasoning: OpenAIReasoningMode;
+  autoRouting: AutoRoutingOutcome;
 }
 
 interface ProposePlanToolCallProps {
@@ -203,6 +210,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const { api } = useAPI();
   const { waitForPreferencePersisted } = useUserPreferencePersistence();
   const { agentId: currentAgentId, agents } = useAgent();
+  const autoRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const isAutoMode = currentAgentId === "auto";
   const openInEditor = useOpenInEditor();
   const workspaceContext = useOptionalWorkspaceContext();
@@ -522,6 +530,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       {}
     );
 
+    const agentBaseById = new Map(agents.map((agent) => [agent.id, agent.base]));
     const { resolvedModel, resolvedThinking, resolvedReasoningMode } =
       resolveWorkspaceAiSettingsForAgent({
         agentId: args.targetAgentId,
@@ -534,8 +543,19 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         existingModel,
         existingThinking,
         existingReasoningMode: existingReasoning,
-        agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
+        agentBaseById,
       });
+    const autoRouting = resolveAutoRoutingForAgent({
+      agentId: args.targetAgentId,
+      agentAiDefaults,
+      agentBaseById,
+      explicitSwitch: true,
+      experimentEnabled: autoRoutingEnabled,
+      routingChoices: readPersistedState<AutoRoutingChoiceByAgent>(
+        getAutoRoutingChoiceByAgentKey(args.workspaceId),
+        {}
+      ),
+    });
 
     return {
       resolvedModel,
@@ -544,6 +564,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       existingModel,
       existingThinking,
       existingReasoning,
+      autoRouting,
     };
   };
 
@@ -566,6 +587,8 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     if (settings.existingReasoning !== settings.resolvedReasoningMode) {
       updatePersistedState(getReasoningModeKey(args.workspaceId), settings.resolvedReasoningMode);
     }
+    // Persist routing for later composer sends; the immediate action below disables routing.
+    applyAutoRoutingOutcome(args.workspaceId, settings.autoRouting);
   };
 
   /**

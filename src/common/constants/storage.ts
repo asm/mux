@@ -234,6 +234,14 @@ export function getAutoThinkingLevelKey(workspaceId: string): string {
 }
 
 /**
+ * Explicit routing picks stay separate from the metadata-hydrated per-agent AI settings
+ * cache, which carries no routing state.
+ */
+export function getAutoRoutingChoiceByAgentKey(workspaceId: string): string {
+  return `autoRoutingChoiceByAgent:${workspaceId}`;
+}
+
+/**
  * Get the localStorage key for the input text for a workspace
  */
 export function getInputKey(workspaceId: string): string {
@@ -878,6 +886,7 @@ const PERSISTENT_WORKSPACE_KEY_FUNCTIONS: Array<(workspaceId: string) => string>
   getModelKey,
   getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
+  getAutoRoutingChoiceByAgentKey,
   getInputKey,
   getAutoExpandPrefsKey,
   getWorkspaceNameStateKey,
