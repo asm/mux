@@ -669,6 +669,11 @@ interface TaskLaunchPlan {
   /** Attempt id the reservation commit (or the queue drain's launch CAS) published for this plan. */
   attemptId?: string;
   /**
+   * createMany only: the parent row was found by id when the reservation was revalidated, so the
+   * commit refuses if it is gone by then (see assertParentAdmitsChild).
+   */
+  requireParentRow?: boolean;
+  /**
    * Flipped by the launch fence immediately before the send is admitted. A launch failure that
    * observes it false has positive evidence that no execution was ever admitted for the attempt.
    */
@@ -699,6 +704,33 @@ export interface TaskRetiresClaim {
   taskId: string;
   attemptId: string;
   nonce: string;
+}
+
+/**
+ * #4782: a child committed under a parent that another backend is removing (or has removed) would
+ * outlive it as an orphaned row. Checked inside every task-creation config write; the removal
+ * checks for descendants after its marker claim (WorkspaceService.removeUnlocked), so either the
+ * child's write sees the marker or the removal sees the child. `requireRow` refuses a parent row
+ * that disappeared since preparation found it by id; callers pass false when preparation did not
+ * (a legacy id-less row resolves only through session metadata, never by id here).
+ */
+function assertParentAdmitsChild(
+  config: Parameters<typeof findWorkspaceEntry>[0],
+  parentWorkspaceId: string,
+  options: { requireRow: boolean }
+): void {
+  const parent = findWorkspaceEntry(config, parentWorkspaceId)?.workspace;
+  if (parent == null) {
+    if (options.requireRow) {
+      throw new Error(`Task.create: parent workspace ${parentWorkspaceId} was removed`);
+    }
+    return;
+  }
+  if (parent.pendingRemoval != null) {
+    throw new Error(
+      `Task.create: parent workspace ${parentWorkspaceId} is being removed (by Xum process ${parent.pendingRemoval.pid})`
+    );
+  }
 }
 
 /** Last stage a reservation entered; carried into abort/timeout diagnostics and the stall warning. */
@@ -6068,6 +6100,7 @@ export class TaskService implements AgentTaskIntegration {
       plans.push({
         taskId,
         parentWorkspaceId: plan.parentWorkspaceId,
+        requireParentRow: findWorkspaceEntry(cfg, plan.parentWorkspaceId) != null,
         parentMeta: plan.parentMeta,
         agentId: plan.agentId,
         agentType: plan.agentId,
@@ -6291,6 +6324,9 @@ export class TaskService implements AgentTaskIntegration {
       const canceledInsideCommit = signal?.aborted === true;
       if (canceledInsideCommit) onCanceledInsideCommit();
       for (const plan of plans) {
+        assertParentAdmitsChild(config, plan.parentWorkspaceId, {
+          requireRow: plan.requireParentRow === true,
+        });
         const runtime = createRuntimeForWorkspace({
           runtimeConfig: plan.taskRuntimeConfig,
           projectPath: plan.parentMeta.projectPath,
@@ -7651,6 +7687,7 @@ export class TaskService implements AgentTaskIntegration {
       try {
         await reserveDesktop(async () => {
           await this.config.editConfig((config) => {
+            assertParentAdmitsChild(config, parentWorkspaceId, { requireRow: parentEntry != null });
             let projectConfig = config.projects.get(configProjectPath);
             if (!projectConfig) {
               projectConfig = { workspaces: [] };
@@ -7998,6 +8035,7 @@ export class TaskService implements AgentTaskIntegration {
 
       // Persist workspace entry before starting work so it's durable across crashes.
       await this.config.editConfig((config) => {
+        assertParentAdmitsChild(config, parentWorkspaceId, { requireRow: parentEntry != null });
         let projectConfig = config.projects.get(configProjectPath);
         if (!projectConfig) {
           projectConfig = { workspaces: [] };
