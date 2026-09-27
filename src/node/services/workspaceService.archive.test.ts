@@ -15,6 +15,7 @@ import { stageWorkspaceAttachment } from "@/node/utils/attachments/stageWorkspac
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { Workspace } from "@/common/types/project";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
 import type { Config } from "@/node/config";
 import type { AIService } from "./aiService";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
@@ -2498,5 +2499,146 @@ describe("WorkspaceService unarchive rehydrates staged attachments", () => {
         .then(() => true)
         .catch(() => false)
     ).toBe(false);
+  });
+});
+
+// #4845: uploads staged before the session mirror existed have only a checkout copy, which a
+// snapshot archive deletes with the worktree. Archive must copy referenced ones into the mirror
+// before capture so unarchive can rehydrate them.
+describe("WorkspaceService snapshot archive backfills pre-mirror staged attachments", () => {
+  const workspaceId = "ws-archive-backfill";
+  const projectPath = "/tmp/project";
+
+  let harness: WorkspaceServiceHarness;
+  let repo: string;
+
+  beforeEach(async () => {
+    repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "ws-archive-backfill-"));
+    execFileSync("git", ["init", "-b", "main"], { cwd: repo, stdio: "ignore" });
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: os.tmpdir() };
+    const metadata: FrontendWorkspaceMetadata = {
+      id: workspaceId,
+      name: path.basename(repo),
+      projectName: "proj",
+      projectPath,
+      runtimeConfig,
+      namedWorkspacePath: repo,
+    };
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({
+        isStreaming: mock(() => false),
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(metadata))),
+      }),
+    });
+    await saveWorkspaces(
+      harness.config,
+      projectPath,
+      [
+        {
+          path: repo,
+          id: workspaceId,
+          name: path.basename(repo),
+          createdAt: "2020-01-01T00:00:00.000Z",
+          runtimeConfig,
+        },
+      ],
+      { worktreeArchiveBehavior: "snapshot" }
+    );
+  });
+
+  afterEach(async () => {
+    await harness.cleanup();
+    await fsPromises.rm(repo, { recursive: true, force: true });
+  });
+
+  function useSnapshotService() {
+    const snapshot: WorktreeArchiveSnapshot = {
+      version: 1,
+      capturedAt: "2026-03-30T00:00:00.000Z",
+      stateDirPath: "archive-state",
+      projects: [
+        {
+          projectPath,
+          projectName: "proj",
+          storageKey: "proj",
+          branchName: path.basename(repo),
+          trunkBranch: "main",
+          baseSha: "base-sha",
+          headSha: "head-sha",
+        },
+      ],
+    };
+    harness.service.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      // Capture deletes the worktree; restore recreates it from git-visible state only.
+      captureSnapshotForArchive: mock(async () => {
+        await fsPromises.rm(path.join(repo, ".xum"), { recursive: true, force: true });
+        return Ok(snapshot);
+      }),
+      restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("restored" as const))),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
+    });
+  }
+
+  /** Stage an upload the way pre-#3947 builds did: checkout copy only, referenced by chat. */
+  async function stagePreMirrorUpload(bytes: Buffer): Promise<string> {
+    const sessionDir = path.join(harness.config.sessionsDir, workspaceId);
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(repo),
+      workspacePath: repo,
+      sessionDir,
+      filename: "notes.md",
+      mediaType: "text/markdown",
+      sizeBytes: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    });
+    if (!staged.success) throw new Error(staged.error);
+    await fsPromises.rm(path.join(sessionDir, "staged-attachments"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(sessionDir, "chat.jsonl"),
+      JSON.stringify({
+        id: "m1",
+        role: "user",
+        parts: [{ type: "text", text: `Attached \`${staged.data.stagedPath}\`` }],
+      }) + "\n"
+    );
+    return staged.data.stagedPath;
+  }
+
+  test("a referenced upload staged before the mirror survives archive and unarchive", async () => {
+    const bytes = Buffer.from("staged before the mirror existed");
+    const stagedPath = await stagePreMirrorUpload(bytes);
+    useSnapshotService();
+
+    expect(await harness.service.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
+    expect(await harness.service.unarchive(workspaceId)).toEqual(Ok(undefined));
+
+    expect(await fsPromises.readFile(path.join(repo, stagedPath))).toEqual(bytes);
+  });
+
+  test("an unreadable history file does not hide references in its siblings", async () => {
+    const bytes = Buffer.from("referenced by chat.jsonl");
+    const stagedPath = await stagePreMirrorUpload(bytes);
+    await fsPromises.mkdir(
+      path.join(harness.config.sessionsDir, workspaceId, CHAT_ARCHIVE_FILE_NAME)
+    );
+    useSnapshotService();
+
+    expect(await harness.service.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
+    expect(await harness.service.unarchive(workspaceId)).toEqual(Ok(undefined));
+
+    expect(await fsPromises.readFile(path.join(repo, stagedPath))).toEqual(bytes);
+  });
+
+  test("a failed backfill copy does not block the archive", async () => {
+    await stagePreMirrorUpload(Buffer.from("cannot be mirrored"));
+    // The mirror root cannot be created, so the copy fails.
+    await fsPromises.writeFile(
+      path.join(harness.config.sessionsDir, workspaceId, "staged-attachments"),
+      "not a directory"
+    );
+    useSnapshotService();
+
+    expect(await harness.service.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
   });
 });

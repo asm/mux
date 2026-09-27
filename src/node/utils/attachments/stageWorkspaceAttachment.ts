@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { constants as fsConstants, type Stats } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 import {
   MAX_STAGED_ATTACHMENT_SIZE_BYTES,
@@ -320,6 +322,150 @@ export async function copyStagedAttachmentMirrorEntries(input: {
   }
 }
 
+/**
+ * Copy referenced checkout uploads that have no mirror entry into the mirror before a snapshot
+ * archive deletes the checkout (#4845). Uploads staged before the mirror existed (#3947) have only
+ * the checkout copy.
+ *
+ * The checkout is repo-controlled, so this never walks it: it reads only the given paths, each of
+ * which must have the exact canonical shape staging produces, must be reachable through real
+ * directories, and must be a regular file within the upload cap. Host-local worktree checkouts
+ * only. Best effort: anything that fails a check or cannot be read is skipped, never thrown.
+ */
+export async function backfillStagedAttachmentMirror(input: {
+  workspacePath: string;
+  sessionDir: string;
+  stagedPaths: readonly string[];
+}): Promise<{ copied: string[]; skipped: string[] }> {
+  assert(path.isAbsolute(input.workspacePath), "workspacePath must be an absolute host path");
+  assert(path.isAbsolute(input.sessionDir), "sessionDir must be absolute");
+  const copied: string[] = [];
+  const skipped: string[] = [];
+  for (const stagedPath of input.stagedPaths) {
+    try {
+      const mirrorPath = resolveStagedAttachmentMirrorPath(input.sessionDir, stagedPath);
+      if (mirrorPath == null) {
+        skipped.push(stagedPath);
+        continue;
+      }
+      const existing = await lstatOrNull(mirrorPath);
+      if (existing?.isFile() && existing.size <= MAX_STAGED_ATTACHMENT_SIZE_BYTES) {
+        continue;
+      }
+      // Never delete a directory in its place; anything else rehydration would reject (a symlink
+      // or an oversized file) is corrupted host state and is replaced below.
+      if (existing?.isDirectory()) {
+        skipped.push(stagedPath);
+        continue;
+      }
+      const bytes = await readCheckoutFileWithoutFollowingLinks(input.workspacePath, stagedPath);
+      if (bytes == null) {
+        skipped.push(stagedPath);
+        continue;
+      }
+      await ensurePrivateDir(input.sessionDir);
+      // A symlinked mirror ancestor (corrupted host state) would redirect the write outside the
+      // session dir, so each directory is created or verified without following links.
+      const entryDir = await ensureRealDirectoryChain(input.sessionDir, [
+        STAGED_ATTACHMENT_MIRROR_DIR_NAME,
+        path.basename(path.dirname(mirrorPath)),
+      ]);
+      if (entryDir == null) {
+        skipped.push(stagedPath);
+        continue;
+      }
+      // Write aside then rename, so a crash never leaves a truncated entry that later archives
+      // would treat as the durable copy. The temp name fails the canonical-name check, and rename
+      // replaces a symlinked leaf itself, never its target.
+      const tempPath = path.join(entryDir, `.backfill-${randomUUID()}`);
+      await fsPromises.writeFile(tempPath, bytes, { flag: "wx" });
+      await fsPromises.rename(tempPath, path.join(entryDir, path.basename(mirrorPath)));
+      copied.push(stagedPath);
+    } catch (error) {
+      log.debug("Skipping staged attachment mirror backfill", {
+        stagedPath,
+        error: getErrorMessage(error),
+      });
+      skipped.push(stagedPath);
+    }
+  }
+  return { copied, skipped };
+}
+
+/**
+ * Read `<root>/<canonical staged path>` from a repo-controlled checkout, or null when any segment
+ * is a symlink or not a directory, the leaf is not a regular file, or it exceeds the upload cap.
+ * O_NOFOLLOW refuses a symlinked leaf, O_NONBLOCK keeps a FIFO from blocking the open, and the
+ * opened file must still be the one reachable through real directories afterwards, so swapping a
+ * segment for a symlink between the checks and the open is detected.
+ */
+async function readCheckoutFileWithoutFollowingLinks(
+  root: string,
+  stagedPath: string
+): Promise<Buffer | null> {
+  const segments = stagedPath.split("/");
+  const leafPath = path.join(root, ...segments);
+  if (!(await isRealDirectoryChain(root, segments.slice(0, -1)))) {
+    return null;
+  }
+  // O_NOFOLLOW is undefined on Windows; the identity re-check below still applies there.
+  const flags =
+    fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
+  const handle = await fsPromises.open(leafPath, flags);
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.size > MAX_STAGED_ATTACHMENT_SIZE_BYTES) {
+      return null;
+    }
+    const current = await fsPromises.lstat(leafPath);
+    if (
+      !(await isRealDirectoryChain(root, segments.slice(0, -1))) ||
+      !current.isFile() ||
+      current.dev !== opened.dev ||
+      current.ino !== opened.ino
+    ) {
+      return null;
+    }
+    // Read at most one byte past the size seen at open, so a file growing meanwhile is refused
+    // instead of read without bound.
+    const buffer = Buffer.alloc(opened.size + 1);
+    let length = 0;
+    while (length < buffer.byteLength) {
+      const { bytesRead } = await handle.read(buffer, length, buffer.byteLength - length, null);
+      if (bytesRead === 0) {
+        break;
+      }
+      length += bytesRead;
+    }
+    return length > opened.size ? null : buffer.subarray(0, length);
+  } finally {
+    await handle.close();
+  }
+}
+
+/** True when every `root/segments...` prefix is a real directory (lstat, no symlinks). */
+async function isRealDirectoryChain(root: string, segments: readonly string[]): Promise<boolean> {
+  let current = root;
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    if (!(await fsPromises.lstat(current)).isDirectory()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function lstatOrNull(filePath: string): Promise<Stats | null> {
+  try {
+    return await fsPromises.lstat(filePath);
+  } catch (error) {
+    if (isErrnoWithCode(error, "ENOENT")) {
+      return null;
+    }
+    throw error;
+  }
+}
+
 export function extractStagedAttachmentPathsFromText(text: string): string[] {
   const paths = new Set<string>();
   const pattern = /`(?<path>\.(?:xum|mux)\/user-attachments\/[^`]+)`/gu;
@@ -328,6 +474,41 @@ export function extractStagedAttachmentPathsFromText(text: string): string[] {
     if (stagedPath != null) {
       paths.add(stagedPath);
     }
+  }
+  return [...paths];
+}
+
+const HISTORY_SCAN_CHUNK_BYTES = 1024 * 1024;
+
+/**
+ * extractStagedAttachmentPathsFromText over a history file, one line at a time, so a large
+ * append-only history never has to be held in memory whole. Paths cannot span lines: they come
+ * from JSON strings, which escape newlines.
+ */
+export async function extractStagedAttachmentPathsFromFile(filePath: string): Promise<string[]> {
+  const paths = new Set<string>();
+  const scan = (text: string) => {
+    for (const stagedPath of extractStagedAttachmentPathsFromText(text)) {
+      paths.add(stagedPath);
+    }
+  };
+  const handle = await fsPromises.open(filePath, "r");
+  try {
+    const decoder = new StringDecoder("utf8");
+    const chunk = Buffer.alloc(HISTORY_SCAN_CHUNK_BYTES);
+    let carry = "";
+    while (true) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, null);
+      if (bytesRead === 0) {
+        break;
+      }
+      const lines = (carry + decoder.write(chunk.subarray(0, bytesRead))).split("\n");
+      carry = lines.pop() ?? "";
+      lines.forEach(scan);
+    }
+    scan(carry + decoder.end());
+  } finally {
+    await handle.close();
   }
   return [...paths];
 }

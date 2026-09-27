@@ -193,9 +193,10 @@ import { removeManagedGitWorktree } from "@/node/worktree/removeManagedGitWorktr
 import { managedRootsByProject, syncProjectCodeWorkspace } from "@/node/worktree/codeWorkspaceSync";
 
 import {
+  backfillStagedAttachmentMirror,
   copyStagedAttachmentMirrorEntries,
   copyStagedWorkspaceAttachments,
-  extractStagedAttachmentPathsFromText,
+  extractStagedAttachmentPathsFromFile,
   readStagedWorkspaceAttachment,
   rehydrateStagedWorkspaceAttachments,
   stageWorkspaceAttachment,
@@ -1378,18 +1379,32 @@ function rollUpAncestorWorkspaceIds(params: {
   ];
 }
 
-async function collectReferencedStagedAttachmentPaths(sessionDir: string): Promise<string[]> {
+/**
+ * Staged paths referenced by the session's history files. Throws on an unreadable file unless
+ * `onUnreadable` is given, in which case that file is reported and its readable siblings still
+ * count.
+ */
+async function collectReferencedStagedAttachmentPaths(
+  sessionDir: string,
+  onUnreadable?: (fileName: string, error: unknown) => void
+): Promise<string[]> {
   const paths = new Set<string>();
   for (const fileName of [CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME, "partial.json"] as const) {
     try {
-      const content = await fsPromises.readFile(path.join(sessionDir, fileName), "utf8");
-      for (const stagedPath of extractStagedAttachmentPathsFromText(content)) {
+      // Streamed: every snapshot archive scans the full append-only history.
+      for (const stagedPath of await extractStagedAttachmentPathsFromFile(
+        path.join(sessionDir, fileName)
+      )) {
         paths.add(stagedPath);
       }
     } catch (error) {
-      if (!isErrnoWithCode(error, "ENOENT")) {
+      if (isErrnoWithCode(error, "ENOENT")) {
+        continue;
+      }
+      if (onUnreadable == null) {
         throw error;
       }
+      onUnreadable(fileName, error);
     }
   }
   return [...paths];
@@ -10608,6 +10623,7 @@ export class WorkspaceService
 
         await this.closeDesktopSessionBestEffort(workspaceId, "archive");
         await this.stopLiveWorkspaceActivityForArchive(workspaceId);
+        await this.backfillStagedAttachmentMirrorBeforeSnapshot(workspaceId, beforeArchiveMetadata);
 
         // Pass acknowledgedUntrackedPaths to capture so it re-verifies at capture time,
         // closing the remaining race window between the final confirmation check and the
@@ -12892,6 +12908,54 @@ export class WorkspaceService
       }
     } catch (error) {
       log.warn("Failed to restore staged attachments after snapshot restore", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  /**
+   * Uploads staged before the session mirror existed (#3947) have only the checkout copy, which
+   * the snapshot archive is about to delete with the worktree (#4845). Copy the ones the chat
+   * references into the mirror so unarchive can rehydrate them. Best-effort by design (#4845): a
+   * skipped copy is lost exactly as before this backfill existed, and never blocks archiving.
+   */
+  private async backfillStagedAttachmentMirrorBeforeSnapshot(
+    workspaceId: string,
+    metadata: WorkspaceMetadata
+  ): Promise<void> {
+    // Snapshot capture runs only for worktree runtimes, whose checkout is host-local.
+    assert(isWorktreeRuntime(metadata.runtimeConfig), "snapshot capture is worktree-only");
+    try {
+      const sessionDir = path.join(this.config.sessionsDir, workspaceId);
+      // One damaged history file must not hide references in its readable siblings.
+      const stagedPaths = await collectReferencedStagedAttachmentPaths(
+        sessionDir,
+        (fileName, error) =>
+          log.warn("Skipping unreadable history file for staged attachment backfill", {
+            workspaceId,
+            fileName,
+            error: getErrorMessage(error),
+          })
+      );
+      if (stagedPaths.length === 0) {
+        return;
+      }
+      const { workspacePath } = createRuntimeContextForWorkspace(metadata);
+      const result = await backfillStagedAttachmentMirror({
+        workspacePath,
+        sessionDir,
+        stagedPaths,
+      });
+      if (result.copied.length > 0 || result.skipped.length > 0) {
+        log.info("Backfilled staged attachment mirror before snapshot archive", {
+          workspaceId,
+          copied: result.copied,
+          skipped: result.skipped,
+        });
+      }
+    } catch (error) {
+      log.warn("Failed to backfill staged attachment mirror before snapshot archive", {
         workspaceId,
         error: getErrorMessage(error),
       });
