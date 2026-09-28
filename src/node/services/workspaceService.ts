@@ -18932,6 +18932,9 @@ export class WorkspaceService
     const goalKind = input.kind ?? GOAL_CONTINUATION_KIND;
     const startStreamInBackground =
       input.startStreamInBackground === true && goalKind !== GOAL_BUDGET_LIMIT_KIND;
+    // Set once the send returns, so its failure callback can tell whether it runs inside it.
+    let sendSettled = false;
+    let failedBeforeStreamInSend = false;
     const sendResult = await this.sendMessage(
       input.workspaceId,
       input.message,
@@ -18946,8 +18949,20 @@ export class WorkspaceService
         agentInitiated: true,
         startStreamInBackground,
         onAcceptedPreStreamFailure: startStreamInBackground
-          ? () =>
-              this.workspaceGoalService?.requestPendingGoalContinuationDispatch(input.workspaceId)
+          ? async () => {
+              // A failure inside this send runs while the idle dispatcher is still dispatching
+              // this continuation. The dispatcher never starts a workspace it is dispatching,
+              // so awaiting a re-dispatch here deadlocked the send (and session disposal,
+              // which drains it, hung workspace removal: #5029). Report it as not dispatched
+              // below instead; the dispatching caller then retries with its own backoff.
+              if (!sendSettled) {
+                failedBeforeStreamInSend = true;
+                return;
+              }
+              await this.workspaceGoalService?.requestPendingGoalContinuationDispatch(
+                input.workspaceId
+              );
+            }
           : undefined,
         requireIdle: true,
         goalKind,
@@ -18958,11 +18973,19 @@ export class WorkspaceService
         admissionStale: input.admissionStale,
       }
     );
+    sendSettled = true;
 
     if (!sendResult.success) {
       log.info("WorkspaceService: goal continuation send skipped", {
         workspaceId: input.workspaceId,
         error: sendResult.error,
+      });
+      return false;
+    }
+    // Accepted, then canceled before streaming, yet the send returned Ok: no stream runs.
+    if (failedBeforeStreamInSend) {
+      log.info("WorkspaceService: goal continuation failed before streaming", {
+        workspaceId: input.workspaceId,
       });
       return false;
     }
