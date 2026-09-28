@@ -1982,9 +1982,10 @@ export class TaskService implements AgentTaskIntegration {
   private workflowAttentionSweepTimer: ReturnType<typeof setInterval> | null = null;
   private readonly pendingWaitersByTaskId = new Map<string, PendingTaskWaiter[]>();
   private readonly pendingStartWaitersByTaskId = new Map<string, PendingTaskStartWaiter[]>();
-  // Tasks whose launch failed but whose failure write rejected (#4747): the row still says
-  // queued/starting and nothing will move it to running, so waiters arm their timeout at once.
-  // A later move to running or a recorded launch failure clears the mark.
+  // Tasks whose launch failed, or whose reservation was canceled or failed, but whose write
+  // ending the row rejected (#4747, #5028): the row still says queued/starting and nothing will
+  // move it to running, so waiters arm their timeout at once. A later move to running, a
+  // recorded launch failure or the workspace's removal clears the mark.
   private readonly unpersistedLaunchFailureTaskIds = new Set<string>();
   // Tracks workspaces currently blocked in a foreground wait (e.g. a task tool call awaiting
   // agent_report). Used to avoid scheduler deadlocks when maxParallelAgentTasks is low and tasks
@@ -6327,22 +6328,36 @@ export class TaskService implements AgentTaskIntegration {
     // write (never detached).
     if (canceledInsideCommit || signal?.aborted) {
       this.closeReservedAttempts(plans, "reservation-canceled");
+      // The first fence write that rejected; thrown once every plan was handled (#5028).
+      let fenceFailure: { error: unknown } | undefined;
       for (const plan of plans) {
         const ownedAttempt = this.ownedAttemptByTaskId.get(plan.taskId);
         let transitioned = canceledInsideCommit;
         let superseded = false;
         if (!canceledInsideCommit) {
-          await this.editWorkspaceEntry(
-            plan.taskId,
-            (ws) => {
-              superseded = rowSupersedes(ws, plan.attemptId);
-              if (ws.taskStatus !== plan.status || superseded) return;
-              ws.taskStatus = "interrupted";
-              ws.taskLaunchError = TASK_RESERVATION_CANCELED_MESSAGE;
-              transitioned = true;
-            },
-            { allowMissing: true }
-          );
+          let rowMoved = false;
+          try {
+            await this.editWorkspaceEntry(
+              plan.taskId,
+              (ws) => {
+                superseded = rowSupersedes(ws, plan.attemptId);
+                if (ws.taskStatus !== plan.status || superseded) {
+                  rowMoved = true;
+                  return;
+                }
+                ws.taskStatus = "interrupted";
+                ws.taskLaunchError = TASK_RESERVATION_CANCELED_MESSAGE;
+                transitioned = true;
+              },
+              { allowMissing: true }
+            );
+          } catch (error: unknown) {
+            // Nothing launches this row now (#5028), unless the row already moved on (another
+            // writer's attempt, whose waiters this cancel must not touch).
+            if (!rowMoved) this.armWaitersOfUnendedTask(plan.taskId);
+            fenceFailure ??= { error };
+            continue;
+          }
         }
         if (transitioned) this.recordTaskInterrupted(plan.taskId, plan.parentWorkspaceId);
         // Waiters are keyed by the stable task id: once another writer re-admitted the row under
@@ -6361,6 +6376,7 @@ export class TaskService implements AgentTaskIntegration {
         );
         await this.emitWorkspaceMetadata(plan.taskId);
       }
+      if (fenceFailure != null) throw fenceFailure.error;
       return interrupted();
     }
 
@@ -6535,6 +6551,7 @@ export class TaskService implements AgentTaskIntegration {
         continue;
       }
       if (committed) {
+        let rowMoved = false;
         try {
           let transitioned = false;
           let superseded = false;
@@ -6542,7 +6559,10 @@ export class TaskService implements AgentTaskIntegration {
             plan.taskId,
             (ws) => {
               superseded = rowSupersedes(ws, plan.attemptId);
-              if (ws.taskStatus !== plan.status || superseded) return;
+              if (ws.taskStatus !== plan.status || superseded) {
+                rowMoved = true;
+                return;
+              }
               ws.taskStatus = "interrupted";
               ws.taskLaunchError = message;
               transitioned = true;
@@ -6558,6 +6578,8 @@ export class TaskService implements AgentTaskIntegration {
             taskId: plan.taskId,
             error: fenceError,
           });
+          // Nothing launches this row now (#5028), unless it already moved on (see above).
+          if (!rowMoved) this.armWaitersOfUnendedTask(plan.taskId);
           continue;
         }
       }
@@ -6978,8 +7000,7 @@ export class TaskService implements AgentTaskIntegration {
       // unknown when the updater never ran. But a waiter that attached while the task was
       // queued/starting arms its timeout only on the move to running, which this failed launch
       // never makes; arm it now (and for later waiters) so they settle at their timeout.
-      this.unpersistedLaunchFailureTaskIds.add(taskId);
-      this.startPendingStartWaiters(taskId);
+      this.armWaitersOfUnendedTask(taskId);
       throw error;
     }
     this.unpersistedLaunchFailureTaskIds.delete(taskId);
@@ -15475,6 +15496,21 @@ export class TaskService implements AgentTaskIntegration {
       this.startPendingStartWaiters(workspaceId);
     }
     return true;
+  }
+
+  /**
+   * A write that would have ended a queued/starting task rejected, and nothing will move the row
+   * to running (#4747, #5028). Fail closed: waiters are not rejected with the unpersisted outcome,
+   * whose owner is unknown when the updater never ran. Their timeout is armed instead, now and for
+   * waiters that attach later, so they settle at their timeout.
+   */
+  private armWaitersOfUnendedTask(taskId: string): void {
+    this.unpersistedLaunchFailureTaskIds.add(taskId);
+    this.startPendingStartWaiters(taskId);
+  }
+
+  noteWorkspaceRemoved(workspaceId: string): void {
+    this.unpersistedLaunchFailureTaskIds.delete(workspaceId);
   }
 
   /** Arms the report timeout of every waiter that attached while the task was queued/starting. */
