@@ -847,7 +847,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                     {/* The dock holds the chat input, which opts into Escape-to-interrupt like the
                         desktop ChatInput textarea; other editors keep Escape to themselves. */}
                     <div
-                      className="relative border-t border-border bg-background-secondary p-3"
+                      className="relative bg-surface-primary px-[15px] pt-2 pb-2"
                       data-escape-interrupts-stream="true"
                     >
                       {selectedWorkspaceId && !autoScroll ? (
