@@ -13844,8 +13844,55 @@ export class TaskService implements AgentTaskIntegration {
           error: "Cannot remove the sub-agent while its git patch artifact is still pending.",
         });
       }
+      // #4761: a live writer in the checkout (a background process, a terminal, an external
+      // editor) could write after the lossy-work check below, and the forced removal would lose
+      // that work unreported. Take the archive path's admission hold: it refuses while such
+      // activity exists and admits no new sends, bash, terminals or opens until it is released
+      // after the removal. Model-driven only: automatic cleanup and the user cascade never refuse.
+      // Only when removal deletes the checkout (see subagentRemovalPreservesCheckout): a preserved
+      // checkout loses no files, and the sticky app marker would block its removal forever.
+      const guardLiveWriters =
+        options?.lossyWorkPolicy === "refuse" && !subagentRemovalPreservesCheckout(entry.workspace);
+      // The fresh background-process check first, as model-driven archive does: it refreshes exit
+      // statuses (the hold's snapshot may still list an exited process) and sees crash orphans.
+      if (
+        guardLiveWriters &&
+        (await this.workspaceService.hasRunningBackgroundBashProcesses(taskId))
+      ) {
+        return Ok({
+          status: "error",
+          action: "remove",
+          ...target,
+          error:
+            "Background bash processes are still running in this sub-agent's checkout. Stop them before removing the sub-agent.",
+        });
+      }
+      const liveWriterHold = guardLiveWriters
+        ? this.workspaceService.acquirePreInterruptionArchiveHold(taskId, {
+            queuedDelegatedTurnCount: 0,
+            expectedDelegatedTurnCorrelations: [],
+            operation: "remove",
+          })
+        : undefined;
+      if (liveWriterHold?.success === false) {
+        return Ok({ status: "error", action: "remove", ...target, error: liveWriterHold.error });
+      }
+      using _liveWriterHold = liveWriterHold?.success === true ? liveWriterHold.data : undefined;
       // Checked under the tree and patch-artifact locks, right before the tombstone and removal.
       if (options?.lossyWorkPolicy === "refuse") {
+        // An editor or native terminal opened earlier is not trackable, so it may still write.
+        if (
+          guardLiveWriters &&
+          (await this.workspaceService.hasUntrackableExternalAppOpen(taskId))
+        ) {
+          return Ok({
+            status: "error",
+            action: "remove",
+            ...target,
+            error:
+              "An external editor or native terminal was opened in this sub-agent's checkout and may still write to it. Ask the user to remove the sub-agent.",
+          });
+        }
         const refusal = await this.refuseLossySubagentRemoval(taskId, entry, patchArtifact ?? null);
         if (refusal != null)
           return Ok({ status: "error", action: "remove", ...target, ...refusal });
@@ -13882,9 +13929,7 @@ export class TaskService implements AgentTaskIntegration {
   ): Promise<{ error: string; paths?: string[] } | null> {
     const ws = entry.workspace;
     const runtimeConfig = ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
-    // Removal deletes no checkout for isolation "none" children (they share the parent's) or for
-    // project-dir local runtimes (deleteWorkspace is a no-op there).
-    if (ws.taskIsolation === "none" || isLocalProjectRuntime(runtimeConfig)) return null;
+    if (subagentRemovalPreservesCheckout(ws)) return null;
     const workspacePath = coerceNonEmptyString(ws.path);
     const workspaceName = coerceNonEmptyString(ws.name);
     const check =
@@ -19769,4 +19814,14 @@ export class TaskService implements AgentTaskIntegration {
     });
     return removedCount;
   }
+}
+
+/**
+ * Removal deletes no checkout for isolation "none" children (they share the parent's) or for
+ * project-dir local runtimes (deleteWorkspace is a no-op there), so it cannot lose their files.
+ */
+function subagentRemovalPreservesCheckout(ws: WorkspaceConfigEntry): boolean {
+  return (
+    ws.taskIsolation === "none" || isLocalProjectRuntime(ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG)
+  );
 }
