@@ -503,6 +503,16 @@ export const STARTUP_RECOVERY_CONCURRENCY = 8;
 export const PLAN_FILE_DELETE_UNREACHABLE_MESSAGE =
   "History was not cleared: the plan file could not be deleted because the workspace's SSH host or container did not respond. Reconnect the host (or start the container) and try again.";
 
+/**
+ * Where a runtime keeps its plan files, for "do these two workspaces share a plan path": the local
+ * home for local and worktree runtimes, the host's home for SSH. Docker and devcontainer plans live
+ * inside their own container and are never shared (undefined).
+ */
+function planStorageOf(runtimeConfig: RuntimeConfig): string | undefined {
+  if (isDockerRuntime(runtimeConfig) || isDevcontainerRuntime(runtimeConfig)) return undefined;
+  return isSSHRuntime(runtimeConfig) ? `ssh:${runtimeConfig.host}` : "local";
+}
+
 /** Why the plan deletion before a history-discarding commit refused that commit. */
 type PlanFileDeletionError =
   | { type: "runtime_unreachable"; message: string }
@@ -7794,6 +7804,15 @@ export class WorkspaceService
         });
       }
 
+      // #5019: delete the plan files after every step that can refuse the removal (the checkout
+      // deletion and the session teardown above) and BEFORE deregistration frees the name: fork()
+      // refuses a registered name, so no fork (in this or another backend) can copy a plan to this
+      // path until the row is gone. If deregistration then fails, the workspace stays registered
+      // without its plan, like its already deleted session. Without captured metadata there is no
+      // path to derive.
+      if (removedMetadata)
+        await this.deletePlanFilesOfRemovedWorkspace(workspaceId, removedMetadata);
+
       // Remove from config
       try {
         await (pendingRemovalId != null
@@ -7930,6 +7949,65 @@ export class WorkspaceService
       }
       this.removingWorkspaces.delete(workspaceId);
       this.retireRemovalInstanceIfIdle();
+    }
+  }
+
+  /**
+   * Delete a removed workspace's plan files (#5019): plan paths key on project and workspace
+   * name, so a plan left behind is inherited by the next workspace that takes the name. Runs past
+   * every refusal point of the removal, so it is best-effort: a failure (for example an
+   * unreachable SSH host, which deletePlanFiles reports as a typed error) is logged and the orphan
+   * stays.
+   */
+  private async deletePlanFilesOfRemovedWorkspace(
+    workspaceId: string,
+    metadata: FrontendWorkspaceMetadata
+  ): Promise<void> {
+    const runtimeConfig = metadata.runtimeConfig;
+    // Skipped where the plan is not at a path this process can safely delete: Docker keeps it in
+    // the container the removal deleted; a devcontainer keeps it inside the container, and the
+    // same host path is not this workspace's (#4775); a Coder workspace that Xum created is
+    // deleted with the workspace, and an exec would reach for a host that is gone.
+    if (
+      isDockerRuntime(runtimeConfig) ||
+      isDevcontainerRuntime(runtimeConfig) ||
+      (isSSHRuntime(runtimeConfig) &&
+        runtimeConfig.coder != null &&
+        runtimeConfig.coder.existingWorkspace !== true)
+    ) {
+      return;
+    }
+    try {
+      // Plans key on the project basename: a same-named workspace in another project with that
+      // basename, on the same plan storage, shares this path, and the plan may be its live one.
+      const storage = planStorageOf(runtimeConfig);
+      const sharedWith = (await this.config.getAllWorkspaceMetadata()).find(
+        (other) =>
+          other.id !== workspaceId &&
+          other.name === metadata.name &&
+          other.projectName === metadata.projectName &&
+          planStorageOf(other.runtimeConfig) === storage
+      );
+      if (sharedWith) {
+        log.info("Keeping the removed workspace's plan path: another workspace shares it", {
+          workspaceId,
+          sharedWith: sharedWith.id,
+        });
+        return;
+      }
+      const deleted = await this.deletePlanFilesOfMetadata(workspaceId, metadata);
+      if (!deleted.success) {
+        log.warn("Failed to delete the plan files of a removed workspace", {
+          workspaceId,
+          errorType: deleted.error.type,
+          error: deleted.error.message,
+        });
+      }
+    } catch (error) {
+      log.warn("Failed to delete the plan files of a removed workspace", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
     }
   }
 
@@ -15948,6 +16026,14 @@ export class WorkspaceService
     const metadata = await this.getInfo(workspaceId);
     // No metadata: no plan path to derive, so there is nothing to delete.
     if (!metadata) return Ok(undefined);
+    return this.deletePlanFilesOfMetadata(workspaceId, metadata);
+  }
+
+  /** deletePlanFilesForWorkspace for metadata the caller already holds (removal: deregistered). */
+  private async deletePlanFilesOfMetadata(
+    workspaceId: string,
+    metadata: FrontendWorkspaceMetadata
+  ): Promise<Result<void, PlanFileDeletionError>> {
     // Create runtime to get correct xumHome (local ~/.xum, SSH ~/.mux, Docker /var/mux)
     const runtime = createRuntimeForWorkspace(metadata);
     const xumHome = runtime.getXumHome();
