@@ -1266,13 +1266,13 @@ describe("vscode webview workspace AI settings", () => {
       },
     });
 
-    // Pick Sonnet 5 for Plan from the model dropdown (the list shows every suggested model).
+    // Pick Sonnet 5.5 for Plan from the model dropdown (the list shows every suggested model).
     await act(async () => {
       fireEvent.click(view.getByRole("combobox"));
       await Promise.resolve();
     });
     await act(async () => {
-      fireEvent.click(view.getByText("Sonnet 5"));
+      fireEvent.click(view.getByText("Sonnet 5.5"));
       await Promise.resolve();
     });
     await bridge.answer("agents.list", AGENT_DESCRIPTORS);
@@ -1329,7 +1329,7 @@ describe("vscode webview workspace AI settings", () => {
       await Promise.resolve();
     });
     await act(async () => {
-      fireEvent.click(view.getByText("Sonnet 5"));
+      fireEvent.click(view.getByText("Sonnet 5.5"));
       await Promise.resolve();
     });
     // A sub-agent follows its backend settings on every refresh, except a deliberate unsent pick.
@@ -1803,7 +1803,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
 
   test("persists only the last of several rapid picks", async () => {
     const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
     await pickModel(view, "Opus 5.5");
 
     const options = await send(bridge, view);
@@ -1832,7 +1832,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
 
   test("never persists for a workspace without loaded AI settings", async () => {
     const { bridge, view } = await open([WORKSPACE]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
 
     const options = await send(bridge, view);
     expect(String(options.model)).toContain("sonnet");
@@ -1878,7 +1878,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
     // Until policy.get answers, the model list is unfiltered and the policy looks disabled, so a
     // pick could be a model the policy forbids.
     const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)], "pending");
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
 
     const options = await send(bridge, view);
     expect(String(options.model)).toContain("sonnet");
@@ -1900,7 +1900,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
         },
       },
     ]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
 
     expect(agentPicker(view).disabled).toBe(true);
     const options = await send(bridge, view);
@@ -1916,7 +1916,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
   test("keeps one persisting send per workspace in flight; the next send writes the latest pick", async () => {
     const other = mainWorkspace(TERRA_HIGH, "ws-2");
     const { bridge, view } = await open([mainWorkspace(TERRA_HIGH), other]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
     const first = await send(bridge, view);
     expect(first.skipAiSettingsPersistence).toBe(false);
 
@@ -1951,7 +1951,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
   test("stops persisting for a workspace after a send ends without a server result", async () => {
     // Own workspace ID: the unknown outcome lasts for this webview session.
     const { bridge, view } = await open([mainWorkspace(TERRA_HIGH, "ws-unknown-outcome")]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
     const first = await send(bridge, view);
     expect(first.skipAiSettingsPersistence).toBe(false);
     const call = bridge.orpcCalls("workspace.sendMessage")[0];
@@ -1966,7 +1966,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
 
   test("keeps a pick pending after a server-reported send failure", async () => {
     const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
     const first = await send(bridge, view);
     expect(first.skipAiSettingsPersistence).toBe(false);
     await reply(bridge, { success: false, error: { type: "policy_denied", message: "denied" } });
