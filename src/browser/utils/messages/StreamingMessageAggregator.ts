@@ -93,6 +93,7 @@ import {
 } from "./pendingInitialUserMessage";
 import { assert } from "@/common/utils/assert";
 import { getStatusStateKey } from "@/common/constants/storage";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   CONTEXT_BOUNDARY_KINDS,
   getContextBoundaryKind,
@@ -817,40 +818,27 @@ export class StreamingMessageAggregator {
     this.invalidateCache();
   }
 
-  /** Load persisted agent status from localStorage */
+  // statusState stays persisted (unlike derived caches): the renderer replays history only
+  // from the latest compaction boundary, so a status_set result compacted away cannot be
+  // re-derived after reload. Keep its JSON format stable for up/downgrade.
   private loadPersistedAgentStatus(): AgentStatus | undefined {
     if (!this.workspaceId) return undefined;
-    try {
-      const stored = localStorage.getItem(getStatusStateKey(this.workspaceId));
-      if (!stored) return undefined;
-      const parsed = AgentStatusSchema.safeParse(JSON.parse(stored));
-      return parsed.success ? parsed.data : undefined;
-    } catch {
-      // Ignore localStorage errors or JSON parse failures
-    }
-    return undefined;
+    const parsed = AgentStatusSchema.safeParse(
+      readPersistedState<unknown>(getStatusStateKey(this.workspaceId), undefined)
+    );
+    return parsed.success ? parsed.data : undefined;
   }
 
-  /** Persist agent status to localStorage */
   private savePersistedAgentStatus(status: AgentStatus): void {
     if (!this.workspaceId) return;
     const parsed = AgentStatusSchema.safeParse(status);
     if (!parsed.success) return;
-    try {
-      localStorage.setItem(getStatusStateKey(this.workspaceId), JSON.stringify(parsed.data));
-    } catch {
-      // Ignore localStorage errors
-    }
+    updatePersistedState(getStatusStateKey(this.workspaceId), parsed.data);
   }
 
-  /** Remove persisted agent status from localStorage */
   private clearPersistedAgentStatus(): void {
     if (!this.workspaceId) return;
-    try {
-      localStorage.removeItem(getStatusStateKey(this.workspaceId));
-    } catch {
-      // Ignore localStorage errors
-    }
+    updatePersistedState(getStatusStateKey(this.workspaceId), null);
   }
 
   private updateStreamClock(context: StreamingContext, serverTimestamp: number): void {
