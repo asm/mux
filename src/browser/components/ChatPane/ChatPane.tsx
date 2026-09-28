@@ -1937,7 +1937,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                     // composer surface is replaced with a single read-only notice.
                     <>
                       {turnStatus}
-                      <TranscriptOnlyNoticePane />
+                      <TranscriptOnlyNoticePane
+                        workspaceId={workspaceId}
+                        heldInputs={workspaceState?.heldInputs ?? NO_HELD_INPUTS}
+                      />
                     </>
                   ) : (
                     <ChatInputPane
@@ -2000,17 +2003,33 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   );
 };
 
-const TranscriptOnlyNoticePane: React.FC = () => {
+const TranscriptOnlyNoticePane: React.FC<{
+  workspaceId: string;
+  heldInputs: readonly HeldInputData[];
+}> = (props) => {
   const columnWidthClass = useChatDockColumnWidthClass();
 
   return (
-    <div
-      className={cn("bg-surface-primary border-border-light border-t pb-2", CHAT_DOCK_GUTTER_CLASS)}
-    >
-      <div className={cn("py-4", columnWidthClass)}>
-        <p role="note" className="text-muted text-sm leading-6">
-          {TRANSCRIPT_ONLY_NOTICE}
-        </p>
+    <div className="bg-surface-primary border-border-light border-t pb-2">
+      {/* #4770: held inputs (e.g. a queued follow-up Stop returned while archiving) would be
+          invisible here, since the composer that shows them is not rendered. Discard only: a
+          transcript-only workspace cannot run a turn. The oldest banner owns the Discard shortcut.
+          Outside the gutter below: HeldInput's ChatDockSurface applies its own. */}
+      {props.heldInputs.map((heldInput, index) => (
+        <HeldInput
+          key={heldInput.id}
+          workspaceId={props.workspaceId}
+          heldInput={heldInput}
+          isShortcutTarget={index === 0}
+          canSend={false}
+        />
+      ))}
+      <div className={CHAT_DOCK_GUTTER_CLASS}>
+        <div className={cn("py-4", columnWidthClass)}>
+          <p role="note" className="text-muted text-sm leading-6">
+            {TRANSCRIPT_ONLY_NOTICE}
+          </p>
+        </div>
       </div>
     </div>
   );

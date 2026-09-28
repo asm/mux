@@ -513,6 +513,28 @@ function planStorageOf(runtimeConfig: RuntimeConfig): string | undefined {
   return isSSHRuntime(runtimeConfig) ? `ssh:${runtimeConfig.host}` : "local";
 }
 
+/**
+ * Sorted display names for a restart blocker's workspaces (#4770): title, else name, else ID. A
+ * hand-edited config can hold a non-string title or name, so those count as missing. Titles may
+ * repeat (across projects, repeated task titles), so a label two workspaces share gets the ID.
+ */
+export function nameRestartBlockerWorkspaces(
+  workspaces: ReadonlyArray<{ id: string; title?: unknown; name?: unknown }>
+): string[] {
+  const labeled = workspaces.map((workspace) => ({
+    id: workspace.id,
+    label:
+      [workspace.title, workspace.name].find(
+        (value): value is string => typeof value === "string" && value.length > 0
+      ) ?? workspace.id,
+  }));
+  const labelCounts = new Map<string, number>();
+  for (const { label } of labeled) labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
+  return labeled
+    .map(({ id, label }) => ((labelCounts.get(label) ?? 0) > 1 ? `${label} (${id})` : label))
+    .sort((a, b) => a.localeCompare(b));
+}
+
 /** Why the plan deletion before a history-discarding commit refused that commit. */
 type PlanFileDeletionError =
   | { type: "runtime_unreachable"; message: string }
@@ -4913,16 +4935,21 @@ export class WorkspaceService
 
   collectRestartBlockers(): RestartBlocker[] {
     const sessions = new Map([...this.sessions, ...this.transientStartupRecoverySessions]);
+    const config = this.config.loadConfigOrDefault();
     const pendingTurns = new Set(this.preflightSendCounts.keys());
     let queuedMessages = 0;
-    let heldInputs = 0;
+    const heldInputWorkspaces: Array<{ id: string; title?: unknown; name?: unknown }> = [];
     let autoRetries = 0;
     for (const [workspaceId, session] of sessions) {
       if (session.hasActiveOrPendingTurnWork()) pendingTurns.add(workspaceId);
       if (session.hasQueuedMessages()) queuedMessages++;
       // Held inputs are not queued work, but they live only in session memory: a restart would
       // silently drop the user's unsent text, attachments and reviews.
-      if (session.getHeldInputs().length > 0) heldInputs++;
+      // Named (#4770): an archived workspace shows its held input only when opened.
+      if (session.getHeldInputs().length > 0) {
+        const entry = findWorkspaceEntry(config, workspaceId)?.workspace;
+        heldInputWorkspaces.push({ id: workspaceId, title: entry?.title, name: entry?.name });
+      }
       if (session.hasPendingAutoRetry()) autoRetries++;
     }
     const blockers: RestartBlocker[] = [
@@ -4950,7 +4977,11 @@ export class WorkspaceService
         ]).size,
       },
       { kind: "queued-messages", count: queuedMessages },
-      { kind: "held-inputs", count: heldInputs },
+      {
+        kind: "held-inputs",
+        count: heldInputWorkspaces.length,
+        workspaceNames: nameRestartBlockerWorkspaces(heldInputWorkspaces),
+      },
       { kind: "auto-retries", count: autoRetries },
       {
         kind: "background-processes",
