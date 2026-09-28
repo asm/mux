@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getInputAttachmentsKey, getInputKey, getReviewsKey } from "@/common/constants/storage";
+import { getInputAttachmentsKey, getInputKey } from "@/common/constants/storage";
 import { installDom } from "../../../../tests/ui/dom";
 import { isRestoredDraftDurable } from "./restoredDraftDurability";
 
@@ -10,14 +10,7 @@ const WORKSPACE_ID = "ws-durable";
 const keys = {
   inputKey: getInputKey(WORKSPACE_ID),
   attachmentsKey: getInputAttachmentsKey(WORKSPACE_ID),
-  reviewsKey: getReviewsKey(WORKSPACE_ID),
 };
-const storedReview = (id: string) => ({
-  id,
-  data: { filePath: "a.ts", lineRange: "1", selectedCode: "x", userNote: id },
-  status: "attached",
-  createdAt: 1,
-});
 
 describe("isRestoredDraftDurable", () => {
   beforeEach(() => {
@@ -31,11 +24,6 @@ describe("isRestoredDraftDurable", () => {
         mediaType: "image/png",
       },
     ]);
-    updatePersistedState(keys.reviewsKey, {
-      workspaceId: WORKSPACE_ID,
-      reviews: { "review-1": storedReview("review-1") },
-      lastUpdated: 1,
-    });
   });
   afterEach(() => {
     cleanupDom?.();
@@ -61,10 +49,6 @@ describe("isRestoredDraftDurable", () => {
 
   test("a restored attachment was not saved (too large, or the write failed)", () => {
     expect(check({ restoredAttachmentIds: ["restored-1", "restored-2"] })).toBe(false);
-  });
-
-  test("a restored note is missing from the review store (the write failed)", () => {
-    expect(check({ restoredReviewIds: ["review-1", "review-2"] })).toBe(false);
   });
 
   test("restored notes went to the memory-only override", () => {

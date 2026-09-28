@@ -171,6 +171,8 @@ const LARGE_REVIEW_COLLAPSE_OUTPUT_BYTES = 250_000;
 
 const REVIEW_PANEL_CACHE_MAX_ENTRIES = 20;
 const REVIEW_PANEL_CACHE_MAX_SIZE_BYTES = 20 * 1024 * 1024; // 20MB
+/** Stable empty list for the immersive view while review state hydrates. */
+const NO_HUNKS: DiffHunk[] = [];
 
 /**
  * Preserve object references for unchanged hunks to prevent re-renders.
@@ -943,8 +945,15 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     workspaceMetadata,
   ]);
 
-  // Initialize review state hook
-  const { isRead, toggleRead, markAsRead, markAsUnread } = useReviewState(workspaceId);
+  // Initialize review state hook. `isLoaded` gates the hunk list: review state lives in the
+  // backend, and rendering before it hydrates would run auto-collapse against empty maps.
+  const {
+    isRead,
+    toggleRead,
+    markAsRead,
+    markAsUnread,
+    isLoaded: reviewStateLoaded,
+  } = useReviewState(workspaceId);
 
   // Refs for values that change frequently but are only read at callback invocation time.
   // Using refs allows callbacks to stay stable (same reference) while still accessing current values.
@@ -2311,7 +2320,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
             )}
           </div>
         )
-      ) : diffState.status === "loading" ? (
+      ) : diffState.status === "loading" || !reviewStateLoaded ? (
         <div className="text-muted flex h-full items-center justify-center text-sm">
           Loading diff...
         </div>
@@ -2628,9 +2637,12 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
             <ImmersiveReviewView
               workspaceId={workspaceId}
               fileTree={fileTree}
-              hunks={filteredHunks}
-              allHunks={hunks}
-              isLoading={diffState.status === "loading" || isLoadingTree}
+              // Withhold hunks until review state hydrates: the immersive view ignores
+              // isLoading once it has hunks, and would render (and accept keyboard actions)
+              // against empty read/note maps that then snap to the persisted ones.
+              hunks={reviewStateLoaded ? filteredHunks : NO_HUNKS}
+              allHunks={reviewStateLoaded ? hunks : NO_HUNKS}
+              isLoading={diffState.status === "loading" || isLoadingTree || !reviewStateLoaded}
               isRead={isRead}
               onToggleRead={handleToggleRead}
               onMarkFileAsRead={handleMarkFileAsRead}
