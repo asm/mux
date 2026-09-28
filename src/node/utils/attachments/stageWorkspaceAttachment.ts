@@ -603,6 +603,28 @@ function resolveStagedAttachmentMirrorPath(sessionDir: string, stagedPath: strin
   return path.join(sessionDir, STAGED_ATTACHMENT_MIRROR_DIR_NAME, id, filename);
 }
 
+/**
+ * Whether the mirror holds exactly the checkout's current bytes for a canonical staged path, so
+ * that rehydration after a snapshot archive restores the upload unchanged (#4895). False for
+ * anything else: legacy or non-canonical paths, links, special or oversized files, a missing or
+ * stale mirror, or a read error. Never follows links in the checkout.
+ */
+export async function stagedAttachmentMirrorMatchesCheckout(input: {
+  workspacePath: string;
+  sessionDir: string;
+  stagedPath: string;
+}): Promise<boolean> {
+  try {
+    const [checkout, mirror] = await Promise.all([
+      readCheckoutFileWithoutFollowingLinks(input.workspacePath, input.stagedPath),
+      readStagedAttachmentMirrorFile(input.sessionDir, input.stagedPath),
+    ]);
+    return checkout != null && mirror != null && checkout.equals(mirror);
+  } catch {
+    return false;
+  }
+}
+
 /** Read a mirror entry, or null when it is absent, not a regular file, or over the size cap. */
 async function readStagedAttachmentMirrorFile(
   sessionDir: string,
