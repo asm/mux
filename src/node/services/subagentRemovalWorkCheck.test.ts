@@ -47,7 +47,11 @@ describe("findUnpreservedSubagentWork", () => {
   });
 
   function check(
-    options: { patchArtifact?: SubagentGitPatchArtifact | null; base?: string | null } = {}
+    options: {
+      patchArtifact?: SubagentGitPatchArtifact | null;
+      base?: string | null;
+      dockerCopy?: boolean;
+    } = {}
   ) {
     const taskBase: Record<string, string> =
       options.base === null ? {} : { "/proj": options.base ?? base };
@@ -57,8 +61,61 @@ describe("findUnpreservedSubagentWork", () => {
       patchArtifact: options.patchArtifact ?? null,
       patchArtifactSessionDir: path.join(rootDir, "sessions"),
       taskBaseCommitShaByProjectPath: taskBase,
+      removalDeletesBundleClone: options.dockerCopy ?? false,
     });
   }
+
+  /**
+   * Mimics a Docker copy (#4761 gap 2): a clone whose origin/* refs become local branches, with
+   * the task branch checked out at the source's main.
+   */
+  function makeStandaloneCopy() {
+    execSync("git checkout -q -b feature && git commit -q --allow-empty -m feature", { cwd: repo });
+    execSync("git checkout -q main", { cwd: repo });
+    const copy = path.join(rootDir, "copy");
+    execSync(`git clone -q ${repo} ${copy}`);
+    // A clone does not inherit the source's local identity config; CI runners have no global one.
+    execSync('git config user.email "test@example.com" && git config user.name test', {
+      cwd: copy,
+    });
+    execSync("git config commit.gpgsign false", { cwd: copy });
+    execSync("git branch feature origin/feature && git checkout -q -b task", { cwd: copy });
+    repo = copy;
+  }
+
+  test("a Docker copy loses commits on other local branches and the stash (#4761 gap 2)", async () => {
+    makeStandaloneCopy();
+    // Branches that came from the source are preserved there.
+    expect(await check({ dockerCopy: true })).toEqual({ success: true, data: { kind: "none" } });
+
+    // A branch the child committed on and then left dies with the container.
+    execSync("git checkout -q -b side && git commit -q --allow-empty -m side", { cwd: repo });
+    execSync("git checkout -q task", { cwd: repo });
+    expect(await check({ dockerCopy: true })).toEqual({
+      success: true,
+      data: { kind: "lossy", paths: [], uncapturedCommitCount: 0, otherRefCommitCount: 1 },
+    });
+    // Other runtimes keep the scope at base..HEAD: a worktree's repository survives removal, and
+    // cp-based SSH copies inherit local-only branches this check cannot attribute.
+    expect(await check()).toEqual({ success: true, data: { kind: "none" } });
+
+    // A stash also lives only in the copy (clones never fetch refs/stash).
+    execSync("git branch -D -q side", { cwd: repo });
+    await fsPromises.writeFile(path.join(repo, "README.md"), "stashed\n");
+    execSync("git stash -q", { cwd: repo });
+    const result = await check({ dockerCopy: true });
+    expect(result.success ? result.data : null).toMatchObject({ kind: "lossy", paths: [] });
+  });
+
+  test("a Docker copy without remote-tracking refs skips the other-branch count (#4761 gap 2)", async () => {
+    makeStandaloneCopy();
+    // A project without an origin URL loses its origin/* refs at creation, so nothing tells source
+    // branches from branches the child made. Counting them would refuse every such removal.
+    execSync("git remote remove origin", { cwd: repo });
+    execSync("git checkout -q -b side && git commit -q --allow-empty -m side", { cwd: repo });
+    execSync("git checkout -q task", { cwd: repo });
+    expect(await check({ dockerCopy: true })).toEqual({ success: true, data: { kind: "none" } });
+  });
 
   test("a clean checkout with no new commits has nothing to preserve", async () => {
     expect(await check()).toEqual({ success: true, data: { kind: "none" } });

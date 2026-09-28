@@ -168,6 +168,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
+  isDockerRuntime,
   isLocalProjectRuntime,
   isWorktreeRuntime,
   runtimeModeSupportsSharedTaskWorkspace,
@@ -13999,6 +14000,7 @@ export class TaskService implements AgentTaskIntegration {
               taskBaseCommitSha: coerceNonEmptyString(ws.taskBaseCommitSha),
               taskBaseCommitShaByProjectPath: ws.taskBaseCommitShaByProjectPath,
             }),
+            removalDeletesBundleClone: isDockerRuntime(runtimeConfig),
           });
     // No per-sub-agent removal with a dirty-checkout confirmation exists in the UI today; the
     // parent deletion dialog is the user-confirmed path that removes sub-agents.
@@ -14013,10 +14015,14 @@ export class TaskService implements AgentTaskIntegration {
     }
     const work = check.data;
     if (work.kind === "none") return null;
+    const otherRefCommitCount = work.otherRefCommitCount ?? 0;
     const lost = [
       ...(work.paths.length > 0 ? ["the uncommitted or untracked files listed in paths"] : []),
       ...(work.uncapturedCommitCount > 0
         ? [`${work.uncapturedCommitCount} commit(s) not captured by a ready patch artifact`]
+        : []),
+      ...(otherRefCommitCount > 0
+        ? [`${otherRefCommitCount} commit(s) held only by other local branches or the stash`]
         : []),
     ];
     assert(lost.length > 0, "a lossy removal result must name what would be lost");
