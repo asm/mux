@@ -862,6 +862,30 @@ export function getReviewImmersiveKey(workspaceId: string): string {
 }
 
 /**
+ * Get the localStorage key for the Review panel's selected file filter per workspace
+ * Format: "review-file-filter:{workspaceId}"
+ */
+export function getReviewFileFilterKey(workspaceId: string): string {
+  return `review-file-filter:${workspaceId}`;
+}
+
+/**
+ * Get the localStorage key for the Timeline panel's event filter per workspace
+ * Format: "timeline-filter:{workspaceId}"
+ */
+export function getTimelineFilterKey(workspaceId: string): string {
+  return `timeline-filter:${workspaceId}`;
+}
+
+/**
+ * Get the localStorage key for the detached desktop popout instance hint per workspace
+ * Format: "desktop-popout:{workspaceId}"
+ */
+export function getDesktopPopoutKey(workspaceId: string): string {
+  return `desktop-popout:${workspaceId}`;
+}
+
+/**
  * Get the localStorage key for auto-compaction enabled preference per workspace
  * Format: "autoCompaction:enabled:{workspaceId}"
  */
@@ -877,37 +901,6 @@ export function getAutoCompactionEnabledKey(workspaceId: string): string {
 export function getAutoCompactionThresholdKey(model: string): string {
   return `autoCompaction:threshold:${model}`;
 }
-
-/**
- * List of workspace-scoped key functions that should be copied on fork and deleted on removal
- */
-const PERSISTENT_WORKSPACE_KEY_FUNCTIONS: Array<(workspaceId: string) => string> = [
-  getWorkspaceAISettingsByAgentKey,
-  getModelKey,
-  getAutoModelRoutingKey,
-  getAutoThinkingLevelKey,
-  getAutoRoutingChoiceByAgentKey,
-  getInputKey,
-  getAutoExpandPrefsKey,
-  getWorkspaceNameStateKey,
-  getInputAttachmentsKey,
-  getAgentIdKey,
-  getPinnedAgentIdKey,
-  getThinkingLevelKey,
-  getReviewSelectedHunkKey,
-  getReviewStateKey,
-  getHunkFirstSeenKey,
-  getReviewExpandStateKey,
-  getReviewReadMoreKey,
-  getFileTreeExpandStateKey,
-  getReviewSearchStateKey,
-  getReviewsKey,
-  getReviewImmersiveKey,
-  getAutoCompactionEnabledKey,
-  getWorkspaceLastReadKey,
-  getStatusStateKey,
-  // Note: auto-compaction threshold is per-model, not per-workspace
-];
 
 /**
  * Get the localStorage key for cached plan content for a workspace
@@ -927,16 +920,149 @@ export function getPostCompactionStateKey(workspaceId: string): string {
   return `postCompactionState:${workspaceId}`;
 }
 
+/** localStorage-backed LRU caches (see src/browser/utils/lruCache.ts). */
+export const SESSION_COST_CACHE_ENTRY_PREFIX = "session-cost:";
+export const SESSION_COST_CACHE_INDEX_KEY = "session-cost-index";
+export const PR_STATUS_CACHE_ENTRY_PREFIX = "prStatus:";
+export const PR_STATUS_CACHE_INDEX_KEY = "prStatusIndex";
+export const BRANCH_CACHE_ENTRY_PREFIX = "branch:";
+export const BRANCH_CACHE_INDEX_KEY = "branchIndex";
+
 /**
- * Additional ephemeral keys to delete on workspace removal (not copied on fork)
+ * Persisted key registry (classification only).
+ *
+ * - `cache`: derived data the app can refetch; the only kind the quota handler may evict.
+ * - `draft`: unsent composer/creation input; never evicted.
+ * - `workspace-scoped`: per-workspace review data and UI state; never evicted.
+ * - `synced`: frontend copy of backend-owned preferences; never evicted.
+ * - `ui`: small UI preferences; never evicted.
+ *
+ * Keys that are not registered are treated as non-evictable, so forgetting to register a key can
+ * only leak space, never lose data.
  */
-const EPHEMERAL_WORKSPACE_KEY_FUNCTIONS: Array<(workspaceId: string) => string> = [
-  getPendingWorkspaceSendErrorKey,
-  getPendingDraftSkillDiscoveryKey,
-  getNotifyOnResponseKey,
-  getPlanContentKey, // Cache only, no need to preserve on fork
-  getPostCompactionStateKey, // Cache only, no need to preserve on fork
+export type PersistedKeyKind = "ui" | "cache" | "workspace-scoped" | "draft" | "synced";
+
+/**
+ * `workspaceId` keys append a scope id to a fixed prefix. The scope id is usually a workspace id,
+ * but creation drafts reuse the same keys with getDraftScopeId()/getPendingScopeId() scope ids and
+ * some keys also accept project/global scope ids.
+ */
+export type PersistedKeyScope = "global" | "workspaceId";
+
+interface WorkspaceKeyRegistration {
+  scope: "workspaceId";
+  getKey: (scopeId: string) => string;
+  kind: PersistedKeyKind;
+  /** Copied to the new workspace on fork (and to the new scope on migrateWorkspaceStorage). */
+  copyOnFork: boolean;
+}
+
+interface GlobalKeyRegistration {
+  scope: "global";
+  key: string;
+  match: "exact" | "prefix";
+  kind: PersistedKeyKind;
+}
+
+export type PersistedKeyRegistration = WorkspaceKeyRegistration | GlobalKeyRegistration;
+
+function workspaceKey(
+  getKey: (scopeId: string) => string,
+  kind: PersistedKeyKind,
+  copyOnFork: boolean
+): WorkspaceKeyRegistration {
+  return { scope: "workspaceId", getKey, kind, copyOnFork };
+}
+
+function globalCacheKey(key: string, match: "exact" | "prefix"): GlobalKeyRegistration {
+  return { scope: "global", key, match, kind: "cache" };
+}
+
+export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
+  // Copied on fork.
+  workspaceKey(getWorkspaceAISettingsByAgentKey, "synced", true),
+  workspaceKey(getModelKey, "ui", true),
+  workspaceKey(getAutoModelRoutingKey, "ui", true),
+  workspaceKey(getAutoThinkingLevelKey, "ui", true),
+  workspaceKey(getAutoRoutingChoiceByAgentKey, "ui", true),
+  workspaceKey(getInputKey, "draft", true),
+  workspaceKey(getAutoExpandPrefsKey, "ui", true),
+  workspaceKey(getWorkspaceNameStateKey, "draft", true),
+  workspaceKey(getInputAttachmentsKey, "draft", true),
+  workspaceKey(getAgentIdKey, "synced", true),
+  workspaceKey(getPinnedAgentIdKey, "ui", true),
+  workspaceKey(getThinkingLevelKey, "ui", true),
+  workspaceKey(getReviewSelectedHunkKey, "workspace-scoped", true),
+  workspaceKey(getReviewStateKey, "workspace-scoped", true),
+  workspaceKey(getHunkFirstSeenKey, "workspace-scoped", true),
+  workspaceKey(getReviewExpandStateKey, "workspace-scoped", true),
+  workspaceKey(getReviewReadMoreKey, "workspace-scoped", true),
+  workspaceKey(getFileTreeExpandStateKey, "workspace-scoped", true),
+  workspaceKey(getReviewSearchStateKey, "workspace-scoped", true),
+  workspaceKey(getReviewsKey, "workspace-scoped", true),
+  workspaceKey(getReviewImmersiveKey, "workspace-scoped", true),
+  workspaceKey(getAutoCompactionEnabledKey, "ui", true),
+  workspaceKey(getWorkspaceLastReadKey, "workspace-scoped", true),
+  // Kept non-evictable until PR4 confirms nothing depends on it surviving a reload.
+  workspaceKey(getStatusStateKey, "workspace-scoped", true),
+  // Note: auto-compaction threshold is per-model, not per-workspace.
+
+  // Deleted with the workspace but not copied on fork.
+  workspaceKey(getPendingWorkspaceSendErrorKey, "workspace-scoped", false),
+  workspaceKey(getPendingDraftSkillDiscoveryKey, "workspace-scoped", false),
+  // Synced: UserPreferencesContext mirrors notifyOnResponseByWorkspace from the backend.
+  workspaceKey(getNotifyOnResponseKey, "synced", false),
+  workspaceKey(getPlanContentKey, "cache", false),
+  workspaceKey(getPostCompactionStateKey, "cache", false),
+
+  // Per-workspace keys that deleteWorkspaceStorage used to miss, leaving orphans behind.
+  workspaceKey(getReasoningModeKey, "ui", false),
+  workspaceKey(getDisableWorkspaceAgentsKey, "ui", false),
+  workspaceKey(getPinnedTodoExpandedKey, "ui", false),
+  workspaceKey(getSubAgentTasksExpandedKey, "ui", false),
+  workspaceKey(getRightSidebarLayoutKey, "ui", false),
+  workspaceKey(getTerminalTitlesKey, "ui", false),
+  workspaceKey(getReviewFileFilterKey, "ui", false),
+  workspaceKey(getTimelineFilterKey, "ui", false),
+  workspaceKey(getDesktopPopoutKey, "ui", false),
+
+  // LRU caches bound themselves by entry count; their entries and index keys are only evicted
+  // under quota pressure.
+  globalCacheKey(SESSION_COST_CACHE_ENTRY_PREFIX, "prefix"),
+  globalCacheKey(SESSION_COST_CACHE_INDEX_KEY, "exact"),
+  globalCacheKey(PR_STATUS_CACHE_ENTRY_PREFIX, "prefix"),
+  globalCacheKey(PR_STATUS_CACHE_INDEX_KEY, "exact"),
+  globalCacheKey(BRANCH_CACHE_ENTRY_PREFIX, "prefix"),
+  globalCacheKey(BRANCH_CACHE_INDEX_KEY, "exact"),
+
+  // Backend data cached only to avoid a flash on mount; the owners refetch or re-test it.
+  // mcpTestResults keys are project-scoped (optionally ":{workspaceId}" after the project path), so
+  // they are registered as one global prefix rather than as a workspace key.
+  globalCacheKey(getWorkspaceKeyPrefix(getArchivedWorkspacesKey), "prefix"),
+  globalCacheKey(getWorkspaceKeyPrefix(getMCPServersKey), "prefix"),
+  globalCacheKey(getWorkspaceKeyPrefix(getMCPTestResultsKey), "prefix"),
 ];
+
+const WORKSPACE_KEY_REGISTRATIONS = PERSISTED_KEY_REGISTRY.filter(
+  (entry): entry is WorkspaceKeyRegistration => entry.scope === "workspaceId"
+);
+
+/** Registered key prefix for a workspace-scoped key function (the key with an empty scope id). */
+export function getWorkspaceKeyPrefix(getKey: (scopeId: string) => string): string {
+  return getKey("");
+}
+
+/** Classify a concrete localStorage key; undefined means unregistered (treated as non-evictable). */
+export function getPersistedKeyKind(key: string): PersistedKeyKind | undefined {
+  for (const entry of PERSISTED_KEY_REGISTRY) {
+    if (entry.scope === "workspaceId") {
+      if (key.startsWith(getWorkspaceKeyPrefix(entry.getKey))) return entry.kind;
+    } else if (entry.match === "exact" ? key === entry.key : key.startsWith(entry.key)) {
+      return entry.kind;
+    }
+  }
+  return undefined;
+}
 
 function isStagedPersistedAttachment(value: unknown): boolean {
   return (
@@ -960,10 +1086,11 @@ function stripStagedDraftAttachments(value: string): string {
 
 /**
  * Copy all workspace-specific localStorage keys from source to destination workspace.
- * Includes keys listed in PERSISTENT_WORKSPACE_KEY_FUNCTIONS (model, draft input text/attachments, etc).
+ * Includes registry keys marked copyOnFork (model, draft input text/attachments, etc).
  */
 export function copyWorkspaceStorage(sourceWorkspaceId: string, destWorkspaceId: string): void {
-  for (const getKey of PERSISTENT_WORKSPACE_KEY_FUNCTIONS) {
+  for (const { getKey, copyOnFork } of WORKSPACE_KEY_REGISTRATIONS) {
+    if (!copyOnFork) continue;
     const sourceKey = getKey(sourceWorkspaceId);
     const destKey = getKey(destWorkspaceId);
     const value = localStorage.getItem(sourceKey);
@@ -981,14 +1108,8 @@ export function copyWorkspaceStorage(sourceWorkspaceId: string, destWorkspaceId:
  * Should be called when a workspace is deleted to prevent orphaned data
  */
 export function deleteWorkspaceStorage(workspaceId: string): void {
-  const allKeyFunctions = [
-    ...PERSISTENT_WORKSPACE_KEY_FUNCTIONS,
-    ...EPHEMERAL_WORKSPACE_KEY_FUNCTIONS,
-  ];
-
-  for (const getKey of allKeyFunctions) {
-    const key = getKey(workspaceId);
-    localStorage.removeItem(key);
+  for (const { getKey } of WORKSPACE_KEY_REGISTRATIONS) {
+    localStorage.removeItem(getKey(workspaceId));
   }
 }
 

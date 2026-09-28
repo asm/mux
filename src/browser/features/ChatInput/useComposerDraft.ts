@@ -57,21 +57,26 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
     value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])
   ) => {
     const next = value instanceof Function ? value(latestAttachmentsRef.current) : value;
+    const previousCount = latestAttachmentsRef.current.length;
     latestAttachmentsRef.current = next;
-    const persists =
+    const withinCap =
       next.length > 0 &&
       estimatePersistedChatAttachmentsChars(next) <= MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS;
+    let persists = false;
     selfWriteRef.current = true;
     try {
-      updatePersistedState<ChatAttachment[] | undefined>(
-        attachmentsKey,
-        persists ? next : undefined
-      );
+      persists =
+        withinCap && updatePersistedState<ChatAttachment[] | undefined>(attachmentsKey, next);
+      // A failed write (quota exceeded even after evicting caches) leaves the previous list on
+      // disk; drop it like an over-cap draft so a reload never restores stale attachments.
+      if (!persists) updatePersistedState<ChatAttachment[] | undefined>(attachmentsKey, undefined);
     } finally {
       selfWriteRef.current = false;
     }
     if (persists || next.length === 0) tooLargeToastKeyRef.current = null;
-    else if (tooLargeToastKeyRef.current !== attachmentsKey) {
+    // Warn once per failing draft, and again whenever another attachment is added to it: the
+    // earlier toast auto-dismisses, so a later add would otherwise fail with no feedback.
+    else if (tooLargeToastKeyRef.current !== attachmentsKey || next.length > previousCount) {
       tooLargeToastKeyRef.current = attachmentsKey;
       pushToast({
         type: "error",
