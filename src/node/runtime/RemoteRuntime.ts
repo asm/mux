@@ -45,6 +45,7 @@ import {
   buildRegularFileReadCommand,
   CAT_VIA_EXEC_COMMAND,
   ensureDirViaExec,
+  readAttemptTimeoutSecs,
   readFileViaExec,
   statViaExec,
   writeFileViaExec,
@@ -384,13 +385,25 @@ export abstract class RemoteRuntime implements Runtime {
 
   private async resolveFilePath(filePath: string, abortSignal?: AbortSignal): Promise<string> {
     if (filePath === "~" || filePath.startsWith("~/")) {
-      return this.resolveWithAbort(this.resolvePath(filePath), abortSignal);
+      return this.resolveWithAbort(this.resolvePathOnce(filePath), abortSignal);
     }
     if (path.posix.isAbsolute(filePath)) {
       return path.posix.normalize(filePath);
     }
-    const basePath = await this.resolveWithAbort(this.resolvePath(this.getBasePath()), abortSignal);
+    const basePath = await this.resolveWithAbort(
+      this.resolvePathOnce(this.getBasePath()),
+      abortSignal
+    );
     return path.posix.resolve(basePath, filePath);
+  }
+
+  /**
+   * One path-resolution attempt, without any retry resolvePath adds. File
+   * operations resolve inside their exec factory, which already retries once
+   * (#4830); stacking a resolvePath retry on top would double the attempts.
+   */
+  protected resolvePathOnce(filePath: string): Promise<string> {
+    return this.resolvePath(filePath);
   }
 
   /**
@@ -421,15 +434,17 @@ export abstract class RemoteRuntime implements Runtime {
   ): ReadableStream<Uint8Array> {
     return readFileViaExec(
       filePath,
-      async (signal) => {
+      async (signal, attempt) => {
         const resolvedPath = await this.resolveFilePath(filePath, signal);
         const quotedPath = this.quoteForRemote(resolvedPath);
-        const command = options?.requireRegularFile
-          ? buildRegularFileReadCommand(quotedPath)
-          : `${CAT_VIA_EXEC_COMMAND} ${quotedPath}`;
+        // The retry reads only a regular file: see readFileViaExec's StartReadExec.
+        const command =
+          options?.requireRegularFile === true || attempt > 0
+            ? buildRegularFileReadCommand(quotedPath)
+            : `${CAT_VIA_EXEC_COMMAND} ${quotedPath}`;
         return this.exec(command, {
           cwd: this.getBasePath(),
-          timeout: 300,
+          timeout: readAttemptTimeoutSecs(attempt, 300),
           abortSignal: signal,
         });
       },
@@ -496,15 +511,16 @@ export abstract class RemoteRuntime implements Runtime {
   stat(filePath: string, abortSignal?: AbortSignal): Promise<FileStat> {
     return statViaExec(
       filePath,
-      async () => {
+      async (attempt) => {
         const resolvedPath = await this.resolveFilePath(filePath, abortSignal);
         return this.exec(`${STAT_VIA_EXEC_COMMAND} ${this.quoteForRemote(resolvedPath)}`, {
           cwd: this.getBasePath(),
-          timeout: 10,
+          timeout: readAttemptTimeoutSecs(attempt, 10),
           abortSignal,
         });
       },
-      (exitCode, stderr) => this.isTransportFailureExit(exitCode, stderr)
+      (exitCode, stderr) => this.isTransportFailureExit(exitCode, stderr),
+      abortSignal
     );
   }
 

@@ -309,6 +309,9 @@ describe("SSH2 channel failures after acquisition (#4835)", () => {
       )
     );
     while (channels.length < pending.length) await new Promise((r) => setTimeout(r, 1));
+    // The one transport retry (#4830) must not find a healthy channel: refuse
+    // every later open, which ssh2 reports through the exec callback.
+    client.exec = (_command, cb) => cb(new Error("(SSH) Channel open failure: open failed"));
     for (const channel of channels) fail(channel);
     return Promise.all(pending);
   }

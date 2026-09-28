@@ -43,6 +43,7 @@ import {
   buildRegularFileReadCommand,
   CAT_VIA_EXEC_COMMAND,
   ensureDirViaExec,
+  readAttemptTimeoutSecs,
   readFileViaExec,
   statViaExec,
   writeFileViaExec,
@@ -577,20 +578,23 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     if (hostPath) {
       return super.readFile(hostPath, abortSignal, options);
     }
-    // Unmounted paths only exist inside the container, so the regular-file
-    // check must run there too (env-var quoting as for the plain cat).
-    const command = options?.requireRegularFile
-      ? buildRegularFileReadCommand(`"$${FILE_PATH_ENV}"`)
-      : `${CAT_VIA_EXEC_COMMAND} "$${FILE_PATH_ENV}"`;
     return readFileViaExec(
       filePath,
-      (signal) =>
-        this.exec(command, {
-          cwd: this.getContainerBasePath(),
-          pathEnv: { [FILE_PATH_ENV]: filePath },
-          timeout: 300,
-          abortSignal: signal,
-        }),
+      (signal, attempt) =>
+        // Unmounted paths only exist inside the container, so the regular-file
+        // check must run there too (env-var quoting as for the plain cat). The
+        // retry reads only a regular file: see readFileViaExec's StartReadExec.
+        this.exec(
+          options?.requireRegularFile === true || attempt > 0
+            ? buildRegularFileReadCommand(`"$${FILE_PATH_ENV}"`)
+            : `${CAT_VIA_EXEC_COMMAND} "$${FILE_PATH_ENV}"`,
+          {
+            cwd: this.getContainerBasePath(),
+            pathEnv: { [FILE_PATH_ENV]: filePath },
+            timeout: readAttemptTimeoutSecs(attempt, 300),
+            abortSignal: signal,
+          }
+        ),
       abortSignal,
       (exitCode, stderr) => this.isTransportFailureExit(exitCode, stderr)
     );
@@ -627,14 +631,15 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     }
     return statViaExec(
       filePath,
-      () =>
+      (attempt) =>
         this.exec(`${STAT_VIA_EXEC_COMMAND} "$${FILE_PATH_ENV}"`, {
           cwd: this.getContainerBasePath(),
           pathEnv: { [FILE_PATH_ENV]: filePath },
-          timeout: 10,
+          timeout: readAttemptTimeoutSecs(attempt, 10),
           abortSignal,
         }),
-      (exitCode, stderr) => this.isTransportFailureExit(exitCode, stderr)
+      (exitCode, stderr) => this.isTransportFailureExit(exitCode, stderr),
+      abortSignal
     );
   }
 
