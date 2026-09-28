@@ -30,6 +30,7 @@ import {
   type BaseSshAcquireConnectionOptions,
   withSshBackoffJitter,
 } from "./sshBackoff";
+import { isPermanentSSHFailure } from "./Runtime";
 
 export type OpenSSHHostKeyPolicyMode = "strict" | "headless-fallback";
 
@@ -285,6 +286,7 @@ export class SSHConnectionPool {
           // Probe failed; if we're in wait mode we'll loop and sleep through the backoff.
           if (
             !shouldWait ||
+            isPermanentSSHFailure(error) ||
             (error instanceof Error &&
               error.message.includes(`did not become healthy within ${maxWaitMs}ms`))
           ) {
@@ -327,7 +329,7 @@ export class SSHConnectionPool {
         if (!wasAborted && (!h?.backoffUntil || h.backoffUntil <= new Date())) {
           this.markFailedByKey(key, errorMessage);
         }
-        if (!shouldWait || wasAborted) {
+        if (!shouldWait || wasAborted || isPermanentSSHFailure(error)) {
           throw error;
         }
         continue;

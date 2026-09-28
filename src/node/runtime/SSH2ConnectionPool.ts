@@ -27,6 +27,7 @@ import {
   type BaseSshAcquireConnectionOptions,
   withSshBackoffJitter,
 } from "./sshBackoff";
+import { isPermanentSSHFailure } from "./Runtime";
 
 let sshPromptService: SshPromptService | undefined;
 
@@ -366,7 +367,8 @@ export class SSH2ConnectionPool {
         const entry = await waitForAbortable(inflight, options.abortSignal);
         return entry;
       } catch (error) {
-        if (!shouldWait) {
+        // connect() already recorded the failure and its backoff; a permanent one ends the wait.
+        if (!shouldWait || isPermanentSSHFailure(error)) {
           throw error;
         }
 
