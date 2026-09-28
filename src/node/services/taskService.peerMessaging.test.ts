@@ -1088,34 +1088,25 @@ describe("TaskService", () => {
           workspaceService,
           historyService,
         });
-        const correlation = spyOn(
-          workspaceTurnManagerFor(taskService),
-          "getActiveWorkspaceTurnMuxMetadataForWorkspace"
-        );
-        try {
-          expect(
-            (await taskService.sendAgentTreeMessage("sender", "target", "Review this")).success
-          ).toBe(true);
-          const [, , options, internal] = sendMessage.mock.calls[0] as Parameters<
-            WorkspaceHost["sendMessage"]
-          >;
-          expect(options).toMatchObject({
-            agentId: entry.expected,
-            model: !hasSettings
-              ? defaultModel
-              : entry.expected === "plan"
-                ? "anthropic:claude-sonnet-4-5"
-                : "openai:gpt-5.2",
-            thinkingLevel: !hasSettings ? "off" : entry.expected === "plan" ? "high" : "medium",
-            queueDispatchMode: "tool-end",
-            muxMetadata: { type: "agent-peer-message", relationship: "unrelated" },
-          });
-          expect(internal?.synthetic).toBe(true);
-          expect(internal?.workspaceTurnContinuation).toBe(false);
-          expect(correlation).not.toHaveBeenCalled();
-        } finally {
-          correlation.mockRestore();
-        }
+        expect(
+          (await taskService.sendAgentTreeMessage("sender", "target", "Review this")).success
+        ).toBe(true);
+        const [, , options, internal] = sendMessage.mock.calls[0] as Parameters<
+          WorkspaceHost["sendMessage"]
+        >;
+        expect(options).toMatchObject({
+          agentId: entry.expected,
+          model: !hasSettings
+            ? defaultModel
+            : entry.expected === "plan"
+              ? "anthropic:claude-sonnet-4-5"
+              : "openai:gpt-5.2",
+          thinkingLevel: !hasSettings ? "off" : entry.expected === "plan" ? "high" : "medium",
+          queueDispatchMode: "tool-end",
+          muxMetadata: { type: "agent-peer-message", relationship: "unrelated" },
+        });
+        expect(internal?.synthetic).toBe(true);
+        expect(internal?.workspaceTurnContinuation).toBe(false);
       }
     );
 
@@ -1147,31 +1138,74 @@ describe("TaskService", () => {
       }
     );
 
-    test.each([false, true])(
-      "refuses a delegated root before dispatch (accepted=%s)",
-      async (accepted) => {
-        const config = await createTestConfig(rootDir);
-        const projectPath = path.join(rootDir, "repo");
-        await saveWorkspaces(
-          config,
-          projectPath,
-          [
-            projectWorkspace(projectPath, "sender", "sender"),
-            projectWorkspace(projectPath, "target", "target", {
-              agentId: "exec",
-              unrelatedWorkspaceConsent: "consent",
-            }),
-          ],
-          testTaskSettings()
-        );
-        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-        const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    async function setUpDelegatedTarget() {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "sender", "sender"),
+          projectWorkspace(projectPath, "target", "target", {
+            agentId: "exec",
+            unrelatedWorkspaceConsent: "consent",
+          }),
+        ],
+        testTaskSettings()
+      );
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      const sendCall = (index: number) =>
+        sendMessage.mock.calls[index] as Parameters<WorkspaceHost["sendMessage"]>;
+      return { taskService, sendMessage, sendCall };
+    }
+
+    // The owner already steers its delegated turn through follow-ups, so its peer message
+    // continues that turn (correlated like same-tree sends).
+    test("continues an accepted delegated turn owned by the sender", async () => {
+      const { taskService, sendCall } = await setUpDelegatedTarget();
+      await registerLiveWorkspaceTurnHandle(
+        taskService,
+        "target",
+        "wst_delegated",
+        "sender",
+        "accepted"
+      );
+      expect(
+        await taskService.sendAgentTreeMessage("sender", "target", "Tokens for the composer")
+      ).toEqual(
+        Ok({ delivery: "queued", relation: "target_unrelated", queueDispatchMode: "tool-end" })
+      );
+      const [, , options, internal] = sendCall(0);
+      expect(options?.agentId).toBe("exec");
+      expect(options?.muxMetadata).toEqual({
+        type: "workspace-turn-task",
+        taskHandleId: "wst_delegated",
+        ownerWorkspaceId: "sender",
+        turnId: "wst_delegated-turn",
+        agentPeerMessageTrigger: {
+          fromWorkspaceId: "sender",
+          fromTitle: "sender",
+          relationship: "unrelated",
+          payloadMessageId: internal?.preTurnMessages?.[0]?.id,
+        },
+      });
+      expect(internal?.workspaceTurnContinuation).toBe(true);
+      expect(internal?.admissionStale?.()).toBe(false);
+    });
+
+    // Another sender's continuation would run under the recipient's saved agent instead of the
+    // owner's per-turn override and land in the owner's result.
+    test.each(["reserved", "accepted"] as const)(
+      "refuses a sender that does not own the %s delegated turn",
+      async (source) => {
+        const { taskService, sendMessage, sendCall } = await setUpDelegatedTarget();
         await registerLiveWorkspaceTurnHandle(
           taskService,
           "target",
           "wst_foreign",
-          "sender",
-          accepted ? "accepted" : "reserved"
+          "owner",
+          source
         );
         const result = await taskService.sendAgentTreeMessage(
           "sender",
@@ -1180,22 +1214,67 @@ describe("TaskService", () => {
         );
         expect(result).toMatchObject(Err({ code: "refused" }));
         assert(!result.success && "reason" in result.error);
-        expect(result.error.reason).toMatch(/retry.*delegated/i);
+        expect(result.error.reason).toMatch(/retry after.*delegated/i);
         expect(sendMessage).not.toHaveBeenCalled();
-        // Existing ownership is separate from ancestry; finishing the delegation opens messaging.
+        // Finishing the delegation opens messaging as an ordinary idle-root wake.
         workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
           "target"
         );
         expect(
-          await taskService.sendAgentTreeMessage("sender", "target", "New synthetic input")
-        ).toEqual(
-          Ok({ delivery: "queued", relation: "target_unrelated", queueDispatchMode: "tool-end" })
-        );
-        const [, , options] = sendMessage.mock.calls[0] as Parameters<WorkspaceHost["sendMessage"]>;
-        expect(options?.agentId).toBe("exec");
+          (await taskService.sendAgentTreeMessage("sender", "target", "New synthetic input"))
+            .success
+        ).toBe(true);
+        const [, , options, internal] = sendCall(0);
         expect(options?.muxMetadata).toMatchObject({ type: "agent-peer-message" });
+        expect(internal?.workspaceTurnContinuation).toBe(false);
       }
     );
+
+    test("refuses the owner while its delegated turn is still reserved", async () => {
+      const { taskService, sendMessage, sendCall } = await setUpDelegatedTarget();
+      await registerLiveWorkspaceTurnHandle(taskService, "target", "wst_own", "sender", "reserved");
+      const result = await taskService.sendAgentTreeMessage("sender", "target", "Too early");
+      expect(result).toMatchObject(Err({ code: "refused" }));
+      assert(!result.success && "reason" in result.error);
+      expect(result.error.reason).toMatch(/retry shortly/i);
+      expect(sendMessage).not.toHaveBeenCalled();
+      // Once the owner's send passes admission, the same message continues the turn.
+      workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.set(
+        "target",
+        { handleId: "wst_own", ownerWorkspaceId: "sender", accepted: true }
+      );
+      expect((await taskService.sendAgentTreeMessage("sender", "target", "Now")).success).toBe(
+        true
+      );
+      const [, , , internal] = sendCall(0);
+      expect(internal?.workspaceTurnContinuation).toBe(true);
+    });
+
+    // A queued continuation must not dispatch into a different delegated turn: its stale
+    // correlation would end as an uncorrelated stream-end and supersede the new turn.
+    test("withdraws a queued continuation when another delegated turn replaces it", async () => {
+      const { taskService, sendCall } = await setUpDelegatedTarget();
+      await registerLiveWorkspaceTurnHandle(
+        taskService,
+        "target",
+        "wst_first",
+        "sender",
+        "accepted"
+      );
+      expect((await taskService.sendAgentTreeMessage("sender", "target", "Queued")).success).toBe(
+        true
+      );
+      const [, , , internal] = sendCall(0);
+      expect(internal?.admissionStale?.()).toBe(false);
+      await registerLiveWorkspaceTurnHandle(
+        taskService,
+        "target",
+        "wst_second",
+        "sender",
+        "accepted"
+      );
+      expect(internal?.admissionStale?.()).toBe(true);
+    });
 
     test.each(["pre-admission", "queued"] as const)(
       "withdraws when delegation starts %s",
