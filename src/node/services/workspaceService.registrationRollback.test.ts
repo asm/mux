@@ -871,22 +871,92 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       });
     });
 
-    // A project-dir fork may reuse a name, even its source's: the plan at the target is not its own.
-    test("local fork named like its source keeps the source's plan", async () => {
-      await withTempMuxRoot(async (root) => {
-        await harness.config.editConfig((cfg) => {
+    // #5009: plan paths depend only on project and workspace name, so a fork that takes an existing
+    // workspace's name would overwrite that workspace's plan. Project-dir forks never fail on the
+    // name by themselves, so fork() must refuse it before copying anything.
+    describe("fork name collisions (#5009)", () => {
+      const addLocalWorkspace = (id: string, name: string) =>
+        harness.config.editConfig((cfg) => {
           cfg.projects.get(projectPath)!.workspaces.push({
-            id: "eeeeeeeee2",
-            name: "local-one",
+            id,
+            name,
             path: projectPath,
             runtimeConfig: { type: "local" },
           });
           return cfg;
         });
-        const sourcePlan = await writePlanFile(root, "project", "local-one");
+      const writeDistinctPlan = async (root: string, name: string) => {
+        const planPath = await writePlanFile(root, "project", name);
+        await fs.writeFile(planPath, `# ${name}'s own plan\n`);
+        return planPath;
+      };
 
-        await expectFailsWithSaveError(() => service.fork("eeeeeeeee2", "local-one"));
-        expect(await exists(sourcePlan)).toBe(true);
+      test.each([
+        { label: "its source", target: "local-one" },
+        { label: "another workspace", target: "local-two" },
+      ])("local fork named like $label is refused and no plan changes", async (c) => {
+        await withTempMuxRoot(async (root) => {
+          await addLocalWorkspace("eeeeeeeee2", "local-one");
+          await addLocalWorkspace("eeeeeeeee3", "local-two");
+          const plans = [
+            await writeDistinctPlan(root, "local-one"),
+            await writeDistinctPlan(root, "local-two"),
+          ];
+          const before = await Promise.all(plans.map((p) => fs.readFile(p)));
+          const copy = spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes");
+          const workspacesBefore = persistedWorkspaceIds();
+
+          const result = await service.fork("eeeeeeeee2", c.target);
+
+          expect(result.success ? "" : result.error).toBe(
+            `Workspace with name "${c.target}" already exists in this project`
+          );
+          expect(copy).not.toHaveBeenCalled();
+          expect(await Promise.all(plans.map((p) => fs.readFile(p)))).toEqual(before);
+          expect(persistedWorkspaceIds()).toEqual(workspacesBefore);
+        });
+      });
+
+      // Worktree runtimes would fail later on the existing checkout; the refusal is uniform and early.
+      test("worktree fork named like another workspace is refused before orchestration", async () => {
+        const source = await createWorktree("wt-src");
+        if (!source.success) throw new Error(source.error);
+        await addLocalWorkspace("eeeeeeeee4", "wt-taken");
+        const worktreesBefore = worktreePaths(projectPath);
+
+        const result = await service.fork(source.data.metadata.id, "wt-taken");
+
+        expect(result.success ? "" : result.error).toBe(
+          'Workspace with name "wt-taken" already exists in this project'
+        );
+        expect(worktreePaths(projectPath)).toEqual(worktreesBefore);
+      });
+
+      // Removal leaves plans behind; a fork may reuse that name, and its rollback must not delete
+      // a file its copy did not create (#5003).
+      test("failed local fork over an orphaned plan leaves that file in place", async () => {
+        await withTempMuxRoot(async (root) => {
+          await addLocalWorkspace("eeeeeeeee7", "local-src2");
+          await writeDistinctPlan(root, "local-src2");
+          const orphanPlan = await writeDistinctPlan(root, "removed-ws");
+
+          await expectFailsWithSaveError(() => service.fork("eeeeeeeee7", "removed-ws"));
+          expect(await exists(orphanPlan)).toBe(true);
+        });
+      });
+
+      test("local fork with a new name still copies the source plan", async () => {
+        await withTempMuxRoot(async (root) => {
+          await addLocalWorkspace("eeeeeeeee5", "local-src");
+          const sourcePlan = await writeDistinctPlan(root, "local-src");
+
+          const result = await service.fork("eeeeeeeee5", "local-new");
+
+          expect(result.success ? "" : result.error).toBe("");
+          expect(await fs.readFile(getPlanFilePath("local-new", "project", root), "utf8")).toBe(
+            await fs.readFile(sourcePlan, "utf8")
+          );
+        });
       });
     });
 

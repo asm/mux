@@ -283,8 +283,9 @@ export async function copyPlanFileAcrossRuntimes(
       if (isRuntimeTransportError(error)) throw error;
       continue; // Missing (or not a regular file): try the next candidate.
     }
-    // A plan already at the target is not this copy's: a project-dir fork may reuse an existing
-    // workspace's name, even the source's. A probe that fails in transport counts as existing.
+    // A plan already at the target is not this copy's: fork() refuses names of live workspaces in
+    // its project (#5009), but removal leaves plan files behind (#5019). A probe that fails in
+    // transport counts as existing.
     const targetExisted = await targetRuntime.stat(targetPath).then(
       () => true,
       (error: unknown) => isRuntimeTransportError(error)
