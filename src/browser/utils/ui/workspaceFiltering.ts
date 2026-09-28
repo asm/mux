@@ -1,3 +1,4 @@
+import type { WorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectConfig } from "@/common/types/project";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
@@ -127,6 +128,32 @@ export interface DelegatedActivityOptions {
   isWorkspaceLiveActive?: (workspaceId: string) => boolean;
 }
 
+/**
+ * The sidebar's "working" reading of a workspace's live store state, used as the
+ * `isWorkspaceLiveActive` hint above. Shared so the composer tray and the sidebar
+ * cannot drift on what counts as live activity.
+ */
+export function isWorkspaceSidebarStateWorking(
+  state: Pick<
+    WorkspaceSidebarState,
+    | "canInterrupt"
+    | "isStarting"
+    | "activeWorkflowRunCount"
+    | "activeBashMonitorCount"
+    | "awaitingUserQuestion"
+  >
+): boolean {
+  return (
+    (state.canInterrupt ||
+      state.isStarting ||
+      state.activeWorkflowRunCount > 0 ||
+      // An armed background bash monitor keeps the workspace "working" so collapsed
+      // project/parent rows don't look idle while it waits to be woken.
+      state.activeBashMonitorCount > 0) &&
+    !state.awaitingUserQuestion
+  );
+}
+
 function createEmptyDelegatedActivity(): WorkspaceDelegatedActivity {
   return {
     activeCount: 0,
@@ -161,12 +188,6 @@ export function isSidebarSubAgentRunning(
     options.hasActiveBashMonitor?.(workspace.id) === true ||
     getIsWorkspaceLiveActive(workspace.id, options)
   );
-}
-
-export function isActionableTaskExecutionStatus(
-  status: FrontendWorkspaceMetadata["taskExecutionStatus"]
-): boolean {
-  return status === "queued" || status === "starting" || status === "running";
 }
 
 export function isActiveOrStartingTaskStatus(

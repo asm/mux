@@ -67,6 +67,7 @@ export const CommandIds = {
   chatInterrupt: () => "chat:interrupt" as const,
   chatJumpBottom: () => "chat:jumpBottom" as const,
   chatVoiceInput: () => "chat:voiceInput" as const,
+  chatRunLatestPlanAction: () => "chat:runLatestPlanAction" as const,
   chatClearTimingStats: () => "chat:clearTimingStats" as const,
 
   // Mode commands
@@ -96,6 +97,8 @@ export const CommandIds = {
   // Settings commands
   settingsOpen: () => "settings:open" as const,
   settingsOpenSection: (section: string) => `settings:open:${section}` as const,
+  settingsToggleKeepScreenAwake: () => "settings:toggle-keep-screen-awake" as const,
+  openServerWindow: () => "remote-connection:open-server-window" as const,
   coderDisconnect: () => "providers:coder:disconnect" as const,
   coderRefreshModels: () => "providers:coder:refresh-models" as const,
 

@@ -1,3 +1,4 @@
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 /**
  * Branch summarization on fork/truncate (rlm-mode experiment).
  *
@@ -29,6 +30,7 @@ import {
   createMuxMessage,
   type MuxMessage,
 } from "@/common/types/message";
+import { anthropicRejectsDisabledThinking } from "@/common/types/thinking";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -42,6 +44,7 @@ import {
   BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS,
   BRANCH_SUMMARY_MIN_SEGMENT_TOKENS,
   BRANCH_SUMMARY_TARGET_WORDS,
+  BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS,
   BRANCH_SUMMARY_TIMEOUT_MS,
 } from "@/constants/branchSummary";
 import {
@@ -157,8 +160,10 @@ export function buildAbandonedBranchTranscript(messages: MuxMessage[]): string {
   // Same exclusion as main request assembly: rows preserved by pre-stream
   // gate rejections are transcript-only — every model call (refine, RLM
   // branch summaries) must skip them or the rejected prompt gets distilled
-  // into durable context anyway.
+  // into durable context anyway. Both /refine and abandoned-branch summaries
+  // must also exclude hidden state before the char cap.
   const formatted = filterPreStreamRejectedRows(messages)
+    .filter((message) => !isModelHiddenMessage(message))
     .map(formatMessageForBranchTranscript)
     .filter((s) => s.length > 0);
 
@@ -436,13 +441,18 @@ async function generateAbandonedBranchSummaryText(input: {
       }
       // streamText (not generateText): Codex OAuth endpoints require
       // stream:true in the request body (same rationale as workspaceTitleGenerator).
-      // No thinking provider options are passed, so the call itself stays
-      // thinking-free on top of the thinking-stripped transcript.
+      // No thinking provider options are passed, so the call stays thinking-free
+      // on top of the thinking-stripped transcript, except on models that cannot
+      // disable thinking: those get low effort and thinking headroom instead.
+      const alwaysThinks = anthropicRejectsDisabledThinking(modelResult.data.metadataModel);
       const stream = streamText({
         model: modelResult.data.model,
         system: input.system,
         prompt: input.prompt,
-        maxOutputTokens: BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
+        maxOutputTokens: alwaysThinks
+          ? BRANCH_SUMMARY_MAX_OUTPUT_TOKENS + BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS
+          : BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
+        ...(alwaysThinks && { providerOptions: { anthropic: { effort: "low" } } }),
         abortSignal,
       });
       // Consume deltas incrementally (not stream.text) so a deadline that
@@ -767,8 +777,10 @@ export async function maybeAppendAbandonedBranchSummary(
     // Filtered here — NOT in buildAbandonedBranchTranscript, which /refine
     // also uses on the active epoch where the preserved copies are the tail's
     // only representation.
+    // Hidden records also cannot make a tiny visible segment eligible for a model call.
     const abandonedMessages = input.abandonedMessages.filter(
       (message) =>
+        !isModelHiddenMessage(message) &&
         message.metadata?.rlmPreservedTailCopy !== true &&
         (message.metadata?.compacted === undefined || message.metadata.compacted === false)
     );

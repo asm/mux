@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, it, test } from "bun:test";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import {

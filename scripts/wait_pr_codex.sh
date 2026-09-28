@@ -31,6 +31,8 @@ fi
 # Polling every 30s reduces GitHub API churn while still giving timely readiness updates.
 POLL_INTERVAL_SECS=30
 
+# Comment/review authors come back as this login, but a reaction's `user.login` is the
+# bot's User login with a "[bot]" suffix; the reaction matchers accept both.
 BOT_LOGIN_GRAPHQL="chatgpt-codex-connector"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CHECK_CODEX_COMMENTS_SCRIPT="$SCRIPT_DIR/check_codex_comments.sh"
@@ -131,6 +133,7 @@ GRAPHQL_QUERY='query($owner: String!, $repo: String!, $pr: Int!) {
           comments(first: 1) {
             nodes {
               id
+              fullDatabaseId
               author { login }
               body
               createdAt
@@ -465,7 +468,7 @@ CHECK_CODEX_STATUS_ONCE() {
     return 0
   fi
 
-  approval_reaction_at=$(echo "$pr_data" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.data.repository.pullRequest.reactions.nodes[]? | select(.user.login == $bot and .createdAt > $request_at) | .createdAt] | sort | last // empty')
+  approval_reaction_at=$(echo "$pr_data" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.data.repository.pullRequest.reactions.nodes[]? | select((.user.login == $bot or .user.login == ($bot + "[bot]")) and .createdAt > $request_at) | .createdAt] | sort | last // empty')
 
   if [[ -n "$approval_reaction_at" ]]; then
     echo ""
@@ -475,15 +478,18 @@ CHECK_CODEX_STATUS_ONCE() {
     return 0
   fi
 
-  # Completed status/no-findings envelopes for the current head are neither
+  # Completed no-findings security envelopes for the current head are neither
   # approval nor a failed review; they are excluded so the poller keeps waiting
-  # for the approval signal. Unknown envelopes and account errors still count.
+  # for the approval signal. Summary boards never count: whether a board blocks
+  # depends on every review thread (resolved advisories), and only the paginated
+  # gate below sees them all. Other comments, including account errors, count.
   codex_response_count_comments=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$pr_head" --arg request_at "$request_at" '
     include "codex_comments";
     [.[] | select(.author.login == $bot and .createdAt > $request_at)
       | select(
-          ((.body | codex_without_help | startswith("<!-- codex-pull-request-review-summary -->") or startswith("Security review completed."))
-            and codex_comment_is_informational($bot; $head)) | not
+          ((.body | codex_without_help | startswith("<!-- codex-pull-request-review-summary -->"))
+            or ((.body | codex_without_help | startswith("Security review completed."))
+              and codex_comment_is_informational($bot; $head; []))) | not
         )] | length
   ')
   codex_response_count_threads=$(echo "$all_threads" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select((.comments.nodes | length) > 0 and .comments.nodes[0].author.login == $bot and .comments.nodes[0].createdAt > $request_at)] | length')
@@ -522,7 +528,7 @@ CHECK_CODEX_STATUS_ONCE() {
     all_thumbs_up_reactions=$(FETCH_ALL_THUMBS_UP_REACTIONS) || return 1
     now_epoch=$(date +%s)
     record_full_reactions_scan "$request_at" "$now_epoch" || return 1
-    approval_reaction_at=$(echo "$all_thumbs_up_reactions" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select(.user.login == $bot and .createdAt > $request_at) | .createdAt] | sort | last // empty')
+    approval_reaction_at=$(echo "$all_thumbs_up_reactions" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select((.user.login == $bot or .user.login == ($bot + "[bot]")) and .createdAt > $request_at) | .createdAt] | sort | last // empty')
 
     if [[ -n "$approval_reaction_at" ]]; then
       echo ""

@@ -38,10 +38,14 @@ interface ModelData {
 
 // GPT-5.6 Sol - Released July 9, 2026 (flagship tier of the GPT-5.6 family).
 // GA model page: 1.05M context window, 128K max output, Feb 16 2026 cutoff.
-// Base pricing: $5/M input, $30/M output, $0.50/M cached input; cache writes
-// billed at 1.25x the active input rate ($6.25/M base). Prompts above 272K
-// input tokens bill the full request at 2x input / 1.5x output: $10/M input,
-// $45/M output, $1/M cached input, $12.50/M cache writes.
+// Pricing: we encode the promotional rates OpenAI actually bills, which the official
+// pricing page says run "at least through November 21, 2026": $4/M input, $20/M
+// output, $0.40/M cached input, $5/M cache writes (1.25x input). Prompts above 272K
+// input tokens bill the full request at 2x input / 1.5x output: $8/M input, $30/M
+// output, $0.80/M cached input, $10/M cache writes. TODO(2026-11-21): re-check the
+// pricing page and restore the standard rates ($5/$30/$0.50/$6.25; long context
+// $10/$45/$1/$12.50) once the promotion ends. Source:
+// https://developers.openai.com/api/docs/pricing as of 2026-09-26.
 // Shared const: the bare "gpt-5.6" alias is a servable id that OpenAI routes
 // to Sol (the response echoes model gpt-5.6-sol), so both ids resolve to the
 // same stats — otherwise token meters/compaction/pricing treat the documented
@@ -49,14 +53,14 @@ interface ModelData {
 const GPT_56_SOL_STATS: ModelData = {
   max_input_tokens: 1050000,
   max_output_tokens: 128000,
-  input_cost_per_token: 0.000005, // $5 per million input tokens (<272K prompt tokens)
-  input_cost_per_token_above_200k_tokens: 0.00001, // $10 per million input tokens (>272K)
-  output_cost_per_token: 0.00003, // $30 per million output tokens (<272K prompt tokens)
-  output_cost_per_token_above_200k_tokens: 0.000045, // $45 per million output tokens (>272K)
-  cache_read_input_token_cost: 0.0000005, // $0.50 per million cached input tokens (<272K)
-  cache_read_input_token_cost_above_200k_tokens: 0.000001, // $1 per million cached input tokens (>272K)
-  cache_creation_input_token_cost: 0.00000625, // $6.25 per million tokens (1.25x input)
-  cache_creation_input_token_cost_above_200k_tokens: 0.0000125, // $12.50 per million tokens (1.25x long-context input)
+  input_cost_per_token: 0.000004, // $4 per million input tokens (<=272K prompt tokens, promo)
+  input_cost_per_token_above_200k_tokens: 0.000008, // $8 per million input tokens (>272K, promo)
+  output_cost_per_token: 0.00002, // $20 per million output tokens (<=272K prompt tokens, promo)
+  output_cost_per_token_above_200k_tokens: 0.00003, // $30 per million output tokens (>272K, promo)
+  cache_read_input_token_cost: 0.0000004, // $0.40 per million cached input tokens (<=272K, promo)
+  cache_read_input_token_cost_above_200k_tokens: 0.0000008, // $0.80 per million cached input tokens (>272K, promo)
+  cache_creation_input_token_cost: 0.000005, // $5 per million tokens (1.25x input, promo)
+  cache_creation_input_token_cost_above_200k_tokens: 0.00001, // $10 per million tokens (1.25x long-context input, promo)
   // OpenAI's published long-context boundary is 272K even though LiteLLM's field names say 200K.
   tiered_pricing_threshold_tokens: 272000,
   litellm_provider: "openai",
@@ -492,6 +496,53 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_reasoning: true,
     supports_response_schema: true,
     knowledge_cutoff: "2026-02-16",
+  },
+
+  // September 22 GPT-6 tiers: the 1.05M total window accepts at most 922K input
+  // tokens. Above 272K input, the full request costs 2x input/cache and 1.5x output.
+  // Function calling with reasoning requires Responses (our default).
+  // Ref: https://developers.openai.com/api/docs/models/gpt-6-sol
+  "gpt-6-sol": {
+    max_input_tokens: 922000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.000002,
+    input_cost_per_token_above_200k_tokens: 0.000004,
+    output_cost_per_token: 0.00001,
+    output_cost_per_token_above_200k_tokens: 0.000015,
+    cache_read_input_token_cost: 0.0000002,
+    cache_read_input_token_cost_above_200k_tokens: 0.0000004,
+    cache_creation_input_token_cost: 0.0000025,
+    cache_creation_input_token_cost_above_200k_tokens: 0.000005,
+    tiered_pricing_threshold_tokens: 272000,
+    litellm_provider: "openai",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+    knowledge_cutoff: "2026-04-20",
+  },
+
+  // Ref: https://developers.openai.com/api/docs/models/gpt-6-luna
+  "gpt-6-luna": {
+    max_input_tokens: 922000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.0000001,
+    input_cost_per_token_above_200k_tokens: 0.0000002,
+    output_cost_per_token: 0.0000005,
+    output_cost_per_token_above_200k_tokens: 0.00000075,
+    cache_read_input_token_cost: 0.00000001,
+    cache_read_input_token_cost_above_200k_tokens: 0.00000002,
+    cache_creation_input_token_cost: 0.000000125,
+    cache_creation_input_token_cost_above_200k_tokens: 0.00000025,
+    tiered_pricing_threshold_tokens: 272000,
+    litellm_provider: "openai",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+    knowledge_cutoff: "2026-05-18",
   },
 
   // GPT-6 Astra - Released September 3, 2026 (OpenAI's frontier tier above the

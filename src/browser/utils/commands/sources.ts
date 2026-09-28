@@ -6,7 +6,7 @@ import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogConte
 import { getContextResetSuccessMessage } from "@/browser/utils/contextResetFeedback";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { PinnedMoveDirection } from "@/browser/utils/ui/pinnedReorder";
-import type { AutoRoutingDimension } from "@/browser/hooks/useSendMessageOptions";
+import type { AutoRoutingDimension } from "@/browser/utils/modelChange";
 import {
   THINKING_LEVELS,
   type OpenAIReasoningMode,
@@ -87,6 +87,8 @@ import {
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
 import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
+import { openServerWindow } from "@/browser/utils/openServerWindow";
+import type { RemoteConnectionApi } from "@/common/types/remoteConnection";
 
 export interface BuildSourcesParams {
   api: APIClient | null;
@@ -161,6 +163,8 @@ export interface BuildSourcesParams {
   onSetTheme: (theme: ThemePreference) => void;
   onOpenSettings?: (section?: string, options?: OpenSettingsOptions) => void;
   onOpenAbout?: () => void;
+  /** Desktop-only bridge (window.api.remoteConnection); absent in browser mode and server windows. */
+  remoteConnection?: RemoteConnectionApi;
 
   // Layout slots
   layoutPresets?: LayoutPresetsConfig | null;
@@ -237,6 +241,9 @@ const getAnalyticsRebuildDatabase = (
   const rebuildDatabase = (candidate as AnalyticsRebuildNamespace).rebuildDatabase;
   return typeof rebuildDatabase === "function" ? rebuildDatabase : null;
 };
+
+const NO_RUNNABLE_PLAN_MESSAGE =
+  "No plan to implement: the latest plan's Implement / Continue in Auto is missing or disabled.";
 
 const showCommandFeedbackToast = (feedback: {
   type: "success" | "error";
@@ -1271,6 +1278,26 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         },
       });
       list.push({
+        id: CommandIds.chatRunLatestPlanAction(),
+        title: "Implement Latest Plan",
+        subtitle: "Continue in Auto when in Auto mode",
+        section: section.chat,
+        keywords: ["plan", "implement", "continue in auto", "propose_plan"],
+        shortcutHint: formatKeybind(KEYBINDS.RUN_LATEST_PLAN_ACTION),
+        run: () => {
+          // The latest plan card runs its enabled primary action and marks the request handled
+          // (#4963); listeners run synchronously inside dispatchEvent.
+          const request = createCustomEvent(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, {
+            workspaceId: id,
+            handled: false,
+          });
+          window.dispatchEvent(request);
+          if (!request.detail.handled) {
+            showCommandFeedbackToast({ type: "error", message: NO_RUNNABLE_PLAN_MESSAGE });
+          }
+        },
+      });
+      list.push({
         id: CommandIds.chatClearTimingStats(),
         title: "Clear Timing Stats",
         subtitle: "Reset session timing data for this workspace",
@@ -1727,9 +1754,32 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     },
   ]);
 
+  // Keyboard route for the Settings → General → System switch. Like that switch, it only
+  // exists in the Electron app (window.api is set by the preload), where the blocker runs.
+  actions.push(() =>
+    typeof window === "undefined" || !window.api
+      ? []
+      : [
+          {
+            id: CommandIds.settingsToggleKeepScreenAwake(),
+            title: "Toggle Keep Screen Awake",
+            subtitle: "Prevent display sleep while agents are working",
+            section: section.settings,
+            keywords: ["awake", "sleep", "screen", "display", "lock", "power", "caffeinate"],
+            run: async () => {
+              if (!p.api) return;
+              // The flag lives in config.json (not localStorage), so read the current value first.
+              const cfg = await p.api.config.getConfig();
+              await p.api.config.updateKeepScreenAwake({ enabled: !cfg.keepScreenAwake });
+            },
+          },
+        ]
+  );
+
   // Settings
   if (p.onOpenSettings) {
     const openSettings = p.onOpenSettings;
+    const remoteConnection = p.remoteConnection;
     actions.push(() => [
       {
         id: CommandIds.settingsOpen(),
@@ -1773,6 +1823,19 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         // generic Providers list.
         run: () => openSettings("providers", { expandProvider: "coder", startCoderLogin: true }),
       },
+      ...(remoteConnection
+        ? [
+            {
+              id: CommandIds.openServerWindow(),
+              title: "Open Server Window",
+              subtitle: "Open a window connected to the running xum server",
+              section: section.settings,
+              keywords: ["server", "remote", "connect", "window", "xum server"],
+              shortcutHint: formatKeybind(KEYBINDS.OPEN_SERVER_WINDOW),
+              run: () => openServerWindow(remoteConnection, openSettings),
+            },
+          ]
+        : []),
       ...(p.agentPluginsEnabled
         ? ([
             {

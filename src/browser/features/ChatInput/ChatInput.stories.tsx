@@ -17,7 +17,7 @@ import {
   waitForChatInputAutofocusDone,
 } from "@/browser/stories/storyPlayHelpers.js";
 import { within, userEvent, waitFor } from "@storybook/test";
-import { MOBILE_TOUCH_TARGET_PX } from "@/constants/layout";
+import { MOBILE_TOUCH_TARGET_PX, NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 
 // Tailwind's `max-w-4xl` in px, the cap the centered transcript and composer columns share.
 const CENTERED_COLUMN_MAX_WIDTH_PX = 896;
@@ -120,6 +120,66 @@ export const ComposerTooltip: AppStory = {
   },
 };
 
+/**
+ * #4770: a transcript-only workspace has no composer, so its held inputs render above the
+ * read-only notice with Discard only (the workspace cannot run a turn).
+ */
+export const TranscriptOnlyHeldInput: AppStory = {
+  // Mirrors the phone Pixel variant for local viewing.
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        return setupSimpleChatStory({
+          workspaceId: "ws-transcript-held",
+          transcriptOnly: true,
+          messages: [
+            createUserMessage("msg-1", "Migrate the storage layer to the new schema.", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 120_000,
+            }),
+            createAssistantMessage("msg-2", "Started the migration; stopped before archiving.", {
+              historySequence: 2,
+              timestamp: STABLE_TIMESTAMP - 60_000,
+            }),
+          ],
+          onChat: (workspaceId, emit) => {
+            emit({
+              type: "held-inputs-changed",
+              workspaceId,
+              heldInputs: [
+                {
+                  id: "held-archived",
+                  reason: "interrupted",
+                  displayText: "Run the migration once the lint pass is green.",
+                  attachmentCount: 1,
+                  reviewCount: 0,
+                },
+              ],
+            });
+          },
+        });
+      }}
+    />
+  ),
+  parameters: {
+    ...appMeta.parameters,
+    pixel: PIXEL_DISABLED,
+  },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    const canvas = within(storyRoot);
+    await waitFor(() => canvas.getByRole("button", { name: "Discard unsent message" }));
+    if (canvas.queryByRole("button", { name: "Send unsent message" }) != null) {
+      throw new Error("A transcript-only held input must not offer Send");
+    }
+    canvas.getByRole("note");
+  },
+};
+
 export const QueuedFollowUp: AppStory = {
   globals: {
     viewport: { value: "mobile1", isRotated: false },
@@ -172,6 +232,36 @@ export const QueuedFollowUp: AppStory = {
                   "Also verify the narrow layout and make sure the action buttons stay easy to scan.",
                 queueDispatchMode: "tool-end",
               });
+              // Refused (held) inputs share the queued message's dock; covering them here keeps
+              // the phone and laptop Pixel variants of that dock in one story (snapshot budget).
+              emit({
+                type: "held-inputs-changed",
+                workspaceId,
+                heldInputs: [
+                  {
+                    id: "held-reported",
+                    reason: "reported",
+                    displayText: "Summarize what changed in the settings validation.",
+                    attachmentCount: 1,
+                    reviewCount: 1,
+                  },
+                  {
+                    id: "held-indeterminate",
+                    reason: "indeterminate",
+                    displayText: "",
+                    attachmentCount: 2,
+                    reviewCount: 0,
+                  },
+                  {
+                    // Returned by Stop while the composer could not take it (#4448).
+                    id: "held-interrupted",
+                    reason: "interrupted",
+                    displayText: "Run the migration once the lint pass is green.",
+                    attachmentCount: 0,
+                    reviewCount: 0,
+                  },
+                ],
+              });
             }, 75);
           },
         });
@@ -181,6 +271,8 @@ export const QueuedFollowUp: AppStory = {
   parameters: {
     ...appMeta.parameters,
     pixel: {
+      // The phone variant (below the narrow breakpoint) pins the held banners' hidden shortcut
+      // hints; laptop pins them visible on the oldest banner.
       matrix: { themes: ["dark", "light"], viewports: ["phone", "laptop"] },
     },
   },
@@ -224,6 +316,52 @@ export const QueuedFollowUp: AppStory = {
       }
       if (statusBounds.right > groupBounds.right + 1) {
         throw new Error("Queued follow-up status overflows its right-aligned metadata row");
+      }
+    });
+
+    await waitFor(() => {
+      const banners = [
+        ...storyRoot.querySelectorAll<HTMLElement>('[data-component="HeldInputBanner"]'),
+      ];
+      if (banners.length !== 3) throw new Error("Held input banners not rendered");
+      for (const banner of banners) {
+        if (banner.scrollWidth > banner.clientWidth) {
+          throw new Error("Held input banner overflows horizontally");
+        }
+      }
+      // Static contract: every shortcut hint carries the narrow-viewport hide rule.
+      const hints = banners.flatMap((banner) => [...banner.querySelectorAll<HTMLElement>("kbd")]);
+      if (
+        hints.some(
+          (hint) =>
+            !hint.className.includes(`[@media(max-width:${NARROW_VIEWPORT_MAX_WIDTH_PX}px)]:hidden`)
+        )
+      ) {
+        throw new Error("Held input shortcut hints must be hidden below the narrow breakpoint");
+      }
+      // Rendered contract at whatever width this runs: hidden on phones (Pixel's phone variant,
+      // the story's mobile viewport), shown only on the oldest banner otherwise (the test-runner
+      // plays at desktop width).
+      const narrow = window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches;
+      const visibleHints = banners.map(
+        (banner) =>
+          [...banner.querySelectorAll<HTMLElement>("kbd")].filter(
+            (hint) => getComputedStyle(hint).display !== "none"
+          ).length
+      );
+      const expected = narrow ? [0, 0, 0] : [2, 0, 0];
+      if (visibleHints.join() !== expected.join()) {
+        throw new Error(
+          `Held input shortcut hints visible ${visibleHints.join()} (expected ${expected.join()}, narrow=${narrow})`
+        );
+      }
+      // Only a confirmed report may say the task reported.
+      if (
+        !banners[0].textContent?.includes("the task reported") ||
+        banners[1].textContent?.includes("reported") ||
+        banners[2].textContent?.includes("reported")
+      ) {
+        throw new Error("Held input banner wording does not match its refusal reason");
       }
     });
 

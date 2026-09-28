@@ -12,6 +12,7 @@ import type {
   MemoryFileInfo,
 } from "@/common/orpc/schemas/memory";
 import type { APIClient } from "@/browser/contexts/API";
+import { createMockReviewStateApi } from "./reviewState";
 import type {
   AgentDefinitionDescriptor,
   AgentDefinitionPackage,
@@ -172,6 +173,8 @@ export interface MockORPCClientOptions {
   worktreeArchiveBehavior?: WorktreeArchiveBehavior;
   /** Initial full-width transcript toggle for config.getConfig */
   chatTranscriptFullWidth?: boolean;
+  /** Initial keep-screen-awake toggle for config.getConfig */
+  keepScreenAwake?: boolean;
   /** Initial runtime enablement for config.getConfig */
   runtimeEnablement?: Record<string, boolean>;
   /** Initial default runtime for config.getConfig (global) */
@@ -427,6 +430,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     coderWorkspaceArchiveBehavior: initialCoderWorkspaceArchiveBehavior = "stop",
     worktreeArchiveBehavior: initialWorktreeArchiveBehavior = "keep",
     chatTranscriptFullWidth: initialChatTranscriptFullWidth = false,
+    keepScreenAwake: initialKeepScreenAwake = false,
     runtimeEnablement: initialRuntimeEnablement,
     defaultRuntime: initialDefaultRuntime,
     heartbeatDefaultPrompt: initialHeartbeatDefaultPrompt,
@@ -579,6 +583,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let coderWorkspaceArchiveBehavior = initialCoderWorkspaceArchiveBehavior;
   let worktreeArchiveBehavior = initialWorktreeArchiveBehavior;
   let chatTranscriptFullWidth = initialChatTranscriptFullWidth;
+  let keepScreenAwake = initialKeepScreenAwake;
   let runtimeEnablement: Record<string, boolean> = initialRuntimeEnablement ?? {
     local: true,
     worktree: true,
@@ -829,6 +834,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           chatTranscriptFullWidth,
           muxGovernorEnrolled,
           llmDebugLogs: false,
+          keepScreenAwake,
         }),
       saveConfig: (input: {
         taskSettings?: unknown;
@@ -939,6 +945,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       updateChatTranscriptFullWidth: (input: { enabled: boolean }) => {
         chatTranscriptFullWidth = input.enabled;
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateKeepScreenAwake: (input: { enabled: boolean }) => {
+        keepScreenAwake = input.enabled;
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
@@ -1104,6 +1115,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     providers: {
       list: () => Promise.resolve(providersList),
       getConfig: () => Promise.resolve(providersConfig),
+      discoverModels: () => Promise.resolve({ status: "unsupported" }),
       setProviderConfig: () => Promise.resolve({ success: true, data: undefined }),
       setModels: () => Promise.resolve({ success: true, data: undefined }),
     },
@@ -1659,6 +1671,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           workspaces.filter((w) => !isWorkspaceArchived(w.archivedAt, w.unarchivedAt))
         );
       },
+      listKnownIdsForStorageGc: () =>
+        Promise.resolve({ workspaceIds: workspaces.map((workspace) => workspace.id) }),
       preflightArchive: () => Promise.resolve({ success: true, data: { kind: "ready" as const } }),
       archive: () => Promise.resolve({ success: true }),
       unarchive: () => Promise.resolve({ success: true }),
@@ -1782,6 +1796,21 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             }
           : rest;
         publishWorkspaceMetadata(next);
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
+      setAgentMessageDispatchMode: (input: {
+        workspaceId: string;
+        mode: "tool-end" | "turn-end";
+      }) => {
+        const current = workspaceMap.get(input.workspaceId);
+        if (!current) {
+          return Promise.resolve({ success: false as const, error: "Workspace not found" });
+        }
+        // Same storage rule as the backend: the tool-end default is an absent field.
+        const { agentMessageDispatchMode: _previous, ...rest } = current;
+        publishWorkspaceMetadata(
+          input.mode === "turn-end" ? { ...rest, agentMessageDispatchMode: "turn-end" } : rest
+        );
         return Promise.resolve({ success: true as const, data: undefined });
       },
       interruptStream: () => Promise.resolve({ success: true, data: undefined }),
@@ -1922,6 +1951,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         },
         sendToBackground: () => Promise.resolve({ success: true, data: undefined }),
       },
+      reviewState: createMockReviewStateApi(),
       stats: {
         subscribe: async function* (input: { workspaceId: string }) {
           const snapshot = workspaceStatsSnapshots.get(input.workspaceId);

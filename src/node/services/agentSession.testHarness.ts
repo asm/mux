@@ -5,6 +5,7 @@ import { EventEmitter } from "events";
 
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { Err, Ok } from "@/common/types/result";
+import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
 import type { StreamEndEvent, StreamAbortEvent } from "@/common/types/stream";
 import type { TurnStreamHandle } from "@/node/services/streamManager";
@@ -17,7 +18,7 @@ import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { HistoryService } from "@/node/services/historyService";
-import type { InitStateManager } from "@/node/services/initStateManager";
+import { InitStateManager } from "@/node/services/initStateManager";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { StreamErrorType } from "@/common/types/errors";
@@ -74,15 +75,6 @@ export function runSessionTerminalPolicy(
     : policy.handleTurnAbort(payload, systemMessageTokens);
 }
 
-function createAgentSessionTestConfig(sessionDir = "/tmp"): Config {
-  return {
-    rootDir: sessionDir,
-    sessionsDir: sessionDir,
-    srcDir: sessionDir,
-    loadConfigOrDefault: mock(() => ({})),
-  } as unknown as Config;
-}
-
 function createMockBackgroundProcessManager(
   overrides?: Partial<BackgroundProcessManager>
 ): BackgroundProcessManager {
@@ -93,8 +85,12 @@ function createMockBackgroundProcessManager(
   } as unknown as BackgroundProcessManager;
 }
 
-function createMockInitStateManager(overrides?: Partial<InitStateManager>): InitStateManager {
-  return Object.assign(new EventEmitter(), overrides) as unknown as InitStateManager;
+/** Real manager (no init runs recorded) with per-test method overrides applied on top. */
+function createTestInitStateManager(
+  config: Config,
+  overrides?: Partial<InitStateManager>
+): InitStateManager {
+  return Object.assign(new InitStateManager(config), overrides);
 }
 
 /** Stream-lifecycle surface AgentSession's constructor requires from its engine seam. */
@@ -109,16 +105,28 @@ export function createStreamLifecycleMocks() {
   };
 }
 
-function createMockAiService(args: {
-  getClosingSignal: () => AbortSignal;
+export interface AgentSessionAIServiceFakeOptions {
+  /** Event source the session subscribes to; tests emit stream events on it. */
   emitter?: EventEmitter;
   overrides?: Partial<AgentSessionAIService>;
-}): {
-  aiEmitter: EventEmitter;
-  aiService: AgentSessionAIService;
-} {
-  const aiEmitter = args?.emitter ?? new EventEmitter();
-  const aiService: AgentSessionAIService = Object.assign(aiEmitter, {
+  /**
+   * Signal that ends the default stream's started-turn handle (usually the session's
+   * closingSignal). Without it the default stream reports a startup failure instead.
+   */
+  getClosingSignal?: () => AbortSignal;
+}
+
+/**
+ * Typed AgentSession AI fake with every required member implemented, so tests never need a
+ * cast (and production never needs a typeof guard for a member a partial fake left out).
+ * The returned object is the emitter itself.
+ */
+export function createAgentSessionAIServiceFake(
+  options: AgentSessionAIServiceFakeOptions = {}
+): AgentSessionAIService & EventEmitter {
+  const aiEmitter = options.emitter ?? new EventEmitter();
+  const getClosingSignal = options.getClosingSignal;
+  const aiService: AgentSessionAIService & EventEmitter = Object.assign(aiEmitter, {
     // Real implementations report failures as Err results, never rejections.
     createModelWithPinnedMetadata: mock(() =>
       Promise.resolve(
@@ -146,8 +154,8 @@ function createMockAiService(args: {
     prepareStreamMessage: mock(() =>
       Promise.resolve(
         Ok({
-          start: (options: Parameters<AgentSessionAIService["streamMessage"]>[0]) =>
-            aiService.streamMessage(options),
+          start: (streamOptions: Parameters<AgentSessionAIService["streamMessage"]>[0]) =>
+            aiService.streamMessage(streamOptions),
           [Symbol.asyncDispose]: () => Promise.resolve(),
         })
       )
@@ -156,34 +164,16 @@ function createMockAiService(args: {
       Promise.resolve(Ok(eventSpine.captureRequestAssembly(workspaceId)))
     ),
     ...createStreamLifecycleMocks(),
-    streamMessage: mock(() =>
+    streamMessage: mock<AgentSessionAIService["streamMessage"]>(() =>
       Promise.resolve(
-        Ok(createStartedTurnHandle(args.getClosingSignal(), "test-assistant-message"))
+        getClosingSignal
+          ? Ok(createStartedTurnHandle(getClosingSignal(), "test-assistant-message"))
+          : Err({ type: "unknown" as const, raw: "Test AI service has no stream" })
       )
     ),
-    ...args?.overrides,
+    ...options.overrides,
   });
-  return { aiEmitter, aiService };
-}
-
-/** Direct session fixtures bypass the app graph, but still use the real context controller. */
-export function createTestAgentSession(
-  options: Omit<ConstructorParameters<typeof AgentSession>[0], "contextManagement"> & {
-    contextManagement?: ContextManagementService;
-  }
-): AgentSession {
-  return new AgentSession({
-    ...options,
-    contextManagement:
-      options.contextManagement ??
-      new ContextManagementService({
-        config: options.config,
-        historyService: options.historyService,
-        aiService: options.aiService,
-        sessionUsageService: options.sessionUsageService,
-        telemetryService: options.telemetryService,
-      }),
-  });
+  return aiService;
 }
 
 export interface AgentSessionHarnessOptions extends Pick<
@@ -193,7 +183,13 @@ export interface AgentSessionHarnessOptions extends Pick<
   | "isStopInProgress"
   | "getStopEpoch"
   | "onTurnSettled"
+  | "onTurnSuperseded"
   | "onBeforeTurnCompletion"
+  | "planSnapshotCaptureTimeoutMs"
+  | "onPostCompactionStateChange"
+  | "sessionUsageService"
+  | "autoModelRouter"
+  | "hasExternalSendPreflight"
 > {
   workspaceId: string;
   contextManagement?: ContextManagementService;
@@ -255,19 +251,28 @@ export async function seedAutoCompactionThreshold(
 export async function createAgentSessionHarness(
   options: AgentSessionHarnessOptions
 ): Promise<AgentSessionHarness> {
+  // A caller-owned HistoryService must come with the Config that owns its sessions dir (and
+  // vice versa); pairing either with a temp stand-in would split session state across roots.
+  assert(
+    (options.historyService == null) === (options.config == null),
+    "createAgentSessionHarness: pass config and historyService together"
+  );
   const testHistory = options.historyService ? undefined : await createTestHistoryService();
   const historyService = options.historyService ?? testHistory!.historyService;
-  const config = options.config ?? testHistory?.config ?? createAgentSessionTestConfig();
+  const config = options.config ?? testHistory!.config;
   const cleanup = testHistory?.cleanup ?? (() => Promise.resolve());
-  const { aiEmitter, aiService } = options.aiService
-    ? { aiEmitter: options.aiEmitter ?? new EventEmitter(), aiService: options.aiService }
-    : createMockAiService({
+  const fake = options.aiService
+    ? undefined
+    : createAgentSessionAIServiceFake({
         getClosingSignal: () => session.closingSignal,
         emitter: options.aiEmitter,
         overrides: options.aiServiceOverrides,
       });
+  const aiService = options.aiService ?? fake!;
+  const aiEmitter = fake ?? options.aiEmitter ?? new EventEmitter();
   const initStateManager =
-    options.initStateManager ?? createMockInitStateManager(options.initStateManagerOverrides);
+    options.initStateManager ??
+    createTestInitStateManager(config, options.initStateManagerOverrides);
   const backgroundProcessManager =
     options.backgroundProcessManager ??
     createMockBackgroundProcessManager(options.backgroundProcessManagerOverrides);
@@ -278,6 +283,7 @@ export async function createAgentSessionHarness(
       config,
       historyService,
       aiService,
+      sessionUsageService: options.sessionUsageService,
     });
   const session: AgentSession = new AgentSession({
     contextManagement,
@@ -297,7 +303,13 @@ export async function createAgentSessionHarness(
     isStopInProgress: options.isStopInProgress,
     getStopEpoch: options.getStopEpoch,
     onTurnSettled: options.onTurnSettled,
+    onTurnSuperseded: options.onTurnSuperseded,
     onBeforeTurnCompletion: options.onBeforeTurnCompletion,
+    planSnapshotCaptureTimeoutMs: options.planSnapshotCaptureTimeoutMs,
+    onPostCompactionStateChange: options.onPostCompactionStateChange,
+    sessionUsageService: options.sessionUsageService,
+    autoModelRouter: options.autoModelRouter,
+    hasExternalSendPreflight: options.hasExternalSendPreflight,
   });
 
   const events: WorkspaceChatMessage[] = [];

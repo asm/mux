@@ -8,13 +8,16 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import type { SendMessageOptions } from "@/common/orpc/types";
+import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import { createMuxMessage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
 import type { SendMessageError } from "@/common/types/errors";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { Err, Ok } from "@/common/types/result";
+import { Err, Ok, type Result } from "@/common/types/result";
 import assert from "@/common/utils/assert";
+import type { SessionContextController } from "./contextManagement/sessionContextController";
 import { prepareProviderRequestMessages } from "./turnContextAssembler";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
+import { buildHistoryEditPrecondition } from "@/common/utils/history/editTruncation";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
@@ -26,6 +29,9 @@ import {
 import type { AgentSessionAIService } from "./agentSession";
 import { CompactionCancellation } from "./compactionCancellation";
 import { HistoryService } from "./historyService";
+import { ExtensionMetadataService } from "./ExtensionMetadataService";
+import { createTestHistoryService } from "./testHistoryService";
+import { WorkspaceGoalService } from "./workspaceGoalService";
 import {
   createAgentSessionHarness,
   seedAutoCompactionThreshold,
@@ -72,6 +78,17 @@ function trackedFilePaths(h: AgentSessionHarness): string[] {
     .paths;
 }
 
+/** Budget state lives on the controller-private token-budget strategy, not the session. */
+function budgetOf(h: AgentSessionHarness) {
+  return Reflect.get(Reflect.get(h.session, "contextController") as object, "tokenBudget") as {
+    contextBudgetGeneration: number;
+    contextBudgetWarningClaimed: boolean;
+    contextBudgetHandoffClaimed: boolean;
+    contextBudgetFlushClaimed: boolean;
+    contextBudgetHistoryAvailable: boolean;
+  };
+}
+
 function text(row: MuxMessage): string {
   return row.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n");
 }
@@ -108,13 +125,10 @@ function isHandoffRow(row: MuxMessage): boolean {
 
 /** Per-window advisory claims; set only once a row is durable, never by pending intent. */
 function budgetClaims(h: AgentSessionHarness): { warning: boolean; handoff: boolean } {
-  const session = h.session as unknown as {
-    contextBudgetWarningClaimed: boolean;
-    contextBudgetHandoffClaimed: boolean;
-  };
+  const budget = budgetOf(h);
   return {
-    warning: session.contextBudgetWarningClaimed,
-    handoff: session.contextBudgetHandoffClaimed,
+    warning: budget.contextBudgetWarningClaimed,
+    handoff: budget.contextBudgetHandoffClaimed,
   };
 }
 
@@ -205,12 +219,14 @@ async function seedLegacyFlushTurn(
 
 describe("AgentSession token-budget lifecycle", () => {
   const harnesses: AgentSessionHarness[] = [];
+  const storageCleanups: Array<() => Promise<void>> = [];
   afterEach(async () => {
     for (const h of harnesses.reverse()) {
       await h.session.dispose();
       await h.cleanup();
     }
     harnesses.length = 0;
+    for (const cleanup of storageCleanups.splice(0)) await cleanup();
     mock.restore();
   });
 
@@ -220,7 +236,30 @@ describe("AgentSession token-budget lifecycle", () => {
     failure?: (
       attempt: number
     ) => SendMessageError | undefined | Promise<SendMessageError | undefined>;
+    /** Inject a real goal service (no goal set) whose stream accounting the test observes. */
+    goals?: boolean;
   }) {
+    let storage: Pick<AgentSessionHarness, "historyService" | "config"> | undefined =
+      args?.previous;
+    if (!storage && args?.goals) {
+      const owned = await createTestHistoryService();
+      storageCleanups.push(owned.cleanup);
+      storage = owned;
+    }
+    const workspaceGoalService =
+      args?.goals && storage
+        ? new WorkspaceGoalService(
+            storage.config,
+            storage.historyService,
+            new ExtensionMetadataService(
+              path.join(storage.config.rootDir, "extension-metadata.json")
+            )
+          )
+        : undefined;
+    const goalAccounting = workspaceGoalService && {
+      recordStreamAccounting: spyOn(workspaceGoalService, "recordStreamAccounting"),
+      previewStreamAccounting: spyOn(workspaceGoalService, "previewStreamAccounting"),
+    };
     const requests: Request[] = [];
     const secondRequest = Promise.withResolvers<Request>();
     const requestWaiters = new Map<number, ReturnType<typeof Promise.withResolvers<Request>>>();
@@ -262,9 +301,10 @@ describe("AgentSession token-budget lifecycle", () => {
     const h = await createAgentSessionHarness({
       workspaceId,
       captureEvents: true,
-      historyService: args?.previous?.historyService,
-      config: args?.previous?.config,
+      historyService: storage?.historyService,
+      config: storage?.config,
       mcpServerManager: args?.mcpServerManager,
+      workspaceGoalService,
       aiServiceOverrides: {
         streamMessage,
         buildMemorySessionContext: mock(() => Promise.resolve(null)),
@@ -314,6 +354,7 @@ describe("AgentSession token-budget lifecycle", () => {
     };
     return {
       ...h,
+      goalAccounting,
       requests,
       completions,
       streamMessage,
@@ -330,11 +371,7 @@ describe("AgentSession token-budget lifecycle", () => {
       (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET
     );
     await seedHistory(h, 20_000);
-    const state = h.session as unknown as {
-      contextBudgetGeneration: number;
-      contextBudgetWarningClaimed: boolean;
-      contextBudgetFlushClaimed: boolean;
-    };
+    const state = budgetOf(h);
     state.contextBudgetWarningClaimed = true;
     state.contextBudgetFlushClaimed = true;
     const generation = state.contextBudgetGeneration;
@@ -611,8 +648,7 @@ describe("AgentSession token-budget lifecycle", () => {
     async (scope) => {
       const h = await setup();
       await seedHistory(h, 120_000);
-      const session = h.session as unknown as { applyContextResetSideEffects(): Promise<void> };
-      const cleanup = spyOn(session, "applyContextResetSideEffects");
+      const cleanup = spyOn(h.session, "applyContextResetSideEffects");
       const unregister = eventSpine.useBefore(
         "request.assemble",
         (ctx) => {
@@ -694,9 +730,8 @@ describe("AgentSession token-budget lifecycle", () => {
         );
       };
       if (phase === "cleanup") {
-        const session = h.session as unknown as { applyContextResetSideEffects(): Promise<void> };
-        const cleanup = session.applyContextResetSideEffects.bind(session);
-        spyOn(session, "applyContextResetSideEffects").mockImplementationOnce(async () => {
+        const cleanup = h.session.applyContextResetSideEffects.bind(h.session);
+        spyOn(h.session, "applyContextResetSideEffects").mockImplementationOnce(async () => {
           replaceRegistration();
           await cleanup();
         });
@@ -742,6 +777,8 @@ describe("AgentSession token-budget lifecycle", () => {
       { workspaceId }
     );
     let removeLive: (() => void) | undefined;
+    // Kept private: the real backoff retry fires ~2 s later on the global clock (these fakes
+    // carry no effectRunner), so the test cancels it and runs the same retry step directly.
     const session = h.session as unknown as {
       retryManager: { cancel(): void };
       retryActiveStream(): Promise<void>;
@@ -768,8 +805,7 @@ describe("AgentSession token-budget lifecycle", () => {
     async (blocked) => {
       const h = await setup({ failure: (attempt) => (attempt === 1 ? exceeded : undefined) });
       await seedHistory(h, 20_000);
-      const session = h.session as unknown as { applyContextResetSideEffects(): Promise<void> };
-      const cleanup = spyOn(session, "applyContextResetSideEffects");
+      const cleanup = spyOn(h.session, "applyContextResetSideEffects");
       const unregister = blocked
         ? eventSpine.useBefore("request.assemble", () => undefined, { workspaceId })
         : eventSpine.useRequestContext(
@@ -1363,6 +1399,27 @@ describe("AgentSession token-budget lifecycle", () => {
     expect((await h.requests[1].onStepSettled?.(step(5_000)))?.decision).toBe("continue");
   });
 
+  test("a settled step whose next request would cross the ceiling seals the window instead of blocking", async () => {
+    // #4855: provider usage far below the ceiling, but the next step's assembled estimate (what
+    // the per-step preflight enforces) reaches it. Rollover must win before that hard stop.
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(
+      (await h.requests[0].onStepSettled?.(step(50_000, { nextRequestTokens: 119_808 })))?.decision
+    ).toBe("rollover");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+    await h.finishAndDispatch();
+    const rows = await allRows(h);
+    const resets = rolloverRows(rows);
+    expect(resets).toHaveLength(1);
+    expect(resets[0].metadata?.muxMetadata).toMatchObject({
+      reason: "mid-stream",
+      contextTokens: 119_808,
+      budgetTokens: 119_808,
+    });
+    expect(text(rows.at(-1)!)).toBe("Continue");
+  });
+
   test("a new_context request is ignored while automatic rollover is disabled or history is unavailable", async () => {
     const h = await setup();
     await seedThreshold(h, 1);
@@ -1878,7 +1935,7 @@ describe("AgentSession token-budget lifecycle", () => {
       expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
       expect(warningRows(await allRows(h))).toHaveLength(0);
       expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
-      const state = h.session as unknown as { contextBudgetHandoffClaimed: boolean };
+      const state = budgetOf(h);
       expect(state.contextBudgetHandoffClaimed).toBe(false);
       await seedThreshold(h, threshold);
       h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
@@ -2280,7 +2337,7 @@ describe("AgentSession token-budget lifecycle", () => {
     expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
     // Fail only the optional advisory lookup, not unrelated stream preparation or rollover admission.
     spyOn(
-      h.session as unknown as { resolveAgentForBudgetChecks: () => Promise<unknown> },
+      budgetOf(h) as unknown as { resolveAgentForBudgetChecks: () => Promise<unknown> },
       "resolveAgentForBudgetChecks"
     ).mockResolvedValueOnce(Err(exceeded));
     h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
@@ -2533,24 +2590,9 @@ describe("AgentSession token-budget lifecycle", () => {
   });
 
   test("a handoff continuation stays ordinary goal work", async () => {
-    const h = await setup();
-    // Minimal goal service: only the stream accounting seams are observed.
-    const recordStreamAccounting = mock((_input: { streamOriginKind?: string }) =>
-      Promise.resolve(null)
-    );
-    const previewStreamAccounting = mock(() => Promise.resolve(null));
-    const noop = () => Promise.resolve();
-    Reflect.set(h.session, "workspaceGoalService", {
-      recordStreamAccounting,
-      previewStreamAccounting,
-      recordStreamStarted: noop,
-      recordUserStoppedStream: noop,
-      applyPendingAfterStreamEnd: noop,
-      requestContinuationAfterStreamEnd: noop,
-      syncGoalModeWithChatTail: noop,
-      getGoal: () => Promise.resolve(null),
-      assertPricedModelForBudgetedGoal: () => Promise.resolve(Ok(undefined)),
-    });
+    const h = await setup({ goals: true });
+    assert(h.goalAccounting, "Expected an injected goal service");
+    const { recordStreamAccounting, previewStreamAccounting } = h.goalAccounting;
     expect(
       (
         await h.session.sendMessage("Goal work", options, {
@@ -2583,6 +2625,63 @@ describe("AgentSession token-budget lifecycle", () => {
       "goal_continuation",
       "goal_continuation",
     ]);
+  });
+
+  test("a handoff continuation after a fenced edit still dispatches", async () => {
+    const h = await setup();
+    await seedHistory(h, 20_000);
+    await h.historyService.appendManyToHistory(workspaceId, [
+      createMuxMessage("edit-target", "user", "Original request"),
+      createMuxMessage("edit-answer", "assistant", "Original answer", { model }),
+    ]);
+    // Fence the edit over the wire projection the client holds, as the UI does.
+    const historyEditPrecondition = buildHistoryEditPrecondition(
+      (await allRows(h)).map((row) => MuxMessageSchema.parse(row) as MuxMessage),
+      "edit-target"
+    );
+    assert(historyEditPrecondition, "Expected an edit fence");
+    expect(
+      (
+        await h.session.sendMessage("Edited request", {
+          ...options,
+          editMessageId: "edit-target",
+          historyEditPrecondition,
+        })
+      ).success
+    ).toBe(true);
+    await h.waitForRequest(1);
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    const continuation = await h.waitForRequest(2);
+    const rows = await allRows(h);
+    expect(isHandoffRow(rows.at(-2)!)).toBe(true);
+    expect(text(rows.at(-1)!)).toBe("Continue");
+    expect(continuation.messages.map(text)).toContain("Edited request");
+    expect(continuation.messages.map(text)).not.toContain("Original request");
+  });
+
+  test("a budget continuation keeps the turn's routing and Chat Instructions state", async () => {
+    const h = await setup();
+    const record: AutoModelRoutingRecord = {
+      requestedFallbackModel: "anthropic:claude-sonnet-4-5",
+      model,
+      status: "routed",
+    };
+    // The record is session-internal; a routed send carries it on its resolved options. The
+    // empty snapshot is the renderer's "Chat Instructions disabled" sentinel.
+    const routed: SendMessageOptions & { autoModelRoutingRecord: AutoModelRoutingRecord } = {
+      ...options,
+      additionalSystemContext: "",
+      autoModelRoutingRecord: record,
+    };
+    expect((await h.session.sendMessage("Routed work", routed)).success).toBe(true);
+    expect(h.requests[0]).toMatchObject({ autoModelRouting: record, additionalSystemContext: "" });
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    expect(await h.waitForRequest(2)).toMatchObject({
+      autoModelRouting: record,
+      additionalSystemContext: "",
+    });
   });
 
   // Older builds offered a hidden notes-flush step before sealing a window. New windows never
@@ -2900,23 +2999,9 @@ describe("AgentSession token-budget lifecycle", () => {
     const first = await setup();
     await seedLegacyFlushTurn(first);
     await first.session.dispose();
-    const h = await setup({ previous: first });
-    const recordStreamAccounting = mock((_input: { streamOriginKind?: string }) =>
-      Promise.resolve(null)
-    );
-    const previewStreamAccounting = mock(() => Promise.resolve(null));
-    const noop = () => Promise.resolve();
-    Reflect.set(h.session, "workspaceGoalService", {
-      recordStreamAccounting,
-      previewStreamAccounting,
-      recordStreamStarted: noop,
-      recordUserStoppedStream: noop,
-      applyPendingAfterStreamEnd: noop,
-      requestContinuationAfterStreamEnd: noop,
-      syncGoalModeWithChatTail: noop,
-      getGoal: () => Promise.resolve(null),
-      assertPricedModelForBudgetedGoal: () => Promise.resolve(Ok(undefined)),
-    });
+    const h = await setup({ previous: first, goals: true });
+    assert(h.goalAccounting, "Expected an injected goal service");
+    const { recordStreamAccounting, previewStreamAccounting } = h.goalAccounting;
     expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
     expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
     // Neither the live preview nor the final accounting sees the housekeeping stream's usage.
@@ -3330,6 +3415,116 @@ describe("AgentSession token-budget lifecycle", () => {
       }
     }
   );
+
+  /**
+   * Records the recovery path's preparation fence and the protected calls it guards. Each
+   * valid fence check queues a microtask; protected work that starts before that microtask
+   * runs proves the session did not yield between the check and the call.
+   *
+   * The marker is a real promise reaction, not `queueMicrotask`: another suite in the shared
+   * Bun process replaces the global with a synchronous stub, which would record the marker
+   * inside the fence check itself and fail this witness for the wrong reason.
+   */
+  function armRecoveryFenceWitness(h: Awaited<ReturnType<typeof setup>>) {
+    const controller = Reflect.get(h.session, "contextController") as SessionContextController;
+    const session = h.session as unknown as {
+      applyContextResetSideEffects(...args: unknown[]): Promise<void>;
+      appendContextRolloverRows(...args: unknown[]): Promise<Result<void>>;
+    };
+    const order: string[] = [];
+    let validated = 0;
+    const validate = controller.validatePreparation.bind(controller);
+    const validateSpy = spyOn(controller, "validatePreparation").mockImplementation((receipt) => {
+      const valid = validate(receipt);
+      if (valid) {
+        const tag = ++validated;
+        order.push(`validate:${tag}`);
+        void Promise.resolve().then(() => order.push(`microtask:${tag}`));
+      }
+      return valid;
+    });
+    const apply = session.applyContextResetSideEffects.bind(session);
+    const applySpy = spyOn(session, "applyContextResetSideEffects").mockImplementation(
+      (...args) => {
+        order.push(`apply:${validated}`);
+        return apply(...args);
+      }
+    );
+    const append = session.appendContextRolloverRows.bind(session);
+    const appendSpy = spyOn(session, "appendContextRolloverRows").mockImplementation((...args) => {
+      order.push(`append:${validated}`);
+      return append(...args);
+    });
+    const failFirstRequest = async () => {
+      const streamError = {
+        workspaceId,
+        messageId: "assistant-1",
+        error: "context limit",
+        errorType: "context_exceeded" as const,
+      };
+      h.aiEmitter.emit("error", streamError);
+      h.completions[0].settle({ status: "failed", streamError });
+      return h.session.waitForPendingStreamErrorRecoveryDecision(streamError.messageId);
+    };
+    return { controller, order, validateSpy, applySpy, appendSpy, failFirstRequest };
+  }
+
+  test("recovery starts each protected publication step synchronously after its fence check", async () => {
+    const h = await setup();
+    await seedHistory(h, 20_000);
+    expect((await h.session.sendMessage("Continue my task", options)).success).toBe(true);
+    const witness = armRecoveryFenceWitness(h);
+    const generation = budgetOf(h).contextBudgetGeneration;
+    expect(await witness.failFirstRequest()).toBe("retry-started");
+    expect(h.requests).toHaveLength(2);
+    expect(rolloverRows(await allRows(h))).toHaveLength(1);
+    expect(witness.applySpy).toHaveBeenCalledTimes(1);
+    expect(witness.appendSpy).toHaveBeenCalledTimes(1);
+    // The recovery clears budget state exactly once, after the rows are durable.
+    expect(budgetOf(h).contextBudgetGeneration).toBe(generation + 1);
+    // Both protected calls must directly follow a valid fence check, ahead of the microtask
+    // that check queued. An intervening await would let the microtask run first.
+    for (const kind of ["apply", "append"] as const) {
+      const entry = witness.order.find((item) => item.startsWith(`${kind}:`));
+      assert(entry, `${kind} must have been recorded`);
+      const index = witness.order.indexOf(entry);
+      const tag = entry.slice(kind.length + 1);
+      expect({ kind, before: witness.order[index - 1] }).toEqual({
+        kind,
+        before: `validate:${tag}`,
+      });
+      expect({ kind, microtaskAfter: witness.order.indexOf(`microtask:${tag}`) > index }).toEqual({
+        kind,
+        microtaskAfter: true,
+      });
+    }
+    // The earlier fence checks yield to awaited work; only the final checkpoints are no-await.
+    expect(witness.order.slice(0, 2)).toEqual(["validate:1", "microtask:1"]);
+  });
+
+  test("budget invalidation before the fence check aborts recovery without replacement", async () => {
+    const h = await setup();
+    await seedHistory(h, 20_000);
+    expect((await h.session.sendMessage("Continue my task", options)).success).toBe(true);
+    const before = await allRows(h);
+    const witness = armRecoveryFenceWitness(h);
+    // Invalidate right before the checkpoint that guards cleanup: the prepared candidate is
+    // complete, but the fence must reject it instead of sealing the old window.
+    let checks = 0;
+    const validate = witness.validateSpy.getMockImplementation()!;
+    witness.validateSpy.mockImplementation((receipt) => {
+      if (++checks === 2) witness.controller.clearBudgetState();
+      return validate(receipt);
+    });
+    expect(await witness.failFirstRequest()).toBe("terminal");
+    expect(checks).toBeGreaterThanOrEqual(2);
+    expect(witness.applySpy).not.toHaveBeenCalled();
+    expect(witness.appendSpy).not.toHaveBeenCalled();
+    expect(h.requests).toHaveLength(1);
+    expect(rolloverRows(await allRows(h))).toHaveLength(0);
+    // Only the rejected request is quarantined; nothing else was appended or replaced.
+    expect((await allRows(h)).map((row) => row.id)).toEqual(before.map((row) => row.id));
+  });
 
   test.each([
     "auto-off",

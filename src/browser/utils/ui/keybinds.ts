@@ -326,6 +326,12 @@ export const KEYBINDS = {
   /** Send an existing queued message immediately */
   SEND_QUEUED_MESSAGE_NOW: { key: "Enter", ctrl: true, shift: true },
 
+  /** Send the oldest held (refused, unsent) message from an empty composer */
+  SEND_HELD_INPUT: { key: "Enter", ctrl: true, alt: true },
+
+  /** Discard the oldest held (refused, unsent) message from an empty composer */
+  DISCARD_HELD_INPUT: { key: "Backspace", ctrl: true, alt: true },
+
   /** Send message after current turn ends */
   SEND_MESSAGE_AFTER_TURN: { key: "Enter", ctrl: true },
 
@@ -516,6 +522,10 @@ export const KEYBINDS = {
   // macOS: Cmd+, Win/Linux: Ctrl+,
   OPEN_SETTINGS: { key: ",", ctrl: true },
 
+  /** Open a window for the xum server running on this Xum root (desktop only, #4846) */
+  // macOS: Cmd+Shift+O, Win/Linux: Ctrl+Shift+O
+  OPEN_SERVER_WINDOW: { key: "O", ctrl: true, shift: true },
+
   /** Open analytics dashboard */
   // macOS: Cmd+Shift+Y, Win/Linux: Ctrl+Shift+Y
   // "Y" for analYtics — Ctrl+. is reserved for CYCLE_AGENT
@@ -626,6 +636,12 @@ export const KEYBINDS = {
 
   /** Toggle plan annotation mode in propose_plan */
   TOGGLE_PLAN_ANNOTATE: { key: "a", shift: true },
+
+  /**
+   * Run the latest plan's primary action (Implement, or Continue in Auto in Auto mode).
+   * Not while typing: only from an empty or unfocused field.
+   */
+  RUN_LATEST_PLAN_ACTION: { key: "Enter", alt: true },
 
   /** Copy image to clipboard (scoped to image lightbox / image context menu) */
   IMAGE_COPY: { key: "c", ctrl: true },

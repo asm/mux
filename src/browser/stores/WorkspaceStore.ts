@@ -5,6 +5,7 @@ import type { MuxMessage, DisplayedMessage, QueuedMessage } from "@/common/types
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isGoalPendingPersistence, type GoalSnapshot } from "@/common/types/goal";
 import type {
+  HeldInput,
   HistoryEditPrecondition,
   WorkspaceActivitySnapshot,
   WorkspaceChatMessage,
@@ -46,7 +47,8 @@ import {
   BASH_TRUNCATE_MAX_TOTAL_BYTES,
 } from "@/common/constants/toolLimits";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useContext, useEffect, useState, useSyncExternalStore } from "react";
+import { LiveBashOutputSourceContext } from "@/browser/stores/liveBashOutputSource";
 import {
   isCaughtUpMessage,
   isStreamAbort,
@@ -63,6 +65,7 @@ import {
   isTaskCreatedEvent,
   isWorkflowRunAttachedEvent,
   isMuxMessage,
+  isHeldInputsChanged,
   isQueuedMessageChanged,
   isRestoreToInput,
   isRuntimeStatus,
@@ -94,7 +97,7 @@ import type { z } from "zod";
 import type { SessionUsageFileSchema } from "@/common/orpc/schemas/chatStats";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import {
-  appendLiveBashOutputChunk,
+  applyLiveBashOutputEvent,
   type LiveBashOutputInternal,
   type LiveBashOutputView,
 } from "@/browser/utils/messages/liveBashOutputBuffer";
@@ -104,6 +107,10 @@ import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
 import { trackStreamCompleted } from "@/common/telemetry";
 import { isWorkflowRunEmittingToolName } from "@/common/utils/workflowRunMessages";
 import { isProviderConfigFixableError } from "@/common/utils/messages/retryEligibility";
+import {
+  markChatSwitchMilestone,
+  markChatSwitchStart,
+} from "@/browser/utils/perf/chatSwitchTiming";
 
 /** Stable empty reference returned when a workspace has no assisted hunks; keeps useSyncExternalStore snapshot identity stable. */
 const EMPTY_ASSISTED_REVIEW: AssistedReviewHunk[] = [];
@@ -198,6 +205,8 @@ export interface WorkspaceState {
   name: string; // User-facing workspace name (e.g., "feature-branch")
   messages: DisplayedMessage[];
   queuedMessage: QueuedMessage | null;
+  /** Manual queued messages refused at dispatch, kept by the backend until sent or discarded. */
+  heldInputs: readonly HeldInput[];
   canInterrupt: boolean;
   isCompacting: boolean;
   isStreamStarting: boolean;
@@ -212,9 +221,20 @@ export interface WorkspaceState {
   transcriptReplayFailed: boolean;
   isHydratingTranscript: boolean;
   // Cached rows are known to be missing backend content that arrived while this
-  // workspace was not subscribed to onChat. Hydration must hide them behind the
-  // skeleton instead of painting them and jumping when caught-up lands.
+  // workspace was not subscribed to onChat. Hydration hides them behind the skeleton
+  // only when the catch-up is not incremental (see isIncrementalCatchUp).
   isTranscriptStale: boolean;
+  /**
+   * Hydration is (or is about to be) a since replay: the server verifies every row up to
+   * the history cursor, and caught-up replaces the rows after it (the ones that arrived
+   * live since the last caught-up, e.g. the prompt and the in-flight reply) with the
+   * server's copies. Those change only by growing, or when edited or deleted elsewhere while
+   * unsubscribed, which caught-up swaps in one commit. Stale cached rows may therefore stay
+   * painted while it catches up; hiding them would also hide the rows after the cursor.
+   * A server downgrade to full swaps rows atomically at caught-up; a full replay or a
+   * reset clears the cursor, so this goes false and the skeleton returns.
+   */
+  isIncrementalCatchUp: boolean;
   hasOlderHistory: boolean;
   loadingOlderHistory: boolean;
   muxMessages: MuxMessage[];
@@ -299,6 +319,9 @@ export interface WorkspaceSidebarState {
  * Currently only recency timestamps for workspace sorting.
  */
 type DerivedState = Record<string, number>;
+
+/** Stable empty held-input list, so an unchanged empty list keeps its identity across renders. */
+const NO_HELD_INPUTS: readonly HeldInput[] = [];
 
 /**
  * Per-attempt context for an onChat subscription. Carries the since-mode anchor the
@@ -440,6 +463,7 @@ interface WorkspaceChatTransientState {
   pendingStreamEvents: WorkspaceChatMessage[];
   replayingHistory: boolean;
   queuedMessage: QueuedMessage | null;
+  heldInputs: readonly HeldInput[];
   liveBashOutput: Map<string, LiveBashOutputInternal>;
   liveAdvisorOutput: Map<string, AdvisorLiveOutputState>;
   liveAdvisorReasoning: Map<string, AdvisorLiveReasoningState>;
@@ -476,6 +500,17 @@ function areHistoryPaginationCursorsEqual(
     a.beforeHistorySequence === b.beforeHistorySequence &&
     (a.beforeMessageId ?? null) === (b.beforeMessageId ?? null)
   );
+}
+
+/**
+ * The onChat replay mode the next subscription attempt requests. Shared by the subscription
+ * and the WorkspaceState selector so they can never disagree about whether catch-up is a
+ * since replay.
+ */
+function getOnChatReplayMode(aggregator: StreamingMessageAggregator): OnChatMode | undefined {
+  const cursor = aggregator.getOnChatCursor();
+  if (!cursor?.history) return undefined;
+  return { type: "since", cursor: { history: cursor.history, stream: cursor.stream } };
 }
 
 function createInitialHistoryPaginationState(): WorkspaceHistoryPaginationState {
@@ -520,6 +555,21 @@ function getBufferedActiveStreamStart(
     model: activeStreamStart.model,
     thinkingLevel: activeStreamStart.thinkingLevel,
   };
+}
+
+/**
+ * Message whose content the buffered stream replay rebuilds: the server replays stream-start
+ * (replay: true) and then the parts after the stream cursor, or every part when it applied no
+ * cursor. A replayed history row for the same message must not seed that rebuild.
+ */
+function getBufferedReplayedStreamMessageId(events: WorkspaceChatMessage[]): string | undefined {
+  let messageId: string | undefined;
+  for (const event of events) {
+    if ("type" in event && event.type === "stream-start" && event.replay === true) {
+      messageId = event.messageId;
+    }
+  }
+  return messageId;
 }
 
 function appendAdvisorLiveText(
@@ -568,6 +618,7 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
     pendingStreamEvents: [],
     replayingHistory: false,
     queuedMessage: null,
+    heldInputs: NO_HELD_INPUTS,
     liveBashOutput: new Map(),
     liveAdvisorOutput: new Map(),
     liveAdvisorReasoning: new Map(),
@@ -850,6 +901,9 @@ export class WorkspaceStore {
 
   // Workspace currently owning the live onChat subscription.
   private activeOnChatWorkspaceId: string | null = null;
+  // Workspaces whose first onChat replay since activation has not settled yet (#4662).
+  // Kept outside chatTransientState because full-replay resets replace transient objects.
+  private chatReplayPendingWorkspaces = new Set<string>();
   // Loop signal of that subscription, so a refresh request can bind to the loop it was made under.
   private activeOnChatSignal: AbortSignal | null = null;
   // The in-flight onChat attempt per workspace (set in subscribe, cleared when the attempt finishes).
@@ -901,6 +955,23 @@ export class WorkspaceStore {
 
   // Per-workspace ephemeral chat state (buffering, queued message, live bash output, etc.)
   private chatTransientState = new Map<string, WorkspaceChatTransientState>();
+
+  /**
+   * Held inputs a composer took from a restore (#4448), per workspace, until the backend's held
+   * list drops them. Hidden from the banner list meanwhile, so input already in the composer never
+   * also shows as "Not sent". Kept outside chatTransientState: a replay reset before the backend's
+   * removal must not resurface them. Each change replaces the Set (visibleHeldInputs caches on
+   * its identity).
+   */
+  private readonly acceptedRestoreHeldInputs = new Map<string, ReadonlySet<string>>();
+  private readonly visibleHeldInputsCache = new Map<
+    string,
+    {
+      raw: readonly HeldInput[];
+      accepted: ReadonlySet<string>;
+      visible: readonly HeldInput[];
+    }
+  >();
 
   // Per-workspace transcript pagination state for loading prior compaction epochs.
   private historyPagination = new Map<string, WorkspaceHistoryPaginationState>();
@@ -1118,11 +1189,12 @@ export class WorkspaceStore {
 
       // Cleanup live bash output once the real tool result contains output.
       // If output is missing (e.g. tmpfile overflow), keep the tail buffer so the UI still shows something.
-      if (toolCallEnd.toolName === "bash" && transient) {
-        const output = (toolCallEnd.result as { output?: unknown } | undefined)?.output;
-        if (typeof output === "string") {
-          transient.liveBashOutput.delete(toolCallEnd.toolCallId);
-        }
+      if (transient) {
+        applyLiveBashOutputEvent(
+          transient.liveBashOutput,
+          toolCallEnd,
+          BASH_TRUNCATE_MAX_TOTAL_BYTES
+        );
       }
 
       // Cleanup ephemeral advisor/task state once the actual tool result is available.
@@ -1265,19 +1337,38 @@ export class WorkspaceStore {
       this.assertChatTransientState(workspaceId).queuedMessage = queuedMessage;
       this.states.bump(workspaceId);
     },
+    "held-inputs-changed": (workspaceId, _aggregator, data) => {
+      if (!isHeldInputsChanged(data)) return;
+      this.assertChatTransientState(workspaceId).heldInputs =
+        data.heldInputs.length > 0 ? data.heldInputs : NO_HELD_INPUTS;
+      // The backend no longer holds these: they need no hiding any more.
+      const accepted = this.acceptedRestoreHeldInputs.get(workspaceId);
+      if (accepted) {
+        const stillHeld = new Set(data.heldInputs.map((input) => input.id));
+        const kept = [...accepted].filter((id) => stillHeld.has(id));
+        if (kept.length === 0) this.acceptedRestoreHeldInputs.delete(workspaceId);
+        else if (kept.length !== accepted.size) {
+          this.acceptedRestoreHeldInputs.set(workspaceId, new Set(kept));
+        }
+      }
+      this.states.bump(workspaceId);
+    },
     "restore-to-input": (_workspaceId, _aggregator, data) => {
       if (!isRestoreToInput(data)) return;
 
-      // Use UPDATE_CHAT_INPUT event with mode="replace"
+      // mode="restore", not "replace": a newer draft typed while the message was queued must
+      // survive (#4431).
       window.dispatchEvent(
         createCustomEvent(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, {
           text: data.text,
-          mode: "replace",
+          mode: "restore",
           fileParts: data.fileParts,
           reviews: data.reviews,
           // Restore events can arrive for a background workspace; never let them
           // overwrite the composer currently mounted for another workspace.
           workspaceId: data.workspaceId,
+          // The composer that applies the restore acknowledges these (acceptRestoredHeldInputs).
+          heldInputIds: data.heldInputIds,
         })
       );
     },
@@ -1563,6 +1654,10 @@ export class WorkspaceStore {
 
     const previousActiveId = this.activeWorkspaceId;
     this.activeWorkspaceId = workspaceId;
+    if (workspaceId) {
+      // Chat-switch User Timing origin (#4504): every switch milestone is measured from here.
+      markChatSwitchStart(workspaceId);
+    }
     this.ensureActiveOnChatSubscription();
 
     // Re-hydrate persisted session usage so cost totals reflect any
@@ -1742,6 +1837,7 @@ export class WorkspaceStore {
         unsubscribe();
       }
       this.ipcUnsubscribers.delete(previousActiveWorkspaceId);
+      this.chatReplayPendingWorkspaces.delete(previousActiveWorkspaceId);
       this.activeOnChatWorkspaceId = null;
       this.activeOnChatSignal = null;
     }
@@ -1758,6 +1854,9 @@ export class WorkspaceStore {
 
       const controller = new AbortController();
       this.ipcUnsubscribers.set(targetWorkspaceId, () => controller.abort());
+      // Set even without a client: probes cannot run without one either, and the replay
+      // starts once the client arrives.
+      this.chatReplayPendingWorkspaces.add(targetWorkspaceId);
       this.activeOnChatWorkspaceId = targetWorkspaceId;
       this.activeOnChatSignal = controller.signal;
       void this.runOnChatSubscription(targetWorkspaceId, controller.signal);
@@ -2453,6 +2552,10 @@ export class WorkspaceStore {
         displayedMessages.length > 0 &&
         !transient.staleSkeletonExpired &&
         (transient.cachedTranscriptStale || displayedOnlyReplayedInitCards);
+      const isIncrementalCatchUp =
+        isHydratingTranscript &&
+        !transient.fullReplayInFlight &&
+        getOnChatReplayMode(aggregator)?.type === "since";
       const aggregatorTodos = aggregator.getCurrentTodos();
       // Sidebar status precedence, split into four tiers so each signal
       // wins exactly when it should. Active and inactive workspaces draw
@@ -2497,6 +2600,7 @@ export class WorkspaceStore {
         name: metadata?.name ?? workspaceId, // Fall back to ID if metadata missing
         messages: displayedMessages,
         queuedMessage: transient.queuedMessage,
+        heldInputs: this.visibleHeldInputs(workspaceId, transient.heldInputs),
         canInterrupt,
         isCompacting: aggregator.isCompacting(),
         isStreamStarting,
@@ -2506,6 +2610,7 @@ export class WorkspaceStore {
         transcriptReplayFailed: transient.replayFailed,
         isHydratingTranscript,
         isTranscriptStale,
+        isIncrementalCatchUp,
         hasOlderHistory: historyPagination.hasOlder,
         loadingOlderHistory: historyPagination.loading,
         muxMessages: messages,
@@ -2661,6 +2766,63 @@ export class WorkspaceStore {
     this.sidebarStateCache.set(workspaceId, newState);
     this.sidebarStateSourceState.set(workspaceId, fullState);
     return newState;
+  }
+
+  /**
+   * A composer applied a restore naming these held inputs (#4448): hide them now and ask the
+   * backend to drop its copy. If the backend refuses, show them again: a visible duplicate of
+   * what the composer holds is recoverable, a hidden held copy is not.
+   */
+  acceptRestoredHeldInputs(workspaceId: string, heldInputIds: readonly string[]): void {
+    assert(workspaceId.length > 0, "acceptRestoredHeldInputs requires a workspaceId");
+    assert(heldInputIds.length > 0, "acceptRestoredHeldInputs requires held input ids");
+    this.acceptedRestoreHeldInputs.set(
+      workspaceId,
+      new Set([...(this.acceptedRestoreHeldInputs.get(workspaceId) ?? []), ...heldInputIds])
+    );
+    this.states.bump(workspaceId);
+
+    const client = this.client;
+    for (const heldInputId of heldInputIds) {
+      if (!client) {
+        this.showRestoredHeldInputAgain(workspaceId, heldInputId, "no ORPC client");
+        continue;
+      }
+      client.workspace.discardHeldInput({ workspaceId, heldInputId }).then(
+        (result) => {
+          if (!result.success) {
+            this.showRestoredHeldInputAgain(workspaceId, heldInputId, result.error);
+          }
+        },
+        (error: unknown) => this.showRestoredHeldInputAgain(workspaceId, heldInputId, error)
+      );
+    }
+  }
+
+  private showRestoredHeldInputAgain(workspaceId: string, heldInputId: string, reason: unknown) {
+    console.warn(
+      `[WorkspaceStore] Could not release held input ${heldInputId} for ${workspaceId}:`,
+      reason
+    );
+    const accepted = this.acceptedRestoreHeldInputs.get(workspaceId);
+    if (!accepted?.has(heldInputId)) return;
+    const remaining = [...accepted].filter((id) => id !== heldInputId);
+    if (remaining.length === 0) this.acceptedRestoreHeldInputs.delete(workspaceId);
+    else this.acceptedRestoreHeldInputs.set(workspaceId, new Set(remaining));
+    this.states.bump(workspaceId);
+  }
+
+  /** The backend's held inputs minus those a composer took (stable array per input). */
+  private visibleHeldInputs(workspaceId: string, raw: readonly HeldInput[]): readonly HeldInput[] {
+    const accepted = this.acceptedRestoreHeldInputs.get(workspaceId);
+    if (accepted === undefined || raw.length === 0) return raw;
+    const cached = this.visibleHeldInputsCache.get(workspaceId);
+    if (cached?.raw === raw && cached.accepted === accepted) return cached.visible;
+    const filtered = raw.filter((input) => !accepted.has(input.id));
+    const visible =
+      filtered.length === raw.length ? raw : filtered.length > 0 ? filtered : NO_HELD_INPUTS;
+    this.visibleHeldInputsCache.set(workspaceId, { raw, accepted, visible });
+    return visible;
   }
 
   /**
@@ -3117,6 +3279,21 @@ export class WorkspaceStore {
   isWorkspaceTranscriptCaughtUp(workspaceId: string): boolean {
     const transient = this.chatTransientState.get(workspaceId);
     return transient !== undefined && transient.caughtUp && transient.historyVerified;
+  }
+
+  /**
+   * Whether the active workspace is still waiting for its first onChat replay since it was
+   * activated. Workspace-open git/PR probes wait for this (#4662) so their process spawns
+   * and result renders do not compete with the replay's history read and transcript paint.
+   * The gate opens on caught-up (complete or failed replay), when an attempt ends without
+   * caught-up (transport error, stall watchdog), or when the workspace stops being active.
+   * Subscribers of {@link subscribeKey} are notified when it opens.
+   */
+  isWorkspaceChatReplayPending(workspaceId: string): boolean {
+    return (
+      this.activeOnChatWorkspaceId === workspaceId &&
+      this.chatReplayPendingWorkspaces.has(workspaceId)
+    );
   }
 
   getWorkspaceHistoryEpoch(workspaceId: string): number {
@@ -4236,12 +4413,11 @@ export class WorkspaceStore {
         if (refreshRequest) attemptContext.refreshRequest = refreshRequest;
         this.currentOnChatAttempts.set(workspaceId, attemptContext);
         if (aggregator) {
-          const cursor = aggregator.getOnChatCursor();
-          if (cursor?.history) {
-            mode = { type: "since", cursor: { history: cursor.history, stream: cursor.stream } };
+          mode = getOnChatReplayMode(aggregator);
+          if (mode?.type === "since") {
             attemptContext.since = {
-              requestedAnchorSequence: cursor.history.historySequence,
-              localActiveStreamMessageId: cursor.stream?.messageId,
+              requestedAnchorSequence: mode.cursor.history.historySequence,
+              localActiveStreamMessageId: mode.cursor.stream?.messageId,
             };
           }
         }
@@ -4312,10 +4488,15 @@ export class WorkspaceStore {
         }
         if (!this.isWorkspaceRegistered(workspaceId)) return;
         this.clearReplayBuffers(workspaceId);
+        // An attempt that ended without caught-up (transport error, stall watchdog) opens
+        // the replay gate anyway, so deferred git/PR probes cannot wait forever on retries.
+        const openedReplayGate = this.chatReplayPendingWorkspaces.delete(workspaceId);
         const transient = this.chatTransientState.get(workspaceId);
         if (transient) {
           // Backoff is still catch-up; cleared stream buffers must also invalidate cached barriers.
           transient.isHydratingTranscript = true;
+        }
+        if (transient || openedReplayGate) {
           this.states.bump(workspaceId);
         }
         if (transient && !transient.caughtUp && this.preReplayUsageSnapshot.delete(workspaceId))
@@ -4510,6 +4691,7 @@ export class WorkspaceStore {
       this.activeOnChatWorkspaceId = null;
       this.activeOnChatSignal = null;
     }
+    this.chatReplayPendingWorkspaces.delete(workspaceId);
     this.currentOnChatAttempts.delete(workspaceId);
     // A pending refresh can never get its baseline from a removed workspace.
     this.settleTranscriptRefresh(workspaceId, {
@@ -4526,6 +4708,8 @@ export class WorkspaceStore {
     this.aggregators.delete(workspaceId);
     this.resetStaleSkeletonDeadline(workspaceId);
     this.chatTransientState.delete(workspaceId);
+    this.acceptedRestoreHeldInputs.delete(workspaceId);
+    this.visibleHeldInputsCache.delete(workspaceId);
     this.workspaceMetadata.delete(workspaceId);
     this.derived.bump("workspaces");
     this.workspaceActivity.delete(workspaceId);
@@ -4630,6 +4814,7 @@ export class WorkspaceStore {
     this.activeWorkspaceId = null;
     this.activeOnChatWorkspaceId = null;
     this.activeOnChatSignal = null;
+    this.chatReplayPendingWorkspaces.clear();
     this.pendingReplayReset.clear();
     this.states.clear();
     this.derived.clear();
@@ -4800,8 +4985,14 @@ export class WorkspaceStore {
         // authoritative: a retry that resolved while disconnected must not keep its banner
         // (and Stop) alive through the outage.
         transient.autoRetryStatus = null;
+        // Held inputs are replayed only while non-empty (like the retry snapshot).
+        transient.heldInputs = NO_HELD_INPUTS;
         for (const event of transient.pendingStreamEvents) {
-          if (isQueuedMessageChanged(event) || isAutoRetryStatusEvent(event)) {
+          if (
+            isQueuedMessageChanged(event) ||
+            isHeldInputsChanged(event) ||
+            isAutoRetryStatusEvent(event)
+          ) {
             this.processStreamEvent(workspaceId, aggregator, event);
           }
         }
@@ -4844,6 +5035,20 @@ export class WorkspaceStore {
       const pendingEvents = transient.pendingStreamEvents;
       const hasActiveStream = getBufferedActiveStreamStart(pendingEvents) !== null;
 
+      // StreamManager persists the finalized row before it leaves STREAMING and emits
+      // stream-end, so a replay in that window carries both the finalized row and a stream
+      // replay of the same message. The stream replay's parts start after the stream cursor
+      // (the local assembly) or from nothing (no cursor applied), never after the finalized
+      // row: seeding the rebuild with that row showed the reply's tail twice (#4505 UAT).
+      // Drop the row; the replayed parts plus the buffered stream-end rebuild the message.
+      const replayedStreamMessageId = getBufferedReplayedStreamMessageId(pendingEvents);
+      const replayedHistoryMessages =
+        replayedStreamMessageId === undefined
+          ? transient.historicalMessages
+          : transient.historicalMessages.filter(
+              (message) => message.id !== replayedStreamMessageId
+            );
+
       const serverActiveStreamMessageId = data.cursor?.stream?.messageId;
       const localActiveStreamMessageId = aggregator.getActiveStreamMessageId();
       const streamContextMismatched =
@@ -4877,6 +5082,10 @@ export class WorkspaceStore {
       if (serverActiveStreamMessageId === undefined) {
         aggregator.clearPendingStreamStartIfNotOptimistic();
       }
+
+      // Every replay (full or since) re-sends the held-input list while it is non-empty, buffered
+      // until after this reset, so a list emptied while disconnected cannot linger.
+      transient.heldInputs = NO_HELD_INPUTS;
 
       if (replay === "full") {
         // Full replay replaces backend-derived history state. Reset transient UI-only
@@ -4921,29 +5130,32 @@ export class WorkspaceStore {
         // the active stream only when the server-confirmed stream matches the local
         // stream the attempt's cursor was built from; otherwise replayed rows plus
         // subsequently replayed stream events rebuild the stream message (stale local
-        // contexts were already cleared above).
+        // contexts were already cleared above). A replayed stream-start for the local stream
+        // also confirms the match: the server applied this attempt's stream cursor, and the
+        // stream may have ended before caught-up (so the caught-up carries no stream cursor).
+        const localStreamMessageId = sinceContext.localActiveStreamMessageId;
         const preservedActiveStreamMessageId =
-          serverActiveStreamMessageId !== undefined &&
-          serverActiveStreamMessageId === sinceContext.localActiveStreamMessageId
-            ? serverActiveStreamMessageId
+          localStreamMessageId !== undefined &&
+          (serverActiveStreamMessageId === localStreamMessageId ||
+            replayedStreamMessageId === localStreamMessageId)
+            ? localStreamMessageId
             : undefined;
         aggregator.reconcileSinceReplay({
           requestedAnchorSequence: sinceContext.requestedAnchorSequence,
-          messages: transient.historicalMessages,
+          messages: replayedHistoryMessages,
           preservedActiveStreamMessageId,
           hasActiveStream,
         });
-        transient.historicalMessages.length = 0;
-      } else if (transient.historicalMessages.length > 0) {
+      } else if (replayedHistoryMessages.length > 0) {
         const loadMode = replay === "full" ? "replace" : "append";
-        aggregator.loadHistoricalMessages(transient.historicalMessages, hasActiveStream, {
+        aggregator.loadHistoricalMessages(replayedHistoryMessages, hasActiveStream, {
           mode: loadMode,
         });
-        transient.historicalMessages.length = 0;
       } else if (replay === "full") {
         // Full replay can legitimately contain zero messages (e.g. compacted to empty).
         aggregator.loadHistoricalMessages([], hasActiveStream, { mode: "replace" });
       }
+      transient.historicalMessages.length = 0;
 
       // Store the server-issued cursor for the next reconnect (full and since replays
       // both refresh it). A caught-up without a cursor means the server could not
@@ -4979,6 +5191,7 @@ export class WorkspaceStore {
       // store never requests live mode (it replays no history), so a live caught-up lets
       // events flow but leaves the mutation barrier closed.
       transient.caughtUp = true;
+      this.chatReplayPendingWorkspaces.delete(workspaceId);
       transient.historyVerified = replay !== "live";
       transient.replayFailed = false;
       transient.isHydratingTranscript = false;
@@ -4987,6 +5200,8 @@ export class WorkspaceStore {
       this.resetStaleSkeletonDeadline(workspaceId);
       this.lastUserPromptStore.bump(workspaceId);
       this.states.bump(workspaceId);
+      // No-op unless this is the workspace the latest switch targeted.
+      markChatSwitchMilestone(workspaceId, "caught-up", { replay });
       this.checkAndBumpRecencyIfChanged(); // Messages loaded, update recency
 
       // Replay resets clear the aggregator before history is rebuilt. Drop the temporary
@@ -5143,17 +5358,12 @@ export class WorkspaceStore {
 
       const transient = this.assertChatTransientState(workspaceId);
 
-      const prev = transient.liveBashOutput.get(data.toolCallId);
-      const next = appendLiveBashOutputChunk(
-        prev,
-        { text: data.text, isError: data.isError },
-        BASH_TRUNCATE_MAX_TOTAL_BYTES
-      );
-
       // Avoid unnecessary re-renders if this event didn't change the stored state.
-      if (next === prev) return;
-
-      transient.liveBashOutput.set(data.toolCallId, next);
+      if (
+        !applyLiveBashOutputEvent(transient.liveBashOutput, data, BASH_TRUNCATE_MAX_TOTAL_BYTES)
+      ) {
+        return;
+      }
 
       // High-frequency: throttle UI updates like other delta-style events.
       this.scheduleIdleStateBump(workspaceId);
@@ -5341,6 +5551,8 @@ export const workspaceStore = {
    */
   isWorkspaceTranscriptCaughtUp: (workspaceId: string) =>
     getStoreInstance().isWorkspaceTranscriptCaughtUp(workspaceId),
+  isWorkspaceChatReplayPending: (workspaceId: string) =>
+    getStoreInstance().isWorkspaceChatReplayPending(workspaceId),
   /** Per-workspace change notifications, so barrier-derived disabled states can subscribe. */
   subscribeKey: (workspaceId: string, listener: () => void) =>
     getStoreInstance().subscribeKey(workspaceId, listener),
@@ -5529,14 +5741,18 @@ export function useBashToolLiveOutput(
   toolCallId: string | undefined
 ): LiveBashOutputView | null {
   const store = getStoreInstance();
+  // A host that does not feed WorkspaceStore (VS Code webview) supplies its own source (#4750).
+  const hostSource = useContext(LiveBashOutputSourceContext);
 
   return useSyncExternalStore(
     (listener) => {
       if (!workspaceId) return () => undefined;
+      if (hostSource) return hostSource.subscribe(workspaceId, listener);
       return store.subscribeKey(workspaceId, listener);
     },
     () => {
       if (!workspaceId || !toolCallId) return null;
+      if (hostSource) return hostSource.get(workspaceId, toolCallId);
       return store.getBashToolLiveOutput(workspaceId, toolCallId);
     }
   );

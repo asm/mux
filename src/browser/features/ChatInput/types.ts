@@ -1,6 +1,6 @@
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { TelemetryRuntimeType } from "@/common/telemetry/payload";
-import type { Review } from "@/common/types/review";
+import type { Review, ReviewNoteData } from "@/common/types/review";
 import type { EditingMessageState, PendingUserMessage } from "@/browser/utils/chatEditing";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { QueuedMessage } from "@/common/types/message";
@@ -66,11 +66,17 @@ export interface ChatInputWorkspaceVariant {
   onQueuedDispatchModeChange?: (mode: QueueDispatchMode) => Promise<void>;
   onQueuedActionError?: (error: unknown) => void;
   onSendQueuedImmediately?: () => Promise<void>;
+  /** Oldest held (refused, unsent) input: the one the held-input shortcuts act on. */
+  heldInputId?: string;
   /** Optional explanation displayed when input is disabled */
   disabledReason?: string;
   onReady?: (api: ChatInputAPI) => void;
   /** Reviews currently attached to chat (from useReviews hook) */
   attachedReviews?: Review[];
+  /** Add a review to the workspace's review store, attached to chat input */
+  onAddReview?: (data: ReviewNoteData) => Review;
+  /** The composer applied a restore naming these backend held inputs; release them (#4448) */
+  onAcceptRestoredHeldInputs?: (heldInputIds: string[]) => void;
   /** Detach a review from chat input (sets status to pending) */
   onDetachReview?: (reviewId: string) => void;
   /** Detach all attached reviews from chat input */

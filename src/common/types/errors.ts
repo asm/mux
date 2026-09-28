@@ -7,6 +7,7 @@ import type z from "zod";
 import type {
   NameGenerationErrorSchema,
   SendMessageAcceptedSchema,
+  PlanReviewErrorSchema,
   SendMessageErrorSchema,
   StreamErrorTypeSchema,
 } from "../orpc/schemas";
@@ -40,3 +41,6 @@ export type SendMessageAccepted = z.infer<typeof SendMessageAcceptedSchema>;
 export type StreamErrorType = z.infer<typeof StreamErrorTypeSchema>;
 
 export type NameGenerationError = z.infer<typeof NameGenerationErrorSchema>;
+
+/** Typed failures of the workspace.planReview.* endpoints. */
+export type PlanReviewError = z.infer<typeof PlanReviewErrorSchema>;

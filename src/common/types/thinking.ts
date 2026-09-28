@@ -279,6 +279,12 @@ export function isGpt6AstraModel(modelString: string): boolean {
   return /^gpt-6-astra(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
 }
 
+/** Released tiers with optional reasoning; do not match unannounced variants. */
+export function isGpt6SolOrLunaModel(modelString: string): boolean {
+  const withoutPrefix = stripModelProviderPrefixes(modelString);
+  return /^gpt-6-(?:sol|luna)(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
+}
+
 /**
  * Whether the given OpenAI model supports the native "max" reasoning effort.
  *
@@ -289,10 +295,15 @@ export function isGpt6AstraModel(modelString: string): boolean {
  *
  * GPT-6 Astra keeps the native max effort (its model page lists
  * low/medium/high/xhigh/max) but, unlike the GPT-5.6 family, rejects `none`; see
- * openaiRejectsDisabledReasoning. Pro mode is independent of that effort ladder.
+ * openaiRejectsDisabledReasoning. Sol/Luna support none through max.
+ * Pro mode is independent of that effort ladder.
  */
 export function openaiSupportsNativeMaxEffort(modelString: string): boolean {
-  return isGpt56FamilyModel(modelString) || isGpt6AstraModel(modelString);
+  return (
+    isGpt56FamilyModel(modelString) ||
+    isGpt6AstraModel(modelString) ||
+    isGpt6SolOrLunaModel(modelString)
+  );
 }
 
 /**
@@ -332,11 +343,15 @@ export function coerceOpenAIReasoningMode(value: unknown): OpenAIReasoningMode |
  * `gpt-5.6` alias) — the Sol/Terra-only restriction came from stale preview
  * coverage.
  *
- * GPT-6 Astra also supports Pro on the same model id; keep it independent of
+ * GPT-6 Astra, Sol, and Luna also support Pro on the same model id; keep it independent of
  * effort so choosing native max does not silently opt users into Pro serving.
  */
 export function openaiSupportsProMode(modelString: string): boolean {
-  return isGpt56FamilyModel(modelString) || isGpt6AstraModel(modelString);
+  return (
+    isGpt56FamilyModel(modelString) ||
+    isGpt6AstraModel(modelString) ||
+    isGpt6SolOrLunaModel(modelString)
+  );
 }
 
 /**
@@ -395,6 +410,20 @@ export function anthropicRejectsDisabledThinking(modelString: string): boolean {
   return (
     /claude-(?:fable|mythos)-/.test(withoutPrefix) ||
     /claude-opus-5-5(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(withoutPrefix)
+  );
+}
+
+/**
+ * Whether the given Anthropic model binds each replayed thinking block to the
+ * conversation prefix (system prompt, tools, and earlier messages) that produced it.
+ *
+ * On enforced accounts, Claude Opus 5.5 and Claude Fable 5.1 (Mythos 5.1 is the same
+ * model) reject a request that replays a block whose prefix has since changed.
+ */
+export function anthropicBindsThinkingToPrefix(modelString: string): boolean {
+  const withoutPrefix = stripModelProviderPrefixes(modelString);
+  return /claude-(?:opus-5-5|fable-5-1|mythos-5-1)(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(
+    withoutPrefix
   );
 }
 

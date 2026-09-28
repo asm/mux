@@ -7,6 +7,7 @@ import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchive
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import type {
   AppConfigMigrations,
+  EvaluationDefaults,
   ModelFallbacks,
   UpdateChannel,
 } from "@/common/config/schemas/appConfigOnDisk";
@@ -93,12 +94,19 @@ export interface ProjectsConfig {
   muxGatewayEnabled?: boolean;
   /** Enable recording AI SDK devtools logs to ~/.xum/sessions/<workspace>/devtools.jsonl */
   llmDebugLogs?: boolean;
+  /**
+   * Desktop only: keep the display (and system) awake while any local workspace is
+   * streaming or waiting on background bash / workflow activity. Absent = off.
+   */
+  keepScreenAwake?: boolean;
   /** Default heartbeat prompt used when a workspace heartbeat does not set its own message. */
   heartbeatDefaultPrompt?: string;
   /** Default heartbeat interval used when a workspace heartbeat does not set its own cadence. */
   heartbeatDefaultIntervalMs?: number;
   /** Global defaults for new workspace goals. */
   goalDefaults?: GoalDefaults;
+  /** Default evaluation model for workflow `evaluate()` steps (Settings → Tasks & Workflows). */
+  evaluationDefaults?: EvaluationDefaults;
   muxGatewayModels?: string[];
   routePriority?: string[];
   routeOverrides?: Record<string, string>;

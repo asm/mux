@@ -22,6 +22,26 @@ const channelDescriptions: Record<UpdateChannel, string> = {
   npm: "Most recently published npm package, including pre-releases.",
 };
 
+/**
+ * Names shown per blocker line, each cut to a length; the rest collapse into a count so the
+ * dialog stays bounded (titles are free text).
+ */
+const MAX_BLOCKER_WORKSPACE_NAMES = 3;
+const MAX_BLOCKER_WORKSPACE_NAME_CHARS = 40;
+
+function formatBlockerWorkspaceNames(names: readonly string[]): string {
+  const shown = names
+    .slice(0, MAX_BLOCKER_WORKSPACE_NAMES)
+    .map((name) =>
+      name.length > MAX_BLOCKER_WORKSPACE_NAME_CHARS
+        ? `${name.slice(0, MAX_BLOCKER_WORKSPACE_NAME_CHARS - 1).trimEnd()}…`
+        : name
+    )
+    .join(", ");
+  const hidden = names.length - MAX_BLOCKER_WORKSPACE_NAMES;
+  return hidden > 0 ? `${shown} and ${hidden} more` : shown;
+}
+
 const blockerLabels: Record<RestartBlocker["kind"], string> = {
   "active-streams": "Active streams",
   "pending-turns": "Pending turns",
@@ -32,6 +52,7 @@ const blockerLabels: Record<RestartBlocker["kind"], string> = {
   requests: "Requests in flight",
   "desktop-sessions": "Live desktop sessions",
   "queued-messages": "Sessions with queued messages",
+  "held-inputs": "Sessions with unsent messages",
   "auto-retries": "Pending auto-retries",
   terminals: "Open terminals",
   "background-processes": "Running background processes",
@@ -366,6 +387,13 @@ export function AboutDialog() {
                         <li key={blocker.kind}>
                           {blockerLabels[blocker.kind]}:{" "}
                           <span className="counter-nums">{blocker.count}</span>
+                          {/* Which workspaces to open, e.g. an archived one (#4770). */}
+                          {blocker.workspaceNames != null && blocker.workspaceNames.length > 0 && (
+                            <span className="break-words">
+                              {" "}
+                              ({formatBlockerWorkspaceNames(blocker.workspaceNames)})
+                            </span>
+                          )}
                         </li>
                       ))}
                     </ul>

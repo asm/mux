@@ -7,12 +7,10 @@ import {
   isAutoModelRoutingEvaluationModel,
   splitAutoModelRoutingEvaluationModel,
 } from "@/common/types/autoModelRouting";
-import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import {
   AUTO_MODEL_ROUTING_EVALUATION_PROVIDERS,
-  TYPESAFE_API_KEY_ENV_VARS,
   TYPESAFE_PROVIDER_KEY,
   type AutoModelRoutingEvaluationProvider,
 } from "@/constants/autoModelRouting";
@@ -22,12 +20,12 @@ import {
   buildAIProviderRequestHeaders,
   normalizeAnthropicBaseURL,
   normalizeOpenAICompatibleBaseURL,
+  withAnthropicEvaluationEffort,
 } from "@/node/services/providerModelFactory";
 import {
-  resolveApiKeyCandidate,
   resolveProviderCredentials,
+  resolveTypeSafeCredentials,
   type ProviderConfigRaw,
-  type ResolvedCredentials,
 } from "@/node/utils/providerRequirements";
 
 /**
@@ -152,22 +150,6 @@ export function resolveEvaluationModelTarget(
   });
 }
 
-function resolveTypeSafeCredentials(
-  config: ProviderConfigRaw,
-  env: Record<string, string | undefined>
-): Pick<ResolvedCredentials, "apiKey" | "baseUrl" | "organization"> {
-  const resolved = resolveApiKeyCandidate(
-    { apiKey: config.apiKey, apiKeyFile: config.apiKeyFile },
-    {
-      envApiKeys: [...TYPESAFE_API_KEY_ENV_VARS],
-      env,
-      fileErrors: "ignore",
-    }
-  );
-  const baseUrl = resolveConfigBaseUrl(config);
-  return resolved.kind === "resolved" ? { apiKey: resolved.apiKey, baseUrl } : { baseUrl };
-}
-
 export function createEvaluationModel(
   modelString: string,
   deps: EvaluationModelFactoryDeps
@@ -189,7 +171,9 @@ export function createEvaluationModel(
       }
       case "anthropic": {
         const { createAnthropic } = yield* Effect.promise(PROVIDER_REGISTRY.anthropic);
-        return Ok(createAnthropic(settings).evaluationModel(modelId));
+        return Ok(
+          withAnthropicEvaluationEffort(createAnthropic(settings).evaluationModel(modelId), modelId)
+        );
       }
       case "google": {
         const { createGoogleGenerativeAI } = yield* Effect.promise(PROVIDER_REGISTRY.google);

@@ -9,11 +9,20 @@ import type { WorkflowRunRecord, WorkflowRunStatus } from "@/common/types/workfl
 import { createMuxMessage } from "@/common/types/message";
 import { createTaskAwaitTool } from "./task_await";
 import { TASK_REPORT_WITHHELD_MESSAGE } from "./taskReportProvenance";
-import { TestTempDir, createTestToolConfig } from "./testHelpers";
+import { TestTempDir, createFakeWorkspaceTurnManager, createTestToolConfig } from "./testHelpers";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { getSubagentGitPatchArtifactsFilePath } from "@/node/services/subagentGitPatchArtifacts";
-import { ForegroundWaitBackgroundedError, type TaskService } from "@/node/services/taskService";
+import {
+  ForegroundWaitBackgroundedError,
+  type AgentTaskReport,
+  type TaskService,
+} from "@/node/services/taskService";
+import type { WorkspaceTurnTaskHandleRecord } from "@/node/services/taskHandleStore";
+import type {
+  WorkspaceTurnManager,
+  WorkspaceTurnWaitResult,
+} from "@/node/services/workspaceTurnManager";
 import { WORKFLOW_CHECKPOINT_RETRY_ERROR_MESSAGE } from "@/common/utils/workflowRetryEligibility";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
@@ -43,6 +52,66 @@ function createWorkflowRun(
   };
 }
 
+// The exact TaskService / WorkspaceTurnManager surfaces task_await calls. Typing the fakes
+// against them keeps per-test mocks from drifting away from the real signatures.
+type FakeTaskServiceApi = Pick<
+  TaskService,
+  | "listActiveDescendantAgentTaskIds"
+  | "isDescendantAgentTask"
+  | "isWorkflowOwnedDescendantAgentTask"
+  | "filterDescendantAgentTaskIds"
+  | "getAgentTaskStatuses"
+  | "getAgentTaskStatus"
+  | "getAgentTaskTimestamps"
+  | "getAgentTaskExecutionId"
+  | "getDescendantAgentTaskExecutionSnapshot"
+  | "markWorkflowRunTerminalAttentionSettled"
+  | "waitForAgentReport"
+>;
+type FakeWorkspaceTurnManagerApi = Pick<
+  WorkspaceTurnManager,
+  | "listWorkspaceTurnTasks"
+  | "getWorkspaceTurnSnapshot"
+  | "markWorkspaceTurnTerminalAttentionConsumed"
+  | "waitForWorkspaceTurn"
+>;
+
+/**
+ * Builds the task_await service dependencies. Defaults describe a parent with no descendant
+ * agent tasks; any agent-report wait is unexpected unless a test overrides it. Methods the tool
+ * probes with `?.` stay absent unless overridden, so their fallback paths remain exercised.
+ */
+function createFakeTaskServices(
+  overrides: Partial<FakeTaskServiceApi & FakeWorkspaceTurnManagerApi> = {}
+): { taskService: TaskService; workspaceTurnManager: WorkspaceTurnManager } {
+  const {
+    listWorkspaceTurnTasks,
+    getWorkspaceTurnSnapshot,
+    markWorkspaceTurnTerminalAttentionConsumed,
+    waitForWorkspaceTurn,
+    ...taskServiceOverrides
+  } = overrides;
+  const taskService: Partial<FakeTaskServiceApi> = {
+    listActiveDescendantAgentTaskIds: () => [],
+    isDescendantAgentTask: () => Promise.resolve(false),
+    getAgentTaskStatuses: () => new Map(),
+    waitForAgentReport: (taskId) => {
+      throw new Error(`unexpected waitForAgentReport(${taskId})`);
+    },
+    ...taskServiceOverrides,
+  };
+  // Partial fakes: the tool only reaches the methods picked above.
+  return {
+    taskService: taskService as TaskService,
+    workspaceTurnManager: createFakeWorkspaceTurnManager({
+      listWorkspaceTurnTasks,
+      getWorkspaceTurnSnapshot,
+      markWorkspaceTurnTerminalAttentionConsumed,
+      waitForWorkspaceTurn,
+    }),
+  };
+}
+
 describe("task_await tool", () => {
   // Workspace-turn reports are classified from the target workspace's history
   // (a real HistoryService, per the repository's testing contract): a target
@@ -64,14 +133,11 @@ describe("task_await tool", () => {
     };
 
     const markWorkspaceTurnTerminalAttentionConsumed = mock(() => Promise.resolve());
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
-      listWorkspaceTurnTasks: mock(() => []),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
-      getAgentTaskStatuses: mock(() => new Map()),
+    const taskServices = createFakeTaskServices({
+      listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
       markWorkspaceTurnTerminalAttentionConsumed,
       getWorkspaceTurnSnapshot: mock(() =>
-        Promise.resolve({
+        Promise.resolve<WorkspaceTurnTaskHandleRecord>({
           kind: "workspace_turn",
           handleId: "wst_done",
           ownerWorkspaceId: "parent-workspace",
@@ -89,13 +155,13 @@ describe("task_await tool", () => {
           finalMessage: {
             messageId: "msg_1",
             parts: [{ type: "text", text: "Done" }],
-            metadata: {},
+            metadata: { model: "test-model" },
           },
         })
       ),
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
     const result = (await Promise.resolve(
       tool.execute!({ task_ids: ["wst_done"], timeout_secs: 0 }, mockToolCallOptions)
     )) as { results: Array<Record<string, unknown>> };
@@ -132,14 +198,11 @@ describe("task_await tool", () => {
       historyService: history.historyService,
     };
 
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
-      listWorkspaceTurnTasks: mock(() => []),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
-      getAgentTaskStatuses: mock(() => new Map()),
+    const taskServices = createFakeTaskServices({
+      listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
       markWorkspaceTurnTerminalAttentionConsumed: mock(() => Promise.resolve()),
       getWorkspaceTurnSnapshot: mock(() =>
-        Promise.resolve({
+        Promise.resolve<WorkspaceTurnTaskHandleRecord>({
           kind: "workspace_turn",
           handleId: "wst_superseded",
           ownerWorkspaceId: "parent-workspace",
@@ -153,9 +216,9 @@ describe("task_await tool", () => {
           disposableWorkspace: false,
         })
       ),
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
     const result = (await Promise.resolve(
       tool.execute!({ task_ids: ["wst_superseded"], timeout_secs: 0 }, mockToolCallOptions)
     )) as { results: Array<Record<string, unknown>> };
@@ -190,25 +253,16 @@ describe("task_await tool", () => {
       disposableWorkspace: false,
     } as const;
     const waitForWorkspaceTurn = mock(
-      (
-        _handleId: string,
-        _options: {
-          timeoutMs?: number;
-          abortSignal?: AbortSignal;
-          requestingWorkspaceId: string;
-          ownerWorkspaceId?: string;
-          backgroundOnMessageQueued?: boolean;
-        }
-      ) =>
+      (_handleId: string, _options: Parameters<WorkspaceTurnManager["waitForWorkspaceTurn"]>[1]) =>
         Promise.resolve({
+          taskId: "wst_nested",
           workspaceId: "child-task",
           updatedAt: "2026-08-10T00:00:01.000Z",
           reportMarkdown: "Nested work completed",
         })
     );
     const markWorkspaceTurnTerminalAttentionConsumed = mock(() => Promise.resolve());
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
+    const taskServices = createFakeTaskServices({
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       getAgentTaskExecutionId: mock(() => "wst_nested"),
       getDescendantAgentTaskExecutionSnapshot: mock(() =>
@@ -219,9 +273,9 @@ describe("task_await tool", () => {
       }),
       waitForWorkspaceTurn,
       markWorkspaceTurnTerminalAttentionConsumed,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["child-task"] }, mockToolCallOptions)
     );
@@ -279,16 +333,15 @@ describe("task_await tool", () => {
         createdWorkspace: false,
         disposableWorkspace: false,
       } as const;
-      const taskService = {
+      const { taskService, workspaceTurnManager } = createFakeTaskServices({
         listActiveDescendantAgentTaskIds: mock(() => []),
         isDescendantAgentTask: mock(() => Promise.resolve(true)),
         getAgentTaskExecutionId: mock(() => continuation.handleId),
         getDescendantAgentTaskExecutionSnapshot: mock(() =>
           Promise.resolve({ ownerWorkspaceId: "parent-task", record: continuation })
         ),
-        getWorkspaceTurnSnapshot: mock(() => {
-          throw new Error("requester-owned snapshot lookup should not be used");
-        }),
+        // The target-scoped lookup (consumingWorkspaceId) answers with the same record.
+        getWorkspaceTurnSnapshot: mock(() => Promise.resolve(continuation)),
         waitForWorkspaceTurn: mock(async () => {
           // The skill read lands in the target's history during the wait.
           await history.historyService.appendToHistory(
@@ -300,17 +353,19 @@ describe("task_await tool", () => {
             })
           );
           return {
+            taskId: targetWorkspaceId,
             workspaceId: targetWorkspaceId,
             updatedAt: "2026-08-10T00:00:02.000Z",
             reportMarkdown: "Applied the conventions",
           };
         }),
         markWorkspaceTurnTerminalAttentionConsumed: mock(() => Promise.resolve()),
-      } as unknown as TaskService;
+      });
       const tool = createTaskAwaitTool({
         ...createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" }),
         historyService: history.historyService,
         taskService,
+        workspaceTurnManager,
         ...(excludeProjectSkillContent ? { excludeProjectSkillContent: true } : {}),
       });
       return (await Promise.resolve(
@@ -351,16 +406,13 @@ describe("task_await tool", () => {
       createdWorkspace: true,
       disposableWorkspace: false,
     } as const;
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
+    const taskServices = createFakeTaskServices({
       listWorkspaceTurnTasks: mock(() => Promise.resolve([runningSnapshot])),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
-      getAgentTaskStatuses: mock(() => new Map()),
       markWorkspaceTurnTerminalAttentionConsumed,
       getWorkspaceTurnSnapshot: mock(() => Promise.resolve(runningSnapshot)),
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
     const result = (await Promise.resolve(
       tool.execute!({ task_ids: ["wst_running"], timeout_secs: 0 }, mockToolCallOptions)
     )) as { results: Array<Record<string, unknown>> };
@@ -410,17 +462,14 @@ describe("task_await tool", () => {
       disposableWorkspace: false,
     } as const;
 
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
+    const taskServices = createFakeTaskServices({
       listWorkspaceTurnTasks: mock(() => Promise.resolve([runningSnapshot])),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
-      getAgentTaskStatuses: mock(() => new Map()),
       getWorkspaceTurnSnapshot: mock((_ownerWorkspaceId: string, taskId: string) =>
         Promise.resolve(taskId === "wst_done" ? completedSnapshot : runningSnapshot)
       ),
       waitForWorkspaceTurn: mock(
         (_taskId: string, options: { abortSignal?: AbortSignal }) =>
-          new Promise((_resolve, reject) => {
+          new Promise<WorkspaceTurnWaitResult>((_resolve, reject) => {
             if (options.abortSignal?.aborted) {
               reject(new Error("Interrupted"));
               return;
@@ -430,9 +479,9 @@ describe("task_await tool", () => {
             });
           })
       ),
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
     const result = (await Promise.resolve(
       tool.execute!(
         { task_ids: ["wst_done", "wst_running"], min_completed: 1, timeout_secs: 60 },
@@ -481,24 +530,22 @@ describe("task_await tool", () => {
     let observedTimeoutMs: number | undefined;
 
     const markWorkspaceTurnTerminalAttentionConsumed = mock(() => Promise.resolve());
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
+    const taskServices = createFakeTaskServices({
       listWorkspaceTurnTasks: mock(() => Promise.resolve([runningSnapshot])),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
-      getAgentTaskStatuses: mock(() => new Map()),
       getWorkspaceTurnSnapshot: mock(() => Promise.resolve(runningSnapshot)),
       markWorkspaceTurnTerminalAttentionConsumed,
       waitForWorkspaceTurn: mock((_taskId: string, options: { timeoutMs?: number }) => {
         observedTimeoutMs = options.timeoutMs;
         return Promise.resolve({
+          taskId: "wst_running",
           workspaceId: "child-running",
           updatedAt: "2026-06-19T00:00:01.000Z",
           reportMarkdown: "Done",
         });
       }),
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
     await Promise.resolve(
       tool.execute!({ task_ids: ["wst_running"], timeout_secs: null }, mockToolCallOptions)
     );
@@ -542,17 +589,14 @@ describe("task_await tool", () => {
     const snapshots = [runningSnapshot, completedSnapshot];
 
     const markWorkspaceTurnTerminalAttentionConsumed = mock(() => Promise.resolve());
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
+    const taskServices = createFakeTaskServices({
       listWorkspaceTurnTasks: mock(() => Promise.resolve([runningSnapshot])),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
-      getAgentTaskStatuses: mock(() => new Map()),
       getWorkspaceTurnSnapshot: mock(() => Promise.resolve(snapshots.shift() ?? completedSnapshot)),
       markWorkspaceTurnTerminalAttentionConsumed,
       waitForWorkspaceTurn: mock(() => Promise.reject(new Error("timed out"))),
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
     const result = (await Promise.resolve(
       tool.execute!({ task_ids: ["wst_race"], timeout_secs: 1 }, mockToolCallOptions)
     )) as { results: Array<Record<string, unknown>> };
@@ -604,17 +648,14 @@ describe("task_await tool", () => {
     } as const;
     const snapshots = [runningSnapshot, errorSnapshot];
     const markWorkspaceTurnTerminalAttentionConsumed = mock(() => Promise.resolve());
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
+    const taskServices = createFakeTaskServices({
       listWorkspaceTurnTasks: mock(() => Promise.resolve([runningSnapshot])),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
-      getAgentTaskStatuses: mock(() => new Map()),
       getWorkspaceTurnSnapshot: mock(() => Promise.resolve(snapshots.shift() ?? errorSnapshot)),
       markWorkspaceTurnTerminalAttentionConsumed,
       waitForWorkspaceTurn: mock(() => Promise.reject(new Error("workspace turn settled"))),
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
     const result = (await Promise.resolve(
       tool.execute!({ task_ids: ["wst_failed"], timeout_secs: 1 }, mockToolCallOptions)
     )) as { results: Array<Record<string, unknown>> };
@@ -669,8 +710,7 @@ describe("task_await tool", () => {
       totalCommitCount: 1,
     } as const;
 
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
+    const taskServices = createFakeTaskServices({
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       waitForAgentReport: mock(async (taskId: string) => {
         await fs.promises.writeFile(
@@ -688,9 +728,9 @@ describe("task_await tool", () => {
 
         return { reportMarkdown: "ok" };
       }),
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["t1"] }, mockToolCallOptions)
@@ -783,8 +823,7 @@ describe("task_await tool", () => {
     }
     const artifactsPath = getSubagentGitPatchArtifactsFilePath(workspaceSessionDir);
 
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
+    const taskServices = createFakeTaskServices({
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       waitForAgentReport: mock(async (taskId: string) => {
         await fs.promises.writeFile(
@@ -811,9 +850,9 @@ describe("task_await tool", () => {
 
         return { reportMarkdown: "ok" };
       }),
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
     const result = (await Promise.resolve(
       tool.execute!({ task_ids: ["t1"] }, mockToolCallOptions)
     )) as {
@@ -844,13 +883,13 @@ describe("task_await tool", () => {
     const waitForAgentReport = mock((taskId: string) =>
       Promise.resolve({ reportMarkdown: `report:${taskId}`, title: `title:${taskId}` })
     );
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["t1", "t2"]),
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["t1", "t2"] }, mockToolCallOptions)
@@ -902,13 +941,13 @@ describe("task_await tool", () => {
         thinkingLevel: "high" as const,
       })
     );
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["t1"]),
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["t1"] }, mockToolCallOptions)
@@ -935,7 +974,7 @@ describe("task_await tool", () => {
       historyService: history.historyService,
     };
 
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["t1"]),
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       waitForAgentReport: mock(() => Promise.resolve({ reportMarkdown: "ok" })),
@@ -943,9 +982,9 @@ describe("task_await tool", () => {
         createdAt: "2026-01-01T00:00:00.000Z",
         reportedAt: "2026-01-01T00:00:02.500Z",
       })),
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["t1"] }, mockToolCallOptions)
@@ -978,7 +1017,7 @@ describe("task_await tool", () => {
       const waitForAgentReport = mock(() => {
         throw new Error("waitForAgentReport should not be called for timeout_secs=0");
       });
-      const taskService = {
+      const taskServices = createFakeTaskServices({
         listActiveDescendantAgentTaskIds: mock(() => ["t1"]),
         isDescendantAgentTask: mock(() => Promise.resolve(true)),
         getAgentTaskStatus: mock(() => "running" as const),
@@ -986,9 +1025,9 @@ describe("task_await tool", () => {
           createdAt: "2026-01-01T00:00:02.000Z",
         })),
         waitForAgentReport,
-      } as unknown as TaskService;
+      });
 
-      const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+      const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
       const result: unknown = await Promise.resolve(
         tool.execute!({ timeout_secs: 0 }, mockToolCallOptions)
@@ -1019,16 +1058,16 @@ describe("task_await tool", () => {
     const backgroundProcessManager = {
       list: listBackgroundProcesses,
     } as unknown as BackgroundProcessManager;
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["t1"]),
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
     const tool = createTaskAwaitTool({
       ...baseConfig,
       backgroundProcessManager,
-      taskService,
+      ...taskServices,
     });
 
     const result: unknown = await Promise.resolve(
@@ -1065,15 +1104,14 @@ describe("task_await tool", () => {
     const isWorkflowOwnedDescendantAgentTask = mock(
       (_ancestorWorkspaceId: string, taskId: string) => Promise.resolve(taskId === "workflow-task")
     );
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
+    const taskServices = createFakeTaskServices({
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       isWorkflowOwnedDescendantAgentTask,
       getAgentTaskStatuses,
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result = (await Promise.resolve(
       tool.execute!({ task_ids: ["workflow-task"] }, mockToolCallOptions)
@@ -1113,17 +1151,15 @@ describe("task_await tool", () => {
     const backgroundProcessManager = {
       list: listBackgroundProcesses,
     } as unknown as BackgroundProcessManager;
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
+    const taskServices = createFakeTaskServices({
       getAgentTaskStatuses,
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
     const tool = createTaskAwaitTool({
       ...baseConfig,
       backgroundProcessManager,
-      taskService,
+      ...taskServices,
     });
 
     const result: unknown = await Promise.resolve(
@@ -1148,19 +1184,18 @@ describe("task_await tool", () => {
     const waitForAgentReport = mock(() => Promise.resolve({ reportMarkdown: "ok" }));
     const isDescendantAgentTask = mock(() => Promise.resolve(true));
 
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       filterDescendantAgentTaskIds: function (ancestorWorkspaceId: string, taskIds: string[]) {
-        expect(this).toBe(taskService);
+        expect(this).toBe(taskServices.taskService);
         expect(ancestorWorkspaceId).toBe("parent-workspace");
         expect(taskIds).toEqual(["t1"]);
         return Promise.resolve(taskIds);
       },
-      listActiveDescendantAgentTaskIds: mock(() => []),
       isDescendantAgentTask,
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["t1"] }, mockToolCallOptions)
@@ -1196,14 +1231,13 @@ describe("task_await tool", () => {
       return new Map([["hallucinated", { exists: false, taskStatus: null }]]);
     });
 
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["real-child"]),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
       getAgentTaskStatuses,
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result = (await Promise.resolve(
       tool.execute!({ task_ids: ["hallucinated"] }, mockToolCallOptions)
@@ -1251,17 +1285,15 @@ describe("task_await tool", () => {
       ]),
     } as unknown as BackgroundProcessManager;
 
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
+    const taskServices = createFakeTaskServices({
       getAgentTaskStatuses,
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
     const tool = createTaskAwaitTool({
       ...baseConfig,
       backgroundProcessManager,
-      taskService,
+      ...taskServices,
     });
 
     const result = (await Promise.resolve(
@@ -1297,7 +1329,7 @@ describe("task_await tool", () => {
       return new Map([["hallucinated", { exists: false, taskStatus: null }]]);
     });
 
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["real-child"]),
       isDescendantAgentTask: mock((ancestorWorkspaceId: string, taskId: string) => {
         expect(ancestorWorkspaceId).toBe("parent-workspace");
@@ -1305,9 +1337,9 @@ describe("task_await tool", () => {
       }),
       getAgentTaskStatuses,
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result = (await Promise.resolve(
       tool.execute!({ task_ids: ["real-child", "hallucinated"] }, mockToolCallOptions)
@@ -1360,14 +1392,12 @@ describe("task_await tool", () => {
       return new Map([["hallucinated", { exists: false, taskStatus: null }]]);
     });
 
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
+    const taskServices = createFakeTaskServices({
       getAgentTaskStatuses,
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["hallucinated"] }, mockToolCallOptions)
@@ -1413,20 +1443,15 @@ describe("task_await tool", () => {
     ]);
 
     const markWorkflowRunTerminalAttentionSettled = mock(() => Promise.resolve());
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
+    const taskServices = createFakeTaskServices({
       markWorkflowRunTerminalAttentionSettled,
-      waitForAgentReport: mock(() => {
-        throw new Error("workflow run IDs should not be treated as agent tasks");
-      }),
-    } as unknown as TaskService;
+    });
     const workflowService = {
       getRun: mock(() => Promise.resolve(completedRun)),
     };
     const tool = createTaskAwaitTool({
       ...baseConfig,
-      taskService,
+      ...taskServices,
       workflowService: workflowService as unknown as TestWorkflowService,
     });
 
@@ -1487,19 +1512,13 @@ describe("task_await tool", () => {
       },
     ]);
 
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
-      waitForAgentReport: mock(() => {
-        throw new Error("workflow run IDs should not be treated as agent tasks");
-      }),
-    } as unknown as TaskService;
+    const taskServices = createFakeTaskServices({});
     const workflowService = {
       getRun: mock(() => Promise.resolve(failedRun)),
     };
     const tool = createTaskAwaitTool({
       ...baseConfig,
-      taskService,
+      ...taskServices,
       workflowService: workflowService as unknown as TestWorkflowService,
     });
 
@@ -1566,19 +1585,13 @@ describe("task_await tool", () => {
       ],
     };
 
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
-      waitForAgentReport: mock(() => {
-        throw new Error("workflow run IDs should not be treated as agent tasks");
-      }),
-    } as unknown as TaskService;
+    const taskServices = createFakeTaskServices({});
     const workflowService = {
       getRun: mock(() => Promise.resolve(failedRun)),
     };
     const tool = createTaskAwaitTool({
       ...baseConfig,
-      taskService,
+      ...taskServices,
       workflowService: workflowService as unknown as TestWorkflowService,
     });
 
@@ -1664,19 +1677,13 @@ describe("task_await tool", () => {
       ],
     };
 
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
-      waitForAgentReport: mock(() => {
-        throw new Error("workflow run IDs should not be treated as agent tasks");
-      }),
-    } as unknown as TaskService;
+    const taskServices = createFakeTaskServices({});
     const workflowService = {
       getRun: mock(() => Promise.resolve(runningRun)),
     };
     const tool = createTaskAwaitTool({
       ...baseConfig,
-      taskService,
+      ...taskServices,
       workflowService: workflowService as unknown as TestWorkflowService,
     });
 
@@ -1731,17 +1738,11 @@ describe("task_await tool", () => {
       ]),
       id: "wfr_reserving",
     };
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
-      waitForAgentReport: mock(() => {
-        throw new Error("workflow run IDs should not be treated as agent tasks");
-      }),
-    } as unknown as TaskService;
+    const taskServices = createFakeTaskServices({});
     const workflowService = { getRun: mock(() => Promise.resolve(reservingRun)) };
     const tool = createTaskAwaitTool({
       ...baseConfig,
-      taskService,
+      ...taskServices,
       workflowService: workflowService as unknown as TestWorkflowService,
     });
 
@@ -1790,20 +1791,14 @@ describe("task_await tool", () => {
       status: "backgrounded" as const,
     };
 
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
-      waitForAgentReport: mock(() => {
-        throw new Error("workflow discovery should not wait for agent reports");
-      }),
-    } as unknown as TaskService;
+    const taskServices = createFakeTaskServices({});
     const workflowService = {
       listRuns: mock(() => Promise.resolve([backgroundedRun])),
       getRun: mock(() => Promise.resolve(backgroundedRun)),
     };
     const tool = createTaskAwaitTool({
       ...baseConfig,
-      taskService,
+      ...taskServices,
       workflowService: workflowService as unknown as TestWorkflowService,
     });
 
@@ -1858,19 +1853,13 @@ describe("task_await tool", () => {
     };
     let getRunCalls = 0;
 
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
-      waitForAgentReport: mock(() => {
-        throw new Error("workflow polling should not wait for agent reports");
-      }),
-    } as unknown as TaskService;
+    const taskServices = createFakeTaskServices({});
     const workflowService = {
       getRun: mock(() => Promise.resolve(getRunCalls++ === 0 ? backgroundedRun : completedRun)),
     };
     const tool = createTaskAwaitTool({
       ...baseConfig,
-      taskService,
+      ...taskServices,
       workflowService: workflowService as unknown as TestWorkflowService,
     });
 
@@ -1914,19 +1903,13 @@ describe("task_await tool", () => {
       },
     ]);
 
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
-      isDescendantAgentTask: mock(() => Promise.resolve(false)),
-      waitForAgentReport: mock(() => {
-        throw new Error("workflow run IDs should not be treated as agent tasks");
-      }),
-    } as unknown as TaskService;
+    const taskServices = createFakeTaskServices({});
     const workflowService = {
       getRun: mock(() => Promise.resolve(interruptedRun)),
     };
     const tool = createTaskAwaitTool({
       ...baseConfig,
-      taskService,
+      ...taskServices,
       workflowService: workflowService as unknown as TestWorkflowService,
     });
 
@@ -1956,13 +1939,13 @@ describe("task_await tool", () => {
     const isDescendantAgentTask = mock(() => Promise.resolve(true));
     const waitForAgentReport = mock(() => Promise.resolve({ reportMarkdown: "ok" }));
 
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds,
       isDescendantAgentTask,
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result: unknown = await Promise.resolve(tool.execute!({}, mockToolCallOptions));
 
@@ -2001,7 +1984,7 @@ describe("task_await tool", () => {
       disposableWorkspace: false,
     } as const;
     const getWorkspaceTurnSnapshot = mock(() => Promise.resolve(continuation));
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["child-task"]),
       listWorkspaceTurnTasks: mock(() => Promise.resolve([continuation])),
       isDescendantAgentTask: mock((_ancestorWorkspaceId: string, taskId: string) =>
@@ -2011,9 +1994,9 @@ describe("task_await tool", () => {
         taskId === "child-task" ? "wst_continuation" : null
       ),
       getWorkspaceTurnSnapshot,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
     const result: unknown = await Promise.resolve(
       tool.execute!({ timeout_secs: 0, min_completed: 2 }, mockToolCallOptions)
     );
@@ -2043,14 +2026,13 @@ describe("task_await tool", () => {
     const waitForAgentReport = mock(() => Promise.reject(new ForegroundWaitBackgroundedError()));
     const getAgentTaskStatus = mock(() => "running" as const);
 
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
+    const taskServices = createFakeTaskServices({
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       waitForAgentReport,
       getAgentTaskStatus,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["t1"] }, mockToolCallOptions)
@@ -2084,14 +2066,13 @@ describe("task_await tool", () => {
       return Promise.reject(new Error("Boom"));
     });
 
-    const taskService = {
-      listActiveDescendantAgentTaskIds: mock(() => []),
+    const taskServices = createFakeTaskServices({
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       getAgentTaskStatus: mock((taskId: string) => (taskId === "timeout" ? "running" : null)),
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["timeout", "missing", "boom"] }, mockToolCallOptions)
@@ -2118,14 +2099,14 @@ describe("task_await tool", () => {
     });
     const getAgentTaskStatus = mock(() => "running" as const);
 
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["t1"]),
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       getAgentTaskStatus,
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ timeout_secs: 0 }, mockToolCallOptions)
@@ -2142,7 +2123,7 @@ describe("task_await tool", () => {
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" }),
       historyService: history.historyService,
     };
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["child-agent"]),
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       getAgentTaskExecutionId: mock(() => "wst_internal"),
@@ -2160,8 +2141,8 @@ describe("task_await tool", () => {
           disposableWorkspace: false,
         })
       ),
-    } as unknown as TaskService;
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     expect(
       await Promise.resolve(
@@ -2190,14 +2171,14 @@ describe("task_await tool", () => {
       Promise.resolve({ reportMarkdown: "ok", title: "cached-title" })
     );
 
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["t1"]),
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       getAgentTaskStatus,
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ timeout_secs: 0 }, mockToolCallOptions)
@@ -2233,29 +2214,29 @@ describe("task_await tool", () => {
 
     let t1Signal: AbortSignal | undefined;
     let t2Signal: AbortSignal | undefined;
-    const waitForAgentReport = mock((taskId: string, opts: { abortSignal?: AbortSignal }) => {
+    const waitForAgentReport = mock((taskId: string, opts?: { abortSignal?: AbortSignal }) => {
       if (taskId === "t1") {
-        t1Signal = opts.abortSignal;
+        t1Signal = opts?.abortSignal;
         return Promise.resolve({ reportMarkdown: "report:t1", title: "title:t1" });
       }
       // t2 stays pending until its per-task signal is aborted (the early-stop detach), mirroring
       // how the real waitForAgentReport rejects with "Interrupted" when its waiter is removed.
-      t2Signal = opts.abortSignal;
-      return new Promise((_resolve, reject) => {
-        opts.abortSignal?.addEventListener("abort", () => reject(new Error("Interrupted")), {
+      t2Signal = opts?.abortSignal;
+      return new Promise<AgentTaskReport>((_resolve, reject) => {
+        opts?.abortSignal?.addEventListener("abort", () => reject(new Error("Interrupted")), {
           once: true,
         });
       });
     });
 
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["t1", "t2"]),
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       getAgentTaskStatus: mock(() => "running" as const),
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["t1", "t2"] }, mockToolCallOptions)
@@ -2292,18 +2273,18 @@ describe("task_await tool", () => {
       }
       // t2 finishes on a later macrotask; min_completed=2 must keep waiting for it rather than
       // returning early after t1.
-      return new Promise((resolve) =>
+      return new Promise<AgentTaskReport>((resolve) =>
         setTimeout(() => resolve({ reportMarkdown: "report:t2", title: "title:t2" }), 5)
       );
     });
 
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["t1", "t2"]),
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["t1", "t2"], min_completed: 2 }, mockToolCallOptions)
@@ -2336,25 +2317,25 @@ describe("task_await tool", () => {
       historyService: history.historyService,
     };
 
-    const waitForAgentReport = mock((taskId: string, opts: { abortSignal?: AbortSignal }) => {
+    const waitForAgentReport = mock((taskId: string, opts?: { abortSignal?: AbortSignal }) => {
       if (taskId === "t1" || taskId === "t2") {
         return Promise.resolve({ reportMarkdown: `report:${taskId}`, title: `title:${taskId}` });
       }
-      return new Promise((_resolve, reject) => {
-        opts.abortSignal?.addEventListener("abort", () => reject(new Error("Interrupted")), {
+      return new Promise<AgentTaskReport>((_resolve, reject) => {
+        opts?.abortSignal?.addEventListener("abort", () => reject(new Error("Interrupted")), {
           once: true,
         });
       });
     });
 
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["t1", "t2", "t3"]),
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       getAgentTaskStatus: mock(() => "running" as const),
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["t1", "t2", "t3"], min_completed: 2 }, mockToolCallOptions)
@@ -2392,13 +2373,13 @@ describe("task_await tool", () => {
       Promise.resolve({ reportMarkdown: `report:${taskId}`, title: `title:${taskId}` })
     );
 
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["t1", "t2"]),
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["t1", "t2"], min_completed: 50 }, mockToolCallOptions)
@@ -2440,14 +2421,14 @@ describe("task_await tool", () => {
       return Promise.reject(new Error("Boom"));
     });
 
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["t1", "t2"]),
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       getAgentTaskStatus: mock(() => null),
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["t1", "t2"], min_completed: 2 }, mockToolCallOptions)
@@ -2475,7 +2456,7 @@ describe("task_await tool", () => {
     };
 
     let t2Ready = false;
-    const waitForAgentReport = mock((taskId: string, opts: { abortSignal?: AbortSignal }) => {
+    const waitForAgentReport = mock((taskId: string, opts?: { abortSignal?: AbortSignal }) => {
       if (taskId === "t1") {
         return Promise.resolve({ reportMarkdown: "report:t1", title: "title:t1" });
       }
@@ -2483,21 +2464,21 @@ describe("task_await tool", () => {
         // Simulates the cached report becoming available after the child finishes.
         return Promise.resolve({ reportMarkdown: "report:t2", title: "title:t2" });
       }
-      return new Promise((_resolve, reject) => {
-        opts.abortSignal?.addEventListener("abort", () => reject(new Error("Interrupted")), {
+      return new Promise<AgentTaskReport>((_resolve, reject) => {
+        opts?.abortSignal?.addEventListener("abort", () => reject(new Error("Interrupted")), {
           once: true,
         });
       });
     });
 
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["t1", "t2"]),
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       getAgentTaskStatus: mock(() => "running" as const),
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const firstResult: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["t1", "t2"] }, mockToolCallOptions)
@@ -2544,14 +2525,14 @@ describe("task_await tool", () => {
     });
     const getAgentTaskStatus = mock(() => "running" as const);
 
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["t1", "t2"]),
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       getAgentTaskStatus,
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!(
@@ -2586,13 +2567,13 @@ describe("task_await tool", () => {
       getProcess: mock(() => Promise.reject(new Error("proc boom"))),
     } as unknown as BackgroundProcessManager;
 
-    const taskService = {
+    const taskServices = createFakeTaskServices({
       listActiveDescendantAgentTaskIds: mock(() => ["t1"]),
       isDescendantAgentTask: mock(() => Promise.resolve(true)),
       waitForAgentReport,
-    } as unknown as TaskService;
+    });
 
-    const tool = createTaskAwaitTool({ ...baseConfig, backgroundProcessManager, taskService });
+    const tool = createTaskAwaitTool({ ...baseConfig, backgroundProcessManager, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["t1", "bash:p1"], min_completed: 2 }, mockToolCallOptions)

@@ -6,6 +6,7 @@ import {
 import {
   SESSION_HISTORY_MAX_SCAN_BYTES,
   SESSION_HISTORY_MAX_LINE_BYTES,
+  SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE,
 } from "@/common/constants/contextBudget";
 import {
   hasRawResetMarker,
@@ -13,7 +14,9 @@ import {
   hasUnreadableHistoryResetEvidence,
   isReadableHistoryMessage,
   scanHistoryFilesBounded,
+  readProviderHistory,
   readProviderHistoryFromLatestBoundary,
+  readProviderHistorySuffix,
   readCompactionPendingHistoryBoundary,
   readCompactionPendingHistoryObservation,
   readHistoryControlEvidenceFromLatestBoundary,
@@ -77,7 +80,7 @@ import { log } from "./log";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { safeStringifyForCounting } from "@/common/utils/tokens/safeStringifyForCounting";
-import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
+import { normalizePersistedMessage } from "@/node/utils/messages/normalizePersistedMessage";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import {
   getContextBoundaryKind,
@@ -135,6 +138,14 @@ interface HistoryPublicationObserver {
   onGenerationAdvanced?: (generation: string) => undefined;
   // Returning undefined excludes async callbacks: receipt capture must not yield after publication.
   onCommitted: () => undefined;
+}
+
+/** Timing hooks for onChat replay instrumentation (#4504). Observes only; never alters the read. */
+export interface HistoryReadObserver {
+  /** Called first thing inside the workspace file-lock critical section. */
+  onLockAcquired?: () => void;
+  /** Raw bytes of the active epoch read from disk (called once per file read). */
+  onBytesRead?: (bytes: number) => void;
 }
 
 interface HistoryRewriteRow {
@@ -783,7 +794,7 @@ export class HistoryService {
           const parsed: unknown = JSON.parse(raw);
           if (!isReadableHistoryMessage(parsed))
             throw new Error("Compaction partial is unreadable");
-          partial = normalizeLegacyMuxMetadata(parsed);
+          partial = normalizePersistedMessage(parsed);
         }
         // Preparation uses provider history, including archive rows exposed by a
         // heartbeat rollback. Compare that same privacy-filtered view under the locks;
@@ -1093,7 +1104,7 @@ export class HistoryService {
       }
     }
 
-    return normalizeLegacyMuxMetadata(value as MuxMessage);
+    return normalizePersistedMessage(value as MuxMessage);
   }
 
   private parseMessages(
@@ -1427,9 +1438,11 @@ export class HistoryService {
 
   private async withRecoveredHistoryLock<T>(
     workspaceId: string,
-    operation: () => Promise<T>
+    operation: () => Promise<T>,
+    onLockAcquired?: () => void
   ): Promise<T> {
     return this.fileLocks.withLock(workspaceId, async () => {
+      onLockAcquired?.();
       await this.recoverTruncateTransactionForReads(workspaceId);
       return operation();
     });
@@ -1645,7 +1658,8 @@ export class HistoryService {
   private static readonly REVERSE_READ_CHUNK_SIZE = 256 * 1024;
   /** String-search needles for context boundary lines. */
   private static readonly BOUNDARY_NEEDLES = [
-    '"compactionBoundary":true',
+    // Shared with the provider scanner so rotation and provider reads recognize the same rows.
+    SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE,
     `"contextBoundaryKind":"${CONTEXT_BOUNDARY_KINDS.RESET}"`,
   ] as const;
 
@@ -1783,7 +1797,7 @@ export class HistoryService {
       const messages: MuxMessage[] = [];
       for (const line of lines) {
         try {
-          messages.push(normalizeLegacyMuxMetadata(JSON.parse(line) as MuxMessage));
+          messages.push(normalizePersistedMessage(JSON.parse(line) as MuxMessage));
         } catch {
           // Skip malformed lines — same self-healing behavior as readChatHistory
         }
@@ -1851,7 +1865,7 @@ export class HistoryService {
           const line = buffer.subarray(lineStart, lineEnd).toString("utf-8").trim();
           if (line.length === 0) continue;
           try {
-            collected.push(normalizeLegacyMuxMetadata(JSON.parse(line) as MuxMessage));
+            collected.push(normalizePersistedMessage(JSON.parse(line) as MuxMessage));
           } catch {
             // Skip malformed lines
           }
@@ -1865,7 +1879,7 @@ export class HistoryService {
         const line = carryoverBytes.toString("utf-8").trim();
         if (line.length > 0) {
           try {
-            collected.push(normalizeLegacyMuxMetadata(JSON.parse(line) as MuxMessage));
+            collected.push(normalizePersistedMessage(JSON.parse(line) as MuxMessage));
           } catch {
             // skip
           }
@@ -1890,7 +1904,7 @@ export class HistoryService {
     return data === null
       ? []
       : this.parseMessages(data, logLabel, (value) =>
-          normalizeLegacyMuxMetadata(value as MuxMessage)
+          normalizePersistedMessage(value as MuxMessage)
         );
   }
 
@@ -1994,7 +2008,7 @@ export class HistoryService {
           .filter(Boolean);
         for (const trimmed of rawLines) {
           try {
-            messages.push(normalizeLegacyMuxMetadata(JSON.parse(trimmed) as MuxMessage));
+            messages.push(normalizePersistedMessage(JSON.parse(trimmed) as MuxMessage));
           } catch {
             // Skip malformed lines — same self-healing behavior as readChatHistory
           }
@@ -2016,7 +2030,7 @@ export class HistoryService {
         if (line.length > 0) {
           let msg: MuxMessage;
           try {
-            msg = normalizeLegacyMuxMetadata(JSON.parse(line) as MuxMessage);
+            msg = normalizePersistedMessage(JSON.parse(line) as MuxMessage);
           } catch {
             return true; // Skip malformed JSON, but never swallow a visitor's I/O failure.
           }
@@ -2093,7 +2107,7 @@ export class HistoryService {
           const line = buffer.subarray(lineStart, lineEnd).toString("utf-8").trim();
           if (line.length === 0) continue;
           try {
-            messages.push(normalizeLegacyMuxMetadata(JSON.parse(line) as MuxMessage));
+            messages.push(normalizePersistedMessage(JSON.parse(line) as MuxMessage));
           } catch {
             // Skip malformed lines
           }
@@ -2112,7 +2126,7 @@ export class HistoryService {
         const line = carryoverBytes.toString("utf-8").trim();
         if (line.length > 0) {
           try {
-            const msg = normalizeLegacyMuxMetadata(JSON.parse(line) as MuxMessage);
+            const msg = normalizePersistedMessage(JSON.parse(line) as MuxMessage);
             const shouldContinue = await visitor([msg]);
             if (shouldContinue === false) return false;
           } catch {
@@ -2328,6 +2342,12 @@ export class HistoryService {
     workspaceId: string,
     beforeHistorySequence: number
   ): Promise<boolean> {
+    // No non-negative sequence is below 0. Replay of an uncompacted chat usually
+    // starts at sequence 0, so this skips parsing the whole file (#4655).
+    if (beforeHistorySequence === 0) {
+      return false;
+    }
+
     let hasOlder = false;
     const visitor = (messages: MuxMessage[]): boolean | void => {
       for (const message of messages) {
@@ -2343,9 +2363,35 @@ export class HistoryService {
       }
     };
 
-    const completed = await this.iterateBackward(this.getChatHistoryPath(workspaceId), visitor);
-    if (completed && !hasOlder) {
-      await this.iterateBackward(this.getChatArchivePath(workspaceId), visitor);
+    // Order does not change this existence check, only its cost. The archive's
+    // newest rows are usually already older than the replayed active epoch, so
+    // its last chunk answers; chat.jsonl rows are mostly >= the replay's oldest
+    // sequence and would be parsed in full before reaching the archive.
+    // An unreadable archive must not fail a check that chat.jsonl alone answers
+    // (reading chat.jsonl first never opened the archive then), so its error is
+    // rethrown only when chat.jsonl has no older row either.
+    let archiveError: Error | undefined;
+    const scanArchive = async () => {
+      archiveError = undefined;
+      try {
+        await this.iterateBackward(this.getChatArchivePath(workspaceId), visitor);
+      } catch (error) {
+        archiveError = error instanceof Error ? error : new Error(String(error));
+      }
+    };
+    await scanArchive();
+    if (!hasOlder) {
+      await this.iterateBackward(this.getChatHistoryPath(workspaceId), visitor);
+    }
+    // A rotation by another backend can move an older row out of chat.jsonl after
+    // the archive read above. Rotation appends the sealed prefix to the archive
+    // before it rewrites chat.jsonl, so reading the archive once more after
+    // chat.jsonl sees that row. Only a "no" answer pays for the second read.
+    if (!hasOlder) {
+      await scanArchive();
+    }
+    if (!hasOlder && archiveError !== undefined) {
+      throw archiveError;
     }
 
     return hasOlder;
@@ -2521,15 +2567,52 @@ export class HistoryService {
    * Prefer this over iterateFullHistory() for provider-request assembly and any path
    * that only needs the active compaction epoch.
    */
-  async getHistoryFromLatestBoundary(workspaceId: string, skip = 0): Promise<Result<MuxMessage[]>> {
+  async getHistoryFromLatestBoundary(
+    workspaceId: string,
+    skip = 0,
+    observer?: HistoryReadObserver
+  ): Promise<Result<MuxMessage[]>> {
     try {
-      return await this.withRecoveredHistoryLock(workspaceId, () =>
-        this.getHistoryFromLatestBoundaryUnlocked(workspaceId, skip)
+      return await this.withRecoveredHistoryLock(
+        workspaceId,
+        () => this.getHistoryFromLatestBoundaryUnlocked(workspaceId, skip, observer?.onBytesRead),
+        observer?.onLockAcquired
       );
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to read history from boundary: ${message}`);
     }
+  }
+
+  /**
+   * A suffix of getHistoryFromLatestBoundary(workspaceId) holding at least `minMatching` rows
+   * that satisfy `matches` (or the whole read when it has fewer), so trailing-window readers
+   * (sidebar status) do not parse the whole active epoch under the lock (#4720).
+   */
+  async getHistorySuffixFromLatestBoundary(
+    workspaceId: string,
+    minMatching: number,
+    matches: (message: MuxMessage) => boolean
+  ): Promise<Result<MuxMessage[]>> {
+    // No ensureSealedHistoryRotatedUnlocked: the bounded read needs rotation neither for
+    // correctness nor for boundedness, and a background tick must stay read-only instead of
+    // paying a one-time full-file scan under the cross-process write lock. Boundary writes,
+    // replay and provider requests still rotate.
+    return this.withRecoveredHistoryResultLock(
+      workspaceId,
+      "Failed to read history suffix from boundary",
+      async () =>
+        Ok(
+          await readProviderHistorySuffix(
+            {
+              chat: this.getChatHistoryPath(workspaceId),
+              archive: this.getChatArchivePath(workspaceId),
+            },
+            minMatching,
+            matches
+          )
+        )
+    );
   }
 
   /** Lifecycle decisions retain malformed IDs/parts without bypassing the raw privacy floor. */
@@ -2556,7 +2639,8 @@ export class HistoryService {
 
   private async getHistoryFromLatestBoundaryUnlocked(
     workspaceId: string,
-    skip: number
+    skip: number,
+    onBytesRead?: (bytes: number) => void
   ): Promise<Result<MuxMessage[]>> {
     // One-time lazy migration: seal any pre-boundary prefix left in chat.jsonl
     // by older builds so this read (and every later one) stays O(active epoch).
@@ -2564,14 +2648,16 @@ export class HistoryService {
 
     // Provider and control-evidence reads share raw privacy floors. UI browsing
     // and archival rotation keep the durable-boundary locator and the full log.
+    const paths = {
+      chat: this.getChatHistoryPath(workspaceId),
+      archive: this.getChatArchivePath(workspaceId),
+    };
+    // Skip 0 (every provider request and replay) reads the active epoch once (#4655); older
+    // epochs keep the two-pass reader, whose clamp-to-oldest fallback needs the full location.
     return Ok(
-      await readProviderHistoryFromLatestBoundary(
-        {
-          chat: this.getChatHistoryPath(workspaceId),
-          archive: this.getChatArchivePath(workspaceId),
-        },
-        skip
-      )
+      skip === 0
+        ? await readProviderHistory(paths, { onBytesRead })
+        : await readProviderHistoryFromLatestBoundary(paths, skip, { onBytesRead })
     );
   }
 
@@ -2784,7 +2870,7 @@ export class HistoryService {
       const partialPath = this.getPartialPath(workspaceId);
       const data = await fs.readFile(partialPath, "utf-8");
       const message: unknown = JSON.parse(data);
-      return isReadableHistoryMessage(message) ? normalizeLegacyMuxMetadata(message) : null;
+      return isReadableHistoryMessage(message) ? normalizePersistedMessage(message) : null;
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
         return null;
@@ -2940,9 +3026,7 @@ export class HistoryService {
         }
         // A failed public read is not absence evidence. Re-read under both locks, and only
         // heal malformed content; a now-valid successor or an I/O error must remain intact.
-        const current = isReadableHistoryMessage(parsed)
-          ? normalizeLegacyMuxMetadata(parsed)
-          : null;
+        const current = isReadableHistoryMessage(parsed) ? normalizePersistedMessage(parsed) : null;
         await assertStillOwned();
         if (!isDeepStrictEqual(current, expected) || !isCurrent()) return Ok(false);
         // Keep the final ownership check and removal indivisible to local cancellation.
@@ -2969,7 +3053,7 @@ export class HistoryService {
       try {
         const partialPath = this.getPartialPath(workspaceId);
         const data = await fs.readFile(partialPath, "utf-8");
-        const partialMessage = normalizeLegacyMuxMetadata(JSON.parse(data) as MuxMessage);
+        const partialMessage = normalizePersistedMessage(JSON.parse(data) as MuxMessage);
         if (partialMessage.id !== messageId) {
           return Ok(false);
         }
@@ -3267,7 +3351,7 @@ export class HistoryService {
     const content = line.at(-1) === 10 ? line.subarray(0, -1) : line;
     const text = content.toString("utf8");
     const parsed = this.parseMessages(text, filePath, (value) =>
-      isReadableHistoryMessage(value) ? normalizeLegacyMuxMetadata(value) : null
+      isReadableHistoryMessage(value) ? normalizePersistedMessage(value) : null
     )[0];
     const protectedReset =
       parsed !== undefined &&
@@ -3499,6 +3583,53 @@ export class HistoryService {
     );
   }
 
+  /**
+   * Derive one new row from FULL history and append it under the SAME write lock.
+   *
+   * Plan-review mutations validate against a projection of every prior record (thread exists,
+   * snapshot hash unseen) before appending; holding the lock across read + append keeps two
+   * windows or backends from both passing that validation against the same stale state. `derive`
+   * returns `message: null` to append nothing (an idempotent no-op) while still returning its
+   * value. Reads the archive too, so reserve it for rare user actions, not hot paths.
+   *
+   * `generation` is the context generation (see captureCompactionReplacement) read under the
+   * same lock, so `derive` can refuse work that was prepared before a destructive mutation.
+   * `derive` may await a short check that must hold at the append (it runs under the lock).
+   */
+  async appendDerivedFromFullHistory<T>(
+    workspaceId: string,
+    derive: (
+      messages: MuxMessage[],
+      lockState: { generation: string | undefined }
+    ) =>
+      | { message: MuxMessage | null; value: T }
+      | Promise<{ message: MuxMessage | null; value: T }>
+  ): Promise<Result<T>> {
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to append derived history",
+      async () => {
+        // Truncation recovery already ran inside withCrossProcessWriteLock, and the read-side
+        // recovery would re-acquire the (non-reentrant) file lock, so read unlocked here.
+        const messages: MuxMessage[] = [];
+        const scanned = await this.iterateFullHistoryUnlocked(workspaceId, "forward", (chunk) => {
+          messages.push(...chunk);
+        });
+        if (!scanned.success) return scanned;
+        const generation =
+          await this.getContinuousCompactionJournal(
+            workspaceId
+          ).captureGenerationUnderHistoryLock();
+        const derived = await derive(messages, { generation });
+        if (derived.message !== null) {
+          const appended = await this.appendToHistoryUnderWriteLock(workspaceId, derived.message);
+          if (!appended.success) return appended;
+        }
+        return Ok(derived.value);
+      }
+    );
+  }
+
   private async appendToHistoryUnderWriteLock(
     workspaceId: string,
     message: MuxMessage
@@ -3617,6 +3748,14 @@ export class HistoryService {
       onCommitted: (
         accepted: Extract<CompactionReplacementOutcome, { kind: "accepted" }>
       ) => undefined;
+      /**
+       * Append precondition on FULL history (archive included), evaluated under this write
+       * lock right before the append; `false` skips the append. The lock is cross-process, so
+       * no clear or truncation by this or a sibling backend can commit between the check and
+       * the write. Scans the archive: set it only for rare rows that depend on earlier rows
+       * (plan-review feedback).
+       */
+      admitsFullHistory?: (messages: MuxMessage[]) => boolean;
     }
   ): Promise<Result<CompactionReplacementOutcome>> {
     const expected = { ...capture };
@@ -3830,6 +3969,15 @@ export class HistoryService {
             return Ok(accepted);
           }
           trigger.metadata = { ...trigger.metadata, compactionReplacementNonce: replacementNonce };
+        }
+        // Last check before the write, so a `false` here is the only reason for this skip.
+        if (prepared.kind === "append" && observer.admitsFullHistory) {
+          const rows: MuxMessage[] = [];
+          const scanned = await this.iterateFullHistoryUnlocked(workspaceId, "forward", (chunk) => {
+            rows.push(...chunk);
+          });
+          if (!scanned.success) return scanned;
+          if (!observer.admitsFullHistory(rows)) return Ok({ kind: "skipped" });
         }
         let superseded = false;
         const rememberPublished = (): undefined => {
@@ -4154,6 +4302,31 @@ export class HistoryService {
           return Err(result.error);
         }
         await this.rotateAfterBoundaryWriteUnlocked(workspaceId, message);
+        return Ok("appended");
+      }
+    );
+  }
+
+  /**
+   * Guarded append: append `message` only while `admits()` returns true, evaluated under the same
+   * write lock (the in-process mutex plus the cross-process lockfile every backend on this Xum
+   * home takes) right before the write. Any backend's history mutation thus lands wholly before
+   * the check or wholly after this append (#4414). `admits` must be a synchronous, pure read of
+   * state outside history (e.g. a strict config read): it runs holding this workspace's history
+   * lock, so calling back into HistoryService deadlocks. A refusal is an expected outcome.
+   */
+  async appendToHistoryIf(
+    workspaceId: string,
+    message: MuxMessage,
+    admits: () => boolean
+  ): Promise<Result<"appended" | "refused">> {
+    return this.withRecoveredHistoryWriteResultLock<"appended" | "refused">(
+      workspaceId,
+      "Failed to append history",
+      async () => {
+        if (!admits()) return Ok("refused");
+        const appended = await this.appendToHistoryUnderWriteLock(workspaceId, message);
+        if (!appended.success) return Err(appended.error);
         return Ok("appended");
       }
     );
@@ -4721,6 +4894,20 @@ export class HistoryService {
         this.sequenceCounters.set(workspaceId, seq + 1);
         appended.set(copy, persistedCopy);
         messages.push(persistedCopy);
+      }
+
+      // The only place that sees the boundary's final bytes (#4551): history scanners skip rows
+      // over the line limit, so say so when a large pending follow-up keeps the row oversized.
+      const boundaryRowBytes = Buffer.byteLength(
+        JSON.stringify({ ...persistedSummary, workspaceId }),
+        "utf8"
+      );
+      if (boundaryRowBytes > SESSION_HISTORY_MAX_LINE_BYTES) {
+        log.warn("Compaction boundary row exceeds the history line limit", {
+          workspaceId,
+          messageId: persistedSummary.id,
+          rowBytes: boundaryRowBytes,
+        });
       }
 
       // Final admission or rename can fail: keep caller rows retryable until the boundary is

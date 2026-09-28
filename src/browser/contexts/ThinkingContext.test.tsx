@@ -1,5 +1,5 @@
 import { GlobalWindow } from "happy-dom";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import React from "react";
 import { ThinkingProvider } from "./ThinkingContext";
@@ -13,7 +13,6 @@ import {
 import { useThinkingLevel } from "@/browser/hooks/useThinkingLevel";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { ThinkingLevel } from "@/common/types/thinking";
-import type { RecursivePartial } from "@/browser/testUtils";
 import {
   getAutoThinkingLevelKey,
   getModelKey,
@@ -27,13 +26,19 @@ import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { enforceThinkingPolicy, getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 
-let currentClientMock: RecursivePartial<APIClient> = {};
+let currentClientMock: TestApiOverrides<APIClient> = {};
 let metadataMap = new Map<string, FrontendWorkspaceMetadata>();
 const METADATA_WAIT_OPTIONS = { timeout: 5000, interval: 50 };
 
 // Setup basic DOM environment for testing-library
 const dom = new GlobalWindow();
+const originalWindow = globalThis.window;
+const originalDocument = globalThis.document;
+const originalLocation = globalThis.location;
+const originalStorageEvent = globalThis.StorageEvent;
+const originalCustomEvent = globalThis.CustomEvent;
 /* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access */
 (global as any).window = dom.window;
 (global as any).document = dom.window.document;
@@ -45,6 +50,16 @@ const dom = new GlobalWindow();
 
 (global as any).console = console;
 /* eslint-enable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access */
+
+// Unit shards run many files in one Bun process: a leaked about:blank window makes
+// json-schema-ref-parser (PTC type generation) in later files parse paths as browser URLs.
+afterAll(() => {
+  globalThis.window = originalWindow;
+  globalThis.document = originalDocument;
+  globalThis.location = originalLocation;
+  globalThis.StorageEvent = originalStorageEvent;
+  globalThis.CustomEvent = originalCustomEvent;
+});
 
 interface TestProps {
   workspaceId: string;
@@ -99,7 +114,9 @@ const ReasoningModeComponent: React.FC = () => {
 };
 
 function renderWithAPI(children: React.ReactNode) {
-  return render(<APIProvider client={currentClientMock as APIClient}>{children}</APIProvider>);
+  return render(
+    <APIProvider client={createTestApiClient(currentClientMock)}>{children}</APIProvider>
+  );
 }
 
 function createWorkspaceMetadata(
@@ -207,7 +224,7 @@ function createWorkspaceClient(): APIClient {
   const projectOverrides = currentClientMock.projects ?? {};
   const serverOverrides = currentClientMock.server ?? {};
 
-  return {
+  return createTestApiClient({
     ...currentClientMock,
     workspace: {
       list: () => Promise.resolve(Array.from(metadataMap.values())),
@@ -239,7 +256,7 @@ function createWorkspaceClient(): APIClient {
       getLaunchProject: () => Promise.resolve(null),
       ...serverOverrides,
     },
-  } as unknown as APIClient;
+  });
 }
 
 function renderWithWorkspaceMetadata(props: {

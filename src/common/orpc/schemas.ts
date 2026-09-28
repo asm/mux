@@ -26,6 +26,15 @@ export {
 // Workspace stats schemas
 export { WorkspaceStatsSnapshotSchema } from "./schemas/workspaceStats";
 
+// Workspace review-state schemas
+export {
+  ReviewStateDeltaSchema,
+  ReviewStateEventSchema,
+  ReviewStateImportLegacyOutputSchema,
+  ReviewStateSectionsSchema,
+  ReviewStateSnapshotSchema,
+} from "./schemas/reviewState";
+
 // Chat stats schemas
 export { ChatStatsSchema, TokenConsumerSchema } from "./schemas/chatStats";
 
@@ -82,6 +91,7 @@ export {
   SendMessageErrorSchema,
   StreamErrorTypeSchema,
   NameGenerationErrorSchema,
+  PlanReviewErrorSchema,
 } from "./schemas/errors";
 
 // Secrets schemas
@@ -167,7 +177,6 @@ export {
   browser,
   devtools,
   uiLayouts,
-  debug,
   desktop,
   general,
   menu,
@@ -184,6 +193,7 @@ export {
   secrets,
   CustomProviderMutationErrorSchema,
   ProviderConfigInfoSchema,
+  ProviderModelDiscoveryResultSchema,
   ProviderModelEntrySchema,
   muxGateway,
   muxGatewayOauth,

@@ -56,25 +56,6 @@ export interface SkillDynamicExecResult {
 
 export type SkillDynamicExecute = (command: string) => Promise<SkillDynamicExecResult>;
 
-/**
- * Extract the commands of whole-line !`command` directives, in body order,
- * capped at MAX_SKILL_DYNAMIC_COMMANDS (matching what injectSkillDynamicContext
- * would execute). Pure — exported for tests and potential UI reuse (e.g.
- * previewing which commands a skill would run).
- */
-export function extractSkillDynamicCommands(body: string): string[] {
-  assert(typeof body === "string", "extractSkillDynamicCommands requires a string body");
-
-  const commands: string[] = [];
-  for (const line of body.split("\n")) {
-    const match = SKILL_DYNAMIC_DIRECTIVE_RE.exec(line);
-    if (!match) continue;
-    if (commands.length >= MAX_SKILL_DYNAMIC_COMMANDS) break;
-    commands.push(match[1]);
-  }
-  return commands;
-}
-
 /** Longest backtick run + 1 (min 3) so the fence can never collide with output content. */
 function computeFence(content: string): string {
   const longestRun = content.match(/`+/g)?.reduce((max, run) => Math.max(max, run.length), 0) ?? 0;
@@ -144,6 +125,14 @@ function renderFailureNote(command: string, reason: string): string {
  * `timeoutMs` is overridable for tests only (same DI-for-testability rationale as
  * `execute`); production callers use the default.
  */
+/**
+ * Whether any line of a skill body is a dynamic-context directive. The routed-turn
+ * pending-size estimate prices such a body at the snapshot cap: expansion can grow it.
+ */
+export function hasSkillDynamicDirective(body: string): boolean {
+  return body.split("\n").some((line) => SKILL_DYNAMIC_DIRECTIVE_RE.test(line));
+}
+
 export async function injectSkillDynamicContext(args: {
   body: string;
   execute: SkillDynamicExecute;

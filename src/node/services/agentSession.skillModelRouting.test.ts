@@ -32,6 +32,7 @@ import {
   ROUTED_SKILL_TRUST_REVOKED_MESSAGE,
 } from "@/node/services/utils/sendMessageError";
 
+import { createTestHistoryService } from "./testHistoryService";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import type { TurnStreamHandle } from "./streamManager";
 import type { StreamEndEvent } from "@/common/types/stream";
@@ -76,6 +77,8 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     return tmp;
   }
 
+  const realConfigLoaders = new WeakMap<Config, Config["loadConfigOrDefault"]>();
+
   async function createRoutingHarness(args: {
     workspacePath: string;
     /** Default true: routing fixtures exercise trusted-project behavior. */
@@ -93,6 +96,8 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     workspaceGoalService?: WorkspaceGoalService;
     /** Turn handle for each streamed request; defaults to a handle that never completes. */
     streamHandle?: (opts: StreamMessageOptions) => TurnStreamHandle;
+    /** Share one session root across sessions (a probe that locates the durable record, then the real one). */
+    testHistory?: Awaited<ReturnType<typeof createTestHistoryService>>;
   }) {
     const workspaceId = "ws-skill-routing";
     const workspaceMeta = {
@@ -113,24 +118,33 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       );
     });
 
-    const config = {
-      srcDir: "/tmp",
-      sessionsDir: "/tmp",
-      getSessionDir: mock((_workspaceId: string) => "/tmp"),
-      loadConfigOrDefault: mock(() => ({
-        ...args.configValues,
-        // Project-scope frontmatter routing requires Project Trust; these
-        // fixtures write skills into the workspace's own project.
-        projects: new Map(
-          args.projectTrusted === false ? [] : [[args.workspacePath, { trusted: true }]]
-        ),
-      })),
-    } as unknown as Config;
+    // The harness pairs a caller-owned history with the Config that owns its sessions dir;
+    // routing fixtures only need to override what loadConfigOrDefault reports.
+    const testHistory = args.testHistory ?? (await createTestHistoryService());
+    const config = testHistory.config;
+    // A shared root is spied once per config: binding an already-spied loader would recurse.
+    const loadReal = realConfigLoaders.get(config) ?? config.loadConfigOrDefault.bind(config);
+    realConfigLoaders.set(config, loadReal);
+    spyOn(config, "loadConfigOrDefault").mockImplementation(
+      () =>
+        ({
+          ...loadReal(),
+          ...args.configValues,
+          // Project-scope frontmatter routing requires Project Trust; these
+          // fixtures write skills into the workspace's own project.
+          projects: new Map(
+            args.projectTrusted === false
+              ? []
+              : [[args.workspacePath, { trusted: true, workspaces: [] }]]
+          ),
+        }) as unknown as ReturnType<Config["loadConfigOrDefault"]>
+    );
 
     const { session, cleanup, historyService, events, aiService } = await createAgentSessionHarness(
       {
         workspaceId,
         config,
+        historyService: testHistory.historyService,
         workspaceGoalService: args.workspaceGoalService,
         aiServiceOverrides: {
           getWorkspaceMetadata: mock((_id: string) => Promise.resolve(Ok(workspaceMeta))),
@@ -142,7 +156,10 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
         captureEvents: true,
       }
     );
-    historyCleanup = cleanup;
+    historyCleanup = async () => {
+      await cleanup();
+      await testHistory.cleanup();
+    };
     sessions.push(session);
     return { session, streamed, historyService, events, aiService };
   }
@@ -172,6 +189,17 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     );
   }
 
+  /** The auto-compaction loop guard the controller consults around every send (#4780, #4947). */
+  function loopGuardStubs() {
+    return {
+      noteUserTurn: mock(() => undefined),
+      noteLiveUsage: mock(() => undefined),
+      noteAutoCompactionRequested: mock(() => undefined),
+      noteAutoCompactionCompleted: mock(() => undefined),
+      suppressRepeatedAutoCompaction: mock(() => false),
+    };
+  }
+
   /** Report a fixed recorded usage (threshold 90%, no force) so the routed pending-payload estimate decides. */
   function stubCompactionMonitor(session: object, usagePercentage: number): void {
     (
@@ -185,6 +213,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       })),
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
+      ...loopGuardStubs(),
     };
   }
 
@@ -201,6 +230,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       })),
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
+      ...loopGuardStubs(),
     };
   }
 
@@ -818,7 +848,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     const withReader = session as unknown as {
       buildSkillReader: (...args: unknown[]) => (skillName: string) => Promise<ResolvedAgentSkill>;
       contextController: {
-        transitionalCompactionHandler: { peekPendingState: () => Promise<unknown> };
+        compaction: { peekPendingState: () => Promise<unknown> };
       };
     };
     const originalBuild = withReader.buildSkillReader.bind(session);
@@ -829,10 +859,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
         return { ...resolved, package: { ...resolved.package, scope: "global" as const } };
       };
     });
-    spyOn(
-      withReader.contextController.transitionalCompactionHandler,
-      "peekPendingState"
-    ).mockResolvedValue({
+    spyOn(withReader.contextController.compaction, "peekPendingState").mockResolvedValue({
       diffs: [],
       loadedSkills: extras?.loadedSkills ?? pendingLoadedSkills,
       readFiles: [],
@@ -2086,28 +2113,33 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     const { session, streamed } = await createRoutingHarness(harnessArgs);
     const internals = session as unknown as {
       aiService: { prepareStreamMessage: { mock: { calls: unknown[][] } } };
-      prepareContextBudgetSend: (...args: unknown[]) => Promise<unknown>;
-      checkFreshContextBudget: (...args: unknown[]) => Promise<unknown>;
+      contextController: { beforeSend: (input: { stage: string }) => Promise<unknown> };
     };
-    // Force the rollover branch: a budget prefix headed by a rollover boundary.
-    spyOn(internals, "prepareContextBudgetSend").mockResolvedValue(
-      Ok({
-        prefix: [
-          createMuxMessage("rollover-boundary", "assistant", "", {
-            timestamp: Date.now(),
-            contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
-            muxMetadata: {
-              type: "context-window-rollover",
-              rolloverId: "rollover-1",
-              reason: "on-send",
-              previousWindowId: "window-0",
-            } as unknown as MuxMessageMetadata,
-          }),
-        ],
-        requestAssemblySnapshot: {},
-      })
+    // Force the rollover branch: the request-stage preparation answers with a budget
+    // prefix headed by a rollover boundary (the token-budget strategy's own verdict);
+    // the later stages proceed untouched.
+    spyOn(internals.contextController, "beforeSend").mockImplementation((input) =>
+      Promise.resolve(
+        input.stage === "request"
+          ? {
+              kind: "proceed",
+              prefixRows: [
+                createMuxMessage("rollover-boundary", "assistant", "", {
+                  timestamp: Date.now(),
+                  contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
+                  muxMetadata: {
+                    type: "context-window-rollover",
+                    rolloverId: "rollover-1",
+                    reason: "on-send",
+                    previousWindowId: "window-0",
+                  } as unknown as MuxMessageMetadata,
+                }),
+              ],
+              assemblySnapshot: {},
+            }
+          : { kind: "proceed" }
+      )
     );
-    spyOn(internals, "checkFreshContextBudget").mockResolvedValue(Ok(undefined));
 
     const result = await session.sendMessage(
       "Use skill done",
@@ -2814,7 +2846,8 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     // a reply), stamps it, and rewrites the sidecar as a valid document — for
     // a malformed nested record and for a torn document alike.
     const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
-    const probe = await createRoutingHarness({ workspacePath });
+    const sharedRoot = await createTestHistoryService();
+    const probe = await createRoutingHarness({ workspacePath, testHistory: sharedRoot });
     const preferencePath = (
       probe.session as unknown as { getAutoRetryPreferencePath(): string }
     ).getAutoRetryPreferencePath();
@@ -2879,7 +2912,10 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       try {
         await fs.mkdir(path.dirname(preferencePath), { recursive: true });
         await fs.writeFile(preferencePath, corruptDocument);
-        const { session, streamed, historyService } = await createRoutingHarness({ workspacePath });
+        const { session, streamed, historyService } = await createRoutingHarness({
+          workspacePath,
+          testHistory: sharedRoot,
+        });
         await seedTurns(historyService);
         const result = await session.sendMessage("next prompt", {
           model: USER_MODEL,
@@ -3189,7 +3225,8 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     // boundary. The reset first reconstructs the record (unanswered turns are
     // stamped) and only then lands the boundary.
     const workspacePath = await createWorkspaceWithSkill({ skillName: "done" });
-    const probe = await createRoutingHarness({ workspacePath });
+    const sharedRoot = await createTestHistoryService();
+    const probe = await createRoutingHarness({ workspacePath, testHistory: sharedRoot });
     const preferencePath = (
       probe.session as unknown as { getAutoRetryPreferencePath(): string }
     ).getAutoRetryPreferencePath();
@@ -3200,7 +3237,10 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
         preferencePath,
         JSON.stringify({ pendingRejectedTurnRepair: { userMessageIds: 42 } }) + "\n"
       );
-      const { session, historyService } = await createRoutingHarness({ workspacePath });
+      const { session, historyService } = await createRoutingHarness({
+        workspacePath,
+        testHistory: sharedRoot,
+      });
       await appendRoutedTurnRows(historyService, "ws-skill-routing");
       const result = await session.appendHeartbeatContextResetBoundary({
         boundaryText: "Heartbeat context reset",

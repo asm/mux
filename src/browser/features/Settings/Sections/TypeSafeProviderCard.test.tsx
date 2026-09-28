@@ -1,8 +1,9 @@
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import type { ReactNode } from "react";
 
-import * as ActualAPIModule from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
 import * as ActualAutoModelRoutingModule from "@/browser/hooks/useAutoModelRouting";
 import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import {
@@ -16,7 +17,6 @@ import {
 import { installDom } from "../../../../../tests/ui/dom";
 
 // Capture before installing module mocks; mock.restore() does not undo them.
-const actualAPIModule = { ...ActualAPIModule };
 const actualAutoModelRoutingModule = { ...ActualAutoModelRoutingModule };
 const actualProvidersConfigModule = { ...ActualProvidersConfigModule };
 let mockEvaluationModel = DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL;
@@ -28,10 +28,6 @@ interface MockApi {
 
 let mockApi: MockApi;
 
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({ api: mockApi, status: "connected" as const }),
-  useOptionalAPI: () => ({ api: mockApi, status: "connected" as const }),
-}));
 void mock.module("@/browser/hooks/useProvidersConfig", () => ({
   useProvidersConfig: () => ({ config: null, loading: false }),
 }));
@@ -44,6 +40,8 @@ void mock.module("@/browser/hooks/useAutoModelRouting", () => ({
 }));
 
 import { TypeSafeProviderCard } from "./TypeSafeProviderCard";
+import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 
 function createMockApi(status: Partial<AutoModelRoutingEvaluationStatus> = {}): MockApi {
   return {
@@ -60,14 +58,24 @@ function createMockApi(status: Partial<AutoModelRoutingEvaluationStatus> = {}): 
     providers: {
       setProviderConfig: mock(() => Promise.resolve({ success: true as const, data: undefined })),
     },
-  };
+  } satisfies TestApiOverrides<APIClient>;
+}
+
+// Inject the per-test client through the real provider; mocking the API module leaks across files.
+function ApiWrapper(props: { children: ReactNode }) {
+  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
+}
+
+function renderCard() {
+  return render(<TypeSafeProviderCard expanded onToggle={() => undefined} />, {
+    wrapper: ApiWrapper,
+  });
 }
 
 describe("TypeSafeProviderCard", () => {
   let cleanupDom: (() => void) | null = null;
 
   afterAll(async () => {
-    await mock.module("@/browser/contexts/API", () => actualAPIModule);
     await mock.module("@/browser/hooks/useProvidersConfig", () => actualProvidersConfigModule);
     await mock.module("@/browser/hooks/useAutoModelRouting", () => actualAutoModelRoutingModule);
   });
@@ -90,9 +98,7 @@ describe("TypeSafeProviderCard", () => {
   }
 
   test("saving and clearing write the typesafe provider entry and drop the draft", async () => {
-    const { getByLabelText, getByRole } = render(
-      <TypeSafeProviderCard expanded onToggle={() => undefined} />
-    );
+    const { getByLabelText, getByRole } = renderCard();
 
     await userEvent.type(getByLabelText("API Key"), " sk-test ");
     fireEvent.click(getByRole("button", { name: "Save" }));
@@ -115,7 +121,7 @@ describe("TypeSafeProviderCard", () => {
 
   test("the status line shows the evaluator's reason when the key is missing", async () => {
     mockApi = createMockApi({ available: false, reason: "No TypeSafe API key configured" });
-    const { container } = render(<TypeSafeProviderCard expanded onToggle={() => undefined} />);
+    const { container } = renderCard();
     await waitFor(() => expect(statusText(container)).toBe("No TypeSafe API key configured"));
     expect(mockApi.config.getAutoModelRoutingEvaluationStatus.mock.calls[0]?.[0]).toEqual({
       evaluationModel: DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
@@ -125,7 +131,7 @@ describe("TypeSafeProviderCard", () => {
   test("the status probe follows a saved TypeSafe evaluator and falls back to the default otherwise", async () => {
     // A policy can allow the saved TypeSafe model while denying the default one.
     mockEvaluationModel = "typesafe:jev-2";
-    const first = render(<TypeSafeProviderCard expanded onToggle={() => undefined} />);
+    const first = renderCard();
     await waitFor(() =>
       expect(mockApi.config.getAutoModelRoutingEvaluationStatus).toHaveBeenCalledTimes(1)
     );
@@ -137,7 +143,7 @@ describe("TypeSafeProviderCard", () => {
     // Another provider's evaluator says nothing about the TypeSafe credential.
     mockApi = createMockApi();
     mockEvaluationModel = "anthropic:claude-haiku-4-5";
-    render(<TypeSafeProviderCard expanded onToggle={() => undefined} />);
+    renderCard();
     await waitFor(() =>
       expect(mockApi.config.getAutoModelRoutingEvaluationStatus).toHaveBeenCalledTimes(1)
     );
@@ -147,9 +153,7 @@ describe("TypeSafeProviderCard", () => {
   });
 
   test("collapsing the card discards an unsaved key", async () => {
-    const { getByLabelText, rerender } = render(
-      <TypeSafeProviderCard expanded onToggle={() => undefined} />
-    );
+    const { getByLabelText, rerender } = renderCard();
     await userEvent.type(getByLabelText("API Key"), "sk-unsaved");
     expect((getByLabelText("API Key") as HTMLInputElement).value).toBe("sk-unsaved");
 
@@ -167,9 +171,7 @@ describe("TypeSafeProviderCard", () => {
           settle = resolve;
         })
     );
-    const { getByLabelText, getByRole, rerender, queryByText } = render(
-      <TypeSafeProviderCard expanded onToggle={() => undefined} />
-    );
+    const { getByLabelText, getByRole, rerender, queryByText } = renderCard();
     await userEvent.type(getByLabelText("API Key"), "sk-replacement");
     fireEvent.click(getByRole("button", { name: "Save" }));
     await waitFor(() => expect(settle).not.toBeNull());
@@ -189,9 +191,7 @@ describe("TypeSafeProviderCard", () => {
     mockApi.providers.setProviderConfig.mockImplementation(() =>
       Promise.resolve({ success: false as const, error: "providers.jsonc is read-only" })
     );
-    const { getByLabelText, getByRole, findByText } = render(
-      <TypeSafeProviderCard expanded onToggle={() => undefined} />
-    );
+    const { getByLabelText, getByRole, findByText } = renderCard();
     await userEvent.type(getByLabelText("API Key"), "sk-test");
     fireEvent.click(getByRole("button", { name: "Save" }));
     expect(await findByText("providers.jsonc is read-only")).toBeTruthy();

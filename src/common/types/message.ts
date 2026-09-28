@@ -22,6 +22,8 @@ import type { ThinkingLevel } from "./thinking";
 import type { AutoModelRoutingRecord } from "./autoModelRouting";
 import { type ReviewNoteData, formatReviewForModel } from "./review";
 import { isMcpPromptCommandKey } from "@/common/utils/tools/mcpPromptCommandKey";
+import type { PlanReviewRecordKind } from "@/common/utils/planReview/planReviewRecord";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 
 export type { ModelMessage };
 
@@ -1066,6 +1068,20 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         fromTitle?: string;
         /** The sender's relationship to the recipient (mirrors the envelope enum). */
         relationship: AgentMessageRelationship;
+        /** Trigger rows only: history ID of the payload row (see AgentPeerMessageMeta). */
+        payloadMessageId?: string;
+      }
+    | {
+        // Native plan review record (src/common/utils/planReview). The <mux_plan_review>
+        // envelope stays in the message text; this metadata mirrors the record identity so
+        // filters and the UI never re-parse it. `feedback` rows are real user messages the
+        // model receives; every other kind is hidden UI state (see isPlanReviewRecordMessage).
+        type: "plan-review";
+        kind: PlanReviewRecordKind;
+        recordId: string;
+        snapshotId?: string;
+        threadId?: string;
+        feedbackId?: string;
       }
   );
 
@@ -1516,6 +1532,12 @@ export type DisplayedMessage =
       isGoalContinuation?: boolean;
       /** True for the one-shot wrap-up turn after a goal continuation exhausts its budget. */
       isBudgetLimitWrapup?: boolean;
+      /**
+       * True for an authentic plan-review feedback row. Generic editing is disabled for it: an edit
+       * resends only the envelope text, which is neutralized as an untrusted lookalike, so the
+       * threads this feedback opened would silently vanish from review state.
+       */
+      isPlanReviewFeedback?: true;
       /** True when this row is loaded above the latest Context Boundary and must not mutate active context. */
       isBeforeLatestContextBoundary?: boolean;
       /** Present when this message invoked an agent skill or MCP prompt via slash command. */
@@ -1557,6 +1579,11 @@ export type DisplayedMessage =
        * payload itself is a separate assistant row). Excluded from human-prompt navigation.
        */
       agentPeerMessageTrigger?: true;
+      /**
+       * Trigger rows that name their payload row: lets the transcript fold this notification
+       * into the payload's agent-message card once that card is actually rendered.
+       */
+      agentPeerTriggerPayload?: { payloadMessageId: string; fromWorkspaceId: string };
       /** Synthetic flush warning; displayed as a machine row, not a human prompt. */
       contextBudgetWarning?: {
         contextTokens: number;
@@ -1744,11 +1771,17 @@ export interface QueuedMessage {
 /** Keep every snapshot kind here so history scans and edits retain it with its user message. */
 export function isSyntheticSnapshotUserMessage(message: MuxMessage): boolean {
   return (
-    message.role === "user" &&
-    message.metadata?.synthetic === true &&
-    (message.metadata.fileAtMentionSnapshot !== undefined ||
-      message.metadata.agentSkillSnapshot !== undefined ||
-      message.metadata.mcpPromptSnapshot !== undefined)
+    (message.role === "user" &&
+      message.metadata?.synthetic === true &&
+      (message.metadata.fileAtMentionSnapshot !== undefined ||
+        message.metadata.agentSkillSnapshot !== undefined ||
+        message.metadata.mcpPromptSnapshot !== undefined)) ||
+    // Plan-review record rows are hidden UI state, not human turns: rolling cut,
+    // keep-recent-tail, retry eligibility and goal reconciliation must all skip them through
+    // this one predicate instead of mistaking them for a user prompt. Edit truncation skips
+    // them too but never cuts them (see getEditTruncateTargetFromMessages): unlike request
+    // preludes they are independent durable mutations.
+    isPlanReviewRecordMessage(message)
   );
 }
 

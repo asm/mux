@@ -6,6 +6,7 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
+import * as RealExperimentsHookModule from "@/browser/hooks/useExperiments";
 import * as APIModule from "@/browser/contexts/API";
 import * as AgentContextModule from "@/browser/contexts/AgentContext";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
@@ -46,7 +47,13 @@ import {
 // The consent dialog integration test renders the REAL modal inside the menu bar. Radix
 // Dialog portals do not render in happy-dom, so the shell is inlined (same double as the
 // modal's own test) and restored after this suite so it cannot leak into later files.
-restoreModulesAfterSuite([["@/browser/components/Dialog/Dialog", { ...RealDialogModule }]]);
+// useExperiments re-exports useExperimentValue from ExperimentsContext, so the timeline-gate
+// stub below also patches that live binding; restore it so later ExperimentsContext consumers
+// (e.g. GeneralSection) do not keep reading the stub.
+restoreModulesAfterSuite([
+  ["@/browser/components/Dialog/Dialog", { ...RealDialogModule }],
+  ["@/browser/hooks/useExperiments", { ...RealExperimentsHookModule }],
+]);
 void mock.module("@/browser/components/Dialog/Dialog", () => ({
   Dialog: (props: { open: boolean; children: ReactNode }) =>
     props.open ? <div>{props.children}</div> : null,
@@ -343,7 +350,11 @@ function getLastTimelineDialogProps() {
 function getLastUnrelatedMessagingModalProps() {
   const spy =
     WorkspaceUnrelatedMessagingModalModule.WorkspaceUnrelatedMessagingModal as unknown as {
-      mock: { calls: Array<[{ open: boolean; onOpenChange: (open: boolean) => void }]> };
+      mock: {
+        calls: Array<
+          [{ open: boolean; consentSupported: boolean; onOpenChange: (open: boolean) => void }]
+        >;
+      };
     };
   return spy.mock.calls.at(-1)?.[0];
 }
@@ -390,6 +401,8 @@ const defaultProps: ComponentProps<typeof WorkspaceMenuBarComponent> = {
   leftSidebarCollapsed: false,
   onToggleLeftSidebarCollapsed: () => undefined,
 };
+
+const CONSENT_SWITCH_NAME = /allow messages from unrelated workspaces/i;
 
 describe("WorkspaceMenuBar archive confirmations", () => {
   beforeEach(() => {
@@ -703,21 +716,25 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       getLastMenuContentProps()?.onConfigureUnrelatedMessaging?.();
     });
     // Workspace A: start a request and leave it in flight (switch locked, "Saving" shown).
-    fireEvent.click(view.getByRole("switch"));
+    fireEvent.click(view.getByRole("switch", { name: CONSENT_SWITCH_NAME }));
     expect(requests).toHaveLength(1);
     expect(requests[0].input).toEqual({ workspaceId, enabled: true });
     await waitFor(() => {
-      expect((view.getByRole("switch") as HTMLButtonElement).disabled).toBe(true);
+      expect(
+        (view.getByRole("switch", { name: CONSENT_SWITCH_NAME }) as HTMLButtonElement).disabled
+      ).toBe(true);
     });
     expect(view.queryByRole("status")).not.toBeNull();
 
     // Workspace B: the dialog opened here must be B's own, not A's still-saving instance.
     view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
-    expect(view.queryByRole("switch")).toBeNull();
+    expect(view.queryByRole("switch", { name: CONSENT_SWITCH_NAME })).toBeNull();
     act(() => {
       getLastMenuContentProps()?.onConfigureUnrelatedMessaging?.();
     });
-    expect((view.getByRole("switch") as HTMLButtonElement).disabled).toBe(false);
+    expect(
+      (view.getByRole("switch", { name: CONSENT_SWITCH_NAME }) as HTMLButtonElement).disabled
+    ).toBe(false);
     expect(view.queryByRole("status")).toBeNull();
 
     // A's request settling (here: refused) belongs to A's dialog and must not surface in B.
@@ -726,17 +743,21 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       await Promise.resolve();
     });
     expect(view.queryByRole("alert")).toBeNull();
-    expect((view.getByRole("switch") as HTMLButtonElement).disabled).toBe(false);
+    expect(
+      (view.getByRole("switch", { name: CONSENT_SWITCH_NAME }) as HTMLButtonElement).disabled
+    ).toBe(false);
 
     // B is fully usable and its request targets B.
-    fireEvent.click(view.getByRole("switch"));
+    fireEvent.click(view.getByRole("switch", { name: CONSENT_SWITCH_NAME }));
     expect(requests).toHaveLength(2);
     expect(requests[1].input).toEqual({ workspaceId: "workspace-2", enabled: true });
     await act(async () => {
       requests[1].settle(Ok(undefined));
       await Promise.resolve();
     });
-    expect((view.getByRole("switch") as HTMLButtonElement).disabled).toBe(false);
+    expect(
+      (view.getByRole("switch", { name: CONSENT_SWITCH_NAME }) as HTMLButtonElement).disabled
+    ).toBe(false);
     expect(view.queryByRole("alert")).toBeNull();
   });
 
@@ -763,8 +784,9 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   // Unrelated delivery requires local or worktree runtimes on BOTH endpoints (TaskService
-  // refuses otherwise), so remote/container workspaces get neither consent entry point: a
-  // grant there could never be honoured. An unset config means the canonical default.
+  // refuses otherwise), so remote/container workspaces get no consent switch: a grant there
+  // could never be honoured. The dialog still opens there for the same-tree hold preference.
+  // An unset config means the canonical default.
   it.each<{ runtime: string; runtimeConfig: RuntimeConfig | undefined }>([
     { runtime: "worktree", runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" } },
     { runtime: "project-dir local", runtimeConfig: { type: "local" } },
@@ -778,6 +800,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
     });
     expect(getLastUnrelatedMessagingModalProps()?.open).toBe(true);
+    expect(getLastUnrelatedMessagingModalProps()?.consentSupported).toBe(true);
   });
 
   it.each<{ runtime: string; runtimeConfig: RuntimeConfig }>([
@@ -791,19 +814,16 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       runtime: "devcontainer",
       runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
     },
-  ])(
-    "hides the consent action and ignores its shortcut for $runtime workspaces",
-    ({ runtimeConfig }) => {
-      render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
+  ])("opens the dialog without the consent switch for $runtime workspaces", ({ runtimeConfig }) => {
+    render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
 
-      expect(getLastMenuContentProps()?.onConfigureUnrelatedMessaging).toBeNull();
-      act(() => {
-        fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
-      });
-      // Not rendered at all, or rendered closed: either way nothing can open here.
-      expect(getLastUnrelatedMessagingModalProps()?.open ?? false).toBe(false);
-    }
-  );
+    expect(typeof getLastMenuContentProps()?.onConfigureUnrelatedMessaging).toBe("function");
+    act(() => {
+      fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
+    });
+    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(true);
+    expect(getLastUnrelatedMessagingModalProps()?.consentSupported).toBe(false);
+  });
 
   it("keeps the Timeline action hidden when immersive review hides the sidebar", () => {
     mockTimelineExperimentEnabled = true;
@@ -863,50 +883,32 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(view.getByText("Archive workspace with untracked files?")).toBeTruthy();
   });
 
-  it("reopens the archive confirmation modal when archive finds new untracked files", async () => {
-    let archiveAttempt = 0;
-    archiveWorkspaceMock = mock(
-      (
-        id: string,
-        options?: { acknowledgedUntrackedPaths?: string[] }
-      ): Promise<ArchiveWorkspaceActionResult> => {
-        archiveAttempt += 1;
-        if (archiveAttempt === 1) {
-          return resolveArchiveResult({
-            kind: "confirm-lossy-untracked-files",
-            paths: ["late-file.txt"],
-          });
-        }
-
-        expect(id).toBe(workspaceId);
-        expect(options).toEqual({ acknowledgedUntrackedPaths: ["late-file.txt"] });
-        return resolveArchiveResult({ kind: "archived" });
-      }
+  it("does not show another workspace's archive confirmation after navigating away", async () => {
+    let resolvePreflight: ((result: ArchivePreflightActionResult) => void) | undefined;
+    preflightArchiveWorkspaceMock = mock(
+      (_workspaceId: string) =>
+        new Promise<ArchivePreflightActionResult>((resolve) => {
+          resolvePreflight = resolve;
+        })
     );
 
     const view = render(<WorkspaceMenuBar {...defaultProps} />);
-
     act(() => {
       fireEvent.click(view.getByRole("button", { name: "Archive chat" }));
     });
+    await waitFor(() => expect(resolvePreflight).toBeDefined());
 
-    await waitFor(() => {
-      expect(view.getByTestId("archive-confirmation-modal")).toBeTruthy();
+    // The menu bar is reused when the user switches workspaces mid-preflight.
+    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+    await act(async () => {
+      resolvePreflight?.({
+        success: true,
+        data: { kind: "confirm-lossy-untracked-files", paths: ["a.txt"] },
+      });
+      await Promise.resolve();
     });
-    expect(archiveShowErrorMock).not.toHaveBeenCalled();
-    expect(archiveWorkspaceMock).toHaveBeenCalledTimes(1);
-    expect(archiveWorkspaceMock).toHaveBeenNthCalledWith(1, workspaceId, undefined);
 
-    act(() => {
-      fireEvent.click(view.getByRole("button", { name: "Archive and delete files" }));
-    });
-
-    await waitFor(() => {
-      expect(archiveWorkspaceMock).toHaveBeenCalledTimes(2);
-    });
-    expect(archiveWorkspaceMock).toHaveBeenNthCalledWith(2, workspaceId, {
-      acknowledgedUntrackedPaths: ["late-file.txt"],
-    });
-    expect(archiveShowErrorMock).not.toHaveBeenCalled();
+    expect(view.queryByTestId("archive-confirmation-modal")).toBeNull();
+    expect(archiveWorkspaceMock).not.toHaveBeenCalled();
   });
 });

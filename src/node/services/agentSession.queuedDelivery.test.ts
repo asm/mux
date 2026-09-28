@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
-import * as path from "node:path";
 
 import type { Config } from "@/node/config";
 
@@ -60,12 +59,8 @@ describe("AgentSession queued delivery", () => {
       setMessageQueued: mock(() => undefined),
       cleanup: mock(() => Promise.resolve()),
     } as unknown as BackgroundProcessManager;
-    const config: Config = {
-      rootDir: created.config.rootDir,
-      sessionsDir: created.config.sessionsDir,
-      srcDir: path.join(created.config.rootDir, "src"),
-      loadConfigOrDefault: mock(() => ({})),
-    } as unknown as Config;
+    // The real test Config: context management subscribes to its change stream.
+    const config: Config = created.config;
     session = new AgentSession({
       workspaceId: WORKSPACE_ID,
       config,

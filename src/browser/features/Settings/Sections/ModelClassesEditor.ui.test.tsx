@@ -2,7 +2,12 @@ import { cleanup, render, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { installDom } from "../../../../../tests/ui/dom";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
-import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, createTestConfig } from "@/browser/testUtils";
+import * as RealAPIModule from "@/browser/contexts/API";
+import * as RealProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import * as RealModelsFromSettingsModule from "@/browser/hooks/useModelsFromSettings";
+import * as RealPolicyContextModule from "@/browser/contexts/PolicyContext";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 
 let apiMock: {
   config: {
@@ -15,6 +20,15 @@ let apiMock: {
 /** Providers map for the availability warning; null = still loading (warning suppressed). */
 let providersConfigMock: Record<string, { isConfigured: boolean; isEnabled?: boolean }> | null =
   null;
+
+// bun module mocks are process-global: re-register the real exports once this
+// suite is done so later files in the same runner see the real modules.
+restoreModulesAfterSuite([
+  ["@/browser/contexts/API", { ...RealAPIModule }],
+  ["@/browser/hooks/useProvidersConfig", { ...RealProvidersConfigModule }],
+  ["@/browser/hooks/useModelsFromSettings", { ...RealModelsFromSettingsModule }],
+  ["@/browser/contexts/PolicyContext", { ...RealPolicyContextModule }],
+]);
 
 void mock.module("@/browser/contexts/API", () => ({
   useOptionalAPI: () => (apiMock ? { api: apiMock } : null),
@@ -49,9 +63,9 @@ import { ModelClassesEditor } from "./ModelClassesEditor";
 function createApiMock(modelClasses: Record<string, string>) {
   return {
     config: {
-      getConfig: mock(() => Promise.resolve({ modelClasses })),
+      getConfig: mock(() => Promise.resolve(createTestConfig({ modelClasses }))),
       updateModelClass: mock(() => Promise.resolve(undefined)),
-      onConfigChanged: mock((_input: undefined, opts: { signal?: AbortSignal }) =>
+      onConfigChanged: mock((_input?: void, opts?: { signal?: AbortSignal }) =>
         Promise.resolve(
           (async function* (): AsyncGenerator<void> {
             // Stay OPEN like the real stream: an iterator that ends reads as a
@@ -59,11 +73,11 @@ function createApiMock(modelClasses: Record<string, string>) {
             // which would refuse the writes these tests exercise. Resolve only
             // on abort (cleanup).
             await new Promise<void>((resolve) => {
-              if (opts.signal?.aborted) {
+              if (opts?.signal?.aborted) {
                 resolve();
                 return;
               }
-              opts.signal?.addEventListener("abort", () => resolve(), { once: true });
+              opts?.signal?.addEventListener("abort", () => resolve(), { once: true });
             });
             yield* [] as void[];
           })()
@@ -210,7 +224,7 @@ describe("ModelClassesEditor", () => {
             })
         ),
         updateModelClass: mock(() => Promise.resolve(undefined)),
-        onConfigChanged: mock((_input: undefined, _opts: { signal?: AbortSignal }) =>
+        onConfigChanged: mock((_input?: void, _opts?: { signal?: AbortSignal }) =>
           Promise.resolve(
             (async function* (): AsyncGenerator<void> {
               // Ends immediately: a dead subscription, not cleanup.
@@ -255,10 +269,11 @@ describe("ModelClassesEditor", () => {
   });
 
   test("warns when no configured route can serve a class model", async () => {
-    apiMock = createApiMock({ small: "anthropic:claude-haiku-4-5+0" });
+    const api = createApiMock({ small: "anthropic:claude-haiku-4-5+0" });
+    apiMock = api;
     // The warning gates on useRouting's `loaded`, which reads the shared
     // AppConfigStore singleton — prime it like useRouting.test does.
-    getAppConfigStore().setClient(apiMock as unknown as APIClient);
+    getAppConfigStore().setClient(createTestApiClient(api));
     providersConfigMock = { anthropic: { isConfigured: false } };
     const { findByText } = render(<ModelClassesEditor />);
 
@@ -298,7 +313,7 @@ describe("ModelClassesEditor", () => {
           });
         }),
         updateModelClass: mock(() => Promise.resolve(undefined)),
-        onConfigChanged: mock((_input: undefined, opts: { signal?: AbortSignal }) =>
+        onConfigChanged: mock((_input?: void, opts?: { signal?: AbortSignal }) =>
           Promise.resolve(
             (async function* (): AsyncGenerator<void> {
               // One peer notification, released by the test; then stay open
@@ -308,11 +323,11 @@ describe("ModelClassesEditor", () => {
               });
               yield;
               await new Promise<void>((resolve) => {
-                if (opts.signal?.aborted) {
+                if (opts?.signal?.aborted) {
                   resolve();
                   return;
                 }
-                opts.signal?.addEventListener("abort", () => resolve(), { once: true });
+                opts?.signal?.addEventListener("abort", () => resolve(), { once: true });
               });
             })()
           )

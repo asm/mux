@@ -17,6 +17,7 @@ import {
 } from "./message";
 import type { MuxMessageMetadata } from "../../types/message";
 import { MuxProviderOptionsSchema } from "./providerOptions";
+import { ReviewNoteDataSchema } from "./reviewState";
 import { RuntimeModeSchema } from "./runtime";
 import { WorkflowRunIdSchema, WorkflowRunRecordSchema } from "./workflow";
 
@@ -211,6 +212,10 @@ export const StreamStartEventSchema = z.object({
     .string()
     .optional()
     .meta({ description: "ACP prompt correlation id for matching stream events" }),
+  // Same turn metadata that stream-end and the persisted row carry. Sent at start so the
+  // renderer can classify the turn (e.g. hide a token-budget maintenance flush) before the
+  // first delta paints, instead of only once the turn has settled.
+  muxMetadata: z.custom<MuxMessageMetadata>().optional(),
 });
 
 export const StreamDeltaEventSchema = z.object({
@@ -665,17 +670,6 @@ export const ChatMuxMessageSchema = MuxMessageSchema.extend({
   type: z.literal("message"),
 });
 
-// Review data schema for queued message display
-export const ReviewNoteDataSchema = z.object({
-  filePath: z.string(),
-  lineRange: z.string(),
-  selectedCode: z.string(),
-  selectedDiff: z.string().optional(),
-  oldStart: z.number().optional(),
-  newStart: z.number().optional(),
-  userNote: z.string(),
-});
-
 export const GoalBudgetLimitedEventSchema = z.object({
   type: z.literal("goal-budget-limited"),
   workspaceId: z.string(),
@@ -705,6 +699,43 @@ export const RestoreToInputEventSchema = z.object({
   text: z.string(),
   fileParts: z.array(FilePartSchema).optional(),
   reviews: z.array(ReviewNoteDataSchema).optional(),
+  /**
+   * Held inputs (see HeldInputsChangedEventSchema) that keep this restored input until a composer
+   * takes it (#4448). A composer that applies the restore acknowledges them with
+   * workspace.discardHeldInput; one that cannot (edit mode, not mounted, not subscribed) leaves
+   * them held, so the input is never lost with this one-shot event.
+   */
+  heldInputIds: z.array(z.string()).optional(),
+});
+
+/**
+ * The session's held inputs (see AgentSession.heldInputs): manual queued messages refused at
+ * dispatch because the task reported before they ran, or returned by a restore that no composer
+ * has taken yet (`interrupted`). Full list, oldest first; sent on every
+ * change and replayed on subscription while non-empty. The session keeps each full send and
+ * re-sends or discards it only on explicit request (workspace.sendHeldInput/discardHeldInput),
+ * so this carries display data only.
+ */
+export const HeldInputsChangedEventSchema = z.object({
+  type: z.literal("held-inputs-changed"),
+  workspaceId: z.string(),
+  heldInputs: z.array(
+    z.object({
+      id: z.string(),
+      /**
+       * Why it was refused. `reported`: the turn before it was the task's terminal report.
+       * `indeterminate`: it could not run and no report was confirmed (the report's outcome could
+       * not be established, or the attempt was otherwise closed/superseded). `interrupted`: Stop,
+       * an edit or a failed queued send returned it from the queue and no composer took it (edit
+       * mode, not mounted, not subscribed).
+       */
+      reason: z.enum(["reported", "indeterminate", "interrupted"]),
+      /** The user's authored text (or slash command); empty for attachment/review-only input. */
+      displayText: z.string(),
+      attachmentCount: z.number().int().nonnegative(),
+      reviewCount: z.number().int().nonnegative(),
+    })
+  ),
 });
 
 // All streaming events now have a `type` field for O(1) discriminated union lookup.
@@ -750,6 +781,7 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   SessionUsageDeltaEventSchema,
   QueuedMessageChangedEventSchema,
   RestoreToInputEventSchema,
+  HeldInputsChangedEventSchema,
   // Auto-compaction status events
   AutoCompactionTriggeredEventSchema,
   AutoCompactionCompletedEventSchema,
@@ -777,11 +809,19 @@ export const RestartBlockerSchema = z.object({
     "requests",
     "desktop-sessions",
     "queued-messages",
+    // Refused queued messages the session keeps for the user (AgentSession.heldInputs); memory only.
+    "held-inputs",
     "auto-retries",
     "terminals",
     "background-processes",
   ]),
   count: z.number().int().positive(),
+  /**
+   * Display names of the workspaces behind the blocker, so the user knows which one to open.
+   * Set for held-inputs only (#4770): unsent messages of an archived workspace are otherwise
+   * visible only in that workspace.
+   */
+  workspaceNames: z.array(z.string()).optional(),
 });
 
 export const UpdateStatusSchema = z.discriminatedUnion("type", [
@@ -960,6 +1000,18 @@ export const SendMessageOptionsSchema = z.object({
    * inheriting a level indexed on the wrong model.
    */
   oneShotThinkingIndex: z.number().int().min(0).optional(),
+  /**
+   * Fields the user deliberately picked (model/thinking/reasoning pickers) before this
+   * manual send. Pins those sent values on agent-task workspaces so they survive
+   * reawakenings. Renderer-origin only; stripped before queueing and dispatch.
+   */
+  aiSelectionIntent: z
+    .object({
+      model: z.literal(true).optional(),
+      thinkingLevel: z.literal(true).optional(),
+      reasoningMode: z.literal(true).optional(),
+    })
+    .optional(),
   experiments: ExperimentsSchema.optional(),
   /**
    * Composer model set to "Auto" (auto-model-routing experiment): classify the prompt's
@@ -1031,4 +1083,12 @@ export const SendMessageOptionsSchema = z.object({
   allowAgentSetGoal: z.boolean().optional(),
   goalInterventionPolicy: GoalInterventionPolicySchema.nullish(),
   queueDispatchMode: z.enum(["tool-end", "turn-end"]).nullish(),
+  /**
+   * The user's authored text when the message text is not it: the composer formats attached
+   * review notes into the provider-facing message (prepareUserMessageForSend) and also carries
+   * them as structured reviews. Queue restores and held-input previews show this text next to
+   * the reviews, so a retry does not send every review twice. Transient: the queue keeps it per
+   * add and never forwards it to the turn.
+   */
+  authoredText: z.string().optional(),
 });

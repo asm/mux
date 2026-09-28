@@ -16,7 +16,11 @@ import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import { createWorkspace, groupWorkspacesByProject } from "../mocks/workspaces";
 import { createStaticChatHandler, createStreamingChatHandler } from "../mocks/chatHandlers";
 import type { GitStatusFixture } from "../mocks/git";
-import { createMockORPCClient, type MockSessionUsage } from "@/browser/stories/mocks/orpc";
+import {
+  createMockORPCClient,
+  type MockORPCClientOptions,
+  type MockSessionUsage,
+} from "@/browser/stories/mocks/orpc";
 import { collapseRightSidebar, selectWorkspace } from "./uiState";
 import { createGitStatusExecutor, type GitDiffFixture } from "./git";
 
@@ -100,6 +104,10 @@ export interface SimpleChatSetupOptions {
   chatTranscriptFullWidth?: boolean;
   /** Timeline events served by the mock workspace.timeline endpoints. */
   timelineEvents?: TimelineEvent[];
+  /** Admin policy served by policy.get (defaults to no policy). */
+  policyResponse?: MockORPCClientOptions["policyResponse"];
+  /** Render the chat workspace as transcript-only (worktree gone; no composer). */
+  transcriptOnly?: boolean;
 }
 
 /**
@@ -116,6 +124,7 @@ export function setupSimpleChatStory(opts: SimpleChatSetupOptions): APIClient {
       name: opts.workspaceName ?? "feature",
       projectName,
       projectPath,
+      transcriptOnly: opts.transcriptOnly,
     }),
     ...(opts.additionalWorkspaces ?? []),
   ];
@@ -193,6 +202,7 @@ export function setupSimpleChatStory(opts: SimpleChatSetupOptions): APIClient {
     chatTranscriptFullWidth: opts.chatTranscriptFullWidth,
     timelineEvents: opts.timelineEvents,
     mcpIcons: opts.mcpIcons,
+    policyResponse: opts.policyResponse,
   });
 }
 

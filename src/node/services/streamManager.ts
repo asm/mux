@@ -3,6 +3,7 @@ import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget"
 import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./contextBudgetError";
 import {
   checkAssembledRequestBudgetForModel,
+  estimateAssembledRequestTokensForModel,
   estimateToolResultTokensForModel,
 } from "./contextBudgetCounting";
 import {
@@ -27,6 +28,7 @@ import {
   LoadAPIKeyError,
   APICallError,
   RetryError,
+  StreamProviderError,
 } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { ProviderOptions } from "@ai-sdk/provider-utils";
@@ -59,6 +61,7 @@ import {
   findFirstReasoningPartIndexInTrailingRun,
   mergeReasoningProviderOptions,
   reasoningProviderOptionsFromMetadata,
+  stripOpenAIReasoningReplay,
   type ReasoningProviderMetadata,
 } from "@/node/utils/messages/reasoningProviderOptions";
 import {
@@ -114,6 +117,7 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import type { SessionUsageService } from "./sessionUsageService";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
+import { neutralizeAgentEnvelopeLookalikesInModelToolParts } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
 import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
@@ -278,6 +282,11 @@ export interface SettledStepBudget {
   toolResultChars: number;
   imageParts: number;
   toolResultTokens?: number;
+  /**
+   * Assembled estimate of the next step's provider request, computed exactly as that step's
+   * preflight will compute it. Absent when no context budget applies.
+   */
+  nextRequestTokens?: number;
   sessionHistoryAvailable: boolean;
   memoryWritable: boolean;
   /** A successful `new_context` result settled in this step (its siblings included). */
@@ -419,6 +428,23 @@ function publishLiveRouting(streamInfo: WorkspaceStreamInfo): void {
     thinkingLevel: coerceThinkingLevel(streamInfo.thinkingLevel),
     autoModelRouting,
   });
+}
+
+/**
+ * Same-turn message transforms applied before every provider step: strip workflow run records
+ * from same-turn tool results (history-level redaction in applyToolOutputRedaction can't see
+ * these), neutralize protocol-envelope lookalikes in same-turn tool inputs/results
+ * (messagePipeline's neutralizer only sees persisted history), then extract supported
+ * attachments out of tool-result JSON so providers don't treat them as text. Idempotent on an
+ * already-transformed prefix. The settled-step budget floor reuses it so it measures exactly the
+ * request the next step's preflight will check.
+ */
+function transformStepMessages(messages: ModelMessage[]): Promise<ModelMessage[]> {
+  return extractToolMediaAsUserMessagesFromModelMessages(
+    neutralizeAgentEnvelopeLookalikesInModelToolParts(
+      stripWorkflowRunRecordsFromModelMessages(messages)
+    )
+  );
 }
 
 interface StepMessageTracker {
@@ -622,6 +648,24 @@ function isStreamTruncatedMessage(message: string): boolean {
     lowerMessage.includes("stream closed before message_stop") ||
     lowerMessage.includes("stream closed before terminal event") ||
     lowerMessage.includes("stream closed unexpectedly before the response completed")
+  );
+}
+
+// OpenAI Responses rejecting replayed reasoning. Exact item type on purpose:
+// `rs_` is a reasoning item; message/tool items use other prefixes.
+const OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN = /Item with id 'rs_[A-Za-z0-9_-]+' not found/;
+// "The encrypted content [for item rs_…] <blob> could not be verified. Reason: …"
+const OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN =
+  /encrypted content\b[\s\S]*?\bcould not be verified/;
+
+// Use the resolved SDK model, not the requested prefix: OpenAI Responses can
+// arrive through direct, custom, Coder, or Vercel gateway routes. xAI Responses
+// and OpenRouter chat-completions models must not enter this recovery path.
+function isOpenAIResponsesModel(model: LanguageModel): boolean {
+  if (typeof model === "string") return false;
+  return (
+    model.provider === "openai.responses" ||
+    (model.provider === "gateway" && model.modelId.startsWith("openai/"))
   );
 }
 
@@ -832,6 +876,8 @@ interface WorkspaceStreamInfo {
   // stream-end prefers cumulative usage across attempts instead of the final
   // attempt's totalUsage only.
   didRetryAfterEmptyOutput?: boolean;
+  // Same for a step-boundary retry without OpenAI reasoning replay.
+  didRetryReasoningReplayAtStep?: boolean;
   // Refusal-fallback chain state. `original` keeps the pre-wrap request inputs
   // (as passed by TurnRequestBuilder) that prepare() does not rebuild, so the request can
   // be rebuilt for a different model. System, tools, and messages are rebuilt
@@ -921,6 +967,9 @@ interface WorkspaceStreamInfo {
   terminalCompletion?: TurnCompletion;
 }
 
+/** Type-only export: test fixtures type hand-built stream state against it. */
+export type { WorkspaceStreamInfo };
+
 // Ensure per-stream part timestamps are strictly monotonic.
 //
 // Date.now() is millisecond-granularity, so two distinct chunks with identical text emitted in the
@@ -964,10 +1013,40 @@ export interface StopStreamOptions {
   expectedMessageId?: string;
 }
 
+/** Snapshot of an active stream, as returned by StreamManager.getStreamInfo. */
+export interface ActiveStreamInfo {
+  messageId: string;
+  model: string;
+  historySequence: number;
+  startTime: number;
+  parts: CompletedMessagePart[];
+  currentStepStartIndex: number;
+  stepStartIndices: number[];
+  initialMetadata?: { systemMessageTokens?: number };
+  toolCompletionTimestamps: Map<string, number>;
+  muxMetadata?: unknown;
+}
+
 interface MockStreamLifecycle {
   isStreaming(workspaceId: string): boolean;
   stop(workspaceId: string, options?: StopStreamOptions): Promise<void>;
-  replayStream(workspaceId: string): Promise<void>;
+  // Mock streams are not registered in workspaceStreams; reconnect replay needs both of these
+  // to see them (#4542).
+  getStreamInfo(workspaceId: string, includeFinalizing: boolean): ActiveStreamInfo | undefined;
+  replayStream(workspaceId: string, opts?: { afterTimestamp?: number }): Promise<void>;
+}
+
+/** The token-counting surface StreamManager uses for live streaming stats. */
+export type StreamManagerTokenTracker = Pick<StreamingTokenTracker, "setModel" | "countTokens">;
+
+/**
+ * Optional collaborators for StreamManager. Production omits both; tests
+ * inject a fake stream factory (so the real request/prepareStep wiring still
+ * runs) and a no-op token tracker (so no tokenizer worker loads).
+ */
+export interface StreamManagerOptions {
+  streamText?: typeof streamText;
+  tokenTracker?: StreamManagerTokenTracker;
 }
 
 export class StreamManager {
@@ -1011,7 +1090,10 @@ export class StreamManager {
    */
   private readonly engineScope?: Scope.Closeable;
   // Token tracker for live streaming statistics
-  private tokenTracker = new StreamingTokenTracker();
+  private readonly tokenTracker: StreamManagerTokenTracker;
+  // Injected stream factory; undefined uses the AI SDK's streamText, resolved at
+  // call time so the default stays the live module export.
+  private readonly streamTextOverride?: typeof streamText;
   // Track OpenAI previousResponseIds that have been invalidated
   // When frontend retries, buildProviderOptions will omit these IDs
   //
@@ -1028,7 +1110,8 @@ export class StreamManager {
     eventSink: TurnEngineEventSink = () => undefined,
     runner: EffectRunner = defaultEffectRunner,
     engineScope?: Scope.Closeable,
-    private readonly toolCallDisplayRegistry = new ToolCallDisplayRegistry()
+    private readonly toolCallDisplayRegistry = new ToolCallDisplayRegistry(),
+    options: StreamManagerOptions = {}
   ) {
     this.historyService = historyService;
     this.sessionUsageService = sessionUsageService;
@@ -1036,6 +1119,8 @@ export class StreamManager {
     this.eventSink = eventSink;
     this.effectRunner = runner;
     this.engineScope = engineScope;
+    this.tokenTracker = options.tokenTracker ?? new StreamingTokenTracker();
+    this.streamTextOverride = options.streamText;
   }
 
   setEventSink(eventSink: TurnEngineEventSink): void {
@@ -1627,7 +1712,9 @@ export class StreamManager {
   ): LanguageModelV2Usage | undefined {
     const cumulativeUsage = streamInfo.cumulativeUsage;
     if (
-      (streamInfo.didRetryPreviousResponseIdAtStep || streamInfo.didRetryAfterEmptyOutput) &&
+      (streamInfo.didRetryPreviousResponseIdAtStep ||
+        streamInfo.didRetryAfterEmptyOutput ||
+        streamInfo.didRetryReasoningReplayAtStep) &&
       hasTokenUsage(cumulativeUsage)
     ) {
       return cumulativeUsage;
@@ -2510,7 +2597,12 @@ export class StreamManager {
       | "tools"
       | "contextBudgetMemoryWritable"
       | "budgetMetadataModel"
-    >
+      | "contextBudgetLimit"
+      | "system"
+      | "messages"
+      | "toolSearchState"
+    >,
+    stepTracker?: StepMessageTracker
   ): Array<ReturnType<typeof stepCountIs>> {
     // Completion-tool stop check: completion/routing tools use explicit
     // success/ok markers (agent_report, propose_plan).
@@ -2575,12 +2667,42 @@ export class StreamManager {
             model: request.modelString,
             metadataModel: request.budgetMetadataModel,
           });
+          // The next step's preflight hard-stops on the assembled estimate, which can exceed
+          // provider-reported usage by ~10% (#4855). Measure that same request here so the
+          // budget decision can roll over before the preflight blocks. Invariant: this measure
+          // is never below the one prepareStep will enforce for the next step. The SDK builds
+          // the next input as this step's input plus its response messages.
+          const nextRequestTokens =
+            request.contextBudgetLimit == null
+              ? undefined
+              : (
+                  await estimateAssembledRequestTokensForModel(
+                    {
+                      system: request.system,
+                      messages: await transformStepMessages([
+                        ...(stepTracker?.latestMessages ?? [
+                          ...request.messages,
+                          ...steps.slice(0, -1).flatMap((prior) => prior.response.messages),
+                        ]),
+                        ...step.response.messages,
+                      ]),
+                      tools: request.tools,
+                    },
+                    {
+                      model: request.modelString,
+                      metadataModel: request.budgetMetadataModel,
+                      modelContextLimit: request.contextBudgetLimit,
+                      activeTools: computeActiveToolNames(request.toolSearchState),
+                    }
+                  )
+                )?.estimate;
           const { decision, continuationEntryId } = await request.onStepSettled({
             model: request.modelString,
             usage: normalizeUsage(step.usage),
             providerMetadata: step.providerMetadata,
             ...size,
             toolResultTokens,
+            ...(nextRequestTokens != null ? { nextRequestTokens } : {}),
             sessionHistoryAvailable: request.tools?.session_history != null,
             memoryWritable: request.contextBudgetMemoryWritable === true,
             newContextRequested: step.toolResults.some(
@@ -2757,7 +2879,7 @@ export class StreamManager {
     // Explicit <ToolSet> pins RUNTIME_CONTEXT to its default: mux tools use
     // Tool's `any` context, which would otherwise infect the inferred result
     // type (no-unsafe-return).
-    return streamText<ToolSet>({
+    return (this.streamTextOverride ?? streamText)<ToolSet>({
       model: request.model,
       messages: request.messages,
       system: request.system,
@@ -2768,12 +2890,7 @@ export class StreamManager {
       abortSignal: abortController.signal,
       prepareStep: async ({ messages: stepMessages, stepNumber }) => {
         // streamText runs multiple internal LLM calls (steps) when tools are enabled.
-        // Strip workflow run records from same-turn tool results (history-level redaction in
-        // applyToolOutputRedaction can't see these), then extract supported attachments out of
-        // tool-result JSON so providers don't treat them as text.
-        const withoutWorkflowRunRecords = stripWorkflowRunRecordsFromModelMessages(stepMessages);
-        const rewritten =
-          await extractToolMediaAsUserMessagesFromModelMessages(withoutWorkflowRunRecords);
+        const rewritten = await transformStepMessages(stepMessages);
         let effectiveMessages = rewritten === stepMessages ? stepMessages : rewritten;
         if (stepTracker?.prefixSwapInvalidated) {
           // Cross-family fallback must not send the old provider's cached prefix.
@@ -2902,9 +3019,7 @@ export class StreamManager {
               thinkingOverride
             );
             // Same per-step transforms the construction-time messages receive.
-            rebuiltFirstStepMessages = await extractToolMediaAsUserMessagesFromModelMessages(
-              stripWorkflowRunRecordsFromModelMessages(rebuilt)
-            );
+            rebuiltFirstStepMessages = await transformStepMessages(rebuilt);
             if (stepTracker) {
               stepTracker.latestMessages = rebuiltFirstStepMessages;
             }
@@ -2960,10 +3075,19 @@ export class StreamManager {
           );
           // Step zero can follow executed tools on a fallback. This late hard stop
           // preserves settled results; it must not reset/replay the activated catalog.
-          if (exceeded)
+          if (exceeded) {
+            // The settled-step callback measured this same request and should have rolled
+            // over first; reaching here after a settled step means the two measures diverged.
+            if (stepNumber > 0 && request.onStepSettled != null)
+              log.warn("Context budget preflight blocked after a settled step", {
+                model: exceeded.model,
+                estimate: exceeded.estimate,
+                hardCeiling: exceeded.hardCeiling,
+              });
             throw new ContextBudgetBlockedError(
-              `The next request exceeds the safe context budget for ${exceeded.model} (${exceeded.estimate} > ${exceeded.hardCeiling}). Use /compact or reduce the active tool/context payload.`
+              `The estimated next request exceeds the safe context budget for ${exceeded.model} (${exceeded.hardCeiling} tokens). Use /compact or reduce the active tool/context payload.`
             );
+          }
         }
         if (
           effectiveMessages === stepMessages &&
@@ -2991,7 +3115,7 @@ export class StreamManager {
       onChunk: request.onChunk,
       tools: request.tools,
       experimental_transform: summarizeInvalidToolInputErrors(),
-      stopWhen: this.createStopWhenCondition(request),
+      stopWhen: this.createStopWhenCondition(request, stepTracker),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment
       providerOptions: request.providerOptions as any, // Pass provider-specific options (thinking/reasoning config)
       headers: request.headers, // Per-request HTTP headers (e.g., anthropic-beta for 1M context)
@@ -3475,6 +3599,12 @@ export class StreamManager {
       ...(streamInfo.thinkingLevel && { thinkingLevel: streamInfo.thinkingLevel }),
       ...(streamInfo.initialMetadata?.acpPromptId != null
         ? { acpPromptId: streamInfo.initialMetadata.acpPromptId }
+        : {}),
+      // The renderer decides at stream start whether this turn belongs in the transcript
+      // (a token-budget flush is maintenance output, not an answer), so it needs the turn
+      // metadata before the first delta rather than only on stream-end.
+      ...(streamInfo.initialMetadata?.muxMetadata != null
+        ? { muxMetadata: streamInfo.initialMetadata.muxMetadata }
         : {}),
     } as StreamStartEvent);
     // Lifecycle spine event: skipped on replay — a reconnecting subscriber
@@ -4157,6 +4287,7 @@ export class StreamManager {
       await this.tokenTracker.setModel(streamInfo.model, streamInfo.metadataModel);
 
       let didRetryPreviousResponseId = false;
+      let didRetryReasoningReplay = false;
       let emptyStreamRecoveryAttempts = 0;
       const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
       let orphanToolResultCount = 0;
@@ -4874,18 +5005,32 @@ export class StreamManager {
           let handledError: unknown = error;
           let retried = false;
           try {
-            retried = await this.retryStreamWithoutPreviousResponseId(
-              workspaceId,
-              streamInfo,
-              error,
-              didRetryPreviousResponseId
-            );
+            if (
+              await this.retryStreamWithoutPreviousResponseId(
+                workspaceId,
+                streamInfo,
+                error,
+                didRetryPreviousResponseId
+              )
+            ) {
+              didRetryPreviousResponseId = true;
+              retried = true;
+            } else if (
+              await this.retryStreamWithoutOpenAIReasoningReplay(
+                workspaceId,
+                streamInfo,
+                error,
+                didRetryReasoningReplay
+              )
+            ) {
+              didRetryReasoningReplay = true;
+              retried = true;
+            }
           } catch (retryError) {
             handledError = retryError;
           }
 
           if (retried) {
-            didRetryPreviousResponseId = true;
             continue;
           }
 
@@ -5008,6 +5153,15 @@ export class StreamManager {
     }
 
     let errorType = this.categorizeError(actualError);
+
+    // A matching rejection that reaches failure handling is final: the one-shot
+    // repair (retryStreamWithoutOpenAIReasoningReplay) already ran, or was
+    // unsafe/no-op. Its generic `api` class is auto-retryable, and every outer
+    // retry would resend the same rejected input, so classify it terminal.
+    // Only this exact shape is reclassified; a later 503/401/429 keeps its own.
+    if (this.isOpenAIReasoningReplayRejection(error, streamInfo.request.model)) {
+      errorType = "reasoning_rejected";
+    }
 
     // Enhance previous-response and model-not-found error messages
 
@@ -5373,6 +5527,121 @@ export class StreamManager {
       ...(stepMessages ? { messages: stepMessages } : {}),
       providerOptions,
     };
+    streamInfo.streamResult = this.createStreamResult(
+      streamInfo.request,
+      streamInfo.abortController,
+      streamInfo.stepTracker
+    );
+
+    return true;
+  }
+
+  // These deterministic rejections survive encrypted-only replay: cross-org
+  // blobs and same-turn reasoning references from a flapping route. Keep the
+  // match narrow so unrelated provider errors retain their normal retry policy.
+  private isOpenAIReasoningReplayRejection(error: unknown, model: LanguageModel): boolean {
+    // The SDK can exhaust its own retries on a synthetic stream-error 500.
+    // Classify only the final cause; earlier failures must not taint a later one.
+    if (RetryError.isInstance(error)) {
+      error = error.lastError;
+    }
+    const statusCode = this.extractStatusCode(error);
+    // WebSocket/SSE validation errors have no HTTP failure status. The SDK
+    // assigns 500 to code-less frames, including missing reasoning references.
+    const isStreamError =
+      StreamProviderError.isInstance(error) ||
+      (APICallError.isInstance(error) &&
+        error.responseHeaders?.["content-type"]?.startsWith("text/event-stream") &&
+        typeof error.data === "object" &&
+        error.data !== null &&
+        "type" in error.data &&
+        (error.data.type === "error" || error.data.type === "response.failed"));
+    if (statusCode !== 400 && statusCode !== 404 && !(statusCode === 500 && isStreamError)) {
+      return false;
+    }
+    if (!isOpenAIResponsesModel(model)) {
+      return false;
+    }
+    if (this.extractErrorCode(error) === "invalid_encrypted_content") {
+      return true;
+    }
+    // Gateways can drop the structured code and forward only the message.
+    const texts = [
+      APICallError.isInstance(error) ? error.responseBody : undefined,
+      error instanceof Error ? error.message : undefined,
+    ];
+    return texts.some(
+      (text) =>
+        typeof text === "string" &&
+        (OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN.test(text) ||
+          OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN.test(text))
+    );
+  }
+
+  // Mirror previousResponseId recovery without repeating emitted output or
+  // completed tools. The repair budget belongs to this attempt, so a manual
+  // continuation may try again after the user changes route or credentials.
+  private async retryStreamWithoutOpenAIReasoningReplay(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    error: unknown,
+    hasRetried: boolean
+  ): Promise<boolean> {
+    if (hasRetried) {
+      return false;
+    }
+
+    if (streamInfo.abortController.signal.aborted || streamInfo.softInterrupt.pending) {
+      return false;
+    }
+
+    const hasParts = streamInfo.parts.length > 0;
+    // If the current step already emitted parts, retrying would duplicate output/tool calls.
+    if (hasParts && streamInfo.currentStepStartIndex !== streamInfo.parts.length) {
+      return false;
+    }
+
+    if (!this.isOpenAIReasoningReplayRejection(error, streamInfo.request.model)) {
+      return false;
+    }
+
+    // Even step 0 can be compacted or rebuilt before output. Retry the prepared
+    // transcript so recovery cannot restore context that preparation discarded.
+    const stepMessages = streamInfo.stepTracker.latestMessages;
+    if (hasParts && !stepMessages) {
+      return false;
+    }
+    const sourceMessages = stepMessages ?? streamInfo.request.messages;
+    const messages = stripOpenAIReasoningReplay(sourceMessages);
+    if (messages === sourceMessages) {
+      return false;
+    }
+
+    const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
+    const errorCode = this.extractErrorCode(error);
+    const statusCode = this.extractStatusCode(error);
+
+    // Step-boundary retries restart the SDK stream, so totalUsage only reflects
+    // the retried step. Track this to prefer cumulativeUsage at stream end.
+    if (hasParts) {
+      streamInfo.didRetryReasoningReplayAtStep = true;
+    }
+
+    workspaceLog.info("Retrying stream without OpenAI reasoning replay", {
+      messageId: streamInfo.messageId,
+      model: streamInfo.model,
+      retryScope: hasParts ? "step" : "stream",
+      errorCode,
+      statusCode,
+    });
+
+    await this.resetStreamStateForRetry(workspaceId, streamInfo, {
+      preserveParts: hasParts,
+      preserveUsage: hasParts,
+      workspaceLog,
+    });
+
+    streamInfo.request = { ...streamInfo.request, messages };
     streamInfo.streamResult = this.createStreamResult(
       streamInfo.request,
       streamInfo.abortController,
@@ -6151,23 +6420,10 @@ export class StreamManager {
    * Gets the current stream info for a workspace if actively streaming.
    * Include finalizing streams when checking whether recovery can proceed.
    */
-  getStreamInfo(
-    workspaceId: string,
-    includeFinalizing = false
-  ):
-    | {
-        messageId: string;
-        model: string;
-        historySequence: number;
-        startTime: number;
-        parts: CompletedMessagePart[];
-        currentStepStartIndex: number;
-        stepStartIndices: number[];
-        initialMetadata?: { systemMessageTokens?: number };
-        toolCompletionTimestamps: Map<string, number>;
-        muxMetadata?: unknown;
-      }
-    | undefined {
+  getStreamInfo(workspaceId: string, includeFinalizing = false): ActiveStreamInfo | undefined {
+    if (this.mockStreamLifecycle) {
+      return this.mockStreamLifecycle.getStreamInfo(workspaceId, includeFinalizing);
+    }
     const typedWorkspaceId = workspaceId as WorkspaceId;
     const streamInfo = this.workspaceStreams.get(typedWorkspaceId);
 
@@ -6205,7 +6461,7 @@ export class StreamManager {
    */
   async replayStream(workspaceId: string, opts?: { afterTimestamp?: number }): Promise<void> {
     if (this.mockStreamLifecycle) {
-      await this.mockStreamLifecycle.replayStream(workspaceId);
+      await this.mockStreamLifecycle.replayStream(workspaceId, opts);
       return;
     }
 
@@ -6346,54 +6602,5 @@ export class StreamManager {
       });
       this.emitTurnEvent(usageEvent);
     }
-  }
-
-  /**
-   * DEBUG ONLY: Trigger an artificial stream error for testing
-   * This method allows integration tests to simulate stream errors without
-   * mocking the AI SDK or network layer. It triggers the same error handling
-   * path as genuine stream errors by aborting the stream and manually triggering
-   * the error event (since abort alone doesn't throw, it just sets a flag that
-   * causes the for-await loop to break cleanly).
-   */
-  async debugTriggerStreamError(workspaceId: string, errorMessage: string): Promise<boolean> {
-    const typedWorkspaceId = workspaceId as WorkspaceId;
-    const streamInfo = this.workspaceStreams.get(typedWorkspaceId);
-
-    // Only trigger error if stream is actively running
-    if (
-      !streamInfo ||
-      (streamInfo.state !== StreamState.STARTING && streamInfo.state !== StreamState.STREAMING)
-    ) {
-      return false;
-    }
-
-    // Abort the stream first (causes for-await loop to break cleanly)
-    streamInfo.abortController.abort(new Error(errorMessage));
-
-    // Mark as error state (same as catch block does)
-    streamInfo.state = StreamState.ERROR;
-
-    // Update streamInfo metadata with error (so subsequent flushes preserve it)
-    streamInfo.initialMetadata = {
-      ...streamInfo.initialMetadata,
-      error: errorMessage,
-      errorType: "network",
-    };
-
-    // Write error state to partial.json (same as real error handling)
-    const persistedPayload = await this.persistStreamError(typedWorkspaceId, streamInfo, {
-      messageId: streamInfo.messageId,
-      error: errorMessage,
-      errorType: "network",
-    });
-    // Debug-injected failures bypass handleStreamFailure, so record the failed
-    // completion here or cleanup would never settle the turn handle.
-    streamInfo.terminalCompletion = { status: "failed", streamError: persistedPayload };
-
-    // Wait for the stream processing to complete (cleanup)
-    await streamInfo.processingPromise;
-
-    return true;
   }
 }

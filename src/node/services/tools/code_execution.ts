@@ -7,7 +7,7 @@
  */
 
 import { tool } from "ai";
-import { z } from "zod";
+import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { Tool } from "ai";
 import type { ToolBridge } from "@/node/services/ptc/toolBridge";
 import type { IJSRuntime, IJSRuntimeFactory } from "@/node/services/ptc/runtime";
@@ -25,7 +25,7 @@ import { toolOutputCarriesProjectSkillContent } from "@/node/services/agentSkill
 
 import { analyzeCode, normalizeMultilineStrings } from "@/node/services/ptc/staticAnalysis";
 import { log } from "@/node/services/log";
-import { getCachedXumTypes, clearTypeCache } from "@/node/services/ptc/typeGenerator";
+import { getCachedXumTypes } from "@/node/services/ptc/typeGenerator";
 import {
   buildHandlePreview,
   RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
@@ -44,13 +44,6 @@ import { jsonSafeClone } from "@/common/utils/jsonSafeClone";
 const DEFAULT_MEMORY_BYTES = 64 * 1024 * 1024; // 64MB
 const DEFAULT_TIMEOUT_SECS = 5 * 60; // 5 minutes
 const MAX_TIMEOUT_SECS = 60 * 60; // 1 hour
-
-/**
- * Clear all type caches. Call for test isolation or when tool schemas might have changed.
- */
-export function clearTypeCaches(): void {
-  clearTypeCache();
-}
 
 /** PTC event with parentToolCallId attached by code_execution */
 export type PTCEventWithParent = PTCEvent & { parentToolCallId: string };
@@ -585,23 +578,7 @@ ${xumTypes}
 
 **Security:** The sandbox has no access to \`require\`, \`import\`, \`process\`, \`fetch\`, or filesystem outside of \`xum.*\` tools.`,
 
-    inputSchema: z.object({
-      code: z
-        .string()
-        .min(1)
-        .describe(
-          "JavaScript code to execute. xum.* calls are synchronous—do not use await. mux.* is a compatibility alias. Use 'return' for final result."
-        ),
-      timeout_secs: z
-        .number()
-        .int()
-        .positive()
-        .nullish()
-        .describe(
-          "Execution timeout in seconds (default: 300, max: 3600). " +
-            "Increase when spawning subagents that may take 5-15+ minutes."
-        ),
-    }),
+    inputSchema: TOOL_DEFINITIONS.code_execution.schema,
 
     execute: async (
       { code, timeout_secs },

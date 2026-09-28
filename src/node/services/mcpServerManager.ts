@@ -24,7 +24,7 @@ import {
   type MCPPrompt,
 } from "@/node/services/mcpClient";
 import { log } from "@/node/services/log";
-import { MCPStdioTransport } from "@/node/services/mcpStdioTransport";
+import { MCPStdioTransport, MCP_STDIO_KILL_JOIN_MS } from "@/node/services/mcpStdioTransport";
 import type {
   BearerChallenge,
   MCPHeaderValue,
@@ -41,7 +41,8 @@ import assert from "@/common/utils/assert";
 import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
 import { shellQuote } from "@/common/utils/shell";
 import { requiredPropertyNames, schemaAcceptsNull } from "@/common/utils/tools/schemaSanitizer";
-import type { Runtime } from "@/node/runtime/Runtime";
+import type { ExecStream, Runtime } from "@/node/runtime/Runtime";
+import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import type { AgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
@@ -60,6 +61,7 @@ import {
 } from "@/node/services/mcpOauthService";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import {
+  omitMCPProtocolMeta,
   transformMCPResult,
   truncateUtf8Bytes,
   type MCPCallToolResult,
@@ -87,9 +89,17 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { isWorkspaceOverridesEpochUnreadable } from "@/node/services/workspaceMcpOverridesService";
+import {
+  MCP_IDLE_CHECK_INTERVAL_MS,
+  MCP_IDLE_TIMEOUT_MS,
+  MCP_LAUNCH_INITIATION_FENCE_MS,
+  MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS,
+  MCP_STARTUP_CONCURRENCY,
+  MCP_STARTUP_TIMEOUT_MS,
+  MCP_STDIO_LAUNCH_FENCE_MS,
+} from "@/constants/mcp";
 
 const TEST_TIMEOUT_MS = 10_000;
-const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
 /**
  * Freshness horizon for cached *legacy* era verdicts.
@@ -100,12 +110,6 @@ const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
  * are re-probed after this horizon to notice server upgrades.
  */
 const LEGACY_ERA_VERDICT_TTL_MS = 24 * 60 * 60 * 1000;
-const IDLE_CHECK_INTERVAL_MS = 60 * 1000; // Check every minute
-const MCP_STARTUP_TIMEOUT_MS = 60_000; // 60s — generous for npx package downloads
-// Bounded so a burst of stdio spawns (npx downloads) cannot thrash the host,
-// while several unhealthy servers' startup deadlines overlap instead of stacking.
-const MCP_STARTUP_CONCURRENCY = 4;
-const MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS = 5_000; // fail-safe so timeout error cannot hang forever
 /**
  * Timed-out servers are restarted from the cached same-signature path, and
  * each restart blocks the turn for up to MCP_STARTUP_TIMEOUT_MS. Without
@@ -368,8 +372,11 @@ export function wrapMCPTools(
             () => Promise.resolve(originalExecute(sanitizedArgs, context)) as Promise<unknown>,
             { toolName, timeoutMs: MCP_TOOL_CALL_TIMEOUT_MS, signal: abortSignal }
           );
-          // The standard key is UI-only for newly produced results. Keeping it
-          // in output would also expose it to the model when history is replayed.
+          // Protocol `_meta` is host-only for newly produced results: the
+          // standard key feeds the UI badge, and the rest has no consumer.
+          // Output is replayed verbatim to the model on later turns and counts
+          // toward the size caps, so none of it is kept (existing history is
+          // not migrated).
           const { rest, displayKeyValue } = takeStandardDisplayMeta(result);
           const response = normalizeServerIdentity(displayKeyValue);
           const identity = response?.identity ?? options?.display?.identity;
@@ -396,7 +403,7 @@ export function wrapMCPTools(
               published = display.registry.set(scope, context.toolCallId, snapshot);
             }
           }
-          return transformMCPResult(rest as MCPCallToolResult);
+          return transformMCPResult(omitMCPProtocolMeta(rest) as MCPCallToolResult);
         } catch (error) {
           // A call that throws or hits its deadline produced no result metadata,
           // but the failed part still belongs to a known server: publish the
@@ -440,17 +447,6 @@ const PENDING_REPAIR_WAIT_MS = 10_000;
  * gate as a whole — not each helper — is bounded.
  */
 const CALL_GATE_TIMEOUT_MS = 30_000;
-/** How long a remote MCP connect keeps the override writer's lock after its initiation (see launchUnderOverrideFence). */
-const LAUNCH_INITIATION_FENCE_MS = 2_000;
-/**
- * How long a stdio launch may take to hand back its exec stream under the
- * override writer's lock before it is ABORTED (see launchUnderOverrideFence).
- * Matches the SSH2 transport's connection-acquisition cap: a cold connection
- * that takes longer fails as a startup timeout and is retried by the next
- * request (with a fresh fence) instead of being released to send its command
- * after a sibling's revocation committed.
- */
-const STDIO_LAUNCH_FENCE_MS = 15_000;
 /** Iterations a served tool call spends waiting for override state to settle before failing closed. */
 const CALL_GATE_MAX_ATTEMPTS = 5;
 
@@ -1325,8 +1321,16 @@ interface WorkspaceServers {
   enabledServersGeneration: number;
   stats: MCPWorkspaceStats;
   timedOutServerNames: string[];
-  /** Prevent concurrent cached retries from stacking startup attempts for the same server. */
-  retryingTimedOutServerNames: Set<string>;
+  /**
+   * In-flight cached retries by server name; prevents concurrent cached
+   * retries from stacking startup attempts for the same server. A batch of
+   * explicit re-queues only (plugin invalidation restart; no backoff record)
+   * carries a promise settling when its retry finishes, which concurrent
+   * serves join instead of serving without the server (#4539). A batch with a
+   * timed-out server's retry carries none: concurrent serves skip it rather
+   * than wait on a possibly hanging startup.
+   */
+  retryingTimedOutServerNames: Map<string, Promise<void> | undefined>;
   /**
    * Consecutive startup timeouts (initial start included) per server still in
    * `timedOutServerNames`, gating getTimedOutServerNamesToRetry (see
@@ -1498,6 +1502,11 @@ export class MCPServerManager {
   private readonly pluginInvalidation?: MCPServerManagerOptions["pluginInvalidation"];
   private componentPolicy: PluginMcpPolicy | undefined;
   private componentPolicyRevision = 0;
+  /** Current shared hold of the component-policy writer lock; see acquireSharedComponentPolicyLock. */
+  private componentPolicyLockShare:
+    | { acquisition: Promise<() => Promise<void>>; holders: number }
+    | undefined;
+  private componentPolicyLockReleasing: Promise<void> = Promise.resolve();
   private readonly managedPluginServers = new Map<string, NonNullable<MCPServerInfo["plugin"]>>();
   private readonly managedPluginInstances = new Map<
     string,
@@ -1534,7 +1543,10 @@ export class MCPServerManager {
       options?.toolCallDisplayRegistry ?? new ToolCallDisplayRegistry();
     this.config = options?.config ?? null;
     this.telemetryService = options?.telemetryService ?? null;
-    this.idleCheckInterval = setInterval(() => this.cleanupIdleServers(), IDLE_CHECK_INTERVAL_MS);
+    this.idleCheckInterval = setInterval(
+      () => this.cleanupIdleServers(),
+      MCP_IDLE_CHECK_INTERVAL_MS
+    );
     this.idleCheckInterval.unref?.();
     if (options?.inlineServers) {
       this.inlineServers = options.inlineServers;
@@ -1680,7 +1692,8 @@ export class MCPServerManager {
     // Overrides are locked first. Uninstall takes the plugin lock and then prunes
     // overrides, so waiting here would deadlock. A contended try-lock fails closed
     // and lets the outer finally release overrides; no admission retry loop.
-    const acquisition = acquire({ signal: options.signal });
+    // Sibling admissions of this manager share one hold (see the share field).
+    const acquisition = this.acquireSharedComponentPolicyLock(acquire);
     let release: () => Promise<void>;
     try {
       release = await bounded(acquisition);
@@ -1702,6 +1715,53 @@ export class MCPServerManager {
       await release();
       throw error;
     }
+  }
+
+  /**
+   * Share one component-policy writer-lock hold across overlapping admissions
+   * of this manager (#4513). The injected try-lock is the installer's mutation
+   * lock, exclusive even within one process, but admissions only READ policy:
+   * sibling launches started concurrently by one serve must not fence each
+   * other out. The first admission try-locks; overlapping admissions join that
+   * same attempt (and its failure), and the last holder releases the lock.
+   * Plugin install/update/uninstall still take the lock exclusively, so they
+   * exclude, and are excluded by, every sharer. Admissions hold it only through
+   * launch initiation, so joiners cannot pin it indefinitely.
+   *
+   * No caller signal reaches the shared attempt: one caller's abort must not
+   * fail its joiners. Callers bound their own wait (see `bounded`).
+   */
+  private acquireSharedComponentPolicyLock(
+    tryAcquire: (options: { signal?: AbortSignal }) => Promise<() => Promise<void>>
+  ): Promise<() => Promise<void>> {
+    let share = this.componentPolicyLockShare;
+    if (share === undefined) {
+      // Wait for the previous share's release: a try-lock racing it would read
+      // this manager's own departing hold as a concurrent plugin update.
+      const acquisition = this.componentPolicyLockReleasing.then(() => tryAcquire({}));
+      const created = { acquisition, holders: 0 };
+      share = created;
+      this.componentPolicyLockShare = created;
+      acquisition.catch(() => {
+        if (this.componentPolicyLockShare === created) this.componentPolicyLockShare = undefined;
+      });
+    }
+    const joined = share;
+    joined.holders++;
+    return joined.acquisition.then((release) => {
+      let released = false;
+      return async () => {
+        if (released) return;
+        released = true;
+        joined.holders--;
+        assert(joined.holders >= 0, "component policy lock share released more than acquired");
+        if (joined.holders > 0) return;
+        if (this.componentPolicyLockShare === joined) this.componentPolicyLockShare = undefined;
+        const releasing = release();
+        this.componentPolicyLockReleasing = releasing.catch(() => undefined);
+        await releasing;
+      };
+    });
   }
 
   private async refreshComponentPolicy(): Promise<Error | undefined> {
@@ -2333,7 +2393,7 @@ export class MCPServerManager {
       }
 
       const idleMs = now - entry.lastActivity;
-      if (idleMs >= IDLE_TIMEOUT_MS) {
+      if (idleMs >= MCP_IDLE_TIMEOUT_MS) {
         // Do not evict retry ownership while retired clients still fail to close.
         // Once they close, a later idle sweep resumes normal workspace eviction.
         if (entry.retiredPluginInstances?.size) {
@@ -3023,7 +3083,7 @@ export class MCPServerManager {
       existing.timedOutServerNames = [];
     }
     if (existing && existing.retryingTimedOutServerNames === undefined) {
-      existing.retryingTimedOutServerNames = new Set();
+      existing.retryingTimedOutServerNames = new Map();
     }
     const leaseCount = this.getLeaseCount(workspaceId);
 
@@ -3042,6 +3102,12 @@ export class MCPServerManager {
       existing.enabledServers = enabledServers;
       existing.enabledServersGeneration = configGenerationUsed;
 
+      // Another serve's in-flight retry (e.g. a plugin-invalidation restart)
+      // of a server this serve enables: join it rather than returning without
+      // that server's tools (#4539). Captured before this serve marks its own.
+      const joinedRetries = [...existing.retryingTimedOutServerNames]
+        .filter(([name]) => enabledServers[name] !== undefined && !existing.instances.has(name))
+        .flatMap(([, retry]) => (retry === undefined ? [] : [retry]));
       const timedOutServerNamesToRetry = this.getTimedOutServerNamesToRetry(
         existing,
         enabledServers
@@ -3063,8 +3129,17 @@ export class MCPServerManager {
         const retryingServerNames = new Set(timedOutServerNamesToRetry);
         // Mark retries before awaiting startup so concurrent same-signature calls do not
         // stack duplicate retry attempts while the previous timeout is still unwinding.
+        // Joinable only when the whole batch is restarts: the batch settles as
+        // one, so a timed-out retry in it would pin joiners to its startup.
+        const retryDone = Promise.withResolvers<void>();
+        const joinable = [...retryingServerNames].every(
+          (serverName) => existing.timedOutRetryBackoff?.has(serverName) !== true
+        );
         for (const serverName of retryingServerNames) {
-          existing.retryingTimedOutServerNames.add(serverName);
+          existing.retryingTimedOutServerNames.set(
+            serverName,
+            joinable ? retryDone.promise : undefined
+          );
         }
 
         try {
@@ -3197,7 +3272,24 @@ export class MCPServerManager {
           for (const serverName of retryingServerNames) {
             existing.retryingTimedOutServerNames.delete(serverName);
           }
+          retryDone.resolve();
         }
+      }
+
+      if (joinedRetries.length > 0) {
+        // Never rejects: each owner resolves its retry in `finally`.
+        await Promise.all(joinedRetries);
+        // The owner may have lost the entry meanwhile; mirror its handling.
+        const current = this.workspaceServers.get(workspaceId);
+        if (current === undefined) {
+          return {
+            tools: {},
+            toolServerNames: {},
+            stats: this.createWorkspaceStats(enabledEntries.length, new Map(), []),
+            promptDescriptors: [],
+          };
+        }
+        if (current !== existing) return this.getToolsForWorkspaceInternal(options, readSignal);
       }
 
       log.debug("[MCP] Using cached servers", {
@@ -3635,7 +3727,7 @@ export class MCPServerManager {
               ...startTimedOutNames,
               ...invalidatedKeys,
             ],
-            retryingTimedOutServerNames: new Set(),
+            retryingTimedOutServerNames: new Map(),
             lastActivity: Date.now(),
             ...(carriedBackoff.records.size > 0
               ? { timedOutRetryBackoff: new Map(carriedBackoff.records) }
@@ -4731,13 +4823,19 @@ export class MCPServerManager {
     // client that is in the middle of closing.
     this.workspaceServers.delete(workspaceId);
 
-    for (const instance of [...entry.instances.values(), ...(entry.retiredPluginInstances ?? [])]) {
-      try {
-        await instance.close();
-      } catch (error) {
-        log.warn("Failed to stop MCP server", { error, name: instance.name });
-      }
-    }
+    // Concurrently: a stdio close can wait out an exit grace before killing (#4760), and
+    // removal awaits this whole stop before deleting the checkout.
+    await Promise.all(
+      [...entry.instances.values(), ...(entry.retiredPluginInstances ?? [])].map(
+        async (instance) => {
+          try {
+            await instance.close();
+          } catch (error) {
+            log.warn("Failed to stop MCP server", { error, name: instance.name });
+          }
+        }
+      )
+    );
   }
 
   /**
@@ -6008,26 +6106,76 @@ export class MCPServerManager {
     {
       log.debug("[MCP] Spawning stdio server", { name });
       const launch = await prepareStdioLaunch(info);
-      const execStream = await this.launchUnderOverrideFence(
-        name,
-        info,
-        (launchSignal) =>
-          runtime.exec(launch.command, {
-            cwd: launch.cwd ?? workspacePath,
-            ...(launch.env !== undefined ? { env: launch.env } : {}),
-            timeout: 60 * 60 * 24, // 24 hours — process lifetime, not startup
-            abortSignal: launchSignal,
-          }),
-        signal,
-        // A host-local exec resolves once the process exists; an SSH exec
-        // can stall on connection acquisition. The writer's lock must not be
-        // held for the whole startup deadline, and the launch must not be
-        // released to send its command after a revocation: abort it instead
-        // (see launchUnderOverrideFence).
-        { workspaceId, abortAfterMs: { ms: STDIO_LAUNCH_FENCE_MS, serverName: name } }
-      );
+      // Lets the transport's close() kill a server that ignores stdin EOF (#4760).
+      const processAbort = new AbortController();
+      // #4857: the server runs in the checkout, so another backend sharing this Xum root must
+      // refuse to rename or remove the workspace while it lives. Held from before the spawn (a
+      // refusal while a mutation runs fails this start) until the process exits, like a
+      // terminal's PTY: close() and the idle sweep only ask it to exit.
+      const useLease =
+        this.config != null && workspaceId != null
+          ? await workspaceUseLeasesFor(this.config).hold(workspaceId, "mcp")
+          : undefined;
+      // #4953: a startup aborted while its exec is pending (the startup timeout) must not
+      // surface before a process the exec still hands back has been killed and has exited.
+      // The timeout waits (bounded) for a cleanup registered synchronously by the abort, so
+      // register the exec's settlement while it is pending; the abort branch below resolves it.
+      const execSettled = Promise.withResolvers<void>();
+      const registerExecCleanup = () => onAbortCleanup?.(execSettled.promise);
+      signal.addEventListener("abort", registerExecCleanup, { once: true });
+      let execStream: ExecStream;
+      try {
+        execStream = await this.launchUnderOverrideFence(
+          name,
+          info,
+          (launchSignal) =>
+            runtime.exec(launch.command, {
+              cwd: launch.cwd ?? workspacePath,
+              ...(launch.env !== undefined ? { env: launch.env } : {}),
+              timeout: 60 * 60 * 24, // 24 hours — process lifetime, not startup
+              abortSignal: AbortSignal.any([launchSignal, processAbort.signal]),
+            }),
+          signal,
+          // A host-local exec resolves once the process exists; an SSH exec
+          // can stall on connection acquisition. The writer's lock must not be
+          // held for the whole startup deadline, and the launch must not be
+          // released to send its command after a revocation: abort it instead
+          // (see launchUnderOverrideFence).
+          { workspaceId, abortAfterMs: { ms: MCP_STDIO_LAUNCH_FENCE_MS, serverName: name } }
+        );
+      } catch (error) {
+        // No process was handed back to watch; a launch that failed started nothing.
+        signal.removeEventListener("abort", registerExecCleanup);
+        execSettled.resolve();
+        await useLease?.release();
+        throw error;
+      }
+      signal.removeEventListener("abort", registerExecCleanup);
+      if (useLease != null) {
+        const releaseUseLease = () =>
+          useLease.release().catch((error: unknown) => {
+            log.warn("[MCP] Failed to release the workspace use lease", {
+              name,
+              workspaceId,
+              error: getErrorMessage(error),
+            });
+          });
+        // A rejected exit observation does not prove the process stopped: ask it to exit and keep
+        // the lease (fail closed) until this backend exits.
+        void execStream.exitCode.then(releaseUseLease, (error: unknown) => {
+          processAbort.abort();
+          log.warn("[MCP] Stdio server exit unconfirmed; keeping its workspace use lease", {
+            name,
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        });
+      }
 
       const cleanupSpawnedExecStream = async () => {
+        // The launch fence stops forwarding the startup signal once it returns, so kill the
+        // process explicitly: closing stdio alone leaves a server that ignores EOF running.
+        processAbort.abort();
         try {
           await execStream.stdin.close();
         } catch (error) {
@@ -6045,16 +6193,36 @@ export class MCPServerManager {
         } catch (error) {
           log.debug("[MCP] Error canceling stderr during startup abort cleanup", { name, error });
         }
+        // Join the killed process's exit, bounded like MCPStdioTransport.close(): on remote
+        // runtimes the abort only starts a SIGTERM-then-dispose sequence (#4953).
+        // A rejected exit observation does not prove the process stopped (as for the use lease
+        // above): keep waiting out the bound, then report the exit as unconfirmed.
+        const exited = await raceWithAbortAndTimeout(
+          execStream.exitCode.catch(() => new Promise<never>(() => undefined)),
+          { timeoutMs: MCP_STDIO_KILL_JOIN_MS }
+        );
+        if (exited.kind !== "ok") {
+          log.warn("[MCP] Killed stdio server did not report its exit after a startup abort", {
+            name,
+            workspaceId,
+            timeoutMs: MCP_STDIO_KILL_JOIN_MS,
+          });
+        }
       };
 
       if (signal.aborted) {
         // runtime.exec() can return after abort when the process was already spawned.
         // Explicitly close/cancel stdio so the spawned process is not left running.
-        await cleanupSpawnedExecStream();
+        try {
+          await cleanupSpawnedExecStream();
+        } finally {
+          execSettled.resolve();
+        }
         return null;
       }
+      execSettled.resolve();
 
-      const transport = new MCPStdioTransport(execStream);
+      const transport = new MCPStdioTransport(execStream, { kill: () => processAbort.abort() });
 
       const instanceRef: { current: MCPServerInstance | null } = { current: null };
       let transportClosed = false;
@@ -6324,7 +6492,7 @@ export class MCPServerManager {
             ...(prior !== undefined ? { prior } : {}),
           }),
         signal,
-        { workspaceId, releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
+        { workspaceId, releaseAfterMs: MCP_LAUNCH_INITIATION_FENCE_MS }
       );
 
     const trySse = () =>
@@ -6341,7 +6509,7 @@ export class MCPServerManager {
             ...(prior !== undefined ? { prior } : {}),
           }),
         signal,
-        { workspaceId, releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
+        { workspaceId, releaseAfterMs: MCP_LAUNCH_INITIATION_FENCE_MS }
       );
 
     let client: Awaited<ReturnType<typeof createMCPClient>> | null = null;

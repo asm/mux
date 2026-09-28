@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, mock } from "bun:test";
-import { createCodeExecutionTool, clearTypeCaches, type MountRunner } from "./code_execution";
+import { createCodeExecutionTool, type MountRunner } from "./code_execution";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { ToolBridge } from "@/node/services/ptc/toolBridge";
 import { extractAttachmentsFromToolOutput } from "@/node/utils/messages/toolResultAttachments";
@@ -558,33 +558,6 @@ describe("createCodeExecutionTool", () => {
       expect(result.result).toEqual({ arr: [null, 1], nan: null });
       expect(result.consoleOutput[0]?.args).toEqual([null]);
     });
-
-    it("captures console.log output", async () => {
-      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge({}));
-
-      const result = (await tool.execute!(
-        { code: 'console.log("hello", 123); return "done"' },
-        mockToolCallOptions
-      )) as PTCExecutionResult;
-
-      expect(result.success).toBe(true);
-      expect(result.result).toBe("done");
-      expect(result.consoleOutput).toHaveLength(1);
-      expect(result.consoleOutput[0].level).toBe("log");
-      expect(result.consoleOutput[0].args).toEqual(["hello", 123]);
-    });
-
-    it("records tool execution time", async () => {
-      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge({}));
-
-      const result = (await tool.execute!(
-        { code: "return 42" },
-        mockToolCallOptions
-      )) as PTCExecutionResult;
-
-      expect(result.success).toBe(true);
-      expect(result.duration_ms).toBeGreaterThanOrEqual(0);
-    });
   });
 
   describe("tool bridge integration", () => {
@@ -641,7 +614,6 @@ describe("createCodeExecutionTool", () => {
         content: "mock file content",
         success: true,
       });
-      expect(result.toolCalls[0].duration_ms).toBeGreaterThanOrEqual(0);
     });
 
     it("validates tool arguments against schema at runtime", async () => {
@@ -796,8 +768,6 @@ describe("createCodeExecutionTool", () => {
 
   describe("type caching", () => {
     it("returns consistent types for same tool set", async () => {
-      clearTypeCaches();
-
       const mockTools: Record<string, Tool> = {
         file_read: createMockTool("file_read", z.object({ filePath: z.string() }), () => ({
           content: "test",
@@ -815,8 +785,6 @@ describe("createCodeExecutionTool", () => {
     });
 
     it("regenerates types when tool set changes", async () => {
-      clearTypeCaches();
-
       const tools1: Record<string, Tool> = {
         file_read: createMockTool("file_read", z.object({ filePath: z.string() }), () => ({
           content: "test",
@@ -1009,24 +977,6 @@ describe("createCodeExecutionTool", () => {
       expect(recovered.success).toBe(true);
       expect(recovered.result).toEqual({ state: "durable", self: "undefined" });
       await host.disposeScope("ws-cyclic-vars");
-    });
-
-    it("clearTypeCaches forces regeneration", async () => {
-      const mockTools: Record<string, Tool> = {
-        file_read: createMockTool("file_read", z.object({ filePath: z.string() }), () => ({
-          content: "test",
-        })),
-      };
-
-      // First call to populate cache
-      await createCodeExecutionTool(runtimeFactory, new ToolBridge(mockTools));
-
-      // Clear and verify new generation works
-      clearTypeCaches();
-
-      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge(mockTools));
-      const desc = (tool as { description?: string }).description ?? "";
-      expect(desc).toContain("function file_read");
     });
   });
 

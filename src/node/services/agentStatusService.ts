@@ -32,8 +32,9 @@ import {
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import {
   isDurableContextBoundaryMarker,
-  sliceMessagesForProviderFromLatestContextBoundary,
+  isDurableContextResetBoundaryMarker,
 } from "@/common/utils/messages/compactionBoundary";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import type { AIService } from "./aiService";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { HistoryService } from "./historyService";
@@ -625,15 +626,28 @@ export class AgentStatusService {
     // cannot attach a newer turn's in-flight text to an older turn whose rows
     // are the only ones verified.
     const partial = await this.historyService.readPartial(workspaceId);
-    const tail = await this.historyService.getLastMessages(
+    // Sidebar status is a provider request too, so it reads the same context the agent's model
+    // sees: the suffix read starts at the latest compaction boundary (the summary row is kept,
+    // the conversation it replaced is not; #4421) or manual reset, and honors RAW reset floors,
+    // so a malformed reset row still discards everything before it (#4555). Only the trailing
+    // window is read: the suffix holds at least the last AGENT_STATUS_MAX_TRAILING_MESSAGES
+    // status rows of the active context, so the window below is unchanged without parsing the
+    // whole epoch under the history lock (#4720).
+    //
+    // UI-only rows (plan-review snapshot/resolve/reopen records, workflow display-only rows)
+    // must not leak into the request, and a readable reset marker is structure, not
+    // conversation. The window is counted in VISIBLE rows: counting before filtering would let
+    // a burst of hidden records (resolving many threads) evict the recent conversation, and
+    // each hidden append would change the hash by evicting a visible row.
+    const tail = await this.historyService.getHistorySuffixFromLatestBoundary(
       workspaceId,
-      AGENT_STATUS_MAX_TRAILING_MESSAGES
+      AGENT_STATUS_MAX_TRAILING_MESSAGES,
+      isStatusTranscriptRow
     );
     if (!tail.success) return { transcript: "", rowIds: [], trustedProjectContent: false };
-    // The bounded tail can reach back past a compaction or context reset (it is
-    // filled from the sealed archive when the active epoch is short): only the
-    // active context is the agent's current work.
-    const result = { data: sliceMessagesForProviderFromLatestContextBoundary(tail.data) };
+    const result = {
+      data: tail.data.filter(isStatusTranscriptRow).slice(-AGENT_STATUS_MAX_TRAILING_MESSAGES),
+    };
 
     const quarantine = await this.workspaceService.getQuarantinedRejectedRowIds(workspaceId);
     if (!quarantine.success) {
@@ -755,7 +769,7 @@ export class AgentStatusService {
   /**
    * Whether the active-segment rows BEFORE the bounded trailing slice carry
    * project skill content. The slice itself is the only history read per tick
-   * (getLastMessages, bounded); the segment is scanned in full only on the
+   * (the bounded suffix read); the segment is scanned in full only on the
    * first look at a workspace or after a burst that pushed more rows through
    * the window than it holds — otherwise every row that left the window since
    * the last tick sat in that tick's slice, whose carrying rows are memoized.
@@ -829,9 +843,12 @@ export class AgentStatusService {
     // Content kept under trust at build time: trust must still hold at dispatch.
     if (trustedProjectContent && !this.isWorkspaceProjectTrusted(workspaceId)) return false;
     if (rowIds.length === 0) return true;
-    const result = await this.historyService.getLastMessages(
+    // The same bounded read the snapshot came from: a burst of hidden rows appended since
+    // (plan-review records) must not push the snapshotted rows out of a last-N window.
+    const result = await this.historyService.getHistorySuffixFromLatestBoundary(
       workspaceId,
-      AGENT_STATUS_MAX_TRAILING_MESSAGES
+      AGENT_STATUS_MAX_TRAILING_MESSAGES,
+      isStatusTranscriptRow
     );
     if (!result.success) return false;
     const quarantine = await this.workspaceService.getQuarantinedRejectedRowIds(workspaceId);
@@ -841,6 +858,11 @@ export class AgentStatusService {
     );
     return rowIds.every((id) => eligible.has(id));
   }
+}
+
+/** Status-visible rows; also the suffix read's stop predicate, so the window cannot differ. */
+function isStatusTranscriptRow(message: MuxMessage): boolean {
+  return !isDurableContextResetBoundaryMarker(message) && !isModelHiddenMessage(message);
 }
 
 function extractMessageText(message: MuxMessage): string {

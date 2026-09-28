@@ -1,5 +1,7 @@
 import type { APIClient } from "@/browser/contexts/API";
 import type { ThinkingLevel } from "@/common/types/thinking";
+import type { BashCollapsedSummaryMode, TranscriptDensity } from "@/common/constants/storage";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 
 /**
  * Slices of the app config consumed by per-model hooks (useRouting,
@@ -10,6 +12,15 @@ export interface AppConfigSnapshot {
   routePriority?: string[];
   routeOverrides?: Record<string, string>;
   minThinkingLevelByModel?: Record<string, ThinkingLevel>;
+  /** Plan Implement / Continue in Auto replace the chat history first (task setting). */
+  proposePlanImplementReplacesChatHistory?: boolean;
+  /**
+   * Read only by the VS Code webview to seed its local preference cache (#4972, #4962). Desktop
+   * hydrates these through UserPreferencesContext / WorkspaceContext instead.
+   */
+  bashCollapsedSummaryMode?: BashCollapsedSummaryMode;
+  transcriptDensity?: TranscriptDensity;
+  agentAiDefaults?: AgentAiDefaults;
 }
 
 /**
@@ -70,10 +81,21 @@ export class AppConfigStore {
       const config = await client.config.getConfig();
       // Only update if this is the latest fetch (ignore stale responses).
       if (myVersion === this.fetchVersion) {
+        // The VS Code webview host projects the config and forwards taskSettings only with
+        // this one flag, or not at all (#4942), so read it defensively.
+        const taskSettings = config.taskSettings as
+          | { proposePlanImplementReplacesChatHistory?: boolean }
+          | undefined;
         this.snapshot = {
           routePriority: config.routePriority,
           routeOverrides: config.routeOverrides,
           minThinkingLevelByModel: config.minThinkingLevelByModel,
+          proposePlanImplementReplacesChatHistory:
+            taskSettings?.proposePlanImplementReplacesChatHistory === true,
+          // The webview projection may omit these (see redactWebviewOrpcResult).
+          bashCollapsedSummaryMode: config.userPreferences?.appearance?.bashCollapsedSummaryMode,
+          transcriptDensity: config.userPreferences?.appearance?.transcriptDensity,
+          agentAiDefaults: config.agentAiDefaults,
         };
         this.notify();
       }
