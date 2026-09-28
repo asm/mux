@@ -760,11 +760,6 @@ export class TokenBudgetStrategy {
     }
     // Keep the continuation's delegated-turn/goal attribution; the warning
     // itself is a separate durable prefix row when this entry dispatches.
-    // Attachments of the triggering send must not ride along on maintenance continuations
-    // (they would be re-sent, and could consume the flush's reserved headroom).
-    const { fileParts: _fileParts, ...streamOptions } = context.options as SendMessageOptions & {
-      fileParts?: unknown;
-    };
     // Capture the exact successor before publishing the queue so handoff stops retain
     // upstream queue-cut attribution without creating a final-flush pair.
     let continuationEntryId: string | undefined;
@@ -776,12 +771,13 @@ export class TokenBudgetStrategy {
           this.pendingBudgetPrompt != null
             ? CONTEXT_WARNING_DEDUPE_KEY
             : CONTEXT_CONTINUE_DEDUPE_KEY,
-        options: streamOptions,
+        options: context.options,
         model: step.model,
         muxMetadata: {
           ...(context.workspaceTurnMetadata ?? { type: "normal" }),
           contextBudgetContinuation: true,
         },
+        autoModelRouting: context.autoModelRouting,
         goalKind: context.goalKind,
         goalId: context.goalId,
       };
@@ -818,7 +814,14 @@ export class TokenBudgetStrategy {
   ):
     | Result<RestoredContextStream | undefined, SendMessageError>
     | Promise<Result<RestoredContextStream | undefined, SendMessageError>> {
-    const { options, model: modelString, admissionCapture, goalKind, goalId } = input;
+    const {
+      options,
+      model: modelString,
+      autoModelRouting,
+      admissionCapture,
+      goalKind,
+      goalId,
+    } = input;
     let resumedFlushCannotWrite = false;
     // A resumed flush runs the middleware chain admitted for its promised reset (see
     // prepareContextBudgetSend), never the live registry.
@@ -909,6 +912,7 @@ export class TokenBudgetStrategy {
                   options,
                   model: modelString,
                   muxMetadata: continuationMetadata,
+                  autoModelRouting,
                   goalKind,
                   goalId,
                 },

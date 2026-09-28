@@ -8,6 +8,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import type { SendMessageOptions } from "@/common/orpc/types";
+import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import { createMuxMessage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
 import type { SendMessageError } from "@/common/types/errors";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -16,6 +17,7 @@ import assert from "@/common/utils/assert";
 import type { SessionContextController } from "./contextManagement/sessionContextController";
 import { prepareProviderRequestMessages } from "./turnContextAssembler";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
+import { buildHistoryEditPrecondition } from "@/common/utils/history/editTruncation";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
@@ -2623,6 +2625,63 @@ describe("AgentSession token-budget lifecycle", () => {
       "goal_continuation",
       "goal_continuation",
     ]);
+  });
+
+  test("a handoff continuation after a fenced edit still dispatches", async () => {
+    const h = await setup();
+    await seedHistory(h, 20_000);
+    await h.historyService.appendManyToHistory(workspaceId, [
+      createMuxMessage("edit-target", "user", "Original request"),
+      createMuxMessage("edit-answer", "assistant", "Original answer", { model }),
+    ]);
+    // Fence the edit over the wire projection the client holds, as the UI does.
+    const historyEditPrecondition = buildHistoryEditPrecondition(
+      (await allRows(h)).map((row) => MuxMessageSchema.parse(row) as MuxMessage),
+      "edit-target"
+    );
+    assert(historyEditPrecondition, "Expected an edit fence");
+    expect(
+      (
+        await h.session.sendMessage("Edited request", {
+          ...options,
+          editMessageId: "edit-target",
+          historyEditPrecondition,
+        })
+      ).success
+    ).toBe(true);
+    await h.waitForRequest(1);
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    const continuation = await h.waitForRequest(2);
+    const rows = await allRows(h);
+    expect(isHandoffRow(rows.at(-2)!)).toBe(true);
+    expect(text(rows.at(-1)!)).toBe("Continue");
+    expect(continuation.messages.map(text)).toContain("Edited request");
+    expect(continuation.messages.map(text)).not.toContain("Original request");
+  });
+
+  test("a budget continuation keeps the turn's routing and Chat Instructions state", async () => {
+    const h = await setup();
+    const record: AutoModelRoutingRecord = {
+      requestedFallbackModel: "anthropic:claude-sonnet-4-5",
+      model,
+      status: "routed",
+    };
+    // The record is session-internal; a routed send carries it on its resolved options. The
+    // empty snapshot is the renderer's "Chat Instructions disabled" sentinel.
+    const routed: SendMessageOptions & { autoModelRoutingRecord: AutoModelRoutingRecord } = {
+      ...options,
+      additionalSystemContext: "",
+      autoModelRoutingRecord: record,
+    };
+    expect((await h.session.sendMessage("Routed work", routed)).success).toBe(true);
+    expect(h.requests[0]).toMatchObject({ autoModelRouting: record, additionalSystemContext: "" });
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    expect(await h.waitForRequest(2)).toMatchObject({
+      autoModelRouting: record,
+      additionalSystemContext: "",
+    });
   });
 
   // Older builds offered a hidden notes-flush step before sealing a window. New windows never
