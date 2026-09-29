@@ -566,6 +566,48 @@ describe("delegated target default consent (#4453)", () => {
     await a.finish();
   });
 
+  test("the flag reaches workspace metadata, and Keep drops only a flagged mark (#4983)", async () => {
+    const a = await crashBeforeRecord();
+    const flagOf = async () =>
+      (await a.config.getAllWorkspaceMetadata()).find((meta) => meta.id === TARGET)
+        ?.delegatedCreationInterrupted;
+    // Keep cannot erase the binding of a creation nobody flagged.
+    expect((await a.real.keepInterruptedDelegatedWorkspace(TARGET)).success).toBe(true);
+    expect(mark(a.config)?.handleId).toBe("wst_handle");
+
+    await (await backend()).manager.resolveOrphanedDelegatedTargets();
+    expect(await flagOf()).toBe(true);
+
+    const published: unknown[] = [];
+    a.real.on("metadata", (event: { workspaceId: string; metadata: unknown }) => {
+      if (event.workspaceId !== TARGET) return;
+      published.push(
+        (event.metadata as { delegatedCreationInterrupted?: true } | null)
+          ?.delegatedCreationInterrupted
+      );
+    });
+    expect((await a.real.keepInterruptedDelegatedWorkspace(TARGET)).success).toBe(true);
+    expect(mark(a.config)).toBeUndefined();
+    expect(await flagOf()).toBeUndefined();
+    // Keep publishes the cleared flag, so the banner goes away without a reload.
+    expect(published).toHaveLength(1);
+    expect(published[0]).toBeUndefined();
+    await a.finish();
+  });
+
+  test("the startup pass never builds probed metadata (#4983)", async () => {
+    const a = await crashBeforeRecord();
+    const b = await backend();
+    // Building metadata probes every checkout, which a stalled mount blocks indefinitely.
+    const build = spyOn(b.config, "getAllWorkspaceMetadata");
+
+    await b.manager.resolveOrphanedDelegatedTargets();
+
+    expect(mark(a.config)?.interruptedAt).toBeString();
+    expect(build).not.toHaveBeenCalled();
+    await a.finish();
+  });
+
   test("a failed flag write never fails startup and is retried next time (#4983)", async () => {
     const a = await crashBeforeRecord({ disposable: true }); // No consent write comes first.
     const b = await backend();

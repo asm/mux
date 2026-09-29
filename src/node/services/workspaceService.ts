@@ -8864,7 +8864,46 @@ export class WorkspaceService
       flagged = true;
       return freshConfig;
     });
+    // Not published here: building metadata probes every checkout, and a stalled mount must not
+    // hold up the startup pass (#4983). The flag reaches the UI with the next metadata load (the
+    // renderer's initial list, usually); #5189 tracks changes made after that load.
     return flagged;
+  }
+
+  /**
+   * The user keeps a flagged delegated target as an ordinary workspace (#4983): drop its mark.
+   * Only a flagged mark is dropped, so no client can erase the binding of a creation that is
+   * still in progress. Idempotent.
+   */
+  async keepInterruptedDelegatedWorkspace(workspaceId: string): Promise<Result<void>> {
+    if (findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId) == null) {
+      return Err("Workspace not found");
+    }
+    let kept = false;
+    try {
+      await this.config.editConfig((freshConfig) => {
+        const entry = findWorkspaceEntry(freshConfig, workspaceId)?.workspace;
+        if (entry?.delegatedCreation?.interruptedAt != null) {
+          delete entry.delegatedCreation;
+          kept = true;
+        }
+        return freshConfig;
+      });
+    } catch (error) {
+      return Err(`Failed to keep workspace: ${getErrorMessage(error)}`);
+    }
+    if (kept) {
+      try {
+        await this.emitCurrentWorkspaceMetadata(workspaceId);
+      } catch (error) {
+        // The mark is gone either way; the next metadata load shows it.
+        log.warn("Failed to publish a kept delegated workspace", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
+    }
+    return Ok(undefined);
   }
 
   async setHeartbeatSettings(
