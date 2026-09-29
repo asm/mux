@@ -18,6 +18,7 @@ import {
   LAUNCH_BEHAVIOR_KEY,
   SELECTED_WORKSPACE_KEY,
   getAgentIdKey,
+  getDraftScopeId,
   getModelKey,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
@@ -39,6 +40,7 @@ import {
 } from "@/browser/utils/aiSelectionIntent";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { resetWorkspaceStorageGcForTests } from "@/browser/utils/workspaceStorageGc";
+import { resetCreationDraftStorageGcForTests } from "@/browser/utils/creationDraftStorageGc";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import * as path from "path";
@@ -2048,6 +2050,84 @@ describe("WorkspaceContext", () => {
     });
   });
 
+  test("collects the settings keys of creation drafts the backend no longer lists (#5053)", async () => {
+    using tempDir = new TestTempDir("ws-context-draft-storage-gc");
+    const config = new Config(path.join(tempDir.path, "xum-home"));
+    const projectPath = path.join(tempDir.path, "project");
+    await config.editConfig((current) => {
+      current.projects.set(projectPath, { workspaces: [] });
+      return current;
+    });
+    const service = new DraftService(config);
+    await service.putListEntry({
+      projectPath,
+      draftId: "listed",
+      subProjectPath: null,
+      createdAt: 1,
+    });
+    const listedKey = getModelKey(getDraftScopeId(projectPath, "listed"));
+    // Deleted in another window: only its settings are left in this origin.
+    const orphanKey = getModelKey(getDraftScopeId(projectPath, "deleted-elsewhere"));
+    resetCreationDraftStorageGcForTests();
+    createMockAPI({
+      projects: {
+        list: () =>
+          Promise.resolve([[projectPath, { workspaces: [] }]] as Awaited<
+            ReturnType<APIClient["projects"]["list"]>
+          >),
+      },
+      localStorage: { [listedKey]: JSON.stringify("m"), [orphanKey]: JSON.stringify("m") },
+      locationPath: "/settings",
+    });
+    currentClientMock.drafts = createDraftServiceClient(service);
+    getDraftStore().setClient(createTestApiClient(currentClientMock));
+    try {
+      await setup();
+      await waitFor(() => expect(localStorage.getItem(orphanKey)).toBeNull());
+      expect(localStorage.getItem(listedKey)).not.toBeNull();
+    } finally {
+      getDraftStore().forgetProject(projectPath);
+      getDraftStore().setClient(null);
+    }
+  });
+
+  test("never collects the settings of the draft a cold start routes to (#5053)", async () => {
+    using tempDir = new TestTempDir("ws-context-draft-storage-gc-route");
+    const config = new Config(path.join(tempDir.path, "xum-home"));
+    const projectPath = path.join(tempDir.path, "project");
+    await config.editConfig((current) => {
+      current.projects.set(projectPath, { workspaces: [] });
+      return current;
+    });
+    // Routed but unlisted (e.g. its list write never landed).
+    const routedKey = getModelKey(getDraftScopeId(projectPath, "routed"));
+    resetCreationDraftStorageGcForTests();
+    createMockAPI({
+      projects: {
+        list: () =>
+          Promise.resolve([[projectPath, { workspaces: [] }]] as Awaited<
+            ReturnType<APIClient["projects"]["list"]>
+          >),
+      },
+      localStorage: { [routedKey]: JSON.stringify("m") },
+      locationPath: `/project?project=${encodeURIComponent(getProjectRouteId(projectPath))}&draft=routed`,
+    });
+    const service = new DraftService(config);
+    currentClientMock.drafts = createDraftServiceClient(service);
+    const getList = mock(() => service.getList({ strict: true }));
+    currentClientMock.drafts.getList = getList;
+    getDraftStore().setClient(createTestApiClient(currentClientMock));
+    try {
+      await setup();
+      await waitFor(() => expect(getList).toHaveBeenCalled());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(localStorage.getItem(routedKey)).not.toBeNull();
+    } finally {
+      getDraftStore().forgetProject(projectPath);
+      getDraftStore().setClient(null);
+    }
+  });
+
   test.each([
     { name: "project", linkedPath: "/alpha", subProjectPath: null },
     { name: "sub-project", linkedPath: "/alpha/sub", subProjectPath: "/alpha/sub" },
@@ -2299,6 +2379,7 @@ function createDraftServiceClient(service: DraftService): TestApiOverrides<APICl
     update: (input) => service.update(input),
     delete: ({ scope }) => service.delete(scope),
     importLegacy: (input) => service.importLegacy(input),
+    getList: () => service.getList({ strict: true }),
     putListEntry: (input) => service.putListEntry(input),
     importLegacyList: ({ entries }) => service.importLegacyList(entries),
     subscribe: async (_input, opts) => {
