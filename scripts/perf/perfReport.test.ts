@@ -6,6 +6,7 @@ import {
   buildReport,
   formatLogLine,
   METRICS,
+  MILESTONES,
   parsePlaywrightResults,
   readScenario,
   renderSummary,
@@ -377,7 +378,7 @@ describe("renderSummary", () => {
       report,
     });
     const [row] = tableRows(markdown, "Scenario metrics");
-    expect(row?.slice(2)).toEqual(METRICS.map(() => "unavailable"));
+    expect(row?.slice(2)).toEqual([...METRICS, ...MILESTONES].map(() => "unavailable"));
 
     const ok = renderSummary({
       runUrl: "https://example.test/run",
@@ -387,6 +388,8 @@ describe("renderSummary", () => {
     const [okRow] = tableRows(ok, "Scenario metrics");
     expect(okRow).not.toContain("unavailable");
     expect(okRow?.[2 + metricColumn("hunkStepMedianMs")]).toBe("—"); // not recorded by this scenario
+    // Milestones apply to workspace-open scenarios only.
+    expect(okRow?.slice(2 + METRICS.length)).toEqual(MILESTONES.map(() => "—"));
   });
 });
 
@@ -474,6 +477,136 @@ describe("chat-switch scenarios", () => {
     expect(keys(report)).toEqual([`summary-missing:${CHAT_SWITCH_KEY}`]);
     expect(report.rows[0]?.scenarios).toEqual([]);
     expect(tableRows(render(report), "Chat switch")).toEqual([]);
+  });
+
+  test("the chat-switch spec never publishes Chrome totals, even without a chatSwitch key or when skipped", () => {
+    const report = buildReport(
+      input({
+        results: playwright([
+          { file: "scenarios/perf.chatSwitch.spec.ts", title: CHAT_SWITCH_TITLE },
+        ]),
+        reads: [
+          readScenario(
+            summary(
+              { runLabel: "chat-switch-mid-stream" },
+              { title: CHAT_SWITCH_TITLE, file: CHAT_SWITCH_SPEC }
+            ),
+            { sampleCount: 1 }
+          ),
+        ],
+      })
+    );
+    expect(report.problems).toEqual([]);
+    expect(tableRows(render(report), "Scenario metrics")).toEqual([]);
+
+    const skipped = buildReport(
+      input({
+        results: playwright([
+          {
+            file: "scenarios/perf.chatSwitch.spec.ts",
+            title: CHAT_SWITCH_TITLE,
+            status: "skipped",
+            attempts: 0,
+          },
+        ]),
+        reads: [],
+      })
+    );
+    expect(tableRows(render(skipped), "Scenario metrics")).toEqual([]);
+  });
+});
+
+const WORKSPACE_OPEN_TITLE = "perf: open workspace with small history profile";
+const WORKSPACE_OPEN_KEY = `perf.workspaceOpen.spec.ts › ${WORKSPACE_OPEN_TITLE}`;
+
+function workspaceOpenReport(milestones: unknown): Report {
+  return buildReport(
+    input({
+      results: playwright([
+        { file: "scenarios/perf.workspaceOpen.spec.ts", title: WORKSPACE_OPEN_TITLE },
+      ]),
+      reads: [
+        readScenario(
+          summary(
+            { runLabel: "workspace-open-small", milestones },
+            {
+              title: WORKSPACE_OPEN_TITLE,
+              file: "/w/tests/e2e/scenarios/perf.workspaceOpen.spec.ts",
+            }
+          ),
+          { sampleCount: 26 }
+        ),
+      ],
+    })
+  );
+}
+
+const MILESTONE_KEY = `milestones-unavailable:${WORKSPACE_OPEN_KEY}/workspace-open-small`;
+
+function milestoneCells(report: Report): string[] | undefined {
+  return tableRows(render(report), "Scenario metrics")[0]?.slice(2 + METRICS.length);
+}
+
+describe("workspace-open milestones", () => {
+  test("are shown for workspace-open scenarios", () => {
+    const report = workspaceOpenReport({
+      firstMessageMs: 364.3,
+      fullyLoadedMs: 448.3,
+      longestTaskMs: 0,
+    });
+    expect(report.problems).toEqual([]);
+    expect(milestoneCells(report)).toEqual(["364", "448", "0"]);
+  });
+
+  test.each(
+    MILESTONES.flatMap((milestone, index) =>
+      [null, undefined, "12", -1, 1e999, Number.NaN].map((value): [string, unknown, number] => [
+        milestone.id,
+        value,
+        index,
+      ])
+    )
+  )("milestone %s = %p is a problem; the other values stay", (id, value, index) => {
+    const milestones: Record<string, unknown> = {
+      firstMessageMs: 364.3,
+      fullyLoadedMs: 448.3,
+      longestTaskMs: 95,
+      [id]: value,
+    };
+    const report = workspaceOpenReport(milestones);
+    expect(keys(report)).toEqual([MILESTONE_KEY]);
+    const expected = ["364", "448", "95"];
+    expected[index] = "unavailable";
+    expect(milestoneCells(report)).toEqual(expected);
+    expect(tableRows(render(report), "Scenario metrics")[0]?.[2]).toBe("900");
+  });
+
+  test("each missing milestone is named with its reason", () => {
+    const report = workspaceOpenReport({
+      firstMessageMs: 1,
+      fullyLoadedMs: null,
+      longestTaskMs: "5",
+    });
+    expect(report.problems[0]?.text).toContain("Fully loaded ms (null), Longest task ms (invalid)");
+    expect(milestoneCells(report)).toEqual(["1", "unavailable", "unavailable"]);
+  });
+
+  test.each([undefined, null, "x", [1]])("milestones of %p are a problem", (milestones) => {
+    const report = workspaceOpenReport(milestones);
+    expect(keys(report)).toEqual([MILESTONE_KEY]);
+    expect(milestoneCells(report)).toEqual(MILESTONES.map(() => "unavailable"));
+    const gap = milestones === undefined ? "missing" : milestones === null ? "null" : "invalid";
+    expect(report.problems[0]?.text).toContain(`First message ms (${gap})`);
+  });
+
+  test("other scenarios ignore milestones, so their cells are not applicable", () => {
+    const report = buildReport(
+      input({
+        reads: [readScenario(summary({ milestones: { firstMessageMs: 5 } }), { sampleCount: 1 })],
+      })
+    );
+    expect(report.problems).toEqual([]);
+    expect(milestoneCells(report)).toEqual(MILESTONES.map(() => "—"));
   });
 });
 

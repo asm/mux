@@ -9,8 +9,11 @@
  * never used instead, because the final attempt is the one that decided the run. One test may
  * write several summaries in its final attempt (the chat-switch test writes a server-window
  * companion); each becomes its own scenario. Chat-switch scenarios are listed but their Chrome
- * totals are not reported; per-leg medians and workspace-open milestones are deferred (#4442)
- * because reporting them without coverage checks would hide lost measurements.
+ * totals are not reported; per-leg medians are deferred (#4442). Workspace-open scenarios add
+ * page milestones.
+ *
+ * Coverage rule (#4442): every value shown either has a check that turns lost data into
+ * "unavailable" plus a problem or warning, or it is not shown. Missing data is never silent.
  *
  * Artifact text is untrusted: it only goes into the Markdown summary, sanitized inside code spans.
  * The job log gets a counts-only line (`formatLogLine`) or a sanitized crash message
@@ -53,6 +56,21 @@ export const METRICS: readonly MetricSpec[] = [
   // Only the immersive-review hunk iteration scenario records it.
   { id: "hunkStepMedianMs", label: "Hunk step ms", decimals: 1, required: false },
 ];
+
+/** Page milestones (`milestones` in perf-summary.json, tests/e2e/utils/pageMilestones.ts). */
+export type MilestoneId = "firstMessageMs" | "fullyLoadedMs" | "longestTaskMs";
+
+export const MILESTONES: ReadonlyArray<{ id: MilestoneId; label: string; decimals: number }> = [
+  // A transcript that never renders still passes the spec (it asserts only fullyLoadedMs), so a
+  // missing first message must be visible here.
+  { id: "firstMessageMs", label: "First message ms", decimals: 0 },
+  { id: "fullyLoadedMs", label: "Fully loaded ms", decimals: 0 },
+  { id: "longestTaskMs", label: "Longest task ms", decimals: 0 },
+];
+
+/** Tests identified by spec file (the basename in the Playwright results), not by label. */
+const WORKSPACE_OPEN_SPEC = "perf.workspaceOpen.spec.ts";
+const CHAT_SWITCH_SPEC = "perf.chatSwitch.spec.ts";
 
 // ---------------------------------------------------------------------------
 // Sanitizing: every string taken from an artifact is untrusted.
@@ -139,6 +157,15 @@ function nonNegativeInteger(value: unknown): number | undefined {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
+/** Why a value the report shows is absent: not written, written as null, or not a valid number. */
+export type ValueGap = "missing" | "null" | "invalid";
+
+function valueGap(value: unknown): ValueGap | undefined {
+  if (finiteNonNegative(value) !== undefined) return undefined;
+  if (value === undefined) return "missing";
+  return value === null ? "null" : "invalid";
+}
+
 // ---------------------------------------------------------------------------
 // perf-summary.json / react-profile.json (tests/e2e/utils/perfProfile.ts, schemaVersion 1)
 // ---------------------------------------------------------------------------
@@ -165,6 +192,35 @@ export type MetricsRead =
     }
   | { ok: false; reason: string };
 
+/** A value that is present and valid, or why it is not. */
+export interface ValuesRead<K extends string> {
+  values: Partial<Record<K, number>>;
+  gaps: Array<{ key: K; gap: ValueGap }>;
+}
+
+function readValues<K extends string>(
+  record: Record<string, unknown>,
+  keys: readonly K[]
+): ValuesRead<K> {
+  const result: ValuesRead<K> = { values: {}, gaps: [] };
+  for (const key of keys) {
+    const gap = valueGap(record[key]);
+    if (gap === undefined) result.values[key] = record[key] as number;
+    else result.gaps.push({ key, gap });
+  }
+  return result;
+}
+
+/** Additive in schemaVersion 1; judged only for workspace-open tests, which always write it. */
+function readMilestones(value: unknown): ValuesRead<MilestoneId> {
+  const ids = MILESTONES.map((milestone) => milestone.id);
+  if (!isRecord(value)) {
+    const gap = valueGap(value) ?? "invalid";
+    return { values: {}, gaps: ids.map((key) => ({ key, gap })) };
+  }
+  return readValues(value, ids);
+}
+
 /**
  * `ok: true` means the summary is readable and attributable to a test attempt. Whether its Chrome
  * metrics are required depends on its siblings (chat-switch tests skip them), so a metrics
@@ -174,6 +230,7 @@ export type ScenarioRead =
   | ({
       ok: true;
       metrics: MetricsRead;
+      milestones: ValuesRead<MilestoneId>;
       /** The summary has a `chatSwitch` key (the chat-switch test's primary summary). */
       chatSwitch: boolean;
     } & ScenarioIdentity & { testKey: string; retry: number })
@@ -257,6 +314,7 @@ export function readScenario(summary: unknown, reactProfile: unknown): ScenarioR
     testKey: key,
     retry,
     metrics: readMetrics(summary, reactProfile),
+    milestones: readMilestones(summary.milestones),
     chatSwitch: "chatSwitch" in summary,
   };
 }
@@ -269,6 +327,8 @@ export type TestStatus = "expected" | "unexpected" | "flaky" | "skipped";
 
 export interface TestOutcome {
   key: string;
+  /** Spec file basename, e.g. `perf.workspaceOpen.spec.ts`. */
+  spec: string;
   title: string;
   status: TestStatus;
   attempts: number;
@@ -315,6 +375,7 @@ export function parsePlaywrightResults(json: unknown): PlaywrightResults {
         const finalRetry = results.length === 0 ? undefined : (lastRetry ?? results.length - 1);
         tests.push({
           key: testKey(specFile, title),
+          spec: basename(specFile),
           title,
           status: status as TestStatus,
           attempts: results.length,
@@ -349,12 +410,15 @@ export interface ReportScenario {
   values?: Partial<Record<MetricId, number>>;
   /** Metrics that should exist but could not be read; shown as "unavailable". */
   unavailable?: MetricId[];
+  /** Page milestones; only workspace-open scenarios have them (others show "—"). */
+  milestones?: ValuesRead<MilestoneId>;
 }
 
 export interface ReportRow {
   test: TestOutcome;
   /**
-   * The final attempt wrote a `chatSwitch` summary. All of that attempt's scenarios (including
+   * The chat-switch test (by spec file, or any test whose final attempt wrote a `chatSwitch`
+   * summary). All of that attempt's scenarios (including
    * profile-only companions) are chat-switch scenarios: their whole-scenario Chrome totals changed
    * scope when server-window switches were added, so they are neither required nor reported.
    */
@@ -380,6 +444,15 @@ export interface ReportInput {
   reads: readonly ScenarioRead[];
 }
 
+function gapList<K extends string>(
+  gaps: ReadonlyArray<{ key: K; gap: ValueGap }>,
+  label: (key: K) => string
+): string {
+  return gaps.map((entry) => `${label(entry.key)} (${entry.gap})`).join(", ");
+}
+
+const MILESTONE_LABEL = (id: MilestoneId) =>
+  MILESTONES.find((milestone) => milestone.id === id)?.label ?? id;
 /**
  * The expected scenarios are exactly the tests this run selected (from the Playwright results), so
  * a filtered manual run expects only what it ran. Summaries are attributed to a test's final
@@ -442,14 +515,23 @@ export function buildReport(input: ReportInput): Report {
       warnings.push(`Test ${code(test.key)} passed only on retry (${test.attempts} attempts).`);
     } else if (test.status === "skipped") {
       warnings.push(`Test ${code(test.key)} was skipped.`);
-      rows.push({ test, chatSwitch: false, scenarios: [], unavailable: "test skipped" });
+      rows.push({
+        test,
+        chatSwitch: test.spec === CHAT_SWITCH_SPEC,
+        scenarios: [],
+        unavailable: "test skipped",
+      });
       continue;
     }
 
     const final = input.reads.filter(
       (read) => read.testKey === test.key && read.retry === test.finalRetry
     );
-    const chatSwitch = final.some((read) => read.ok && read.chatSwitch);
+    // The chat-switch spec is classified by file, so a summary that lost its `chatSwitch` key never
+    // publishes its scope-dependent Chrome totals as an ordinary scenario.
+    const chatSwitch =
+      test.spec === CHAT_SWITCH_SPEC || final.some((read) => read.ok && read.chatSwitch);
+    const workspaceOpen = test.spec === WORKSPACE_OPEN_SPEC;
     const scenarios: ReportScenario[] = [];
     const invalid: string[] = [];
     for (const read of final) {
@@ -458,11 +540,21 @@ export function buildReport(input: ReportInput): Report {
       } else if (!chatSwitch) {
         if (read.metrics.ok) {
           const { values, unavailable } = read.metrics;
-          scenarios.push({ label: read.label, values, unavailable });
+          const milestones = workspaceOpen ? read.milestones : undefined;
+          scenarios.push({ label: read.label, values, unavailable, milestones });
           if (unavailable.includes("reactRenders")) {
             problems.push({
               key: `react-profile-unreadable:${test.key}/${read.label}`,
               text: `Scenario ${code(read.label)} has no readable React profile (\`react-profile.json\` is missing or malformed), so React renders are unavailable.`,
+            });
+          }
+          if (milestones && milestones.gaps.length > 0) {
+            problems.push({
+              key: `milestones-unavailable:${test.key}/${read.label}`,
+              text: `Scenario ${code(read.label)} has no usable page milestones for ${gapList(
+                milestones.gaps,
+                MILESTONE_LABEL
+              )}, so those cells are unavailable.`,
             });
           }
         } else {
@@ -594,7 +686,7 @@ export function renderSummary(input: {
   const metricRows: string[] = [];
   for (const row of rows.filter((entry) => !entry.chatSwitch)) {
     if (row.scenarios.length === 0) {
-      const cells = METRICS.map(() => "unavailable");
+      const cells = [...METRICS, ...MILESTONES].map(() => "unavailable");
       metricRows.push(`| ${code(row.test.key)} | ${unavailable(row)} | ${cells.join(" | ")} |`);
     }
     for (const scenario of row.scenarios) {
@@ -603,6 +695,16 @@ export function renderSummary(input: {
           ? "unavailable"
           : formatValue(scenario.values?.[spec.id], spec.decimals)
       );
+      const { milestones } = scenario;
+      for (const spec of MILESTONES) {
+        cells.push(
+          milestones === undefined
+            ? "—"
+            : milestones.values[spec.id] === undefined
+              ? "unavailable"
+              : formatValue(milestones.values[spec.id], spec.decimals)
+        );
+      }
       metricRows.push(`| ${code(row.test.key)} | ${code(scenario.label)} | ${cells.join(" | ")} |`);
     }
   }
@@ -613,16 +715,26 @@ export function renderSummary(input: {
     lines.push("### Scenario metrics", "");
     if (metricRows.length > 0) {
       lines.push(
-        ...tableHeader(["Test", "Scenario", ...METRICS.map((spec) => spec.label)], 2),
+        ...tableHeader(
+          [
+            "Test",
+            "Scenario",
+            ...METRICS.map((spec) => spec.label),
+            ...MILESTONES.map((spec) => spec.label),
+          ],
+          2
+        ),
         ...metricRows,
         ""
       );
     }
-    lines.push("— means the scenario does not record that metric.");
+    lines.push(
+      "— means the scenario does not record that metric. Page milestones (the last three columns) are recorded by workspace-open scenarios only."
+    );
     if (chatSwitchLabels.length > 0) {
       lines.push(
         "",
-        `Chat-switch scenarios (${chatSwitchLabels.join(", ")}) are not listed: their whole-scenario Chrome totals changed scope when server-window switches were added, so they are not comparable over time. Per-leg chat-switch medians and workspace-open milestones are not reported yet (#4442).`
+        `Chat-switch scenarios (${chatSwitchLabels.join(", ")}) are not listed: their whole-scenario Chrome totals changed scope when server-window switches were added, so they are not comparable over time. Per-leg chat-switch medians are not reported yet (#4442).`
       );
     }
     lines.push("");
