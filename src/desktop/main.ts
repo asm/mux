@@ -48,10 +48,6 @@ import { RemoteConnectionManager } from "./remoteConnectionManager";
 import { getLocalServerLoadUrl } from "./localServerDiscovery";
 import { REMOTE_CONNECTION_CHANNELS } from "@/common/constants/remoteConnection";
 import { randomBytes } from "crypto";
-import { RPCHandler } from "@orpc/server/message-port";
-import { onError } from "@orpc/server";
-import { formatOrpcError } from "../node/orpc/formatOrpcError";
-import { ServerLockfile } from "../node/services/serverLockfile";
 import "disposablestack/auto";
 
 import type {
@@ -184,7 +180,6 @@ import { normalizeAndValidateExternalUrl } from "./utils/normalizeAndValidateExt
 import { hasSameOrigin } from "./utils/hasSameOrigin";
 import assert from "../common/utils/assert";
 import { setOpenSSHHostKeyPolicyMode } from "@/node/runtime/sshConnectionPool";
-import { warmConfiguredTokenizers } from "../node/utils/main/tokenizerWarmModels";
 import { isBashAvailable } from "../node/utils/main/bashPath";
 import windowStateKeeper from "electron-window-state";
 import { getTitleBarOptions } from "./titleBarOptions";
@@ -476,6 +471,10 @@ function initializeRemoteConnections(): void {
     assertLocalController(event);
     assert(config, "Open Server Window requires the loaded config");
     // peek() never deletes a stale lock, so discovery cannot race a starting xum server.
+    // loadServices() has already loaded this module; importing it here keeps zod off the
+    // pre-splash path (#4423).
+    // eslint-disable-next-line no-restricted-syntax -- keeps zod off the pre-splash path (#4423)
+    const { ServerLockfile } = await import("../node/services/serverLockfile");
     const lock = await new ServerLockfile(config.rootDir).peek();
     // The token stays in this process: it only reaches the sandboxed window's load URL.
     return manager.openLocalServer(getLocalServerLoadUrl(lock, process.pid));
@@ -698,6 +697,20 @@ function createTray() {
 }
 
 /**
+ * How long to leave the main thread idle after the splash window's `show` event so its first
+ * frame reaches the screen. The imports that are only needed once services run load
+ * synchronously inside loadServices() (kept off the pre-splash path, #4423), and it starts right
+ * after `show`; without this wait they block the main thread before the first frame is
+ * presented, so the window maps but stays blank (measured on Linux: the logo painted ~1.5 s
+ * after `show`; 30-100 ms waits painted it within ~10 ms).
+ * Electron has no "first frame presented" signal for an onscreen window: ready-to-show fires
+ * before `show`, and waiting on capturePage() or a double requestAnimationFrame painted in time
+ * in only 2/10 and 2/3 runs, so a short timer is the only option. It only bounds startup by this many ms;
+ * if it is too short, the result is today's behavior (logo late), never a hang.
+ */
+const SPLASH_FIRST_PAINT_WAIT_MS = 60;
+
+/**
  * Create and show splash screen - instant visual feedback (<100ms)
  *
  * Shows a lightweight native window with static HTML while services load.
@@ -732,8 +745,8 @@ async function showSplashScreen() {
     splashWindow!.once("show", () => {
       const loadTime = Date.now() - startTime;
       console.log(`[${timestamp()}] Splash screen shown (${loadTime}ms)`);
-      // Give one more event loop tick for the window to actually paint
-      setImmediate(resolve);
+      // Let the first frame reach the screen before loadServices() blocks the main thread.
+      setTimeout(resolve, SPLASH_FIRST_PAINT_WAIT_MS);
     });
     splashWindow!.show();
   });
@@ -773,11 +786,20 @@ async function loadServices(): Promise<void> {
   // - ServiceContainer transitively imports the entire AI SDK (ai, @ai-sdk/anthropic, etc.)
   // - These are large modules (~100ms load time) that would block splash from appearing
   // - Loading happens once, then cached
+  // - formatOrpcError reaches WorkflowService (effect, oRPC schemas) for one string constant,
+  //   and tokenizer warm-up reaches the tool schemas; together they cost ~500 ms before the
+  //   splash when imported statically (#4423). scripts/check-startup-imports.ts bans effect
+  //   and zod so they stay here.
   const [
     { createConfigStores },
     { ServiceContainer: ServiceContainerClass },
     { TerminalWindowManager: TerminalWindowManagerClass },
     { router },
+    { formatOrpcError },
+    { warmConfiguredTokenizers },
+    { RPCHandler },
+    { onError },
+    { ServerLockfile },
   ] = await Promise.all([
     import("../node/config"),
     import("../node/services/serviceContainer"),
@@ -785,6 +807,11 @@ async function loadServices(): Promise<void> {
     // The oRPC router statically reaches every handler (and the `ai` package via
     // workspaceTitleGenerator), so it must stay off the pre-splash import path.
     import("../node/orpc/router"),
+    import("../node/orpc/formatOrpcError"),
+    import("../node/utils/main/tokenizerWarmModels"),
+    import("@orpc/server/message-port"),
+    import("@orpc/server"),
+    import("../node/services/serverLockfile"),
   ]);
   /* eslint-enable no-restricted-syntax */
   const stores = createConfigStores();
