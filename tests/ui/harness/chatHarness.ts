@@ -1,13 +1,14 @@
 import { act, fireEvent, waitFor } from "@testing-library/react";
 
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getInputKey } from "@/common/constants/storage";
+import { getDraftStore, type DraftStoreScope } from "@/browser/stores/DraftStore";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 
 export class ChatHarness {
   constructor(
     private readonly container: HTMLElement,
-    private readonly workspaceId: string
+    private readonly workspaceId: string,
+    /** The composer's draft scope; a creation composer passes its creation draft scope. */
+    private readonly draftScope: DraftStoreScope = { kind: "workspace", workspaceId }
   ) {}
 
   private async getActiveTextarea(): Promise<HTMLTextAreaElement> {
@@ -42,10 +43,10 @@ export class ChatHarness {
     textarea.focus();
 
     // happy-dom + React can be flaky for synthetic textarea input events.
-    // Since ChatInput uses usePersistedState, updating the persisted key is both deterministic
+    // ChatInput renders the draft store, so writing the draft there is both deterministic
     // and exercises the real UI state path.
     act(() => {
-      updatePersistedState(getInputKey(this.workspaceId), text);
+      getDraftStore().setText(this.draftScope, text);
     });
 
     await waitFor(
@@ -142,7 +143,7 @@ export class ChatHarness {
     textarea.focus();
 
     act(() => {
-      updatePersistedState(getInputKey(this.workspaceId), text);
+      getDraftStore().setText(this.draftScope, text);
     });
 
     await waitFor(

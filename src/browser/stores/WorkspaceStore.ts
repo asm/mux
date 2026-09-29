@@ -2715,11 +2715,17 @@ export class WorkspaceStore {
   }
 
   /**
-   * A composer applied a restore naming these held inputs (#4448): hide them now and ask the
-   * backend to drop its copy. If the backend refuses, show them again: a visible duplicate of
-   * what the composer holds is recoverable, a hidden held copy is not.
+   * A composer applied a restore naming these held inputs (#4448): hide them now (the composer
+   * shows the restored draft), and once `durable` resolves true (the draft write is confirmed by
+   * the backend) ask the backend to drop its copy. If the draft is not durable or the backend
+   * refuses, show them again: a visible duplicate of what the composer holds is recoverable, a
+   * hidden held copy is not.
    */
-  acceptRestoredHeldInputs(workspaceId: string, heldInputIds: readonly string[]): void {
+  acceptRestoredHeldInputs(
+    workspaceId: string,
+    heldInputIds: readonly string[],
+    durable: Promise<boolean>
+  ): void {
     assert(workspaceId.length > 0, "acceptRestoredHeldInputs requires a workspaceId");
     assert(heldInputIds.length > 0, "acceptRestoredHeldInputs requires held input ids");
     this.acceptedRestoreHeldInputs.set(
@@ -2728,6 +2734,25 @@ export class WorkspaceStore {
     );
     this.states.bump(workspaceId);
 
+    durable.then(
+      (isDurable) => {
+        if (isDurable) {
+          this.discardRestoredHeldInputs(workspaceId, heldInputIds);
+          return;
+        }
+        for (const heldInputId of heldInputIds) {
+          this.showRestoredHeldInputAgain(workspaceId, heldInputId, "restored draft not durable");
+        }
+      },
+      (error: unknown) => {
+        for (const heldInputId of heldInputIds) {
+          this.showRestoredHeldInputAgain(workspaceId, heldInputId, error);
+        }
+      }
+    );
+  }
+
+  private discardRestoredHeldInputs(workspaceId: string, heldInputIds: readonly string[]): void {
     const client = this.client;
     for (const heldInputId of heldInputIds) {
       if (!client) {

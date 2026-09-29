@@ -28,8 +28,6 @@ import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions"
 import {
   AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
-  getInputKey,
-  getInputAttachmentsKey,
   getModelKey,
   getNotifyOnResponseAutoEnableKey,
   getNotifyOnResponseKey,
@@ -68,10 +66,8 @@ import {
   unlockInitialStaging,
 } from "@/browser/features/ChatInput/initialStagingLock";
 import { appendStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
-import {
-  estimatePersistedChatAttachmentsChars,
-  MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS,
-} from "@/browser/features/ChatInput/draftAttachmentsStorage";
+import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
@@ -291,53 +287,36 @@ export type RuntimeAvailabilityState =
   | { status: "loaded"; data: RuntimeAvailabilityMap };
 
 function isWorkspaceDraftEmpty(workspaceId: string): boolean {
-  return (
-    readPersistedState<string>(getInputKey(workspaceId), "").trim().length === 0 &&
-    (readPersistedState<ChatAttachment[] | undefined>(
-      getInputAttachmentsKey(workspaceId),
-      undefined
-    )?.length ?? 0) === 0
-  );
+  const draft = getDraftStore().getView({ kind: "workspace", workspaceId });
+  return draft.text.trim().length === 0 && draft.attachmentCount === 0;
 }
 
-// Persist a failed creation send's draft under the new workspace's keys so the
-// retry happens there instead of creating a duplicate workspace.
-function transferDraftToWorkspace(
+// Move a failed creation send's draft into the new workspace's draft so the
+// retry happens there instead of creating a duplicate workspace. The creation
+// draft is already deleted, so this waits until the backend confirmed the
+// hand-off (a hard close right after must not lose the prompt). A failed save
+// is logged: the text still shows in the composer, and the store retries it.
+async function transferDraftToWorkspace(
   workspaceId: string,
   text: string,
   attachments: ChatAttachment[],
   forceProjectSkillDiscovery: boolean
-): void {
+): Promise<void> {
   if (forceProjectSkillDiscovery) {
     // The original send resolved its slash skill against the project path;
     // carry that choice so the retry cannot resolve a different skill from
     // the new worktree.
     updatePersistedState(getPendingDraftSkillDiscoveryKey(workspaceId), true);
   }
-  updatePersistedState(getInputKey(workspaceId), text);
-  if (attachments.length === 0) {
-    // A text-only send never touches the attachments key: the mounted composer
-    // is unlocked during such a send, and a write here (even of "nothing") would
-    // replace attachments the user added there meanwhile.
-    return;
-  }
-  // Base64-bearing attachments can exceed the persistence cap. Drop the
-  // largest ones first so small retryable chips (e.g. a pending file whose
-  // staging failed) survive the transfer.
-  let persistable = attachments;
-  while (
-    persistable.length > 0 &&
-    estimatePersistedChatAttachmentsChars(persistable) > MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS
-  ) {
-    const largest = persistable.reduce((a, b) =>
-      JSON.stringify(b).length > JSON.stringify(a).length ? b : a
-    );
-    persistable = persistable.filter((attachment) => attachment !== largest);
-  }
-  updatePersistedState(
-    getInputAttachmentsKey(workspaceId),
-    persistable.length > 0 ? persistable : undefined
-  );
+  const scope = { kind: "workspace" as const, workspaceId };
+  getDraftStore().setText(scope, text);
+  // A text-only send never touches the attachments: the mounted composer is
+  // unlocked during such a send, and a write here (even of "nothing") would
+  // replace attachments the user added there meanwhile.
+  if (attachments.length > 0) getDraftStore().setAttachments(scope, attachments);
+  await getDraftStore()
+    .flush(scope)
+    .catch((error: unknown) => console.warn("Failed to save the transferred draft:", error));
 }
 
 /**
@@ -708,16 +687,10 @@ export function useCreationWorkspace({
           .catch(() => null);
 
         const isDraftScope = typeof draftId === "string" && draftId.trim().length > 0;
-        const pendingScopeId = projectPath
-          ? isDraftScope
-            ? getDraftScopeId(projectPath, draftId)
-            : getPendingScopeId(projectPath)
-          : null;
-
         const clearPendingDraft = () => {
           // Once the workspace exists, drop the draft even if the initial send fails
           // so we don't keep a hidden placeholder in the sidebar.
-          if (!pendingScopeId) {
+          if (!projectPath) {
             return;
           }
 
@@ -726,8 +699,16 @@ export function useCreationWorkspace({
             return;
           }
 
-          updatePersistedState(getInputKey(pendingScopeId), "");
-          updatePersistedState(getInputAttachmentsKey(pendingScopeId), undefined);
+          getDraftStore()
+            .deleteDraft(
+              getComposerDraftScope({
+                variant: "creation",
+                workspaceId: null,
+                creationProjectPath: projectPath,
+                pendingDraftId: draftId ?? undefined,
+              })
+            )
+            .catch(() => undefined);
         };
 
         // Sync preferences before switching (keeps workspace settings consistent).
@@ -804,7 +785,7 @@ export function useCreationWorkspace({
           // For slash-skill sends messageText is the rewritten skill text;
           // restore the original typed command from rawCommand so the retry
           // re-invokes the skill.
-          transferDraftToWorkspace(
+          await transferDraftToWorkspace(
             metadata.id,
             overrideRawCommand ?? messageText,
             [
@@ -922,7 +903,7 @@ export function useCreationWorkspace({
           // attachment-bearing sends lock that composer, so a text-only send that waited on
           // init may already hold something the user typed there; never overwrite that.
           if (isWorkspaceDraftEmpty(metadata.id)) {
-            transferDraftToWorkspace(
+            await transferDraftToWorkspace(
               metadata.id,
               overrideRawCommand ?? messageText,
               [
