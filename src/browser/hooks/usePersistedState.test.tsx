@@ -7,6 +7,16 @@ import {
 } from "../../../tests/ui/quotaLimitedStorage";
 
 import {
+  LAST_CUSTOM_MODEL_PROVIDER_KEY,
+  LAST_VISITED_ROUTE_KEY,
+  MAX_PERSISTED_KEY_CHARS,
+  UI_THEME_KEY,
+  getLastRuntimeConfigKey,
+  getPersistedKeyRegistration,
+  getTimelineFilterKey,
+} from "@/common/constants/storage";
+import {
+  removePersistedStateKeys,
   readPersistedRawString,
   readPersistedState,
   readPersistedString,
@@ -17,6 +27,8 @@ import {
   writePersistedRawString,
   type PersistedStateWriteEvent,
 } from "./usePersistedState";
+
+const QUOTA_FULL_KEY = getLastRuntimeConfigKey("/repo/quota-full");
 
 describe("raw persisted strings when storage access is denied", () => {
   let cleanupDom: (() => void) | null = null;
@@ -62,12 +74,12 @@ describe("usePersistedState backend sync", () => {
   });
 
   test("backend cache hydration updates subscribers that did not opt into storage listening", () => {
-    const { result } = renderHook(() => usePersistedState("backend-synced-key", "initial"));
+    const { result } = renderHook(() => usePersistedState(UI_THEME_KEY, "initial"));
 
     expect(result.current[0]).toBe("initial");
 
     act(() => {
-      syncPersistedStateFromBackend("backend-synced-key", "from-backend");
+      syncPersistedStateFromBackend(UI_THEME_KEY, "from-backend");
     });
 
     expect(result.current[0]).toBe("from-backend");
@@ -79,13 +91,13 @@ describe("usePersistedState backend sync", () => {
       events.push(event);
     });
 
-    updatePersistedState("observed-key", "local-value");
-    syncPersistedStateFromBackend("observed-key", "backend-value");
+    updatePersistedState(LAST_CUSTOM_MODEL_PROVIDER_KEY, "local-value");
+    syncPersistedStateFromBackend(LAST_CUSTOM_MODEL_PROVIDER_KEY, "backend-value");
     unsubscribe();
 
     expect(events).toEqual([
-      { key: "observed-key", newValue: "local-value", source: "local" },
-      { key: "observed-key", newValue: "backend-value", source: "backend" },
+      { key: LAST_CUSTOM_MODEL_PROVIDER_KEY, newValue: "local-value", source: "local" },
+      { key: LAST_CUSTOM_MODEL_PROVIDER_KEY, newValue: "backend-value", source: "backend" },
     ]);
   });
 });
@@ -144,9 +156,9 @@ describe("persisted state writes under storage quota pressure", () => {
       const keptKeys = ["review-state:aaaaaaaaaa", "inputAttachments:aaaaaaaaaa", "uiTheme"];
       for (const key of keptKeys) storage.seed(key, "y".repeat(150));
 
-      write("input:quota-draft", "z".repeat(600));
+      write(LAST_VISITED_ROUTE_KEY, "z".repeat(600));
 
-      expect(storage.getItem("input:quota-draft")).toBe(JSON.stringify("z".repeat(600)));
+      expect(storage.getItem(LAST_VISITED_ROUTE_KEY)).toBe(JSON.stringify("z".repeat(600)));
       for (const key of cacheKeys) expect(storage.getItem(key)).toBeNull();
       for (const key of keptKeys) expect(storage.getItem(key)).not.toBeNull();
       expect(warn).not.toHaveBeenCalled();
@@ -160,24 +172,126 @@ describe("persisted state writes under storage quota pressure", () => {
     const events: PersistedStateWriteEvent[] = [];
     const unsubscribe = subscribePersistedStateWrites((event) => events.push(event));
 
-    const results = [1, 2, 3].map(() => updatePersistedState("input:quota-full", "z".repeat(400)));
+    const results = [1, 2, 3].map(() => updatePersistedState(QUOTA_FULL_KEY, "z".repeat(400)));
     unsubscribe();
 
     expect(results).toEqual([false, false, false]);
-    expect(storage.getItem("input:quota-full")).toBeNull();
+    expect(storage.getItem(QUOTA_FULL_KEY)).toBeNull();
     expect(storage.getItem("session-cost:bbbbbbbbbb")).toBeNull();
     expect(storage.getItem("review-state:bbbbbbbbbb")).not.toBeNull();
     // First write: original attempt plus one retry after eviction. Later writes find nothing
     // left to evict and do not retry.
     expect(storage.setItemCalls).toEqual([
-      "input:quota-full",
-      "input:quota-full",
-      "input:quota-full",
-      "input:quota-full",
+      QUOTA_FULL_KEY,
+      QUOTA_FULL_KEY,
+      QUOTA_FULL_KEY,
+      QUOTA_FULL_KEY,
     ]);
     // Nothing changed on disk, so no write observer hears about it.
     expect(events).toEqual([]);
     // One warning per key per session instead of one per keystroke.
     expect(warn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("persisted state key budgets", () => {
+  let cleanupDom: (() => void) | null = null;
+  let error: ReturnType<typeof spyOn<Console, "error">>;
+  let warn: ReturnType<typeof spyOn<Console, "warn">>;
+
+  // Every test uses its own workspace id because refusals are logged once per key per session.
+  const TIMELINE_FILTER_BUDGET = getPersistedKeyRegistration(
+    getTimelineFilterKey("budget")
+  )!.maxValueChars;
+  const valueOfLength = (serializedLength: number) => "x".repeat(serializedLength - 2);
+  // Refusal logs shorten long keys, so match on the key's start.
+  const logsFor = (spy: typeof error | typeof warn, key: string) =>
+    spy.mock.calls.filter((call) => String(call[0]).includes(`"${key.slice(0, 100)}`));
+  const refusalLogsFor = (key: string) => logsFor(error, key);
+  // Over-budget values still work for the session, so they only warn.
+  const overBudgetLogsFor = (key: string) => logsFor(warn, key);
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+    error = spyOn(console, "error").mockImplementation(() => undefined);
+    warn = spyOn(console, "warn").mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    error.mockRestore();
+    warn.mockRestore();
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("stores a value at its budget; one char more stays in memory only, logged once", () => {
+    const key = getTimelineFilterKey("budget0001");
+    const atBudget = valueOfLength(TIMELINE_FILTER_BUDGET);
+
+    expect(updatePersistedState(key, atBudget)).toBe(true);
+    const overBudget = valueOfLength(TIMELINE_FILTER_BUDGET + 1);
+    expect(updatePersistedState(key, overBudget)).toBe(true);
+    expect(updatePersistedState(key, overBudget)).toBe(true);
+
+    // Readers see the new value for this session; localStorage keeps the last value that fit.
+    expect(readPersistedState(key, "")).toBe(overBudget);
+    expect(window.localStorage.getItem(key)).toBe(JSON.stringify(atBudget));
+    expect(overBudgetLogsFor(key)).toHaveLength(1);
+    expect(refusalLogsFor(key)).toHaveLength(0);
+
+    // A value that fits again is stored and replaces the in-memory one; removal clears both.
+    expect(updatePersistedState(key, "tools")).toBe(true);
+    expect(window.localStorage.getItem(key)).toBe(JSON.stringify("tools"));
+    expect(updatePersistedState(key, overBudget)).toBe(true);
+    expect(updatePersistedState(key, null)).toBe(true);
+    expect(readPersistedState(key, "all")).toBe("all");
+  });
+
+  test("an over-budget hook update changes the UI state but not the stored value", () => {
+    const key = getTimelineFilterKey("budget0002");
+    const { result } = renderHook(() => usePersistedState(key, "all"));
+    const overBudget = valueOfLength(TIMELINE_FILTER_BUDGET + 1);
+
+    // A refused write used to leave the UI unchanged, which froze whatever wrote it.
+    act(() => result.current[1](overBudget));
+
+    expect(result.current[0]).toBe(overBudget);
+    expect(window.localStorage.getItem(key)).toBeNull();
+    expect(overBudgetLogsFor(key)).toHaveLength(1);
+  });
+
+  test("refuses unregistered keys and keys over the length cap, but always allows removal", () => {
+    const unregistered = "unregistered-feature:state";
+    const overlongKey = getTimelineFilterKey("w".repeat(MAX_PERSISTED_KEY_CHARS));
+
+    expect(updatePersistedState(unregistered, true)).toBe(false);
+    syncPersistedStateFromBackend(overlongKey, "all");
+    // Unlike over-budget values, these are not kept in memory either.
+    expect(readPersistedState(unregistered, null)).toBeNull();
+    expect(readPersistedState(overlongKey, null)).toBeNull();
+    expect(window.localStorage.getItem(unregistered)).toBeNull();
+    expect(window.localStorage.getItem(overlongKey)).toBeNull();
+    expect(refusalLogsFor(unregistered)).toHaveLength(1);
+    expect(refusalLogsFor(overlongKey)).toHaveLength(1);
+    // The log line stays bounded instead of echoing the whole oversized key.
+    expect(String(refusalLogsFor(overlongKey)[0][0]).length).toBeLessThan(overlongKey.length);
+
+    // Legacy keys are no longer registered; startup cleanups must still remove them.
+    window.localStorage.setItem("input:legacy-draft", JSON.stringify("old text"));
+    expect(updatePersistedState("input:legacy-draft", null)).toBe(true);
+    expect(window.localStorage.getItem("input:legacy-draft")).toBeNull();
+  });
+
+  test("batch removal clears every key and mounted hooks fall back to their defaults", () => {
+    const keys = [getTimelineFilterKey("budget0003"), getTimelineFilterKey("budget0004")];
+    for (const key of keys) window.localStorage.setItem(key, JSON.stringify("tools"));
+    const { result } = renderHook(() => usePersistedState(keys[0], "all", { listener: true }));
+    expect(result.current[0]).toBe("tools");
+
+    act(() => removePersistedStateKeys(keys));
+
+    expect(result.current[0]).toBe("all");
+    for (const key of keys) expect(window.localStorage.getItem(key)).toBeNull();
   });
 });

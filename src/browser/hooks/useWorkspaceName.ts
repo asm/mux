@@ -2,7 +2,10 @@ import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { z } from "zod";
 import { useAPI } from "@/browser/contexts/API";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { getWorkspaceNameStateKey } from "@/common/constants/storage";
+import {
+  WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS,
+  getWorkspaceNameStateKey,
+} from "@/common/constants/storage";
 import type { NameGenerationError } from "@/common/types/errors";
 import {
   validateWorkspaceBranchName,
@@ -94,6 +97,28 @@ const WorkspaceNamePersistedStateSchema = z.object({
 });
 
 export type WorkspaceNamePersistedState = z.infer<typeof WorkspaceNamePersistedStateSchema>;
+
+/** FNV-1a (32-bit). Only detects changes past the stored prefix; not a security hash. */
+function hashMessage(message: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < message.length; index++) {
+    hash ^= message.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+/**
+ * lastGeneratedFor only detects whether the message changed, so a long message is stored as a
+ * bounded fingerprint: the full creation message can be many KB, and the persisted state must fit
+ * its localStorage budget. The fingerprint ends with the full message's length and hash, so an
+ * edit past the prefix still counts as a change and regenerates the name.
+ */
+function toStoredMessage(message: string): string {
+  if (message.length <= WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS) return message;
+  const suffix = `\u2026#${message.length}:${hashMessage(message)}`;
+  return message.slice(0, WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS - suffix.length) + suffix;
+}
 
 const DEFAULT_PERSISTED_STATE: WorkspaceNamePersistedState = {
   generatedIdentity: null,
@@ -246,7 +271,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
           setStored((prev) => ({
             ...prev,
             generatedIdentity: identity,
-            lastGeneratedFor: forMessage,
+            lastGeneratedFor: toStoredMessage(forMessage),
           }));
 
           safeResolve(identity);
@@ -257,7 +282,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
         setStored((prev) => ({
           ...prev,
           generatedIdentity: fallbackIdentity,
-          lastGeneratedFor: forMessage,
+          lastGeneratedFor: toStoredMessage(forMessage),
         }));
         setError(null);
         safeResolve(fallbackIdentity);
@@ -270,7 +295,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
         setStored((prev) => ({
           ...prev,
           generatedIdentity: fallbackIdentity,
-          lastGeneratedFor: forMessage,
+          lastGeneratedFor: toStoredMessage(forMessage),
         }));
         setError(null);
         safeResolve(fallbackIdentity);
@@ -291,7 +316,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     // - Auto-generation is disabled
     // - Message is empty
     // - Already generated for this message
-    if (!autoGenerate || !message.trim() || lastGeneratedFor === message) {
+    if (!autoGenerate || !message.trim() || lastGeneratedFor === toStoredMessage(message)) {
       // Clear any pending timer since conditions changed
       if (debounceTimerRef.current) {
         clearTimeout(debounceTimerRef.current);
@@ -401,7 +426,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     }
 
     // If we have an identity that was generated for the current message, use it
-    if (generatedIdentity && lastGeneratedFor === message) {
+    if (generatedIdentity && lastGeneratedFor === toStoredMessage(message)) {
       return generatedIdentity;
     }
 

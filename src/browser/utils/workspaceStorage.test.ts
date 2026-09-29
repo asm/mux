@@ -3,9 +3,16 @@ import { GlobalWindow } from "happy-dom";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { QuotaLimitedStorage } from "../../../tests/ui/quotaLimitedStorage";
 
-import { deleteWorkspaceStorage, migrateWorkspaceStorage } from "@/browser/utils/workspaceStorage";
+import {
+  copyWorkspaceStorage,
+  deleteWorkspaceStorage,
+  migrateWorkspaceStorage,
+} from "@/browser/utils/workspaceStorage";
 import {
   getModelKey,
+  getReviewsKey,
+  getPersistedKeyRegistration,
+  getWorkspaceNameStateKey,
   getDesktopPopoutKey,
   getDisableWorkspaceAgentsKey,
   getMCPTestResultsKey,
@@ -100,5 +107,48 @@ describe("migrateWorkspaceStorage", () => {
     migrateWorkspaceStorage("__pending__/repo", "ws-destination");
 
     expect(storage.getItem(sourceKey)).toBe(JSON.stringify("anthropic:claude-opus"));
+  });
+
+  // Older builds stored values larger than today's budgets (e.g. the whole creation message in
+  // workspaceNameState). The destination can only hold such a value in memory, so the source must
+  // stay the durable copy.
+  test("keeps a source value that is over its budget at the destination", () => {
+    const domWindow = new GlobalWindow() as unknown as Window & typeof globalThis;
+    globalThis.window = domWindow;
+    globalThis.document = domWindow.document;
+    globalThis.localStorage = domWindow.localStorage;
+    const sourceKey = getWorkspaceNameStateKey("__pending__/repo2");
+    const budget = getPersistedKeyRegistration(sourceKey)!.maxValueChars;
+    const legacyValue = JSON.stringify({ lastGeneratedFor: "m".repeat(budget) });
+    localStorage.setItem(sourceKey, legacyValue);
+
+    migrateWorkspaceStorage("__pending__/repo2", "ws-destination2");
+
+    expect(localStorage.getItem(sourceKey)).toBe(legacyValue);
+  });
+});
+
+describe("copyWorkspaceStorage", () => {
+  beforeEach(() => {
+    saveDomGlobals();
+    const domWindow = new GlobalWindow() as unknown as Window & typeof globalThis;
+    globalThis.window = domWindow;
+    globalThis.document = domWindow.document;
+    globalThis.localStorage = domWindow.localStorage;
+  });
+
+  afterEach(() => {
+    restoreDomGlobals();
+  });
+
+  // A source whose legacy review data was never imported has no review-state.json for the backend
+  // fork to copy; the fork's own one-time import needs the legacy keys.
+  test("carries not-yet-imported legacy review data to a fork", () => {
+    const legacyReviews = JSON.stringify({ workspaceId: "ws-source", reviews: { r1: {} } });
+    localStorage.setItem(getReviewsKey("ws-source"), legacyReviews);
+
+    expect(copyWorkspaceStorage("ws-source", "ws-fork")).toBe(true);
+
+    expect(localStorage.getItem(getReviewsKey("ws-fork"))).toBe(legacyReviews);
   });
 });
