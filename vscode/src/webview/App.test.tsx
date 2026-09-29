@@ -97,14 +97,18 @@ async function clearProvidersConfig(bridge: TestBridge): Promise<void> {
   await refreshed;
 }
 
-async function selectWorkspace(bridge: TestBridge, history: unknown[] = []): Promise<void> {
+async function selectWorkspace(
+  bridge: TestBridge,
+  history: unknown[] = [],
+  workspace: UiWorkspace = WORKSPACE
+): Promise<void> {
   await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
-  await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE] });
-  await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
+  await bridge.emit({ type: "workspaces", workspaces: [workspace] });
+  await bridge.emit({ type: "setSelectedWorkspace", workspaceId: workspace.id });
   for (const event of history) {
-    await bridge.emit({ type: "chatEvent", workspaceId: WORKSPACE.id, event });
+    await bridge.emit({ type: "chatEvent", workspaceId: workspace.id, event });
   }
-  await bridge.emit({ type: "chatEvent", workspaceId: WORKSPACE.id, event: { type: "caught-up" } });
+  await bridge.emit({ type: "chatEvent", workspaceId: workspace.id, event: { type: "caught-up" } });
 }
 
 function toolMessage(
@@ -2224,4 +2228,232 @@ describe("vscode webview message rows", () => {
 
     expect(view.queryByText(/bash · Watching PR 27330 until it is ready/)).not.toBeNull();
   });
+});
+
+describe("vscode webview retry barrier (#5092)", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  const userRow = (id: string, sequence: number) => ({
+    ...createMuxMessage(id, "user", "Hello", { historySequence: sequence, timestamp: sequence }),
+    type: "message",
+  });
+  // A persisted failed turn: renders as a stream-error row, like desktop's.
+  const failedTurn = (errorType: "network" | "context_exceeded" | "authentication") => [
+    userRow("u1", 1),
+    {
+      type: "message",
+      id: "a1",
+      role: "assistant",
+      parts: [],
+      metadata: { historySequence: 2, timestamp: 2, error: "provider exploded", errorType },
+    },
+  ];
+  // Scheduled at call time: a countdown that already ran out shows "Retrying..." instead.
+  const scheduledRetry = () => ({
+    type: "auto-retry-scheduled",
+    attempt: 2,
+    delayMs: 60_000,
+    scheduledAt: Date.now(),
+  });
+  const chatEvent = (bridge: TestBridge, event: unknown, workspaceId = WORKSPACE.id) =>
+    bridge.emit({ type: "chatEvent", workspaceId, event });
+  // A live stream the user stops after its first token.
+  const stopMidStream = async (bridge: TestBridge, workspaceId = WORKSPACE.id) => {
+    await chatEvent(
+      bridge,
+      {
+        type: "stream-start",
+        workspaceId,
+        messageId: "a1",
+        model: "anthropic:claude-sonnet-4-5",
+        historySequence: 2,
+        startTime: 2,
+      },
+      workspaceId
+    );
+    await chatEvent(
+      bridge,
+      {
+        type: "stream-delta",
+        workspaceId,
+        messageId: "a1",
+        delta: "Half an answer",
+        tokens: 3,
+        timestamp: 3,
+      },
+      workspaceId
+    );
+    await chatEvent(
+      bridge,
+      { type: "stream-abort", workspaceId, messageId: "a1", abortReason: "user" },
+      workspaceId
+    );
+  };
+  const click = async (element: HTMLElement) => {
+    await act(async () => {
+      fireEvent.click(element);
+      await Promise.resolve();
+    });
+  };
+
+  test("Retry after a stream error resumes the stream without toggling auto-retry", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, failedTurn("network"));
+
+    expect(view.container.textContent).toContain("Stream interrupted");
+    await click(view.getByRole("button", { name: "Retry" }));
+
+    const resumes = bridge.orpcCalls("workspace.resumeStream");
+    expect(resumes).toHaveLength(1);
+    expect(resumes[0].input).toMatchObject({ workspaceId: WORKSPACE.id });
+    expect(bridge.orpcCalls("workspace.setAutoRetryEnabled")).toHaveLength(0);
+
+    // A refused resume is reported on the barrier.
+    await bridge.emit({
+      type: "orpcResponse",
+      requestId: resumes[0].requestId,
+      ok: true,
+      kind: "value",
+      value: { success: false, error: { type: "runtime_not_ready", message: "resume refused" } },
+    });
+    expect(view.container.textContent).toContain("Retry failed:");
+  });
+
+  test("while the backend has a retry scheduled, the barrier shows its countdown and offers no Retry or Stop", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    // The replayed status snapshot arrives before caught-up, after the failed turn.
+    await selectWorkspace(bridge, [...failedTurn("network"), scheduledRetry()]);
+
+    expect(view.container.textContent).toContain("Retrying in");
+    expect(view.container.textContent).toContain("(attempt 2)");
+    // A manual Retry would race the armed backoff; the webview never stops auto-retry either.
+    expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(view.queryByRole("button", { name: /^Stop/ })).toBeNull();
+
+    // The status belongs to this workspace: another failed workspace offers Retry again.
+    const other: UiWorkspace = { ...WORKSPACE, id: "ws-2", workspaceName: "other" };
+    await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE, other] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: other.id });
+    for (const event of [...failedTurn("network"), { type: "caught-up" }]) {
+      await chatEvent(bridge, event, other.id);
+    }
+    expect(view.container.textContent).not.toContain("Retrying");
+    expect(view.getByRole("button", { name: "Retry" })).toBeTruthy();
+  });
+
+  test("a context_exceeded error shows no retry barrier", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, failedTurn("context_exceeded"));
+
+    expect(view.container.textContent).toContain("provider exploded");
+    expect(view.container.textContent).not.toContain("Stream interrupted");
+    expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  test("a replayed terminal context_exceeded error survives history loading and shows no Retry", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    // The backend replays the turn's terminal error before caught-up (pre-stream failure).
+    await selectWorkspace(bridge, [
+      userRow("u1", 1),
+      {
+        type: "stream-error",
+        messageId: "a1",
+        error: "prompt is too long",
+        errorType: "context_exceeded",
+      },
+    ]);
+
+    expect(view.container.textContent).toContain("prompt is too long");
+    expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  test("without a server connection the retry barrier is not offered", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, failedTurn("network"));
+    expect(view.getByRole("button", { name: "Retry" })).toBeTruthy();
+
+    // File mode keeps the transcript, but the host refuses every bridged action.
+    await bridge.emit({ type: "connectionStatus", status: { mode: "file", error: "offline" } });
+
+    expect(view.container.textContent).toContain("provider exploded");
+    expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  test("a user-stopped stream shows the interrupted divider; its button and Shift+R resume it", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [userRow("u1", 1)]);
+    await stopMidStream(bridge);
+
+    // A user stop is not an error: no retry barrier, only the divider.
+    expect(view.container.textContent).not.toContain("Stream interrupted");
+    await click(view.getByRole("button", { name: "Continue interrupted response" }));
+    expect(bridge.orpcCalls("workspace.resumeStream")).toHaveLength(1);
+    await bridge.answer("workspace.resumeStream", { success: true, data: { started: true } });
+
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "R", shiftKey: true });
+      await Promise.resolve();
+    });
+    const resumes = bridge.orpcCalls("workspace.resumeStream");
+    expect(resumes).toHaveLength(2);
+    expect(resumes[1].input).toMatchObject({ workspaceId: WORKSPACE.id });
+    // Resuming a user stop never flips the auto-retry preference.
+    expect(bridge.orpcCalls("workspace.setAutoRetryEnabled")).toHaveLength(0);
+  });
+
+  // #4738: a child task keeps its assigned agent (agentType), even when a stale stored pick says
+  // otherwise; Retry and resume must send it, as the composer does.
+  const subAgent: UiWorkspace = {
+    ...WORKSPACE,
+    ai: { parentWorkspaceId: "ws-parent", agentId: "plan", agentType: "exec" },
+  };
+  const resumedAgentId = (bridge: TestBridge) => {
+    const resumes = bridge.orpcCalls("workspace.resumeStream");
+    expect(resumes).toHaveLength(1);
+    return (resumes[0].input as { options?: { agentId?: string } }).options?.agentId;
+  };
+
+  test("a sub-agent's Retry sends its locked agent, not a stale stored pick", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, failedTurn("network"), subAgent);
+    await act(async () => {
+      updatePersistedState(getAgentIdKey(subAgent.id), "plan");
+      await Promise.resolve();
+    });
+
+    await click(view.getByRole("button", { name: "Retry" }));
+    expect(resumedAgentId(bridge)).toBe("exec");
+  });
+
+  test("a sub-agent's interrupted-divider resume sends its locked agent, not a stale stored pick", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [userRow("u1", 1)], subAgent);
+    await stopMidStream(bridge);
+    await act(async () => {
+      updatePersistedState(getAgentIdKey(subAgent.id), "plan");
+      await Promise.resolve();
+    });
+
+    await click(view.getByRole("button", { name: "Continue interrupted response" }));
+    expect(resumedAgentId(bridge)).toBe("exec");
+  });
+
 });

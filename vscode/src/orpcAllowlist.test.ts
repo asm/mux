@@ -218,6 +218,33 @@ describe("held inputs (#4771)", () => {
   });
 });
 
+describe("retry barrier (#5092)", () => {
+  const known = new Set(["ws-1"]);
+
+  test("resumes a known workspace's stream with only its ID and send options", () => {
+    const options = { model: "anthropic:claude-sonnet-4-5", agentId: "exec" };
+    expect(isAllowedOrpcPath(["workspace", "resumeStream"])).toBe(true);
+    // Retry resumes only; the webview never toggles the auto-retry preference.
+    expect(isAllowedOrpcPath(["workspace", "setAutoRetryEnabled"])).toBe(false);
+    expect(
+      sanitizeWebviewOrpcInput(
+        ["workspace", "resumeStream"],
+        { workspaceId: "ws-1", options, extra: true },
+        known
+      )
+    ).toEqual({ ok: true, input: { workspaceId: "ws-1", options } });
+  });
+
+  test("rejects unknown workspaces and malformed input", () => {
+    for (const [procedure, input] of [
+      ["resumeStream", { workspaceId: "ws-2", options: {} }],
+      ["resumeStream", null],
+    ] as const) {
+      expect(sanitizeWebviewOrpcInput(["workspace", procedure], input, known).ok).toBe(false);
+    }
+  });
+});
+
 describe("policy (#4739)", () => {
   test("allows reading the effective policy and its change signal only", () => {
     expect(isAllowedOrpcPath(["policy", "get"])).toBe(true);
