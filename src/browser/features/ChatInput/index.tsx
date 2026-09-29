@@ -253,6 +253,8 @@ interface InternalSendOverrides extends SendOverrides {
 interface ReviewsForSend {
   data: ReviewNoteDataForDisplay[] | undefined;
   ids: string[];
+  /** The attached notes could not be loaded, so none are included (#5011). */
+  unavailable?: boolean;
 }
 
 /**
@@ -1771,9 +1773,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // dependency list; the React Compiler already handles memoization.
   /**
    * The composer's review notes for a send. Attached notes live in the backend review-state
-   * store; a send racing its first hydration waits for it (normally already resolved) and reads
-   * them from the store, so neither a command (e.g. /compact's follow-up) nor a normal send is
-   * built from the empty loading view.
+   * store; a send racing its hydration waits for it (normally already done) and reads them from
+   * the store, so neither a command (e.g. /compact's follow-up) nor a normal send is built from
+   * the empty loading view. After a failed subscription the store retries it (bounded, #5011);
+   * if the notes still cannot be read, none are included and `unavailable` is set, so the send
+   * path can say so (see warnIfReviewsUnavailable).
    */
   const readReviewsForSend = async (): Promise<ReviewsForSend> => {
     const renderTime: ReviewsForSend = { data: reviewData, ids: reviewIdsForCheck };
@@ -1782,13 +1786,26 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // Without an API client (backend reconnecting) hydration cannot finish, and waiting would
     // hold this send in flight and fire it after reconnect; let the send path report
     // "Not connected to server" instead.
-    if (!api || reviewStateStore.isReady(workspaceId)) return renderTime;
-    await reviewStateStore.whenReady(workspaceId);
-    const attached = reviewStateStore.getAttachedReviews(workspaceId);
+    if (!api || reviewStateStore.isHydrated(workspaceId)) return renderTime;
+    const attached = await reviewStateStore.readAttachedReviewsForSend(workspaceId);
+    if (attached === null) {
+      // The render-time notes may be a stale cache; send none rather than a possibly wrong set.
+      return { data: undefined, ids: [], unavailable: true };
+    }
     return {
       data: attached.length > 0 ? attached.map((review) => review.data) : undefined,
       ids: attached.map((review) => review.id),
     };
+  };
+
+  /** Only for paths that send the notes, so a command like /vim never shows this. */
+  const warnIfReviewsUnavailable = (reviews: ReviewsForSend) => {
+    if (!reviews.unavailable) return;
+    pushToast({
+      type: "error",
+      message:
+        "Review notes could not be loaded, so none were attached. They are kept; send them once they load.",
+    });
   };
 
   const executeParsedCommand = async (
@@ -2335,8 +2352,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               reviews: reviewsForSend,
             });
       if (commandHandled) {
+        // /compact is the only command whose message carries the review notes.
+        if (parsed?.type === "compact") warnIfReviewsUnavailable(reviewsForSend);
         return;
       }
+      warnIfReviewsUnavailable(reviewsForSend);
 
       // A normal workspace send supersedes any pending asynchronous slash
       // command completion. If that older command fails after this send clears
