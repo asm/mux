@@ -1195,7 +1195,9 @@ const localPlugin = {
         };
         // `const { localStorage } = window` reads the property without a MemberExpression, and the
         // new binding has a declaration, so the reference check below would not see it.
-        const checkDestructuring = (pattern, source) => {
+        // `window as Window`, `window!` and `window satisfies ...` still name the global object.
+        const checkDestructuring = (pattern, rawSource) => {
+          const source = rawSource ? unwrapAssertions(rawSource) : rawSource;
           if (pattern.type !== "ObjectPattern" || source?.type !== "Identifier") return;
           if (!GLOBAL_OBJECTS.has(source.name)) return;
           for (const property of pattern.properties) {
@@ -1212,12 +1214,13 @@ const localPlugin = {
         return {
           MemberExpression(node) {
             const name = memberName(node);
+            const object = unwrapAssertions(node.object);
             if (
               STORAGE_GLOBALS.has(name) &&
-              node.object.type === "Identifier" &&
-              GLOBAL_OBJECTS.has(node.object.name)
+              object.type === "Identifier" &&
+              GLOBAL_OBJECTS.has(object.name)
             ) {
-              report(node, `${node.object.name}.${name}`);
+              report(node, `${object.name}.${name}`);
             }
           },
           VariableDeclarator(node) {
