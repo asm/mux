@@ -30,28 +30,35 @@ describe("context budget warnings", () => {
     sessionHistoryAvailable: true,
   };
 
-  test("publishes a visible advisory with optional backward-compatible handoff metadata", () => {
-    const warning = createContextBudgetWarning(options);
-    expect(warning.role).toBe("user");
-    expect(warning.metadata).toMatchObject({ synthetic: true, uiVisible: true });
-    expect(warning.metadata?.muxMetadata).not.toHaveProperty("handoff");
-    expect(warning.metadata?.muxMetadata).not.toHaveProperty("handoffTokens");
+  test("publishes a visible advisory with backward-compatible stage metadata", () => {
     const handoff = createContextBudgetWarning({
       ...options,
       handoff: true,
       handoffTokens: 89_600,
     });
+    expect(handoff.role).toBe("user");
+    expect(handoff.metadata).toMatchObject({ synthetic: true, uiVisible: true });
     expect(handoff.metadata?.muxMetadata).toMatchObject({
       handoff: true,
       handoffTokens: 89_600,
       budgetTokens: 119_808,
     });
-    expect(handoff.parts).not.toEqual(warning.parts);
+    expect(handoff.metadata?.muxMetadata).not.toHaveProperty("final");
+    const final = createContextBudgetWarning({ ...options, final: true });
+    expect(final.metadata?.muxMetadata).toMatchObject({ final: true });
+    expect(final.metadata?.muxMetadata).not.toHaveProperty("handoff");
+    expect(final.parts).not.toEqual(handoff.parts);
   });
 
-  test("rejects budgets outside the known limit", () => {
-    expect(() => createContextBudgetWarning({ ...options, budgetTokens: 128_001 })).toThrow();
-    expect(() => createContextBudgetWarning({ ...options, handoffTokens: 128_001 })).toThrow();
+  test("rejects contradictory stages and budgets outside the known limit", () => {
+    expect(() => createContextBudgetWarning({ ...options, final: true, handoff: true })).toThrow();
+    expect(() => createContextBudgetWarning(options)).toThrow();
+    const handoff = { ...options, handoff: true };
+    expect(() => createContextBudgetWarning({ ...handoff, budgetTokens: 128_001 })).toThrow();
+    expect(() => createContextBudgetWarning({ ...handoff, handoffTokens: 128_001 })).toThrow();
+    expect(() =>
+      createContextBudgetWarning({ ...options, final: true, sessionHistoryAvailable: false })
+    ).toThrow();
   });
 
   test("dispatch capabilities control handoff guidance without granting unavailable tools", () => {
@@ -61,7 +68,6 @@ describe("context budget warnings", () => {
     // Policy permission cannot prove advertising: unknown and permitted use conditional guidance.
     expect(parts({ newContextAvailable: "unknown" })).toEqual(parts({ newContextAvailable: true }));
     expect(parts({ newContextAvailable: false })).not.toEqual(parts({ newContextAvailable: true }));
-    expect(parts({ memoryWritable: false })).not.toEqual(parts({ memoryWritable: true }));
     // History recovery takes precedence over a tool that would discard the active window.
     expect(parts({ sessionHistoryAvailable: false, newContextAvailable: true })).toEqual(
       parts({ sessionHistoryAvailable: false, newContextAvailable: false })
@@ -82,8 +88,23 @@ describe("context window rollover recovery", () => {
       budgetTokens: 96_000,
       memoryWritable: true,
       sessionHistoryAvailable: true,
+      handoff: true,
     });
     expect(hasRolloverEligibleMessages([old, boundary, leadIn, warning])).toBe(false);
+    const finalPrompt = createContextBudgetWarning({
+      contextTokens: 110_000,
+      maxTokens: 128_000,
+      budgetTokens: 96_000,
+      memoryWritable: true,
+      sessionHistoryAvailable: true,
+      final: true,
+    });
+    expect(warning.metadata?.muxMetadata).not.toHaveProperty("final");
+    expect(finalPrompt.metadata?.muxMetadata).toMatchObject({
+      type: "context-budget-warning",
+      final: true,
+    });
+    expect(hasRolloverEligibleMessages([old, boundary, leadIn, warning, finalPrompt])).toBe(false);
     expect(
       hasRolloverEligibleMessages([
         old,
@@ -110,6 +131,7 @@ describe("context window rollover recovery", () => {
           budgetTokens: 96_000,
           memoryWritable: true,
           sessionHistoryAvailable: true,
+          handoff: true,
         }),
       ])
     ).toBe("w:12");

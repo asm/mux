@@ -32,6 +32,7 @@ function step(inputTokens: number, overrides?: Partial<SettledStepBudget>): Sett
     toolResultChars: 0,
     imageParts: 0,
     sessionHistoryAvailable: true,
+    newContextAvailable: true,
     ...overrides,
   };
 }
@@ -182,7 +183,6 @@ describe("AgentSession queue-cut receipts", () => {
   });
 
   test.each([
-    { usage: 85_000, decision: "warn", dedupeKey: CONTEXT_WARNING_DEDUPE_KEY },
     { usage: 90_000, decision: "warn", dedupeKey: CONTEXT_WARNING_DEDUPE_KEY },
     { usage: 120_000, decision: "rollover", dedupeKey: CONTEXT_CONTINUE_DEDUPE_KEY },
   ])("a budget stop at $usage designates only its single continuation", async (fixture) => {
@@ -213,7 +213,7 @@ describe("AgentSession queue-cut receipts", () => {
     const h = await setup();
     try {
       await h.startBudgetTurn();
-      const outcome = await h.requests[0].onStepSettled!(step(85_000));
+      const outcome = await h.requests[0].onStepSettled!(step(90_000));
       const continueEntryId = queueOf(h).getEntryIdByDedupeKey(CONTEXT_WARNING_DEDUPE_KEY);
       expect(outcome).toEqual({ decision: "warn", continuationEntryId: continueEntryId });
 
@@ -240,7 +240,7 @@ describe("AgentSession queue-cut receipts", () => {
       await h.startBudgetTurn();
       h.session.queueMessage("Unrelated follow-up", { model: TEST_MODEL, agentId: "exec" });
       const unrelatedEntryId = queueOf(h).getNextQueueCutCandidate()!.entryId;
-      const outcome = await h.requests[0].onStepSettled!(step(85_000));
+      const outcome = await h.requests[0].onStepSettled!(step(90_000));
       expect(outcome).toEqual({ decision: "warn" });
       expect(h.session.getQueueCutReceipt(unrelatedEntryId)).toBeUndefined();
     } finally {

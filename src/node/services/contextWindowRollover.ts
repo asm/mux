@@ -119,6 +119,7 @@ interface ContextBudgetWarningOptions {
   budgetTokens: number;
   memoryWritable: boolean;
   sessionHistoryAvailable: boolean;
+  final?: boolean;
   handoff?: boolean;
   handoffTokens?: number;
   newContextAvailable?: boolean | "unknown";
@@ -131,12 +132,18 @@ export function buildBudgetWarningText(options: ContextBudgetWarningOptions): st
     budgetTokens,
     memoryWritable,
     sessionHistoryAvailable,
+    final,
     handoff,
-    handoffTokens,
   } = options;
   assert(
-    handoffTokens == null ||
-      (Number.isFinite(handoffTokens) && handoffTokens > 0 && handoffTokens <= maxTokens),
+    Boolean(final) !== Boolean(handoff),
+    "A budget prompt is either the handoff request or the final step"
+  );
+  assert(
+    options.handoffTokens == null ||
+      (Number.isFinite(options.handoffTokens) &&
+        options.handoffTokens > 0 &&
+        options.handoffTokens <= maxTokens),
     "Handoff target must be within the model limit"
   );
   assert(maxTokens > 0, "context budget warnings require a known positive limit");
@@ -145,38 +152,37 @@ export function buildBudgetWarningText(options: ContextBudgetWarningOptions): st
     "context budget warnings require a positive budget within the model limit"
   );
   const usage = `Context budget ~${Math.round((contextTokens / budgetTokens) * 100)}% used (${Math.ceil(contextTokens)} of ${budgetTokens} tokens before Xum forces a rollover at the usable limit).`;
-  // Permissions do not guarantee advertising; deferred tools or middleware may still hide them.
-  // Wording follows the Codex token-budget reminder: save the checkpoint, then request a window.
-  const checkpoint = memoryWritable
-    ? `Before starting a new context window, save a concise checkpoint in ${SESSION_MEMORY_VIRTUAL_DIR} with the goal, decisions, progress, learnings, next steps, and the window ID and item ID of every relevant user request still being solved, as well as important actions and tool calls. Clean up old notes that are obsolete. Future context windows will not include the current conversation.`
-    : "Memory writes are unavailable for this turn; skip the checkpoint.";
-  if (handoff && sessionHistoryAvailable) {
+  // Wording follows the Codex token-budget reminder and fallback prompt.
+  const checkpoint = `a concise checkpoint in ${SESSION_MEMORY_VIRTUAL_DIR} with the goal, decisions, progress, learnings, next steps, and the window ID and item ID of every relevant user request still being solved, as well as important actions and tool calls`;
+  if (final) {
+    // The final prompt is only offered while new_context (so memory and history recovery) is
+    // available. It is prompt-only: if the model ignores it, the usable limit forces the rollover.
+    assert(sessionHistoryAvailable, "final handoff requires history recovery");
     return [
       usage,
-      "The context handoff target has been reached. Finish the current small unit of work and start no substantial new work in this window.",
-      checkpoint,
-      // A policy check proves permission, not advertising (deferred tools or middleware may hide it).
-      options.newContextAvailable === false
-        ? "new_context is not available under the current tool policy. Save your checkpoint and continue; Xum will attempt a rollover at the usable limit or pause safely."
-        : "After saving your checkpoint, call new_context in a later step to continue in a fresh context window.",
-      "If the task is already complete, finish the reply instead.",
+      "The current context window is exhausted. Do not continue the task or give a final answer in this window. The next window will not automatically include this conversation.",
+      `Save ${checkpoint} with the memory tool now. After the memory result returns, call new_context. Do not use any tools other than memory and new_context.`,
     ].join(" ");
   }
-  const target =
-    handoffTokens != null && !handoff
-      ? ` The upcoming handoff target is ${handoffTokens} tokens; prepare to finish a small unit of work and save your checkpoint there.`
-      : "";
-  return `${usage}${target} ${
-    !sessionHistoryAvailable
-      ? "History recovery is unavailable for this turn. Ask the user to enable history recovery or use /compact before the window fills."
-      : memoryWritable
-        ? `If your checkpoint in ${SESSION_MEMORY_VIRTUAL_DIR} is stale, update it now, then continue the current task without commentary.`
-        : "Memory writes are unavailable for this turn. If session_history is available after rollover, use it to retrieve prior windows; continue the current task."
-  }`;
+  if (!sessionHistoryAvailable) {
+    return `${usage} History recovery is unavailable for this turn. Ask the user to enable history recovery or use /compact before the window fills.`;
+  }
+  return [
+    usage,
+    "The context handoff target has been reached. Finish the current small unit of work and start no substantial new work in this window.",
+    memoryWritable
+      ? `Before starting a new context window, save ${checkpoint}. Clean up old notes that are obsolete. Future context windows will not include the current conversation.`
+      : "Memory writes are unavailable for this turn; skip the checkpoint.",
+    // A policy check proves permission, not advertising (deferred tools or middleware may hide it).
+    options.newContextAvailable === false
+      ? "new_context is not available under the current tool policy. Continue; Xum will attempt a rollover at the usable limit or pause safely."
+      : "After saving your checkpoint, call new_context in a later step to continue in a fresh context window. If new_context is not available to you, continue.",
+    "If the task is already complete, finish the reply instead.",
+  ].join(" ");
 }
 
 export function createContextBudgetWarning(options: ContextBudgetWarningOptions): MuxMessage {
-  const { contextTokens, maxTokens, budgetTokens, handoff, handoffTokens } = options;
+  const { contextTokens, maxTokens, budgetTokens, final, handoff, handoffTokens } = options;
   return createMuxMessage(createUserMessageId(), "user", buildBudgetWarningText(options), {
     timestamp: Date.now(),
     synthetic: true,
@@ -186,6 +192,7 @@ export function createContextBudgetWarning(options: ContextBudgetWarningOptions)
       contextTokens,
       maxTokens,
       budgetTokens,
+      ...(final ? { final: true as const } : {}),
       ...(handoff ? { handoff: true as const } : {}),
       ...(handoffTokens != null ? { handoffTokens } : {}),
     },

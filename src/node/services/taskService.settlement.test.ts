@@ -913,10 +913,11 @@ describe("TaskService", () => {
         await waitForRequest(1);
         const budgetStep: SettledStepBudget = {
           model: childModel,
-          usage: { inputTokens: 85_000, outputTokens: 10, totalTokens: 85_010 },
+          usage: { inputTokens: 90_000, outputTokens: 10, totalTokens: 90_010 },
           toolResultChars: 0,
           imageParts: 0,
           sessionHistoryAvailable: true,
+          newContextAvailable: true,
         };
         const budgetOutcome = await requests[0].onStepSettled?.(budgetStep);
         expect(budgetOutcome?.decision).toBe("warn");
