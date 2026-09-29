@@ -7,12 +7,46 @@ import {
 } from "../../../tests/ui/quotaLimitedStorage";
 
 import {
+  readPersistedRawString,
+  readPersistedState,
+  readPersistedString,
   subscribePersistedStateWrites,
   syncPersistedStateFromBackend,
   updatePersistedState,
   usePersistedState,
+  writePersistedRawString,
   type PersistedStateWriteEvent,
 } from "./usePersistedState";
+
+describe("raw persisted strings when storage access is denied", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  // Some browsers throw from the window.localStorage getter itself when storage is blocked; the
+  // auth token is read during render, so this must not throw.
+  test("reads return null and writes return false instead of throwing", () => {
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      get() {
+        throw new DOMException("Access is denied for this document.", "SecurityError");
+      },
+    });
+
+    expect(readPersistedRawString("mux:auth-token")).toBeNull();
+    expect(writePersistedRawString("mux:auth-token", "token")).toBe(false);
+    // JSON reads (e.g. palette recents, experiment flags in state initializers) use defaults.
+    expect(readPersistedState("commandPalette:recent", ["none"])).toEqual(["none"]);
+    expect(readPersistedString("uiTheme")).toBeUndefined();
+  });
+});
 
 describe("usePersistedState backend sync", () => {
   let cleanupDom: (() => void) | null = null;
