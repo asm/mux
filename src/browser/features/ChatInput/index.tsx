@@ -1219,10 +1219,32 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     [applyDraftFromPending, focusMessageInput, setDraftReviews]
   );
 
+  // The edit whose draft a cancel restored. Recorded explicitly: the edit target also leaves the
+  // live transcript when the accepted edit replaces it (possibly before the send returns), and
+  // that is not a cancel.
+  const cancelledEditIdRef = useRef<string | null>(null);
   const restorePreEditDraft = useCallback(() => {
+    cancelledEditIdRef.current = editingMessageIdRef.current ?? null;
     setDraft(preEditDraftRef.current);
     setDraftReviews(preEditReviewsRef.current);
   }, [preEditDraftRef, preEditReviewsRef, setDraft, setDraftReviews]);
+
+  // Completing an edit sends the edited message; the unsent draft from before the edit comes
+  // back as on cancel, so typed input is never lost (#5155). Functional updates keep anything
+  // typed while the send was in flight, after the restored draft. Not for an edit the user
+  // cancelled meanwhile: that one already got its draft back. Returns whether it restored.
+  const restorePreEditDraftAfterSend = (editMessageId: string | undefined): boolean => {
+    if (editMessageId === undefined || cancelledEditIdRef.current === editMessageId) return false;
+    const preEdit = preEditDraftRef.current;
+    setInput((current) =>
+      [preEdit.text, current].filter((part) => part.trim().length > 0).join("\n\n")
+    );
+    if (preEdit.attachments.length > 0) {
+      setAttachments((current) => [...preEdit.attachments, ...current]);
+    }
+    setDraftReviews(preEditReviewsRef.current);
+    return true;
+  };
 
   // Method to restore text to input (used by compaction cancel)
   const restoreText = useCallback(
@@ -1336,6 +1358,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return;
     }
     appliedEditIdRef.current = editingMessage.id;
+    cancelledEditIdRef.current = null;
     preEditDraftRef.current = getDraft();
     preEditReviewsRef.current = draftReviews;
     applyDraftFromPending(editingMessage.pending, `edit-${editingMessage.id}`);
@@ -1918,12 +1941,19 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       },
     };
 
+    // A completed edit restored its pre-edit draft, review notes included: keep them.
+    let restoredPreEditDraft = false;
+    // An editing command whose edit the user cancelled meanwhile: the composer holds the restored
+    // draft now, not the command, so the command's clears must not touch it.
+    const editCancelled = () =>
+      commandEnv.editMessageId !== undefined &&
+      cancelledEditIdRef.current === commandEnv.editMessageId;
     // Command actions stop at the caller's UI boundary; creation mode intentionally has its own applier.
     const applyCommandActions = (actions: CommandAction[]) => {
       for (const action of actions) {
         switch (action.type) {
           case "clear-input":
-            setInput("");
+            if (!editCancelled()) setInput("");
             break;
           case "reset-input-height":
             if (inputRef.current) inputRef.current.style.height = "";
@@ -1941,7 +1971,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             setSendingCount((count) => count + (action.sending ? 1 : -1));
             break;
           case "clear-attachments":
-            setAttachments([]);
+            if (!editCancelled()) setAttachments([]);
             break;
           case "detach-reviews":
             if (variant === "workspace") props.onDetachAllReviews?.();
@@ -1957,6 +1987,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             if (variant === "workspace") props.onMessageSent?.(action.dispatchMode);
             break;
           case "cancel-edit":
+            // Emitted once an editing command (/compact) was accepted: the edit is complete.
+            restoredPreEditDraft = restorePreEditDraftAfterSend(commandEnv.editMessageId);
             commandOnCancelEdit?.();
             break;
           case "edit-history-changed":
@@ -1980,7 +2012,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       case "consume":
         // Commands clear the composer through their own clear-input actions;
         // clearing again here would wipe a draft typed while phases ran.
-        setDraftReviews(null);
+        if (!restoredPreEditDraft) setDraftReviews(null);
         break;
       case "restore":
         setInput(restoreInput);
@@ -2719,6 +2751,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           warnIfReviewsUnavailable(reviewsForSend);
 
           // Exit editing mode if we were editing
+          restorePreEditDraftAfterSend(editMessageForSend?.id);
           if (editMessageForSend && props.onCancelEdit) {
             props.onCancelEdit();
           } else if (editMessageForSend) {
