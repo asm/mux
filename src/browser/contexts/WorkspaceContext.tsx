@@ -411,6 +411,15 @@ function isDraftEmpty(projectPath: string, draftId: string): boolean {
   return true;
 }
 
+/** Whether the project's default creation composer (bare project page) holds nothing. */
+function isDefaultCreationDraftEmpty(projectPath: string): boolean {
+  const draft = getDraftStore().getView(defaultCreationDraftScope(projectPath));
+  if (draft.text.trim().length > 0 || draft.attachmentCount > 0) return false;
+  // A workspace name typed there counts too, as in isDraftEmpty.
+  const scopeId = getPendingScopeId(projectPath);
+  return readPersistedState<unknown>(getWorkspaceNameStateKey(scopeId), null) === null;
+}
+
 /**
  * Find an existing empty draft for a project (optionally within a specific sub-project).
  * Returns the draft ID if found, or null if no empty draft exists.
@@ -1996,6 +2005,14 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         readPersistedState<WorkspaceDraftsByProject>(WORKSPACE_DRAFTS_BY_PROJECT_KEY, {})
       );
       const existingDrafts = freshDrafts[projectPath] ?? [];
+
+      // Text typed on the bare project page (no draft id) lives in the project's default creation
+      // draft, which only that page shows. While it holds anything, the project row opens it
+      // instead of a new draft, so typed text is never hidden behind an empty composer (#5071).
+      if (subProjectPath === undefined && !isDefaultCreationDraftEmpty(projectPath)) {
+        navigateToProject(projectPath, undefined, { replace: options?.replace });
+        return;
+      }
 
       // If there's an existing empty draft (optionally in the same sub-project), reuse it
       // instead of creating yet another empty draft.
