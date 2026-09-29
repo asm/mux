@@ -20,6 +20,7 @@ import type {
   FrontendWorkspaceMetadata,
   WorkspaceMetadata,
   WorkspaceRemovalDescendant,
+  WorkspaceRemoveWarning,
 } from "@/common/types/workspace";
 import type { AgentAiSettingsLayerValues } from "@/common/types/agentAiSettings";
 import type {
@@ -729,7 +730,7 @@ export interface WorkspaceLifecycleHost {
     force?: boolean,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void>>;
+  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }>;
   /** Own cleanup outside the originating session callback and inside bounded app shutdown. */
   deferWorkspaceCleanup(run: () => Promise<void>): void;
 }
@@ -803,7 +804,7 @@ export interface AgentTaskIntegration {
     workspaceId: string,
     acknowledgedIds: string[],
     gatedIds?: ReadonlySet<string>
-  ): Promise<Result<void>>;
+  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }>;
   hasActiveDescendantAgentTasksForWorkspace(workspaceId: string): boolean;
   hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId: string): Promise<boolean>;
   /** A running continuation has a matching accepted live registration, not only a persisted execution status. */
