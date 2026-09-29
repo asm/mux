@@ -425,7 +425,7 @@ describe("DevcontainerRuntime.deleteWorkspace", () => {
 
   // #4819: undoing a creation that reused a branch removes the host worktree but not the branch.
   it("keeps the branch on a forced delete with keepBranch", async () => {
-    spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue(undefined);
+    spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue({ kind: "absent" });
     const projectPath = path.join(root, "repo");
     await fs.mkdir(projectPath);
     const git = (...args: string[]) =>
@@ -468,5 +468,51 @@ describe("DevcontainerRuntime.deleteWorkspace", () => {
     expect(result.success).toBe(true);
     expect(git("rev-parse", "reused")).toBe(tip);
     expect(await fs.stat(workspacePath).catch(() => null)).toBeNull();
+  });
+
+  // #5120: a container that could not be removed is a failure the caller can name, not a success.
+  it("reports a failed container teardown and names the container", async () => {
+    spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue({
+      kind: "error",
+      message: "Docker is not available: spawn docker ENOENT",
+    });
+    const projectPath = path.join(root, "repo");
+    await fs.mkdir(projectPath);
+    const git = (...args: string[]) =>
+      execFileSync("git", args, { cwd: projectPath, encoding: "utf8" }).trim();
+    git("init", "-b", "main");
+    git(
+      "-c",
+      "user.email=t@example.com",
+      "-c",
+      "user.name=T",
+      "commit",
+      "--allow-empty",
+      "-m",
+      "i"
+    );
+    const runtime = new DevcontainerRuntime({
+      srcBaseDir: path.join(root, "src"),
+      configPath: ".devcontainer/devcontainer.json",
+    });
+    const workspacePath = runtime.getWorkspacePath(projectPath, "ws");
+    git("worktree", "add", "-b", "ws", workspacePath);
+
+    const result = await runtime.deleteWorkspace(projectPath, "ws", true, undefined, true);
+
+    expect(result).toEqual({
+      success: false,
+      error: expect.stringContaining("spawn docker ENOENT") as unknown as string,
+      leftoverPaths: [`devcontainer container labeled devcontainer.local_folder=${workspacePath}`],
+    });
+    // A forced delete (rollbacks, forced removal) still removes the host worktree, as before.
+    expect(await fs.stat(workspacePath).catch(() => null)).toBeNull();
+
+    // A non-forced delete keeps the worktree, and with it the branch mapping a retry needs.
+    git("worktree", "add", "-b", "ws2", runtime.getWorkspacePath(projectPath, "ws2"));
+    const kept = await runtime.deleteWorkspace(projectPath, "ws2", false, undefined, true);
+    expect(kept.success).toBe(false);
+    expect(await fs.stat(runtime.getWorkspacePath(projectPath, "ws2"))).toBeTruthy();
+    expect(git("branch", "--list", "ws2")).not.toBe("");
   });
 });
