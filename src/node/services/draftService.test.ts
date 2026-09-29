@@ -8,7 +8,12 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
 import { draftTooLargeMessage, isDraftTooLargeError } from "@/common/utils/drafts";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
-import type { DraftAttachment, DraftEvent, DraftScope } from "@/common/orpc/schemas/drafts";
+import type {
+  DraftAttachment,
+  DraftEvent,
+  DraftListEntry,
+  DraftScope,
+} from "@/common/orpc/schemas/drafts";
 import { DraftService } from "./draftService";
 
 const WORKSPACE_ID = "draft-ws";
@@ -419,5 +424,262 @@ describe("DraftService", () => {
     await cleanup;
 
     expect((await new DraftService(config).get(creation)).text).toBe("keep me");
+  });
+});
+
+describe("DraftService creation draft list", () => {
+  const entry = (projectPath: string, draftId: string, extra?: Partial<DraftListEntry>) => ({
+    projectPath,
+    draftId,
+    subProjectPath: null,
+    createdAt: 1,
+    ...extra,
+  });
+
+  it("keeps every listed draft across a restart, far beyond the old 32 KiB localStorage budget", async () => {
+    using tempDir = new TestTempDir("drafts-list-restart");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    // Long sub-project paths: 150 entries serialize to well over 32 KiB (#5225).
+    const subProjectPath = path.join(projectPath, "packages", "x".repeat(400));
+    const entries = Array.from({ length: 150 }, (_, i) =>
+      entry(projectPath, `draft-${i}`, { subProjectPath, createdAt: i })
+    );
+    for (const listed of entries) await service.putListEntry(listed);
+    expect(JSON.stringify(entries).length).toBeGreaterThan(32 * 1024);
+
+    const restarted = await new DraftService(config).getList();
+    expect(restarted.entries).toEqual(entries);
+  });
+
+  it("updates the sub-project, keeps a listed draft whose text is cleared, and delists it on delete", async () => {
+    using tempDir = new TestTempDir("drafts-list-lifecycle");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const events: DraftEvent[] = [];
+    service.on(DraftService.CHANGE_EVENT, (event: DraftEvent) => events.push(event));
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
+
+    await service.putListEntry(entry(projectPath, "draft-a", { createdAt: 5 }));
+    await service.putListEntry(
+      entry(projectPath, "draft-a", { subProjectPath: "/sub", createdAt: 9 })
+    );
+    expect((await service.getList()).entries).toEqual([
+      entry(projectPath, "draft-a", { subProjectPath: "/sub", createdAt: 5 }),
+    ]);
+    const listEvent = events.findLast((event) => event.type === "list");
+    expect(listEvent).toMatchObject({ entries: [{ draftId: "draft-a", subProjectPath: "/sub" }] });
+
+    // Clearing the text deletes the body, never the list entry.
+    await service.update({ scope, text: "typed" });
+    await service.update({ scope, text: "" });
+    expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual(["draft-a"]);
+
+    await service.update({ scope, text: "typed again" });
+    await service.delete(scope);
+    expect((await new DraftService(config).getList()).entries).toEqual([]);
+    expect((await service.get(scope)).text).toBe("");
+
+    // Unconfigured projects own nothing.
+    await service.putListEntry(entry("/not/configured", "draft-x"));
+    expect((await service.getList()).entries).toEqual([]);
+  });
+
+  it("imports legacy entries without clobbering and relists unlisted bodies on every import", async () => {
+    using tempDir = new TestTempDir("drafts-list-import");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    // Bodies whose list entries fell out of the over-budget localStorage list (#5225).
+    await service.update({ scope: { kind: "creation", projectPath, draftId: "lost" }, text: "a" });
+    await service.update({
+      scope: { kind: "creation", projectPath, draftId: "listed" },
+      text: "b",
+    });
+    // The default composer's draft is never a listed draft.
+    await service.update({
+      scope: { kind: "creation", projectPath, draftId: "default" },
+      text: "c",
+    });
+
+    await service.importLegacyList([
+      entry(projectPath, "listed", { subProjectPath: "/sub", createdAt: 2 }),
+      entry(projectPath, "empty", { createdAt: 3 }),
+      entry("/not/configured", "orphan"),
+    ]);
+    const first = (await service.getList()).entries;
+    expect(first.map(({ draftId }) => draftId)).toEqual(["listed", "empty", "lost"]);
+    expect(first[0]).toEqual(
+      entry(projectPath, "listed", { subProjectPath: "/sub", createdAt: 2 })
+    );
+
+    // A second origin's import adds the entries the list lacks, plus bodies without a row (its
+    // legacy bodies may have been imported after the first origin created the list).
+    await service.delete({ kind: "creation", projectPath, draftId: "lost" });
+    await service.update({ scope: { kind: "creation", projectPath, draftId: "late" }, text: "d" });
+    await new DraftService(config).importLegacyList([
+      entry(projectPath, "listed", { subProjectPath: "/other", createdAt: 7 }),
+      entry(projectPath, "second", { createdAt: 8 }),
+    ]);
+    expect(
+      (await new DraftService(config).getList()).entries.map(({ draftId, subProjectPath }) => [
+        draftId,
+        subProjectPath,
+      ])
+    ).toEqual([
+      ["listed", "/sub"],
+      ["empty", null],
+      ["second", null],
+      ["late", null],
+    ]);
+  });
+
+  it("drops a removed project's entries on project removal and GC, keeping scratch", async () => {
+    using tempDir = new TestTempDir("drafts-list-removal");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    await service.putListEntry(entry(projectPath, "draft-a"));
+    await service.putListEntry(entry(SCRATCH_PROJECT_CONFIG_KEY, "draft-s"));
+    const projectEntry = config.loadConfigOrDefault().projects.get(projectPath)!;
+    await config.editConfig((current) => {
+      current.projects.delete(projectPath);
+      return current;
+    });
+    await service.deleteProjectDrafts(projectPath);
+    expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual(["draft-s"]);
+
+    // GC: an entry without a body (an empty draft) of a project removed while not running.
+    await config.editConfig((current) => {
+      current.projects.set(projectPath, projectEntry);
+      return current;
+    });
+    await service.putListEntry(entry(projectPath, "draft-b"));
+    await config.editConfig((current) => {
+      current.projects.delete(projectPath);
+      return current;
+    });
+    await new DraftService(config).collectOrphanedCreationDrafts();
+    const survivor = await new DraftService(config).getList();
+    expect(survivor.entries.map(({ draftId }) => draftId)).toEqual(["draft-s"]);
+  });
+
+  it("starts subscriptions with the list in the snapshot", async () => {
+    using tempDir = new TestTempDir("drafts-list-snapshot");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const { revision } = await service.putListEntry(entry(projectPath, "draft-a"));
+    const snapshot = await new DraftService(config).getSnapshotEvent();
+    expect(snapshot.list.entries).toEqual([entry(projectPath, "draft-a")]);
+    expect(await service.getSnapshotEvent()).toMatchObject({ list: { revision } });
+  });
+});
+
+describe("DraftService creation draft list self-healing", () => {
+  it("sees list changes made by another backend on the same root", async () => {
+    using tempDir = new TestTempDir("drafts-list-foreign");
+    const { config, projectPath } = await createHarness(tempDir);
+    const first = new DraftService(config);
+    expect((await first.getList()).entries).toEqual([]);
+    const entry = { projectPath, draftId: "draft-b", subProjectPath: null, createdAt: 1 };
+    await new DraftService(config).putListEntry(entry);
+    expect((await first.getSnapshotEvent()).list.entries).toEqual([entry]);
+  });
+
+  it("relists the bodies of rows a malformed list file lost on its next write", async () => {
+    using tempDir = new TestTempDir("drafts-list-malformed");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    await service.update({ scope: { kind: "creation", projectPath, draftId: "lost" }, text: "a" });
+    const listFile = path.join(config.rootDir, "drafts", "list.json");
+    await fs.writeFile(listFile, JSON.stringify({ version: 1, entries: [{ draftId: 7 }] }));
+
+    await service.putListEntry({ projectPath, draftId: "new", subProjectPath: null, createdAt: 1 });
+    expect((await service.getList()).entries.map(({ draftId }) => draftId).sort()).toEqual([
+      "lost",
+      "new",
+    ]);
+  });
+
+  it("still hydrates draft bodies when the list file cannot be read", async () => {
+    using tempDir = new TestTempDir("drafts-list-unreadable");
+    const { config } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    await service.update({ scope: WORKSPACE_SCOPE, text: "body" });
+    // A directory where the list file belongs: reads fail with EISDIR.
+    await fs.mkdir(path.join(config.rootDir, "drafts", "list.json"), { recursive: true });
+
+    const snapshot = await new DraftService(config).getSnapshotEvent();
+    expect(snapshot.drafts.map(({ text }) => text)).toEqual(["body"]);
+    expect(snapshot.list.entries).toEqual([]);
+  });
+});
+
+describe("DraftService creation draft list repair", () => {
+  it("rebuilds a damaged list even when the requested change is a no-op", async () => {
+    using tempDir = new TestTempDir("drafts-list-noop-repair");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    await service.update({ scope: { kind: "creation", projectPath, draftId: "lost" }, text: "a" });
+    const kept = { projectPath, draftId: "kept", subProjectPath: null, createdAt: 1 };
+    const listFile = path.join(config.rootDir, "drafts", "list.json");
+    await fs.writeFile(listFile, JSON.stringify({ version: 1, entries: [kept, { draftId: 7 }] }));
+
+    await service.putListEntry(kept);
+    expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual([
+      "kept",
+      "lost",
+    ]);
+  });
+
+  it("never relists the bodies of unconfigured projects", async () => {
+    using tempDir = new TestTempDir("drafts-list-unowned-bodies");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const removed = path.join(tempDir.path, "removed");
+    await config.editConfig((current) => {
+      current.projects.set(removed, { workspaces: [] });
+      return current;
+    });
+    await service.update({
+      scope: { kind: "creation", projectPath: removed, draftId: "gone" },
+      text: "a",
+    });
+    await service.update({ scope: { kind: "creation", projectPath, draftId: "mine" }, text: "b" });
+    // Removed without its cleanup (e.g. it failed): the body is still on disk.
+    await config.editConfig((current) => {
+      current.projects.delete(removed);
+      return current;
+    });
+
+    await new DraftService(config).importLegacyList([]);
+    expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual(["mine"]);
+  });
+});
+
+describe("DraftService creation draft list compatibility", () => {
+  it("refuses to rewrite a list file written by a newer version", async () => {
+    using tempDir = new TestTempDir("drafts-list-newer-version");
+    const { config, projectPath } = await createHarness(tempDir);
+    const listFile = path.join(config.rootDir, "drafts", "list.json");
+    await fs.mkdir(path.dirname(listFile), { recursive: true });
+    const future = { projectPath, draftId: "future", subProjectPath: null, createdAt: 1 };
+    const content = JSON.stringify({ version: 2, order: ["future"], entries: [future] });
+    await fs.writeFile(listFile, content);
+    const service = new DraftService(config);
+
+    let error: unknown;
+    try {
+      await service.putListEntry({
+        projectPath,
+        draftId: "added",
+        subProjectPath: null,
+        createdAt: 2,
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect(await fs.readFile(listFile, "utf-8")).toBe(content);
+    // Still readable.
+    expect((await service.getList()).entries).toEqual([future]);
   });
 });

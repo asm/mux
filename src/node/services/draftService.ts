@@ -10,15 +10,22 @@ import { withTargetMutationLock } from "@/node/services/refinement/targetMutatio
 import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
-import { DRAFT_ID_PATTERN, MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
-import type {
-  Draft,
-  DraftEvent,
-  DraftGetOutput,
-  DraftImportLegacyOutput,
-  DraftScope,
-  DraftSummary,
-  DraftUpdateInput,
+import {
+  DEFAULT_CREATION_DRAFT_ID,
+  DRAFT_ID_PATTERN,
+  MAX_DRAFT_JSON_BYTES,
+} from "@/constants/drafts";
+import {
+  DraftListEntrySchema,
+  type Draft,
+  type DraftEvent,
+  type DraftGetOutput,
+  type DraftImportLegacyOutput,
+  type DraftList,
+  type DraftListEntry,
+  type DraftScope,
+  type DraftSummary,
+  type DraftUpdateInput,
 } from "@/common/orpc/schemas/drafts";
 import {
   createEmptyDraft,
@@ -45,10 +52,17 @@ import {
  * - Creation drafts ("new workspace" composer): `<xumRoot>/drafts/<projectHash>/<draftId>.json`,
  *   storing projectPath inside the file. Deleted by `delete`, by project removal
  *   (deleteProjectDrafts) and by the startup GC (collectOrphanedCreationDrafts).
+ * - The creation draft list (sidebar rows, including empty drafts): `<xumRoot>/drafts/list.json`.
+ *   Only `delete`, putListEntry, importLegacyList, project removal and the GC change it; clearing a
+ *   draft's text never delists it. `delete` removes the body, then the entry, under the body lock
+ *   (the only nesting: body lock, then list lock). A crash in between leaves an empty listed row,
+ *   never an unlisted body.
  */
 const DRAFT_FILE_NAME = "draft.json";
 const CREATION_DRAFTS_DIR_NAME = "drafts";
 const DRAFT_FILE_VERSION = 1;
+const LIST_FILE_NAME = "list.json";
+const LIST_FILE_VERSION = 1;
 
 type WorkspaceScope = Extract<DraftScope, { kind: "workspace" }>;
 type CreationScope = Extract<DraftScope, { kind: "creation" }>;
@@ -78,6 +92,7 @@ export class DraftService extends EventEmitter {
    */
   private readonly revisions = new Map<string, number>();
   private readonly initialRevision = Date.now();
+  private listRevision = this.initialRevision;
   /**
    * Metadata (text + attachment metadata, no payloads) of every draft, so bulk hydration does not
    * re-read multi-MB files. Filled lazily by the first list(); writes keep it current.
@@ -87,10 +102,78 @@ export class DraftService extends EventEmitter {
   /** Keys written while a scan runs: the scan must not overwrite them with what it read. */
   private scanTouched: Set<string> | null = null;
 
+  private readonly listFile: string;
+
   constructor(config: Config) {
     super();
     this.config = config;
     this.creationRoot = path.join(config.rootDir, CREATION_DRAFTS_DIR_NAME);
+    this.listFile = path.join(this.creationRoot, LIST_FILE_NAME);
+  }
+
+  /**
+   * The creation draft list, read from disk every time: it is small, and a sibling backend on the
+   * same root may have changed it (no lock: writes are atomic renames).
+   */
+  async getList(): Promise<DraftList> {
+    const { entries } = await this.readListFile();
+    return { entries, revision: this.listRevision };
+  }
+
+  /**
+   * List a creation draft, or update a listed draft's sub-project (its createdAt is kept). Skipped
+   * for a project without an owner (like `update`) and for the default draft, which is never
+   * listed. Returns the list revision.
+   */
+  async putListEntry(entry: DraftListEntry): Promise<{ revision: number }> {
+    assert(DRAFT_ID_PATTERN.test(entry.draftId), "putListEntry requires a valid draftId");
+    const scope: CreationScope = { kind: "creation", ...entry };
+    if (entry.draftId === DEFAULT_CREATION_DRAFT_ID) return { revision: this.listRevision };
+    return {
+      revision: await this.mutateList(async (entries) => {
+        // Under the list lock, so a project removal's cleanup cannot run in between.
+        if (!(await this.hasOwner(scope))) return null;
+        const index = entries.findIndex((listed) => isSameListEntry(listed, entry));
+        if (index === -1) return [...entries, entry];
+        if (entries[index].subProjectPath === entry.subProjectPath) return null;
+        const next = [...entries];
+        next[index] = { ...entries[index], subProjectPath: entry.subProjectPath };
+        return next;
+      }),
+    };
+  }
+
+  /**
+   * One-way import of a renderer's legacy localStorage list: adds only entries the list lacks
+   * (another origin may have imported or edited them already) and skips unowned projects. The
+   * first import (no list.json yet) also lists every non-empty creation draft body without an
+   * entry: the legacy list dropped newer entries once it outgrew its localStorage budget (#5225),
+   * leaving their bodies unreachable. Returns the list revision.
+   */
+  async importLegacyList(legacy: DraftListEntry[]): Promise<{ revision: number }> {
+    return {
+      revision: await this.mutateList(async (entries, exists) => {
+        // Under the list lock, so a project removal's cleanup cannot run in between.
+        const configured = this.configuredProjectDirNames();
+        const next = [...entries];
+        for (const entry of legacy) {
+          const owned =
+            entry.projectPath === SCRATCH_PROJECT_CONFIG_KEY ||
+            configured.has(projectDraftsDirName(entry.projectPath));
+          if (
+            owned &&
+            entry.draftId !== DEFAULT_CREATION_DRAFT_ID &&
+            !next.some((listed) => isSameListEntry(listed, entry))
+          ) {
+            next.push(entry);
+          }
+        }
+        // Every import also lists owned bodies without a row: origins migrate at different times,
+        // and an origin's legacy bodies can be imported after another origin created the list.
+        next.push(...(await this.findUnlistedCreationDrafts(next)));
+        return exists && next.length === entries.length ? null : next;
+      }),
+    };
   }
 
   /** Every draft as metadata (no attachment payloads). */
@@ -149,12 +232,24 @@ export class DraftService extends EventEmitter {
     });
   }
 
-  /** Delete a draft. No owner check: removing data is always allowed. */
+  /**
+   * Delete a draft; a creation draft is also delisted (after its body, see the class comment).
+   * No owner check: removing data is always allowed.
+   */
   async delete(scope: DraftScope): Promise<{ revision: number }> {
     const filePath = this.filePathFor(scope);
-    return this.withWriteLock(scope, async () => ({
-      revision: await this.persist(scope, filePath, createEmptyDraft()),
-    }));
+    return this.withWriteLock(scope, async () => {
+      const revision = await this.persist(scope, filePath, createEmptyDraft());
+      // Delisted under the body lock too (body lock, then list lock; nothing takes them in the
+      // other order), so no write can recreate the body between the two steps.
+      if (scope.kind === "creation") {
+        await this.mutateList((entries) => {
+          const next = entries.filter((listed) => !isSameListEntry(listed, scope));
+          return next.length === entries.length ? null : next;
+        });
+      }
+      return { revision };
+    });
   }
 
   /**
@@ -231,6 +326,12 @@ export class DraftService extends EventEmitter {
       // be registered again (with a new creation draft) by now; its drafts are owned again.
       if (this.configuredProjectDirNames().has(dirName)) return;
       await this.clearProjectDir(projectDir);
+      // Delisted under the same lock (dir lock, then list lock, as in `delete`): once the bodies
+      // are gone the rows go too, even if the path is registered again right after.
+      await this.mutateList((entries) => {
+        const next = entries.filter((entry) => entry.projectPath !== projectPath);
+        return next.length === entries.length ? null : next;
+      });
     });
   }
 
@@ -252,6 +353,8 @@ export class DraftService extends EventEmitter {
           await this.clearProjectDir(projectDir);
         });
       }
+      // Empty listed drafts have no body, hence no dir: collect their entries separately.
+      await this.removeUnownedListEntries();
     } catch (error) {
       log.warn("Failed to collect orphaned creation drafts", { error });
     }
@@ -259,7 +362,16 @@ export class DraftService extends EventEmitter {
 
   /** The event a new subscription starts with. */
   async getSnapshotEvent(): Promise<Extract<DraftEvent, { type: "snapshot" }>> {
-    return { type: "snapshot", drafts: await this.list() };
+    let list: DraftList;
+    try {
+      list = await this.getList();
+    } catch (error) {
+      // An unreadable list file (EACCES, EISDIR...) must not block every draft body: the list
+      // shows empty until it is readable again (writes to it keep failing and are retried).
+      log.warn("Failed to read the creation draft list", { error });
+      list = { entries: [], revision: this.listRevision };
+    }
+    return { type: "snapshot", drafts: await this.list(), list };
   }
 
   private getRevision(key: string): number {
@@ -389,6 +501,119 @@ export class DraftService extends EventEmitter {
     const event: DraftEvent = { type: "changed", ...summary };
     this.emit(DraftService.CHANGE_EVENT, event);
     return revision;
+  }
+
+  /**
+   * "missing": no list.json yet. "damaged": unparseable, a malformed structure or dropped malformed
+   * entries (the valid entries are kept, with a warning); the next mutation rebuilds it (see
+   * mutateList). Other read failures throw, so a write never replaces a list it could not read.
+   */
+  private async readListFile(): Promise<{
+    entries: DraftListEntry[];
+    state: "ok" | "missing" | "damaged";
+    /** Written by a newer version: readable, but never rewritten by this one. */
+    newer: boolean;
+  }> {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(await fs.readFile(this.listFile, "utf-8"));
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return { entries: [], state: "missing", newer: false };
+      if (!(error instanceof SyntaxError)) throw error;
+      log.warn(`Rebuilding unparseable creation draft list ${this.listFile}`, { error });
+      return { entries: [], state: "damaged", newer: false };
+    }
+    const file = (raw ?? {}) as { version?: unknown; entries?: unknown };
+    const newer = typeof file.version === "number" && file.version > LIST_FILE_VERSION;
+    const rawEntries = file.entries;
+    const entries: DraftListEntry[] = [];
+    for (const rawEntry of Array.isArray(rawEntries) ? rawEntries : []) {
+      const parsed = DraftListEntrySchema.safeParse(rawEntry);
+      if (parsed.success) entries.push(parsed.data);
+    }
+    const intact = Array.isArray(rawEntries) && entries.length === rawEntries.length;
+    if (!intact && !newer) log.warn(`Rebuilding malformed creation draft list ${this.listFile}`);
+    return { entries, state: intact ? "ok" : "damaged", newer };
+  }
+
+  /**
+   * Read-modify-write list.json under its own lock (taken inside a body lock only by `delete`,
+   * never the other way round). `change` returns the new entries, or null for no change. Writing a
+   * missing list, and every mutation of a damaged one (even a no-op), also lists each owned,
+   * non-empty creation body without an entry. A missing list is not created by a no-op: on
+   * upgrade the startup GC runs before the renderer's legacy import, whose sub-projects must win.
+   * Returns the (new) list revision.
+   */
+  private mutateList(
+    change: (
+      entries: DraftListEntry[],
+      exists: boolean
+    ) => DraftListEntry[] | null | Promise<DraftListEntry[] | null>
+  ): Promise<number> {
+    return withTargetMutationLock(this.config.rootDir, this.listFile, async () => {
+      const { entries, state, newer } = await this.readListFile();
+      if (newer) {
+        // A downgrade: rewriting a newer version's file would silently drop or contradict its
+        // data. Refuse; clients keep their change and retry, and the next upgrade can write it.
+        throw new Error(`Creation draft list ${this.listFile} was written by a newer version`);
+      }
+      let next = await change(entries, state === "ok");
+      if (next === null && state !== "damaged") return this.listRevision;
+      next ??= entries;
+      if (state !== "ok") next = [...next, ...(await this.findUnlistedCreationDrafts(next))];
+      await fs.mkdir(this.creationRoot, { recursive: true });
+      await writeFileAtomic(
+        this.listFile,
+        JSON.stringify({ version: LIST_FILE_VERSION, entries: next })
+      );
+      this.listRevision++;
+      const event: DraftEvent = { type: "list", entries: next, revision: this.listRevision };
+      this.emit(DraftService.CHANGE_EVENT, event);
+      return this.listRevision;
+    });
+  }
+
+  /** Drop the entries of projects that are no longer configured (scratch is always owned). */
+  private async removeUnownedListEntries(): Promise<void> {
+    await this.mutateList((entries) => {
+      const owned = this.configuredProjectDirNames();
+      const next = entries.filter(
+        (entry) =>
+          entry.projectPath === SCRATCH_PROJECT_CONFIG_KEY ||
+          owned.has(projectDraftsDirName(entry.projectPath))
+      );
+      return next.length === entries.length ? null : next;
+    });
+  }
+
+  /**
+   * Non-empty creation draft bodies of owned projects without a list entry (never the default
+   * draft), oldest first.
+   */
+  private async findUnlistedCreationDrafts(listed: DraftListEntry[]): Promise<DraftListEntry[]> {
+    await this.ensureIndex();
+    const owned = this.configuredProjectDirNames();
+    const found: DraftListEntry[] = [];
+    for (const { summary, filePath } of [...this.index.values()]) {
+      const scope = summary.scope;
+      if (scope.kind !== "creation" || scope.draftId === DEFAULT_CREATION_DRAFT_ID) continue;
+      if (!owned.has(projectDraftsDirName(scope.projectPath))) continue;
+      if (listed.some((entry) => isSameListEntry(entry, scope))) continue;
+      let createdAt: number;
+      try {
+        createdAt = (await fs.stat(filePath)).mtimeMs;
+      } catch (error) {
+        if (hasErrorCode(error, "ENOENT")) continue;
+        throw error;
+      }
+      found.push({
+        projectPath: scope.projectPath,
+        draftId: scope.draftId,
+        subProjectPath: null,
+        createdAt,
+      });
+    }
+    return found.sort((a, b) => a.createdAt - b.createdAt);
   }
 
   private bumpRevision(key: string): number {
@@ -522,6 +747,13 @@ export class DraftService extends EventEmitter {
     }
     await fs.rm(projectDir, { recursive: true, force: true });
   }
+}
+
+function isSameListEntry(
+  a: { projectPath: string; draftId: string },
+  b: { projectPath: string; draftId: string }
+): boolean {
+  return a.projectPath === b.projectPath && a.draftId === b.draftId;
 }
 
 /** Entry names of a directory; empty when it does not exist. */
