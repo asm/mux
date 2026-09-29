@@ -50,6 +50,7 @@ describe("ACP slash command support", () => {
       "compact",
       "fork",
       "new",
+      "discard-held",
       "react-effects",
       "deep-review",
       "triage",
@@ -211,6 +212,20 @@ describe("ACP slash command support", () => {
 
     expect(noArgs.formattedMessage).toBe("Use skill react-effects");
     expect(noArgs.argumentText).toBe("");
+  });
+
+  it("parses /discard-held with an optional positive number", () => {
+    const parse = (input: string) => parseAcpSlashCommand(input, mapSkillsByName(skills));
+    expect(parse("/discard-held")).toEqual({ kind: "discard-held" });
+    expect(parse("/discard-held 2")).toEqual({ kind: "discard-held", number: 2 });
+    for (const input of [
+      "/discard-held 0",
+      "/discard-held one",
+      "/discard-held 1 2",
+      "/discard-held -1",
+    ]) {
+      expect(parse(input)?.kind).toBe("invalid");
+    }
   });
 
   it("leaves unknown slash commands untouched for normal prompt handling", () => {
