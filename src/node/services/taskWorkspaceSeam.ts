@@ -276,6 +276,15 @@ export interface RemovalCheckoutOptions {
   mutationGateHeld?: boolean;
 }
 
+/**
+ * What a model-facing archive would lose across the tree it cascades over (#4930): the untracked
+ * paths of the target itself and of each sub-agent whose snapshot archive cannot preserve them.
+ */
+export interface ArchiveCascadePreflight {
+  targetPaths: string[];
+  subagents: Array<{ workspaceId: string; title: string; paths: string[] }>;
+}
+
 export interface ArchiveWorkspaceOptions {
   /**
    * Refuse to archive when the effective worktree archive behavior would delete the checkout
@@ -688,6 +697,10 @@ export interface WorkspaceLifecycleHost {
     workspaceId: string,
     options?: { worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior }
   ): Promise<Result<ArchivePreflightResult>>;
+  preflightArchiveCascade(
+    workspaceId: string,
+    worktreeArchiveBehavior: WorktreeArchiveBehavior
+  ): Promise<Result<ArchiveCascadePreflight>>;
   acquirePreInterruptionArchiveHold(
     workspaceId: string,
     options: {
