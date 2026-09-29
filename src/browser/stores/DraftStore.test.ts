@@ -25,7 +25,6 @@ import { DraftService } from "@/node/services/draftService";
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { installDom } from "../../../tests/ui/dom";
 import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
-import { QuotaLimitedStorage } from "../../../tests/ui/quotaLimitedStorage";
 import { DraftStore, draftStoreScopeKey } from "./DraftStore";
 
 // Older builds wrote these legacy keys; the key registry refuses them now, so seed them the way
@@ -54,6 +53,10 @@ function createClient(service: DraftService) {
     failImports: 0,
     failDeletes: 0,
     failGets: 0,
+    failListPuts: 0,
+    failListImports: 0,
+    /** Consumed one per putListEntry call, in call order. */
+    listPutGates: [] as Array<Promise<void>>,
     updateGate: null as Promise<void> | null,
     getGate: null as Promise<void> | null,
     subscribeGate: null as Promise<void> | null,
@@ -91,6 +94,25 @@ function createClient(service: DraftService) {
         throw new Error("import failed");
       }
       return service.importLegacy(input);
+    },
+    putListEntry: async (entry: Parameters<DraftService["putListEntry"]>[0]) => {
+      await control.listPutGates.shift();
+      if (control.failListPuts > 0) {
+        control.failListPuts--;
+        throw new Error("list put failed");
+      }
+      return service.putListEntry(entry);
+    },
+    importLegacyList: async ({
+      entries,
+    }: {
+      entries: Parameters<DraftService["importLegacyList"]>[0];
+    }) => {
+      if (control.failListImports > 0) {
+        control.failListImports--;
+        throw new Error("list import failed");
+      }
+      return service.importLegacyList(entries);
     },
     subscribe: async (_input: void, opts?: { signal?: AbortSignal }) => {
       await control.subscribeGate;
@@ -202,12 +224,11 @@ describe("DraftStore", () => {
       attachments: [image],
     });
     expect(store.getAttachments(creation)).toEqual([image]);
-    // The pending draft became a listed creation draft of its project, still visible.
-    const listed = readPersistedState<Record<string, Array<{ draftId: string }>>>(
-      WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-      {}
-    )[projectPath];
-    expect(listed).toHaveLength(1);
+    // The pending draft became a listed creation draft of its project, still visible. draft-a
+    // had no list entry (none was seeded), so the first list write relisted its body too.
+    const projectDrafts = store.getCreationDraftsByProject()[projectPath];
+    expect(projectDrafts).toHaveLength(2);
+    const listed = projectDrafts.filter(({ draftId }) => draftId !== "draft-a");
     const converted: DraftScope = { kind: "creation", projectPath, draftId: listed[0].draftId };
     expect((await service.get(converted)).text).toBe("pending text");
     expect(listPersistedKeys("input")).toEqual([]);
@@ -326,45 +347,188 @@ describe("DraftStore", () => {
     ]);
   });
 
-  test("keeps the legacy pending draft reachable when the draft list cannot be written", async () => {
-    using tempDir = new TestTempDir("draft-store-legacy-quota");
-    const { projectPath, service, client } = await createHarness(tempDir);
-    const inputKey = getInputKey(getPendingScopeId(projectPath));
+  test("lists an attachment-only legacy pending draft on a later start after a failed listing", async () => {
+    using tempDir = new TestTempDir("draft-store-legacy-attachments");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
     const attachmentsKey = getInputAttachmentsKey(getPendingScopeId(projectPath));
-    const inputValue = JSON.stringify("pending text");
-    // A full origin: the legacy keys fit, the draft list entry never does.
-    const full = new QuotaLimitedStorage(inputKey.length + inputValue.length + 16);
-    full.seed(inputKey, inputValue);
-    full.seed(attachmentsKey, JSON.stringify([image]));
-    Object.defineProperty(window, "localStorage", { configurable: true, value: full });
+    seedLegacyKey(attachmentsKey, [image]);
 
+    // The draft is imported, but listing it fails: its only legacy key must survive (#5226).
+    control.failListPuts = 1;
     const first = createStore(client);
     await first.whenReady();
     first.setClient(null);
-    // The backend holds the draft, but only the legacy key can lead a composer to it.
-    expect(full.getItem(inputKey)).toBe(inputValue);
+    expect(listPersistedKeys("inputAttachments")).toEqual([attachmentsKey]);
 
-    const roomy = new QuotaLimitedStorage(1_000_000);
-    for (let index = 0; index < full.length; index++) {
-      const key = full.key(index)!;
-      roomy.seed(key, full.getItem(key)!);
-    }
-    Object.defineProperty(window, "localStorage", { configurable: true, value: roomy });
     const second = createStore(client);
     await second.whenReady();
-
-    const listed = readPersistedState<Record<string, Array<{ draftId: string }>>>(
-      WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-      {}
-    )[projectPath];
-    expect(listed).toHaveLength(1);
-    // The retry re-imports into the same draft instead of adding a second one.
     const creationDrafts = (await service.list()).filter(({ scope }) => scope.kind === "creation");
-    expect(creationDrafts.map(({ scope }) => scope)).toEqual([
-      { kind: "creation", projectPath, draftId: listed[0].draftId },
+    expect(creationDrafts).toHaveLength(1);
+    const scope = creationDrafts[0].scope as Extract<DraftScope, { kind: "creation" }>;
+    expect((await service.get(scope)).attachments).toEqual([image]);
+    await waitFor(
+      () => second.getCreationDraftsByProject()[projectPath]?.[0]?.draftId === scope.draftId
+    );
+    expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual([
+      scope.draftId,
     ]);
-    expect((await service.get(creationDrafts[0].scope)).attachments).toEqual([image]);
-    expect(roomy.getItem(inputKey)).toBeNull();
+    expect(listPersistedKeys("inputAttachments")).toEqual([]);
+  });
+
+  test("imports the legacy draft list once, shows it while the import fails, and relists lost drafts", async () => {
+    using tempDir = new TestTempDir("draft-store-legacy-list");
+    const { config, projectPath, service, client, control } = await createHarness(tempDir);
+    // An older list that outgrew its 32 KiB budget (#5225), and a body whose row it lost.
+    const subProjectPath = path.join(projectPath, "x".repeat(300));
+    const legacy = Array.from({ length: 100 }, (_, i) => ({
+      draftId: `old-${i}`,
+      subProjectPath,
+      createdAt: i,
+    }));
+    seedLegacyKey(WORKSPACE_DRAFTS_BY_PROJECT_KEY, { [projectPath]: legacy });
+    await service.update({ scope: { kind: "creation", projectPath, draftId: "lost" }, text: "t" });
+    const listedIds = (store: DraftStore) =>
+      (store.getCreationDraftsByProject()[projectPath] ?? []).map(({ draftId }) => draftId);
+
+    control.failListImports = 1;
+    const failing = createStore(client);
+    await failing.whenReady();
+    expect(listedIds(failing)).toEqual(legacy.map(({ draftId }) => draftId));
+    expect(listPersistedKeys(WORKSPACE_DRAFTS_BY_PROJECT_KEY)).toHaveLength(1);
+    failing.setClient(null);
+
+    const store = createStore(client);
+    await store.whenReady();
+    const expected = [...legacy.map(({ draftId }) => draftId), "lost"];
+    await waitFor(() => listedIds(store).join() === expected.join());
+    expect(store.getCreationDraftsByProject()[projectPath][0].subProjectPath).toBe(subProjectPath);
+    expect(listPersistedKeys(WORKSPACE_DRAFTS_BY_PROJECT_KEY)).toEqual([]);
+
+    // Restart: a new backend and store list every draft from the backend alone.
+    const restarted = createStore(createClient(new DraftService(config)).client);
+    await restarted.whenReady();
+    expect(listedIds(restarted)).toEqual(expected);
+  });
+
+  test("sends list puts of one draft in order, so an older sub-project never lands last", async () => {
+    using tempDir = new TestTempDir("draft-store-list-order");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    let releaseFirst: () => void = () => undefined;
+    control.listPutGates.push(
+      new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      })
+    );
+    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: "/a", createdAt: 1 });
+    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: "/b", createdAt: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    releaseFirst();
+    await waitFor(async () => (await service.getList()).entries[0]?.subProjectPath === "/b");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect((await service.getList()).entries.map((entry) => entry.subProjectPath)).toEqual(["/b"]);
+    await waitFor(
+      () => store.getCreationDraftsByProject()[projectPath]?.[0]?.subProjectPath === "/b"
+    );
+  });
+
+  test("retries a list put that failed on a replaced client through the current one", async () => {
+    using tempDir = new TestTempDir("draft-store-list-reconnect");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    control.listPutGates.push(
+      new Promise<void>((resolve) => {
+        release = resolve;
+      })
+    );
+    control.failListPuts = 1;
+    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: null, createdAt: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Reconnect while the put is in flight; then the old request fails.
+    store.setClient(createClient(service).client);
+    // Let the new subscription's snapshot (and its resend attempt) run first.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    release();
+    await waitFor(async () => (await service.getList()).entries.length === 1, 5_000);
+  });
+
+  test("a delete waits for the draft's list put, so it is not relisted", async () => {
+    using tempDir = new TestTempDir("draft-store-list-delete-order");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    control.listPutGates.push(
+      new Promise<void>((resolve) => {
+        release = resolve;
+      })
+    );
+    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: null, createdAt: 1 });
+    const deleted = store.deleteDraft({ kind: "creation", projectPath, draftId: "d1" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    release();
+    await deleted;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect((await service.getList()).entries).toEqual([]);
+    expect(store.getCreationDraftsByProject()[projectPath]).toBeUndefined();
+  });
+
+  test("replaces a malformed legacy draft list, so its import still completes", async () => {
+    using tempDir = new TestTempDir("draft-store-legacy-list-malformed");
+    const { projectPath, service, client } = await createHarness(tempDir);
+    window.localStorage.setItem(WORKSPACE_DRAFTS_BY_PROJECT_KEY, "{not json");
+    await service.update({ scope: { kind: "creation", projectPath, draftId: "lost" }, text: "t" });
+    const store = createStore(client);
+    await store.whenReady();
+    await waitFor(() => store.getCreationDraftsByProject()[projectPath]?.[0]?.draftId === "lost");
+    expect(listPersistedKeys(WORKSPACE_DRAFTS_BY_PROJECT_KEY)).toEqual([]);
+  });
+
+  test("keeps a deleted draft hidden when its list put lands while the delete waits", async () => {
+    using tempDir = new TestTempDir("draft-store-list-delete-hidden");
+    const { projectPath, client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    control.listPutGates.push(
+      new Promise<void>((resolve) => {
+        release = resolve;
+      })
+    );
+    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: null, createdAt: 1 });
+    // The backend delete keeps failing: only the pending delete hides the row.
+    control.failDeletes = 100;
+    const deleted = store.deleteDraft({ kind: "creation", projectPath, draftId: "d1" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    release();
+    await deleted;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(store.getCreationDraftsByProject()[projectPath]).toBeUndefined();
+  });
+
+  test("lists a legacy creation draft whose row the legacy list had already lost", async () => {
+    using tempDir = new TestTempDir("draft-store-legacy-unlisted-body");
+    const { projectPath, service, client } = await createHarness(tempDir);
+    // The body exists only in localStorage, and the (over-budget) legacy list lost its row.
+    seedLegacyKey(getInputKey(getDraftScopeId(projectPath, "draft-x")), "typed in an old build");
+    seedLegacyKey(WORKSPACE_DRAFTS_BY_PROJECT_KEY, {
+      [projectPath]: [{ draftId: "other", subProjectPath: null, createdAt: 1 }],
+    });
+    const store = createStore(client);
+    await store.whenReady();
+    await waitFor(() =>
+      (store.getCreationDraftsByProject()[projectPath] ?? []).some(
+        ({ draftId }) => draftId === "draft-x"
+      )
+    );
+    expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual([
+      "other",
+      "draft-x",
+    ]);
+    expect(listPersistedKeys("input")).toEqual([]);
   });
 
   test("imports legacy drafts of workspace ids that start with underscores", async () => {
