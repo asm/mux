@@ -22,6 +22,7 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createTestHistoryService } from "./testHistoryService";
+import { createContextBudgetWarning } from "./contextWindowRollover";
 import { extractToolInstructionsFromSources } from "./systemMessage";
 
 import {
@@ -543,6 +544,52 @@ describe("assemblePromptPayload", () => {
     expect(payload.messages.map((message) => message.role)).toEqual(["assistant", "user"]);
     expect(JSON.stringify(payload.messages[1])).toContain("approved plan body");
   });
+
+  test("token budget tags persisted user rows with their session_history item ID", async () => {
+    const request = createMuxMessage("request", "user", "fix the bug", { historySequence: 7 });
+    const reply = createMuxMessage("reply", "assistant", "on it", { historySequence: 8 });
+    const advisory = createContextBudgetWarning({
+      contextTokens: 80_000,
+      maxTokens: 128_000,
+      budgetTokens: 96_000,
+      memoryWritable: true,
+      sessionHistoryAvailable: true,
+    });
+    advisory.metadata!.historySequence = 9;
+    const unsequenced = createMuxMessage("pending", "user", "follow-up");
+    const history = [request, reply, advisory, unsequenced];
+    const text = (payload: Awaited<ReturnType<typeof assemble>>) =>
+      JSON.stringify(payload.messages);
+
+    const tagged = text(await assemble({ history, tagHistoryItemIds: true }));
+    expect(tagged).toContain("[id: 7]");
+    expect(tagged).not.toContain("[id: 8]");
+    // Budget-internal rows and rows without a persisted sequence cannot be read back.
+    expect(tagged).not.toContain("[id: 9]");
+    expect(tagged).not.toContain("[id: m:");
+    expect(text(await assemble({ history }))).not.toContain("[id:");
+
+    // A tag depends only on its own row, so appending history keeps the cached prefix intact.
+    const shortPayload = await assemble({ history: [request, reply], tagHistoryItemIds: true });
+    const longPayload = await assemble({
+      history: [request, reply, createMuxMessage("next", "user", "next", { historySequence: 10 })],
+      tagHistoryItemIds: true,
+    });
+    expect(JSON.stringify(longPayload.messages.slice(0, shortPayload.messages.length))).toBe(
+      JSON.stringify(shortPayload.messages)
+    );
+  });
+
+  test("token budget tags survive user-row merging but skip rows session_history hides", async () => {
+    const snapshot = createMuxMessage("snapshot", "user", "file snapshot", {
+      historySequence: 11,
+      synthetic: true,
+    });
+    const request = createMuxMessage("request", "user", "fix the bug", { historySequence: 12 });
+    const payload = await assemble({ history: [snapshot, request], tagHistoryItemIds: true });
+    expect(JSON.stringify(payload.messages)).not.toContain("[id: 11]");
+    expect(JSON.stringify(payload.messages)).toContain("[id: 12]");
+  });
 });
 
 describe("buildPlanInstructions", () => {
@@ -992,10 +1039,10 @@ describe("buildStreamSystemContext", () => {
       hotMemoriesBlock: notesBlock,
     });
     const notesSection = (text: string) =>
-      text.split("<context-notes-guidance>")[1]?.split("</context-notes-guidance>")[0];
+      text.split("<context-window-guidance>")[1]?.split("</context-window-guidance>")[0];
     expect(notesSection(writableNotes.systemMessage)).toBeDefined();
-    expect(notesSection(readOnlyNotes.systemMessage)).toBeDefined();
-    expect(notesSection(readOnlyNotes.systemMessage)).not.toBe(
+    // Every agent may write its session checkpoint, so read-only agents get the same guidance.
+    expect(notesSection(readOnlyNotes.systemMessage)).toBe(
       notesSection(writableNotes.systemMessage)
     );
     expect(memorySection(readOnlyNotes.systemMessage)).not.toEqual(

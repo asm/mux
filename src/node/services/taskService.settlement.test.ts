@@ -906,7 +906,7 @@ describe("TaskService", () => {
             await session.sendMessage("Research the topic and report.", {
               model: childModel,
               agentId: "exec",
-              experiments: { tokenBudget: true },
+              experiments: { tokenBudget: true, memory: true },
             })
           ).success
         ).toBe(true);
@@ -917,7 +917,6 @@ describe("TaskService", () => {
           toolResultChars: 0,
           imageParts: 0,
           sessionHistoryAvailable: true,
-          memoryWritable: true,
         };
         const budgetOutcome = await requests[0].onStepSettled?.(budgetStep);
         expect(budgetOutcome?.decision).toBe("warn");

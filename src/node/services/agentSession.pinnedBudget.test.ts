@@ -7,8 +7,6 @@ import { TelemetryService } from "./telemetryService";
 import { MemoryService } from "./memoryService";
 import { MemoryMetaService } from "./memoryMeta";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { FLUSH_MAX_OUTPUT_TOKENS } from "@/common/constants/contextBudget";
-import { ANTHROPIC_THINKING_BUDGETS } from "@/common/types/thinking";
 import * as fs from "node:fs/promises";
 import { attachLanguageModelCleanup, runLanguageModelCleanup } from "./languageModelCleanup";
 import { WorkspaceGoalService } from "./workspaceGoalService";
@@ -252,7 +250,7 @@ describe("pinned full-payload rollover admission", () => {
         const result = await h.session.sendMessage("Small follow-up", {
           model,
           agentId: "exec",
-          experiments: { tokenBudget: true, toolSearch: kind === "deferred-schema" },
+          experiments: { tokenBudget: true, memory: true, toolSearch: kind === "deferred-schema" },
         });
         const fits = kind === "deferred-schema";
         expect(result.success).toBe(fits);
@@ -310,7 +308,7 @@ describe("pinned full-payload rollover admission", () => {
         });
       const sending = h.session.sendMessage(
         "Canceled candidate",
-        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
         {
           onAccepted:
             phase === "after-preparation"
@@ -364,7 +362,7 @@ describe("pinned full-payload rollover admission", () => {
           (
             await h.session.sendMessage(
               "Manual intervention",
-              { model, agentId: "exec", experiments: { tokenBudget: true } },
+              { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
               {
                 enqueuedAtMs: consent ? goal!.lastUserActivationAtMs! - 1000 : undefined,
               }
@@ -399,7 +397,7 @@ describe("pinned full-payload rollover admission", () => {
       const result = await fixture.h.session.sendMessage("Manual intervention", {
         model,
         agentId: "exec",
-        experiments: { tokenBudget: true },
+        experiments: { tokenBudget: true, memory: true },
       });
       expect(result).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
       expect((await fixture.goalService.getGoal(workspaceId))?.status).toBe("paused");
@@ -475,6 +473,35 @@ describe("pinned full-payload rollover admission", () => {
       }
     }
   );
+  test("the first fresh-window request shows the IDs its rows were appended with", async () => {
+    const fixture = await setup("small");
+    const { h, historyService, start } = fixture;
+    try {
+      const result = await h.session.sendMessage("Small follow-up", {
+        model,
+        agentId: "exec",
+        experiments: { tokenBudget: true, memory: true },
+      });
+      expect(result.success).toBe(true);
+      const after = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!after.success) throw new Error(after.error);
+      const boundary = after.data[0];
+      const trigger = after.data.findLast((row) => row.role === "user");
+      expect(boundary.metadata?.muxMetadata?.type).toBe("context-window-rollover");
+      expect(start).toHaveBeenCalledTimes(1);
+      const request = start.mock.calls[0][0];
+      const system: unknown = request.system;
+      if (typeof system !== "string") throw new Error("Expected a string system prompt");
+      const windowSection = system.split("<context_window>")[1]?.split("</context_window>")[0];
+      expect(windowSection).toContain(`w:${String(boundary.metadata?.historySequence)}`);
+      expect(windowSection).toContain("w:0");
+      expect(JSON.stringify(request.messages)).toContain(
+        `[id: ${String(trigger?.metadata?.historySequence)}]`
+      );
+    } finally {
+      await fixture.cleanup();
+    }
+  });
   test.each(["dispose", "cancel", "admission-revoked"] as const)(
     "%s after preparation publishes no stream or accepted history",
     async (action) => {
@@ -508,7 +535,7 @@ describe("pinned full-payload rollover admission", () => {
       let revoked = false;
       const sending = h.session.sendMessage(
         "Revocable candidate",
-        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
         {
           cancelSignal: controller.signal,
           admissionStale: () => revoked,
@@ -571,7 +598,7 @@ describe("pinned full-payload rollover admission", () => {
       expect(
         await h.session.sendMessage(
           "Prepared but not committed",
-          { model, agentId: "exec", experiments: { tokenBudget: true } },
+          { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
           { onAccepted: accepted }
         )
       ).toMatchObject({ success: false, error: { type: "unknown" } });
@@ -632,7 +659,7 @@ describe("pinned full-payload rollover admission", () => {
           await h.session.sendMessage("Start a fresh window", {
             model,
             agentId: "exec",
-            experiments: { tokenBudget: true },
+            experiments: { tokenBudget: true, memory: true },
           })
         ).success
       ).toBe(true);
@@ -659,7 +686,7 @@ describe("pinned full-payload rollover admission", () => {
     }
   });
 
-  test("a final-flush turn never starts MCP servers", async () => {
+  test("a persisted legacy flush trigger resumes as an ordinary turn", async () => {
     const fixture = await setup("small");
     completeStartedTurnsOnStop(fixture);
     const { h, service, start } = fixture;
@@ -668,8 +695,13 @@ describe("pinned full-payload rollover admission", () => {
     // No on-send auto-compaction: the persisted trigger must be the request's last user row.
     await seedAutoCompactionThreshold(h.config, model, 100);
     try {
-      // A persisted flush trigger resumed after a restart keeps its flag for the request builder
-      // even with token-budget mode off (a fresh queued entry would be degraded instead).
+      // Builds from #4156 persisted this hidden trigger for a one-step, memory-only flush turn.
+      // Nothing executes that turn specially any more: it resumes with the normal toolset.
+      const legacyFlushMetadata = {
+        type: "normal",
+        contextBudgetContinuation: true,
+        contextBudgetFlush: true,
+      } as const;
       expect(
         (
           await fixture.historyService.appendToHistory(
@@ -677,11 +709,7 @@ describe("pinned full-payload rollover admission", () => {
             createMuxMessage("flush-trigger", "user", "Flush context notes now.", {
               synthetic: true,
               uiVisible: false,
-              muxMetadata: {
-                type: "normal",
-                contextBudgetContinuation: true,
-                contextBudgetFlush: true,
-              },
+              muxMetadata: legacyFlushMetadata,
             })
           )
         ).success
@@ -696,103 +724,23 @@ describe("pinned full-payload rollover admission", () => {
         ).success
       ).toBe(true);
       expect(start).toHaveBeenCalledTimes(1);
-      // The memory-only ceiling proves the flag reached the builder: no catalog search and no
-      // read-only session_history (a history read would consume the single flush step).
-      const flushTools = Object.keys(start.mock.calls[0][0].tools ?? {});
-      expect(flushTools).not.toContain("tool_catalog_search");
-      expect(flushTools).not.toContain("session_history");
-      expect(startServers).not.toHaveBeenCalled();
-      await h.session.interruptStream();
-      await h.session.waitForIdle();
-      // Control: an ordinary turn on the same fixture does start them.
-      expect(
-        (
-          await h.session.sendMessage("Ordinary turn", {
-            model,
-            agentId: "exec",
-            experiments: { tokenBudget: false },
-          })
-        ).success
-      ).toBe(true);
+      const resumed = start.mock.calls[0][0];
       expect(startServers).toHaveBeenCalledTimes(1);
-    } finally {
-      await fixture.cleanup();
-    }
-  });
-
-  test("a final-flush fallback runs at its own inherent thinking minimum with a matching cap", async () => {
-    const fixture = await setup("small");
-    completeStartedTurnsOnStop(fixture);
-    const { h, config, start } = fixture;
-    // gpt-5.2 cannot go below medium thinking, and the user floor for it is higher still; the
-    // flush must ignore the floor (housekeeping) but size its cap for the model's own minimum.
-    const fallbackModel = "openai:gpt-5.2";
-    await config.editConfig((cfg) => ({
-      ...cfg,
-      modelFallbacks: { [model]: { models: [fallbackModel] } },
-      minThinkingLevelByModel: { [fallbackModel]: "high" },
-    }));
-    await seedAutoCompactionThreshold(h.config, model, 100);
-    try {
-      expect(
-        (
-          await fixture.historyService.appendToHistory(
-            workspaceId,
-            createMuxMessage("flush-trigger", "user", "Flush context notes now.", {
-              synthetic: true,
-              uiVisible: false,
-              muxMetadata: {
-                type: "normal",
-                contextBudgetContinuation: true,
-                contextBudgetFlush: true,
-              },
-            })
-          )
-        ).success
-      ).toBe(true);
-      expect(
-        (
-          await h.session.resumeStream({
-            model,
-            agentId: "exec",
-            thinkingLevel: "high",
-            experiments: { tokenBudget: false },
-          })
-        ).success
-      ).toBe(true);
-      expect(start).toHaveBeenCalledTimes(1);
-      const primary = start.mock.calls[0][0];
-      // The primary's inherent minimum is off, so its cap carries no thinking budget.
-      expect(primary.maxOutputTokens).toBe(FLUSH_MAX_OUTPUT_TOKENS);
-      const fallback = await primary.modelFallback!.prepare(fallbackModel, {
-        thinkingLevelOverride: "high",
-      });
-      expect(fallback.success).toBe(true);
-      if (fallback.success) {
-        expect(fallback.data.thinkingLevel).toBe("medium");
-        expect(fallback.data.maxOutputTokens).toBe(
-          FLUSH_MAX_OUTPUT_TOKENS + ANTHROPIC_THINKING_BUDGETS.medium
-        );
-      }
+      expect(resumed.maxOutputTokens).toBeUndefined();
       await h.session.interruptStream();
       await h.session.waitForIdle();
-      // Control: an ordinary turn's fallback honors the user floor and keeps the caller's cap.
       expect(
         (
           await h.session.sendMessage("Ordinary turn", {
             model,
             agentId: "exec",
-            thinkingLevel: "off",
             experiments: { tokenBudget: false },
           })
         ).success
       ).toBe(true);
-      const ordinary = await start.mock.calls[1][0].modelFallback!.prepare(fallbackModel);
-      expect(ordinary.success).toBe(true);
-      if (ordinary.success) {
-        expect(ordinary.data.thinkingLevel).toBe("high");
-        expect(ordinary.data.maxOutputTokens).toBeUndefined();
-      }
+      const ordinaryTools = Object.keys(start.mock.calls[1][0].tools ?? {}).sort();
+      expect(ordinaryTools).toContain("session_history");
+      expect(Object.keys(resumed.tools ?? {}).sort()).toEqual(ordinaryTools);
     } finally {
       await fixture.cleanup();
     }
@@ -819,7 +767,7 @@ describe("pinned full-payload rollover admission", () => {
           await h.session.sendMessage("Use a prepared primary", {
             model,
             agentId: "exec",
-            experiments: { tokenBudget: true },
+            experiments: { tokenBudget: true, memory: true },
           })
         ).success
       ).toBe(true);
@@ -867,7 +815,7 @@ describe("pinned full-payload rollover admission", () => {
       }
       const sending = h.session.sendMessage(
         "Durable prepared monitor wake",
-        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
         {
           synthetic: true,
           agentInitiated: true,
@@ -925,7 +873,7 @@ describe("pinned full-payload rollover admission", () => {
       const controller = new AbortController();
       const sending = h.session.sendMessage(
         "Accepted prepared wake",
-        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
         {
           synthetic: true,
           agentInitiated: true,
@@ -984,7 +932,7 @@ describe("pinned full-payload rollover admission", () => {
       const cancelState = { canceledBeforeAcceptance: false };
       const sending = h.session.sendMessage(
         "Wake retained when rollback fails",
-        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
         {
           acceptanceOrigin: "automatic",
           synthetic: true,

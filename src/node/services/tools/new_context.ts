@@ -20,7 +20,6 @@ export const createNewContextTool: ToolFactory = (_config: ToolConfiguration) =>
       Promise.resolve({
         success: true,
         status: "scheduled",
-        message:
-          "A fresh context window starts after this tool step settles. Finish any notes now; completed tool results stay retrievable through session_history.",
+        message: "A new context window will start without summarizing conversation history.",
       }),
   });

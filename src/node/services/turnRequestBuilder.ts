@@ -13,13 +13,11 @@ import {
   MEMORY_INTUITION_MAX_USES_PER_TURN,
   type MemoryScopeAccess,
 } from "@/common/constants/memory";
-import { CONTEXT_NOTES_MEMORY_PATH } from "@/common/constants/contextBudget";
-import { getContextBudgetFlushMaxOutputTokens } from "@/common/utils/compaction/contextBudget";
 import {
   resolveHeadlessAgentDefinition,
   resolveHeadlessAgentSettings,
 } from "@/node/services/memoryConsolidationService";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, isTokenBudgetActive } from "@/common/constants/experiments";
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
 
@@ -135,7 +133,7 @@ import {
 } from "@/node/services/mcpServerManager";
 import { type MemoryService, type MemorySessionContext } from "@/node/services/memoryService";
 import type { TaskService } from "@/node/services/taskService";
-import { resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
+import { resolveMemoryAccessPolicy, resolveMemoryScopes } from "@/node/services/tools/memory";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import {
   MCP_OVERRIDES_READ_TIMEOUT_MS,
@@ -207,11 +205,13 @@ import type { OauthServiceBindings, ProviderModelFactory } from "./providerModel
 import {
   assemblePromptPayload,
   buildPlanInstructions,
+  buildContextWindowSection,
   buildStreamSystemContext,
   formatMcpWarningPrefix,
   prepareProviderRequestMessages,
   removeIntuitionGuidance,
 } from "./turnContextAssembler";
+import { resolveContextWindowIds } from "./contextWindowRollover";
 export { prepareProviderRequestMessages };
 import {
   simulateContextLimitError,
@@ -272,7 +272,7 @@ export function resolveXumToolScope(
 
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ErrorEvent } from "@/common/types/stream";
-import { withContextBudgetFlushToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -328,7 +328,7 @@ export interface StreamMessageOptions {
    */
   resolveMemoryContext?: (
     modelString: string,
-    options?: { includeHotMemories?: boolean; onlyContextNotes?: boolean }
+    options?: { includeHotMemories?: boolean }
   ) => Promise<MemorySessionContext | undefined>;
   experiments?: SendMessageOptions["experiments"];
   allowAgentSetGoal?: boolean;
@@ -995,19 +995,11 @@ export class TurnRequestBuilder {
     let modelString = opts.modelString;
     let autoModelRouting = opts.autoModelRouting;
     let activeTurnThinkingOverride = opts.activeTurnThinkingOverride;
-    // SECURITY: the context-budget final flush is a hidden automatic turn whose only job is
-    // writing the workspace context notes, on a transcript that may carry injected tool output.
-    // It must not gain synthesized code execution (PTC) or run repository tool hooks, and its
-    // memory writes are pinned to the notes file below.
-    const contextBudgetFlushTurn = muxMetadata?.contextBudgetFlush === true;
-    const gatedExperiments = resolveBackendGatedPtcExperiments(
+    const experiments: StreamMessageOptions["experiments"] = resolveBackendGatedPtcExperiments(
       experimentsFromOptions,
       (experimentId) =>
         this.dependencies.experimentsService?.isExperimentEnabled(experimentId) === true
     );
-    const experiments: StreamMessageOptions["experiments"] = contextBudgetFlushTurn
-      ? { ...gatedExperiments, programmaticToolCalling: false }
-      : gatedExperiments;
     const combinedAbortSignal = context.abortSignal;
     const syntheticMessageId = context.syntheticMessageId;
     const startTime = context.startTime;
@@ -1489,13 +1481,8 @@ export class TurnRequestBuilder {
     // project-scope listing sees a running runtime (a stopped Docker/remote
     // workspace would yield an empty/partial context, and AgentSession caches
     // the result per model/session segment).
-    // Flush turns only ever see the context notes (index and preload): other memories must
-    // not be disclosed to, or laundered through, the hidden prompt-influenced turn.
     const memoryContext = resolveMemoryContext
-      ? await resolveMemoryContext(modelString, {
-          includeHotMemories: false,
-          onlyContextNotes: contextBudgetFlushTurn,
-        })
+      ? await resolveMemoryContext(modelString, { includeHotMemories: false })
       : undefined;
 
     const cfg = this.dependencies.config.loadConfigOrDefault();
@@ -1513,8 +1500,7 @@ export class TurnRequestBuilder {
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) === true;
     const isExperimentEnabled = (id: Parameters<ExperimentsService["isExperimentEnabled"]>[0]) =>
       this.dependencies.experimentsService?.isExperimentEnabled(id) === true;
-    const sessionHistoryEnabled =
-      experiments?.tokenBudget ?? isExperimentEnabled(EXPERIMENT_IDS.TOKEN_BUDGET);
+    const sessionHistoryEnabled = isTokenBudgetActive(experiments, isExperimentEnabled);
     const timelineExperimentEnabled =
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE) === true;
     const workspaceHeartbeatsExperimentEnabled =
@@ -1550,10 +1536,7 @@ export class TurnRequestBuilder {
       memoryToolAvailableForModel &&
       memoryHotSetExperimentEnabled &&
       resolveMemoryContext !== undefined
-        ? await resolveMemoryContext(modelStringForContext, {
-            includeHotMemories: true,
-            onlyContextNotes: contextBudgetFlushTurn,
-          })
+        ? await resolveMemoryContext(modelStringForContext, { includeHotMemories: true })
         : memoryContext;
     emitStartupBreadcrumb("loading_workspace_context");
     // One cache per request: resolution, plan handoff, prompt body, and
@@ -1568,11 +1551,7 @@ export class TurnRequestBuilder {
       requestedAgentId: agentId,
       strictAgentResolution,
       disableWorkspaceAgents: disableWorkspaceAgents ?? false,
-      // Flush turns get the memory-only ceiling here, independent of caller options, so a
-      // resumed or retried stream cannot widen the hidden turn's toolset.
-      callerToolPolicy: contextBudgetFlushTurn
-        ? withContextBudgetFlushToolPolicy(toolPolicy)
-        : toolPolicy,
+      callerToolPolicy: toolPolicy,
       cfg,
       emitError: (event) => {
         if (!context.admissionOnly) this.dependencies.emit("error", event);
@@ -1618,15 +1597,10 @@ export class TurnRequestBuilder {
       ) &&
       !isRlmModeEnabled(experiments, isExperimentEnabled);
     const legacyModeForMetadata = getLegacyModeForAgentMetadata(effectiveAgentId, effectiveMode);
-    const agentMemoryAccess = resolveMemoryAccessPolicy({
+    const memoryAccess: MemoryScopeAccess = resolveMemoryAccessPolicy({
       planLike: agentIsPlanLike,
       editingCapable: isExecLikeEditingCapableInResolvedChain(agentInheritanceChain),
     });
-    // Flush turns: keep global/project stores read-only and pin mutations to the notes file
-    // (memoryWritePath below) so injected transcript content cannot reach other memory.
-    const memoryAccess: MemoryScopeAccess = contextBudgetFlushTurn
-      ? { global: "read", project: "read", workspace: agentMemoryAccess.workspace }
-      : agentMemoryAccess;
     const projectTrusted = isWorkspaceProjectTrusted(this.dependencies.config, metadata);
     // projectAutomationDisabled: benchmark harnesses opt out of automatic
     // repo hook execution (tool_env/tool_pre/tool_post) while keeping
@@ -1926,9 +1900,7 @@ export class TurnRequestBuilder {
     let mcpPromptRuntime: MCPPromptRuntime | undefined;
     let mcpSetupDurationMs = 0;
 
-    // SECURITY: the memory-only flush turn filters every MCP tool out anyway, so never start
-    // repository-configured servers (with project secrets) for this hidden automatic turn.
-    if (this.dependencies.bindings.mcpServerManager && !contextBudgetFlushTurn) {
+    if (this.dependencies.bindings.mcpServerManager) {
       const mcpServerManager = this.dependencies.bindings.mcpServerManager;
       const mcpToolSetupStartedAt = Date.now();
       try {
@@ -2608,7 +2580,7 @@ export class TurnRequestBuilder {
       historyService: this.dependencies.historyService,
       memoryService: this.dependencies.bindings.memoryService,
       memoryAccess,
-      ...(contextBudgetFlushTurn ? { memoryWritePath: CONTEXT_NOTES_MEMORY_PATH } : {}),
+      memoryScopes: resolveMemoryScopes(tokenBudgetEnabled),
       contextBudgetRolloverAvailable,
       // Experiments for inheritance to subagents and workflow tool gating.
       experiments: {
@@ -2629,8 +2601,7 @@ export class TurnRequestBuilder {
       // description (same disclosure mechanic as skills).
       memoryIndexEntries: memoryContext?.indexEntries,
       // Trust gating: only run hooks/scripts when the full shared workspace runtime is trusted.
-      // Flush turns never run repository tool hooks around their pinned memory write.
-      trusted: sharedExecutionTrusted && !contextBudgetFlushTurn,
+      trusted: sharedExecutionTrusted,
     };
     const emitNestedPtcToolEvent = (event: PTCEventWithParent) => {
       if (event.type === "tool-call-start" || event.type === "tool-call-end") {
@@ -2824,6 +2795,27 @@ export class TurnRequestBuilder {
           }
         }
 
+        // The window section goes last, resolved from the rows being sent, so start() can
+        // re-render it without rerunning assembly middleware or tool construction.
+        const baseSystem = attemptSystem;
+        const baseSystemTokens = attemptSystemTokens;
+        const renderContextWindowSection = async () => {
+          const ids = tokenBudgetEnabled
+            ? resolveContextWindowIds(options.sourceMessages)
+            : undefined;
+          attemptSystem = baseSystem;
+          attemptSystemTokens = baseSystemTokens;
+          if (ids == null) return;
+          const section = `\n\n${buildContextWindowSection(ids)}`;
+          attemptSystem += section;
+          const tokenizer = await getTokenizerForModel(
+            seed.rawModelString,
+            seed.capabilityModelString
+          );
+          attemptSystemTokens += await tokenizer.countTokens(section);
+        };
+        await renderContextWindowSection();
+
         if (options.initializeToolSearch && toolSearchRuntime?.state) {
           seedToolSearchActivationsFromMessages(
             toolSearchRuntime.state,
@@ -2890,6 +2882,7 @@ export class TurnRequestBuilder {
               providersConfig: seed.providersConfig,
               anthropicCacheTtl: effectiveAnthropicCacheTtl,
               workspaceId,
+              tagHistoryItemIds: tokenBudgetEnabled,
             },
             {
               enabled: tokenBudgetEnabled,
@@ -2952,8 +2945,6 @@ export class TurnRequestBuilder {
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
           systemMessageTokens: attemptSystemTokens,
           tools: attemptTools,
-          contextBudgetMemoryWritable:
-            memoryAccess.workspace === "readwrite" && attemptTools.memory !== undefined,
           engineTools: attemptPayload.tools ?? attemptTools,
           toolNamesForSentinel,
           forcedFirstStepToolNames,
@@ -2969,6 +2960,17 @@ export class TurnRequestBuilder {
           onStreamConstructed: () =>
             emitEnvelopeWith(seed.effectiveThinkingLevel, preparedAttempt.providerOptions),
           rebuildFirstStepForThinkingLevel,
+          rebuildAfterSequencing: async () => {
+            await renderContextWindowSection();
+            const payload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
+            return {
+              system: attemptSystem,
+              systemMessageTokens: attemptSystemTokens,
+              engineSystem: payload.system,
+              messages: payload.messages,
+              contextBudgetLimit: payload.contextBudgetLimit,
+            };
+          },
         };
       } catch (error) {
         if (options.cleanupModelOnError) {
@@ -3004,15 +3006,6 @@ export class TurnRequestBuilder {
     const tools = primaryRequest.tools;
     systemMessage = primaryRequest.system;
     systemMessageTokens = primaryRequest.systemMessageTokens;
-    const finalMessages = primaryRequest.messages;
-    // Debug sinks pair systemMessage with the message list, so when the
-    // assembler embedded the system prompt as a leading cached row
-    // (engineSystem undefined), drop that row to keep the system prompt
-    // single-sourced in captures.
-    const debugViewMessages =
-      primaryRequest.engineSystem == null && finalMessages[0]?.role === "system"
-        ? finalMessages.slice(1)
-        : finalMessages;
 
     captureMcpToolTelemetry({
       telemetryService: this.dependencies.telemetryService,
@@ -3043,11 +3036,37 @@ export class TurnRequestBuilder {
       assert(!started && !transferred, "Prepared request must be started once before disposal");
       started = true;
       activeTurnThinkingOverride = thinkingOverride;
-      if (context.admissionOnly)
+      if (context.admissionOnly) {
         requestHistorySequence = messages.reduce(
           (latest, row) => Math.max(latest, row.metadata?.historySequence ?? -1),
           -1
         );
+        // Rollover admission prepared before append sequenced these same rows, so the prompt
+        // lacked the window IDs and [id] markers. The re-assembly budget-checks them too.
+        try {
+          primaryRequest = {
+            ...primaryRequest,
+            ...(await primaryRequest.rebuildAfterSequencing()),
+          };
+        } catch (error) {
+          if (error instanceof ContextBudgetExceededError) {
+            runLanguageModelCleanup(modelResult.data.model);
+            return { type: "finished", result: Err(error.details) };
+          }
+          throw error;
+        }
+        systemMessage = primaryRequest.system;
+        systemMessageTokens = primaryRequest.systemMessageTokens;
+      }
+      const finalMessages = primaryRequest.messages;
+      // Debug sinks pair systemMessage with the message list, so when the
+      // assembler embedded the system prompt as a leading cached row
+      // (engineSystem undefined), drop that row to keep the system prompt
+      // single-sourced in captures.
+      const debugViewMessages =
+        primaryRequest.engineSystem == null && finalMessages[0]?.role === "system"
+          ? finalMessages.slice(1)
+          : finalMessages;
       if (combinedAbortSignal.aborted)
         return {
           type: "finished",
@@ -3270,21 +3289,14 @@ export class TurnRequestBuilder {
                       prepareOptions.continuation.assistantMessage
                     )
                   : messages;
-                // The flush is housekeeping: it runs at the fallback model's own inherent
-                // minimum (no user floor, no mid-turn override), mirroring the primary flush
-                // request, and gets a cap sized for THAT level below.
-                const requestedThinkingLevel = contextBudgetFlushTurn
-                  ? THINKING_LEVEL_OFF
-                  : (prepareOptions?.thinkingLevelOverride ?? effectiveThinkingLevel);
                 const nextSeedResult = await prepareModelSeed({
                   rawModelString: nextModelString,
-                  requestedThinkingLevel,
-                  minimumThinkingLevelOverride: contextBudgetFlushTurn
-                    ? undefined
-                    : lookupMinThinkingLevelOverride(
-                        this.dependencies.config.loadConfigOrDefault().minThinkingLevelByModel,
-                        nextModelString
-                      ),
+                  requestedThinkingLevel:
+                    prepareOptions?.thinkingLevelOverride ?? effectiveThinkingLevel,
+                  minimumThinkingLevelOverride: lookupMinThinkingLevelOverride(
+                    this.dependencies.config.loadConfigOrDefault().minThinkingLevelByModel,
+                    nextModelString
+                  ),
                   enforceMinimum: true,
                 });
                 if (!nextSeedResult.success) {
@@ -3322,22 +3334,11 @@ export class TurnRequestBuilder {
                   messages: nextRequest.messages,
                   system: nextRequest.engineSystem,
                   tools: nextRequest.engineTools,
-                  contextBudgetMemoryWritable: nextRequest.contextBudgetMemoryWritable,
                   contextBudgetLimit: nextRequest.contextBudgetLimit,
                   providerOptions: nextRequest.providerOptions,
                   headers: nextHeaders,
                   callSettingsOverrides: nextRequest.resolvedOverrides.standard,
                   thinkingLevel: nextRequest.effectiveThinkingLevel,
-                  // A fallback with a higher thinking minimum than the primary would be
-                  // rejected under the primary's flush cap (thinking budget must stay below
-                  // max_tokens), losing the only notes-preserving step.
-                  ...(contextBudgetFlushTurn
-                    ? {
-                        maxOutputTokens: getContextBudgetFlushMaxOutputTokens(
-                          nextRequest.effectiveThinkingLevel
-                        ),
-                      }
-                    : {}),
                   forcedFirstStepToolNames: nextRequest.forcedFirstStepToolNames,
                   rebuildProviderOptionsForThinkingLevel:
                     nextRequest.rebuildProviderOptionsForThinkingLevel,
@@ -3416,7 +3417,6 @@ export class TurnRequestBuilder {
         messageId: assistantMessageId,
         abortSignal: combinedAbortSignal,
         tools: toolsForStream,
-        contextBudgetMemoryWritable: primaryRequest.contextBudgetMemoryWritable,
         contextBudgetLimit: primaryRequest.contextBudgetLimit,
         initialMetadata: {
           ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),

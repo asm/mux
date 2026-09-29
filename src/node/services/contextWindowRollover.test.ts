@@ -7,6 +7,7 @@ import {
   estimateLastStepToolResults,
   hasRolloverEligibleMessages,
   hasUnconsumedNewContextRequest,
+  resolveContextWindowIds,
   type ContextWindowRollover,
 } from "./contextWindowRollover";
 
@@ -45,17 +46,12 @@ describe("context budget warnings", () => {
       handoffTokens: 89_600,
       budgetTokens: 119_808,
     });
-    expect(handoff.metadata?.muxMetadata).not.toHaveProperty("final");
     expect(handoff.parts).not.toEqual(warning.parts);
   });
 
-  test("rejects contradictory stages and budgets outside the known limit", () => {
-    expect(() => createContextBudgetWarning({ ...options, final: true, handoff: true })).toThrow();
+  test("rejects budgets outside the known limit", () => {
     expect(() => createContextBudgetWarning({ ...options, budgetTokens: 128_001 })).toThrow();
     expect(() => createContextBudgetWarning({ ...options, handoffTokens: 128_001 })).toThrow();
-    expect(() =>
-      createContextBudgetWarning({ ...options, final: true, memoryWritable: false })
-    ).toThrow();
   });
 
   test("dispatch capabilities control handoff guidance without granting unavailable tools", () => {
@@ -70,7 +66,6 @@ describe("context budget warnings", () => {
     expect(parts({ sessionHistoryAvailable: false, newContextAvailable: true })).toEqual(
       parts({ sessionHistoryAvailable: false, newContextAvailable: false })
     );
-    expect(parts({ final: true, handoff: false })).not.toEqual(parts({ handoff: false }));
   });
 });
 
@@ -89,20 +84,6 @@ describe("context window rollover recovery", () => {
       sessionHistoryAvailable: true,
     });
     expect(hasRolloverEligibleMessages([old, boundary, leadIn, warning])).toBe(false);
-    const finalFlush = createContextBudgetWarning({
-      contextTokens: 110_000,
-      maxTokens: 128_000,
-      budgetTokens: 96_000,
-      memoryWritable: true,
-      sessionHistoryAvailable: true,
-      final: true,
-    });
-    expect(warning.metadata?.muxMetadata).not.toHaveProperty("final");
-    expect(finalFlush.metadata?.muxMetadata).toMatchObject({
-      type: "context-budget-warning",
-      final: true,
-    });
-    expect(hasRolloverEligibleMessages([old, boundary, leadIn, warning, finalFlush])).toBe(false);
     expect(
       hasRolloverEligibleMessages([
         old,
@@ -161,6 +142,24 @@ describe("context window rollover recovery", () => {
     expect(
       leadIn.parts.some((part) => part.type === "text" && part.text.includes(previousWindowId))
     ).toBe(true);
+  });
+
+  test("window IDs name a previous window only after a token-budget rollover", () => {
+    expect(resolveContextWindowIds([])).toEqual({ currentWindowId: "w:0" });
+    const [boundary] = createRolloverPrefix({ ...rollover, previousWindowId: "w:3" });
+    boundary.metadata!.historySequence = 12;
+    expect(resolveContextWindowIds([boundary])).toEqual({
+      currentWindowId: "w:12",
+      previousWindowId: "w:3",
+    });
+    // A manual reset is a privacy floor, not a continuation of the window before it.
+    const [manualReset] = createRolloverPrefix(rollover);
+    delete manualReset.metadata!.muxMetadata;
+    manualReset.metadata!.historySequence = 20;
+    expect(resolveContextWindowIds([boundary, manualReset])).toEqual({ currentWindowId: "w:20" });
+    // A boundary without a persisted sequence has no canonical ID to show.
+    const [unsequenced] = createRolloverPrefix(rollover);
+    expect(resolveContextWindowIds([unsequenced])).toBeUndefined();
   });
 
   test.each(
