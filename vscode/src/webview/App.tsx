@@ -24,7 +24,14 @@ import { RouterProvider } from "xum/browser/contexts/RouterContext";
 import { PolicyProvider } from "xum/browser/contexts/PolicyContext";
 import { AgentProvider } from "xum/browser/contexts/AgentContext";
 import { BashCollapsedSummaryModeProvider } from "xum/browser/features/Tools/BashCollapsedSummaryModeContext";
-import { BackgroundBashProvider } from "xum/browser/contexts/BackgroundBashContext";
+import {
+  BackgroundBashProvider,
+  useBackgroundBashError,
+} from "xum/browser/contexts/BackgroundBashContext";
+import { BackgroundProcessesBanner } from "xum/browser/components/BackgroundProcessesBanner/BackgroundProcessesBanner";
+import { PopoverError } from "xum/browser/components/PopoverError/PopoverError";
+import { useBackgroundBashStoreRaw } from "xum/browser/stores/BackgroundBashStore";
+import { mergeConsecutiveStreamErrors } from "xum/browser/utils/messages/messageUtils";
 import { seedWorkspaceLocalStorageFromBackend } from "xum/browser/contexts/WorkspaceContext";
 import { WorkspaceModeAISync } from "xum/browser/components/WorkspaceModeAISync/WorkspaceModeAISync";
 import { resolvePersistedAgentId } from "xum/common/utils/agentIds";
@@ -98,9 +105,17 @@ import type { VscodeBridge } from "./vscodeBridge";
 // (#4711). PolicyProvider falls back to "no policy" because the bridge rejects policy.* calls (the
 // backend still enforces policy on send). A single AgentProvider covers both the transcript
 // (ProposePlanToolCall) and the composer.
+/** Identifies the server connection: switching servers keeps mode "api" but changes the URL. */
+function getApiConnectionKey(status: UiConnectionStatus | null): string | null {
+  return status?.mode === "api" ? (status.baseUrl ?? "api") : null;
+}
+
 function WebviewChatProviders(props: {
   workspaceId: string | undefined;
   workspaceAi: UiWorkspaceAiState | undefined;
+  selectedWorkspaceId: string | null;
+  /** The server connection; background bash state and errors never outlive it. */
+  apiConnectionKey: string | null;
   children: ReactNode;
 }) {
   return (
@@ -123,7 +138,21 @@ function WebviewChatProviders(props: {
         {props.workspaceId ? <WorkspaceModeAISync workspaceId={props.workspaceId} /> : null}
         {/* Re-renders bash tool headers when the seeded collapsed-summary mode arrives (#4972). */}
         <BashCollapsedSummaryModeProvider>
-          <TooltipProvider>{props.children}</TooltipProvider>
+          <TooltipProvider>
+            {/* Covers the transcript's bash cards and the dock's background processes strip
+                (#5092). Without a selection nothing reads it: both render only for a selected
+                workspace. */}
+            {/* Keyed by the server connection: a server switch remounts the provider (and the
+                strip) before paint, so a late action failure from the previous server can never
+                show over the new one, even for a workspace ID both servers share. */}
+            <BackgroundBashProvider
+              key={props.apiConnectionKey ?? "no-connection"}
+              workspaceId={props.selectedWorkspaceId ?? ""}
+            >
+              {props.children}
+              <BackgroundBashErrorPopover workspaceId={props.selectedWorkspaceId} />
+            </BackgroundBashProvider>
+          </TooltipProvider>
         </BashCollapsedSummaryModeProvider>
       </AgentProvider>
     </PolicyProvider>
@@ -147,6 +176,36 @@ const VSCODE_CHAT_HOST_CONTEXT_VALUE = {
 // When released, rows are candidates again, so the reading position survives appends.
 const TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE = { overflowAnchor: "none" } as const;
 const TRANSCRIPT_BOTTOM_SENTINEL_STYLE = { overflowAnchor: "auto" } as const;
+
+const EMPTY_DISPLAYED_ROWS: { messages: DisplayedMessage[]; rendered: DisplayedMessage[] } = {
+  messages: [],
+  rendered: [],
+};
+
+// Terminate failures of the background processes strip, shown like desktop WorkspaceShell does.
+// Cleared on a workspace switch, as desktop ChatPane does, so it never shows under another chat.
+function BackgroundBashErrorPopover(props: { workspaceId: string | null }): JSX.Element {
+  const { error, clearError } = useBackgroundBashError();
+  // The error belongs to the workspace it was raised in. Hide it during the render that switches
+  // workspaces (a post-render clear alone would paint it over the new chat for a frame), then
+  // clear it and follow the new workspace.
+  const [errorWorkspaceId, setErrorWorkspaceId] = useState(props.workspaceId);
+  const switched = errorWorkspaceId !== props.workspaceId;
+  useEffect(() => {
+    if (!switched) {
+      return;
+    }
+    clearError();
+    setErrorWorkspaceId(props.workspaceId);
+  }, [clearError, props.workspaceId, switched]);
+  return (
+    <PopoverError
+      error={switched ? null : error}
+      prefix="Failed to terminate:"
+      onDismiss={clearError}
+    />
+  );
+}
 
 const MAX_BUFFERED_HISTORICAL_MESSAGES = CHAT_BUFFER_LIMITS.MAX_HISTORICAL_MESSAGES;
 const MAX_BUFFERED_STREAM_EVENTS = CHAT_BUFFER_LIMITS.MAX_STREAM_EVENTS;
@@ -228,6 +287,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   const [transcriptCaughtUp, setTranscriptCaughtUp] = useState(false);
 
   const activeWorkspaceIdRef = useRef<string | null>(null);
+  const connectionKeyRef = useRef<string | null>(null);
   activeWorkspaceIdRef.current = selectedWorkspaceId;
 
   const chatReplayStateRef = useRef<ChatReplayState | null>(null);
@@ -245,7 +305,20 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   // The backend's held inputs for the selected workspace (#4771): full list, replayed on each
   // subscription while non-empty.
   const [heldInputs, setHeldInputs] = useState<readonly HeldInputData[]>([]);
-  const [displayedMessages, setDisplayedMessages] = useState<DisplayedMessage[]>([]);
+  // Desktop ChatPane renders consecutive identical stream errors as one row with a count (#5092).
+  // The merged rows are derived once per new aggregator snapshot (every flush re-renders, and the
+  // snapshot keeps its identity while unchanged) and kept beside the raw rows: the retry
+  // derivation's candidates and the resume read the raw rows, as ChatPane passes
+  // workspaceState.messages.
+  const [displayedRows, setDisplayedRows] = useState(EMPTY_DISPLAYED_ROWS);
+  const setDisplayedMessages = (messages: DisplayedMessage[]) =>
+    setDisplayedRows((previous) =>
+      previous.messages === messages
+        ? previous
+        : { messages, rendered: mergeConsecutiveStreamErrors(messages) }
+    );
+  const displayedMessages = displayedRows.messages;
+  const renderedMessages = displayedRows.rendered;
   // Armed background bash monitors of the selected workspace, forwarded by the host (#4971).
   const [activeBashMonitorCount, setActiveBashMonitorCount] = useState(0);
   // The backend's auto-retry status, read-only (the webview never toggles or stops auto-retry):
@@ -258,6 +331,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
     status: AutoRetryStatus;
   } | null>(null);
   const workspacesRef = useRef<UiWorkspace[]>([]);
+  const backgroundBashStore = useBackgroundBashStoreRaw();
 
   // Every flush re-renders, even when the displayed messages are unchanged: the turn-status barrier
   // reads aggregator state that has no transcript row (stream lifecycle, startup breadcrumbs) (#4971).
@@ -374,9 +448,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   pushNoticeRef.current = pushNotice;
 
   const canChat = Boolean(connectionStatus?.mode === "api" && selectedWorkspaceId);
-  // Identifies the server connection: switching servers keeps mode "api" but changes the URL.
-  const apiConnectionKey =
-    connectionStatus?.mode === "api" ? (connectionStatus.baseUrl ?? "api") : null;
+  const apiConnectionKey = getApiConnectionKey(connectionStatus);
 
   // #4766: the model list, model routing and thinking floors read the shared providers and app
   // config stores, which the desktop connects in AppLoader. Connect them while the host has a
@@ -400,12 +472,16 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
     });
     providersConfigStore.setClient(apiClient);
     appConfigStore.setClient(apiClient);
+    // The background processes strip and the bash tool cards' live process status (#5092). A
+    // server switch already dropped the previous server's cached rows (connectionStatus handler).
+    backgroundBashStore.setClient(apiClient);
     return () => {
       unsubscribeSeed();
       providersConfigStore.setClient(null);
       appConfigStore.setClient(null);
+      backgroundBashStore.setClient(null);
     };
-  }, [apiClient, apiConnectionKey]);
+  }, [apiClient, apiConnectionKey, backgroundBashStore]);
 
   useEffect(() => {
     const unsubscribe = bridge.onMessage((raw) => {
@@ -421,10 +497,20 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
       const msg = raw as ExtensionToWebviewMessage;
 
       switch (msg.type) {
-        case "connectionStatus":
+        case "connectionStatus": {
           transcriptBarrier.setConnected(msg.status.mode === "api");
+          const nextConnectionKey = getApiConnectionKey(msg.status);
+          if (nextConnectionKey !== connectionKeyRef.current) {
+            connectionKeyRef.current = nextConnectionKey;
+            // Workspace IDs can repeat across servers. Drop the previous server's background bash
+            // subscriptions and cached rows now, before the render that shows the new connection,
+            // so it never paints them; the connection effect installs the new server's client.
+            backgroundBashStore.setClient(null);
+            backgroundBashStore.clearCachedState();
+          }
           setConnectionStatus(msg.status);
           return;
+        }
         case "workspaces":
           // Seed each workspace's persisted agent/AI settings into the composer's storage, with the
           // desktop's own rules (#4738): a main workspace is snapshotted once per webview load, a
@@ -844,12 +930,13 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
     : undefined;
   const transcriptBundles = useTranscriptBundles({
     workspaceId: selectedWorkspaceId ?? "",
-    messages: displayedMessages,
+    messages: renderedMessages,
     transcriptDensity,
     isTurnActive: streamState ? streamState.isStreamStarting || streamState.canInterrupt : false,
   });
   // Retry barrier and interrupted dividers, with desktop ChatPane's shared derivation fed from this
-  // webview's aggregator. Its rows are never deferred, so both message inputs are the same rows.
+  // webview's aggregator. Its rows are never deferred, so renderedMessages are the merged rows on
+  // screen and messages the raw ones, as in ChatPane.
   const aggregator = aggregatorRef.current;
   const autoRetryStatus =
     autoRetryState?.workspaceId === selectedWorkspaceId ? autoRetryState.status : null;
@@ -857,7 +944,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
     selectedWorkspaceId && aggregator && streamState
       ? getRetryBarrierDerivation({
           messages: displayedMessages,
-          renderedMessages: displayedMessages,
+          renderedMessages,
           pendingStreamStartTime: aggregator.getPendingStreamStartTime(),
           runtimeStatus: aggregator.getRuntimeStatus(),
           lastAbortReason: aggregator.getLastAbortReason(),
@@ -892,7 +979,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   // bash_output grouping, task report linking and prompt navigation, as in ChatPane (#5002).
   const transcriptRowDerivations = useTranscriptRowDerivations({
     workspaceId: selectedWorkspaceId ?? "",
-    messages: displayedMessages,
+    messages: renderedMessages,
   });
   // Stable so the per-prompt navigation objects keep their identity across flushes. Every row is
   // mounted (no bounded reveal), so the target can be scrolled to directly; disabling auto-scroll
@@ -909,7 +996,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
     [contentRef, disableAutoScroll]
   );
   const userMessageNavigationByHistoryId = useUserMessageNavigation({
-    messages: displayedMessages,
+    messages: renderedMessages,
     onNavigateToMessage: handleNavigateToMessage,
   });
 
@@ -931,6 +1018,8 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                 // the same selection must change this prop so the lookup runs again (#4797).
                 workspaceId={agentScopeWorkspaceId}
                 workspaceAi={selectedWorkspace?.ai}
+                selectedWorkspaceId={selectedWorkspaceId}
+                apiConnectionKey={apiConnectionKey}
               >
                 <div className="flex h-screen flex-col">
                   <div className="border-b border-border bg-background-secondary p-3">
@@ -990,89 +1079,85 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                   >
                     <div style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}>
                       {selectedWorkspaceId ? (
-                        <BackgroundBashProvider workspaceId={selectedWorkspaceId}>
-                          <LiveBashOutputSourceContext.Provider value={liveBashOutput}>
-                            <TranscriptBundleRows
+                        <LiveBashOutputSourceContext.Provider value={liveBashOutput}>
+                          <TranscriptBundleRows
+                            workspaceId={selectedWorkspaceId}
+                            messages={renderedMessages}
+                            indexOffset={0}
+                            bundles={transcriptBundles}
+                            renderMessageAtIndex={(msg, index, options) => {
+                              const rowProps = getTranscriptRowProps({
+                                derivations: transcriptRowDerivations,
+                                userMessageNavigationByHistoryId,
+                                messages: renderedMessages,
+                                message: msg,
+                                index,
+                              });
+                              if (rowProps.hidden) {
+                                return null;
+                              }
+                              const { bashOutputGroup, bashGroupKey } = rowProps;
+                              const row = (
+                                <DisplayedMessageRenderer
+                                  message={msg}
+                                  workspaceId={selectedWorkspaceId}
+                                  isLatestProposePlan={msg.id === latestProposePlanId}
+                                  isCompacting={aggregatorRef.current?.isCompacting() ?? false}
+                                  onCloseEphemeral={messageRowActions.closeEphemeral}
+                                  onShowAllHistory={messageRowActions.showAllHistory}
+                                  bashOutputGroup={bashOutputGroup}
+                                  taskReportLinking={rowProps.taskReportLinking}
+                                  userMessageNavigation={rowProps.userMessageNavigation}
+                                />
+                              );
+                              return (
+                                <Fragment key={options.key}>
+                                  {options.className ? (
+                                    <div className={options.className}>{row}</div>
+                                  ) : (
+                                    row
+                                  )}
+                                  {bashOutputGroup?.position === "first" && bashGroupKey ? (
+                                    <BashOutputCollapsedIndicator
+                                      processId={bashOutputGroup.processId}
+                                      collapsedCount={bashOutputGroup.collapsedCount}
+                                      isExpanded={rowProps.isBashGroupExpanded}
+                                      onToggle={() =>
+                                        transcriptRowDerivations.toggleBashOutputGroup(bashGroupKey)
+                                      }
+                                    />
+                                  ) : null}
+                                  {retryBarrier?.interruptedBarrierMessageIds.has(msg.id) ? (
+                                    <InterruptedBarrier
+                                      resumable={
+                                        retryBarrier.interruptedTailResumable &&
+                                        msg.id === retryBarrier.lastRetryCandidateMessage?.id
+                                      }
+                                      onResume={resumeInterruptedStream}
+                                      error={resumeInterruptedError}
+                                    />
+                                  ) : null}
+                                </Fragment>
+                              );
+                            }}
+                          />
+                          {/* Transcript tail, after the rows, as in desktop ChatPane. */}
+                          {canChat && retryBarrier?.shouldMountRetryBarrier && streamState ? (
+                            <RetryBarrierContent
                               workspaceId={selectedWorkspaceId}
+                              visible={retryBarrier.showRetryBarrierUI}
                               messages={displayedMessages}
-                              indexOffset={0}
-                              bundles={transcriptBundles}
-                              renderMessageAtIndex={(msg, index, options) => {
-                                const rowProps = getTranscriptRowProps({
-                                  derivations: transcriptRowDerivations,
-                                  userMessageNavigationByHistoryId,
-                                  messages: displayedMessages,
-                                  message: msg,
-                                  index,
-                                });
-                                if (rowProps.hidden) {
-                                  return null;
-                                }
-                                const { bashOutputGroup, bashGroupKey } = rowProps;
-                                const row = (
-                                  <DisplayedMessageRenderer
-                                    message={msg}
-                                    workspaceId={selectedWorkspaceId}
-                                    isLatestProposePlan={msg.id === latestProposePlanId}
-                                    isCompacting={aggregatorRef.current?.isCompacting() ?? false}
-                                    onCloseEphemeral={messageRowActions.closeEphemeral}
-                                    onShowAllHistory={messageRowActions.showAllHistory}
-                                    bashOutputGroup={bashOutputGroup}
-                                    taskReportLinking={rowProps.taskReportLinking}
-                                    userMessageNavigation={rowProps.userMessageNavigation}
-                                  />
-                                );
-                                return (
-                                  <Fragment key={options.key}>
-                                    {options.className ? (
-                                      <div className={options.className}>{row}</div>
-                                    ) : (
-                                      row
-                                    )}
-                                    {bashOutputGroup?.position === "first" && bashGroupKey ? (
-                                      <BashOutputCollapsedIndicator
-                                        processId={bashOutputGroup.processId}
-                                        collapsedCount={bashOutputGroup.collapsedCount}
-                                        isExpanded={rowProps.isBashGroupExpanded}
-                                        onToggle={() =>
-                                          transcriptRowDerivations.toggleBashOutputGroup(
-                                            bashGroupKey
-                                          )
-                                        }
-                                      />
-                                    ) : null}
-                                    {retryBarrier?.interruptedBarrierMessageIds.has(msg.id) ? (
-                                      <InterruptedBarrier
-                                        resumable={
-                                          retryBarrier.interruptedTailResumable &&
-                                          msg.id === retryBarrier.lastRetryCandidateMessage?.id
-                                        }
-                                        onResume={resumeInterruptedStream}
-                                        error={resumeInterruptedError}
-                                      />
-                                    ) : null}
-                                  </Fragment>
-                                );
-                              }}
+                              autoRetryStatus={autoRetryStatus}
+                              // The webview shows the backend's retry countdown but never
+                              // stops auto-retry, so no Stop action.
+                              showStopAutoRetry={false}
+                              isStreamStarting={streamState.isStreamStarting}
+                              canInterrupt={streamState.canInterrupt}
+                              onRetry={resumeInterruptedStreamAsync}
+                              retryError={resumeInterruptedError}
                             />
-                            {/* Transcript tail, after the rows, as in desktop ChatPane. */}
-                            {canChat && retryBarrier?.shouldMountRetryBarrier && streamState ? (
-                              <RetryBarrierContent
-                                workspaceId={selectedWorkspaceId}
-                                visible={retryBarrier.showRetryBarrierUI}
-                                messages={displayedMessages}
-                                autoRetryStatus={autoRetryStatus}
-                                // The webview shows the backend's retry countdown but never
-                                // stops auto-retry, so no Stop action.
-                                showStopAutoRetry={false}
-                                isStreamStarting={streamState.isStreamStarting}
-                                canInterrupt={streamState.canInterrupt}
-                                onRetry={resumeInterruptedStreamAsync}
-                                retryError={resumeInterruptedError}
-                              />
-                            ) : null}
-                          </LiveBashOutputSourceContext.Provider>
-                        </BackgroundBashProvider>
+                          ) : null}
+                        </LiveBashOutputSourceContext.Provider>
                       ) : null}
 
                       {notices.map((notice) => (
@@ -1136,6 +1221,21 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                             isShortcutTarget={index === 0}
                           />
                         ))}
+                      </div>
+                    ) : null}
+                    {/* Background bashes sit between held inputs and the turn status, as in the
+                        desktop dock. Keyed so the expanded list and an open output dialog never
+                        carry over to another workspace. Without a server connection the store has
+                        no client, so its last-known processes are not offered. */}
+                    {selectedWorkspaceId && canChat ? (
+                      // The shared banner brings its own dock gutter (desktop's composer has the
+                      // same one); cancel this dock's padding so it lines up with the composer.
+                      <div className="-mx-[15px]">
+                        <BackgroundProcessesBanner
+                          // Sibling of the composer, which is keyed by the bare workspace ID.
+                          key={`background-processes-${selectedWorkspaceId}`}
+                          workspaceId={selectedWorkspaceId}
+                        />
                       </div>
                     ) : null}
                     {/* Live turn status sits beside the input, below held inputs, as in desktop. */}

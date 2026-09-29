@@ -2,6 +2,7 @@ import "../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { Profiler } from "react";
 
 import { installDom } from "../../../tests/ui/dom";
 import { readPersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
@@ -2353,6 +2354,34 @@ describe("vscode webview retry barrier (#5092)", () => {
     expect(view.getByRole("button", { name: "Retry" })).toBeTruthy();
   });
 
+  test("repeated identical stream errors render as one card with a count, as on desktop", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    const failedAttempt = (id: string, sequence: number) => ({
+      type: "message",
+      id,
+      role: "assistant",
+      parts: [],
+      metadata: {
+        historySequence: sequence,
+        timestamp: sequence,
+        error: "provider exploded",
+        errorType: "network",
+      },
+    });
+    await selectWorkspace(bridge, [
+      userRow("u1", 1),
+      failedAttempt("a1", 2),
+      failedAttempt("a2", 3),
+      failedAttempt("a3", 4),
+    ]);
+
+    expect(view.container.textContent?.match(/provider exploded/g)).toHaveLength(1);
+    expect(view.container.textContent).toContain("×3");
+    // The merged card is still the retry candidate.
+    expect(view.getByRole("button", { name: "Retry" })).toBeTruthy();
+  });
+
   test("a context_exceeded error shows no retry barrier", async () => {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
@@ -2456,4 +2485,253 @@ describe("vscode webview retry barrier (#5092)", () => {
     expect(resumedAgentId(bridge)).toBe("exec");
   });
 
+});
+
+describe("vscode webview background processes strip (#5092)", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  // The background bash store is an app-wide singleton that keeps each workspace's last-known
+  // processes, so these tests use workspaces no other test selects.
+  const workspaceA: UiWorkspace = { ...WORKSPACE, id: "ws-bash-a", workspaceName: "bash-a" };
+  const workspaceB: UiWorkspace = { ...WORKSPACE, id: "ws-bash-b", workspaceName: "bash-b" };
+  const runningProcess = {
+    id: "bash-1",
+    pid: 4242,
+    script: "sleep 600",
+    startTime: Date.now(),
+    status: "running",
+  };
+  // The oRPC client reaches the bridge after a few promise hops.
+  const settle = () =>
+    act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  // Plays the host opening the subscription's stream and emitting one state.
+  const emitProcesses = async (
+    bridge: TestBridge,
+    call: { requestId: string },
+    streamId: string,
+    processes: unknown[]
+  ) => {
+    await bridge.emit({
+      type: "orpcResponse",
+      requestId: call.requestId,
+      ok: true,
+      kind: "stream",
+      streamId,
+    });
+    await bridge.emit({
+      type: "orpcStreamData",
+      streamId,
+      value: { processes, foregroundToolCallIds: [] },
+    });
+    await settle();
+  };
+  const click = async (element: Element) => {
+    await act(async () => {
+      fireEvent.click(element);
+      await Promise.resolve();
+    });
+  };
+
+  test("shows the selected workspace's running processes in the dock and terminates them", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], workspaceA);
+    await settle();
+
+    const subscriptions = bridge.orpcCalls("workspace.backgroundBashes.subscribe");
+    expect(subscriptions.map((call) => call.input)).toEqual([{ workspaceId: workspaceA.id }]);
+    await emitProcesses(bridge, subscriptions[0], "stream-a", [runningProcess]);
+
+    await click(view.getByRole("button", { name: /1 background bash/ }));
+    const script = view.container.querySelector('[title="sleep 600"]');
+    if (!script) throw new Error("the expanded strip does not list the process");
+    // The output dialog (it polls getOutput) is not offered in the webview (#5196).
+    expect(view.queryByRole("button", { name: "View output" })).toBeNull();
+    // Each row ends with its Terminate button.
+    const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
+    await click(rowButtons[rowButtons.length - 1]);
+    await settle();
+
+    expect(
+      bridge.orpcCalls("workspace.backgroundBashes.terminate").map((call) => call.input)
+    ).toEqual([{ workspaceId: workspaceA.id, processId: "bash-1" }]);
+    // Re-renders (history caught up, expanding, terminating) keep the one backend stream.
+    expect(bridge.orpcCalls("workspace.backgroundBashes.subscribe")).toHaveLength(1);
+  });
+
+  test("does not offer sending a running foreground bash to the background", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-fg", workspaceName: "bash-fg" };
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], workspace);
+    await settle();
+    const chat = (event: Record<string, unknown>) =>
+      bridge.emit({ type: "chatEvent", workspaceId: workspace.id, event });
+    await chat({
+      type: "stream-start",
+      workspaceId: workspace.id,
+      messageId: "a1",
+      model: "anthropic:claude-sonnet-4-5",
+      historySequence: 1,
+      startTime: 1,
+    });
+    await chat({
+      type: "tool-call-start",
+      workspaceId: workspace.id,
+      messageId: "a1",
+      toolCallId: "call-fg",
+      toolName: "bash",
+      args: { script: "make build", timeout_secs: 60, display_name: "Build" },
+      tokens: 1,
+      timestamp: 2,
+    });
+    // The backend reports the call as a foreground bash that could be backgrounded, but the
+    // bridge refuses sendToBackground (bashForegroundControls is unsupported in the webview).
+    const call = bridge.orpcCalls("workspace.backgroundBashes.subscribe")[0];
+    await bridge.emit({
+      type: "orpcResponse",
+      requestId: call.requestId,
+      ok: true,
+      kind: "stream",
+      streamId: "stream-fg",
+    });
+    await bridge.emit({
+      type: "orpcStreamData",
+      streamId: "stream-fg",
+      value: { processes: [], foregroundToolCallIds: ["call-fg"] },
+    });
+    await settle();
+
+    expect(view.container.textContent).toContain("make build");
+    expect(view.queryByRole("button", { name: "Send to background" })).toBeNull();
+  });
+
+  test("a terminate failure that arrives after a workspace switch is not shown over the new chat", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-late", workspaceName: "bash-late" };
+    const other: UiWorkspace = { ...WORKSPACE, id: "ws-bash-late-2", workspaceName: "bash-late-2" };
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], workspace);
+    await settle();
+    await emitProcesses(
+      bridge,
+      bridge.orpcCalls("workspace.backgroundBashes.subscribe")[0],
+      "stream-late",
+      [runningProcess]
+    );
+    await click(view.getByRole("button", { name: /1 background bash/ }));
+    const script = view.container.querySelector('[title="sleep 600"]');
+    if (!script) throw new Error("the expanded strip does not list the process");
+    const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
+    await click(rowButtons[rowButtons.length - 1]);
+    await settle();
+    expect(bridge.orpcCalls("workspace.backgroundBashes.terminate")).toHaveLength(1);
+
+    // Switch before the host answers, then the terminate fails.
+    await bridge.emit({ type: "workspaces", workspaces: [workspace, other] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: other.id });
+    await bridge.emit({ type: "chatEvent", workspaceId: other.id, event: { type: "caught-up" } });
+    await settle();
+    await bridge.answer("workspace.backgroundBashes.terminate", {
+      success: false,
+      error: "terminate refused",
+    });
+    await settle();
+
+    // PopoverError renders in a portal, so check the whole document.
+    expect(document.body.textContent).not.toContain("terminate refused");
+  });
+
+  test("switching servers shows neither the previous server's rows nor its late errors, from the first render", async () => {
+    // Both servers expose a workspace with this ID.
+    const workspace: UiWorkspace = {
+      ...WORKSPACE,
+      id: "ws-bash-server",
+      workspaceName: "bash-server",
+    };
+    const bridge = new TestBridge();
+    // Snapshot the document after every commit, before passive effects run.
+    const commits: Array<{ rows: boolean; error: boolean }> = [];
+    const onRender = () => {
+      const text = document.body.textContent ?? "";
+      commits.push({
+        rows: text.includes("background bash"),
+        error: text.includes("terminate refused"),
+      });
+    };
+    const view = render(
+      <Profiler id="app" onRender={onRender}>
+        <App bridge={bridge} />
+      </Profiler>
+    );
+    await selectWorkspace(bridge, [], workspace);
+    await settle();
+    await emitProcesses(
+      bridge,
+      bridge.orpcCalls("workspace.backgroundBashes.subscribe")[0],
+      "stream-server-1",
+      [runningProcess]
+    );
+    await click(view.getByRole("button", { name: /1 background bash/ }));
+    const script = view.container.querySelector('[title="sleep 600"]');
+    if (!script) throw new Error("the expanded strip does not list the process");
+    const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
+    // Terminate on server A; its answer arrives only after the switch.
+    await click(rowButtons[rowButtons.length - 1]);
+    await settle();
+
+    commits.length = 0;
+    await bridge.emit({
+      type: "connectionStatus",
+      status: { mode: "api", baseUrl: "http://other" },
+    });
+    await bridge.answer("workspace.backgroundBashes.terminate", {
+      success: false,
+      error: "terminate refused",
+    });
+    await settle();
+
+    expect(commits.length).toBeGreaterThan(0);
+    expect(commits.filter((commit) => commit.rows || commit.error)).toEqual([]);
+    expect(bridge.orpcCalls("workspace.backgroundBashes.subscribe").length).toBeGreaterThan(1);
+  });
+
+  test("does not show another workspace's processes after a switch", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], workspaceA);
+    await settle();
+    await emitProcesses(
+      bridge,
+      bridge.orpcCalls("workspace.backgroundBashes.subscribe")[0],
+      "stream-a",
+      [runningProcess]
+    );
+    expect(view.getByRole("button", { name: /1 background bash/ })).toBeTruthy();
+
+    await bridge.emit({ type: "workspaces", workspaces: [workspaceA, workspaceB] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: workspaceB.id });
+    await bridge.emit({
+      type: "chatEvent",
+      workspaceId: workspaceB.id,
+      event: { type: "caught-up" },
+    });
+    await settle();
+
+    expect(view.queryByRole("button", { name: /background bash/ })).toBeNull();
+    const subscriptions = bridge.orpcCalls("workspace.backgroundBashes.subscribe");
+    expect(subscriptions.map((call) => call.input)).toContainEqual({ workspaceId: workspaceB.id });
+  });
 });

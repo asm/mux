@@ -25,8 +25,15 @@ describe("isAllowedOrpcPath", () => {
       .toBe(false);
   });
 
-  test("rejects nested routers", () => {
-    expect(isAllowedOrpcPath(["workspace", "backgroundBashes", "subscribe"]))
+  test("rejects nested routers other than the background processes strip's", () => {
+    expect(isAllowedOrpcPath(["workspace", "backgroundBashes", "sendToBackground"]))
+      .toBe(false);
+    // The output dialog polls getOutput and is not offered in the webview (#5196).
+    expect(isAllowedOrpcPath(["workspace", "backgroundBashes", "getOutput"]))
+      .toBe(false);
+    expect(isAllowedOrpcPath(["workspace", "goal", "get"]))
+      .toBe(false);
+    expect(isAllowedOrpcPath(["workspace", "backgroundBashes", "subscribe", "x"]))
       .toBe(false);
   });
 
@@ -241,6 +248,69 @@ describe("retry barrier (#5092)", () => {
       ["resumeStream", null],
     ] as const) {
       expect(sanitizeWebviewOrpcInput(["workspace", procedure], input, known).ok).toBe(false);
+    }
+  });
+});
+
+describe("background processes strip (#5092)", () => {
+  const known = new Set(["ws-1"]);
+  const path = (procedure: string) => ["workspace", "backgroundBashes", procedure];
+
+  test("lists and terminates a known workspace's processes with only the fields each needs", () => {
+    for (const [procedure, input, forwarded] of [
+      ["subscribe", { workspaceId: "ws-1", processId: "p1" }, { workspaceId: "ws-1" }],
+      [
+        "terminate",
+        { workspaceId: "ws-1", processId: "p1", extra: true },
+        { workspaceId: "ws-1", processId: "p1" },
+      ],
+    ] as const) {
+      expect(isAllowedOrpcPath(path(procedure))).toBe(true);
+      expect(sanitizeWebviewOrpcInput(path(procedure), input, known)).toEqual({
+        ok: true,
+        input: forwarded,
+      });
+    }
+  });
+
+  test("empties monitor match lines before the process state reaches the webview", () => {
+    const monitor = {
+      filter: "ERROR",
+      totalMatches: 2,
+      lastLines: ["ERROR token=abc"],
+      stopped: false,
+    };
+    const state = {
+      processes: [
+        { id: "p1", script: "tail -f log", status: "running", monitor },
+        { id: "p2", script: "sleep 5", status: "running" },
+      ],
+      foregroundToolCallIds: ["call-1"],
+    };
+    expect(redactWebviewOrpcResult(path("subscribe"), state)).toEqual({
+      processes: [
+        {
+          id: "p1",
+          script: "tail -f log",
+          status: "running",
+          monitor: { ...monitor, lastLines: [] },
+        },
+        { id: "p2", script: "sleep 5", status: "running" },
+      ],
+      foregroundToolCallIds: ["call-1"],
+    });
+    // The host's copy is not mutated.
+    expect(monitor.lastLines).toEqual(["ERROR token=abc"]);
+  });
+
+  test("rejects unknown workspaces and malformed input", () => {
+    for (const [procedure, input] of [
+      ["subscribe", { workspaceId: "ws-2" }],
+      ["subscribe", null],
+      ["terminate", { workspaceId: "ws-2", processId: "p1" }],
+      ["terminate", { workspaceId: "ws-1" }],
+    ] as const) {
+      expect(sanitizeWebviewOrpcInput(path(procedure), input, known).ok).toBe(false);
     }
   });
 });

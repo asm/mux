@@ -22,6 +22,7 @@ import { ElapsedTimeDisplay } from "./Shared/ElapsedTimeDisplay";
 import { useBashToolLiveOutput } from "@/browser/stores/WorkspaceStore";
 import { useForegroundBashToolCallIds } from "@/browser/stores/BackgroundBashStore";
 import { useBackgroundBashActions } from "@/browser/contexts/BackgroundBashContext";
+import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { buildBashCollapsedSummary } from "./bashCollapsedSummary";
 import { useBashCollapsedSummaryMode } from "./BashCollapsedSummaryModeContext";
@@ -71,6 +72,12 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
     status === "executing" ? workspaceId : undefined
   );
   const { sendToBackground } = useBackgroundBashActions();
+  // Hosts that cannot send a foreground bash to the background (the VS Code webview) hide the
+  // control instead of offering an action their bridge refuses.
+  const { uiSupport } = useChatHostContext();
+  const canHostSendToBackground = uiSupport.bashForegroundControls === "supported";
+  // Hosts without the output dialog (the VS Code webview) hide its button.
+  const canViewOutput = uiSupport.backgroundBashOutput === "supported";
 
   const liveOutput = useBashToolLiveOutput(
     shouldTrackLiveBashState ? workspaceId : undefined,
@@ -121,7 +128,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
     toolCallId && workspaceId && foregroundBashToolCallIds.has(toolCallId)
   );
   const handleSendToBackground =
-    toolCallId && workspaceId
+    canHostSendToBackground && toolCallId && workspaceId
       ? () => {
           sendToBackground(toolCallId);
         }
@@ -176,7 +183,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             {bashCollapsedSummary.command}
           </span>
         )}
-        {isBackground && backgroundProcessId && workspaceId && (
+        {isBackground && backgroundProcessId && workspaceId && canViewOutput && (
           <Tooltip>
             <TooltipTrigger asChild>
               <button
@@ -230,6 +237,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             <TooltipTrigger asChild>
               <button
                 type="button"
+                aria-label="Send to background"
                 onClick={(e) => {
                   e.stopPropagation(); // Don't toggle expand
                   handleSendToBackground();
