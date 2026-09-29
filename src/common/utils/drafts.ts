@@ -6,7 +6,7 @@ import {
   type DraftScope,
   type DraftSummary,
 } from "@/common/orpc/schemas/drafts";
-import { MAX_DRAFT_JSON_CHARS } from "@/constants/drafts";
+import { MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
 
 /** Stable map key for a draft scope (creation keys are unambiguous for any project path). */
 export function draftScopeKey(scope: DraftScope): string {
@@ -37,15 +37,47 @@ export function isDraftEmpty(draft: Draft): boolean {
   return draft.text.length === 0 && draft.attachments.length === 0;
 }
 
-/** JSON size of a draft, compared against MAX_DRAFT_JSON_CHARS. */
-export function draftJsonChars(draft: Draft): number {
-  return JSON.stringify({ text: draft.text, attachments: draft.attachments }).length;
+const UTF8_CHUNK_UNITS = 64 * 1024;
+const utf8Encoder = new TextEncoder();
+// Up to 3 bytes per UTF-16 code unit, so one chunk always fits.
+const utf8Scratch = new Uint8Array(UTF8_CHUNK_UNITS * 3);
+
+/**
+ * UTF-8 byte length of a string, counted natively in fixed-size chunks: no encoded copy of a
+ * multi-MB draft, and no per-character JavaScript work for ASCII or dense non-ASCII text alike.
+ */
+function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let start = 0; start < value.length; ) {
+    let end = Math.min(start + UTF8_CHUNK_UNITS, value.length);
+    // Never split a surrogate pair: each half alone would count as 3 bytes instead of 4 total.
+    const last = value.charCodeAt(end - 1);
+    if (end < value.length && last >= 0xd800 && last <= 0xdbff) end--;
+    bytes += utf8Encoder.encodeInto(value.slice(start, end), utf8Scratch).written;
+    start = end;
+  }
+  return bytes;
 }
 
-/** The save error for a draft over MAX_DRAFT_JSON_CHARS (shown by the composer as a toast). */
-export function draftTooLargeMessage(chars: number): string {
+/**
+ * JSON size of a draft in UTF-8 bytes, compared against MAX_DRAFT_JSON_BYTES. Bytes, because the
+ * transport limits count bytes: UTF-16 code units undercount non-ASCII text up to 3x.
+ */
+export function draftJsonBytes(draft: Draft): number {
+  return utf8ByteLength(JSON.stringify({ text: draft.text, attachments: draft.attachments }));
+}
+
+const DRAFT_TOO_LARGE_PREFIX = "Draft is too large to save";
+
+/** The save error for a draft over MAX_DRAFT_JSON_BYTES (shown by the composer as a toast). */
+export function draftTooLargeMessage(bytes: number): string {
   const toMb = (value: number) => Math.ceil(value / (1024 * 1024));
-  return `Draft is too large to save (${toMb(chars)} MB; the limit is ${toMb(MAX_DRAFT_JSON_CHARS)} MB). Remove an attachment.`;
+  return `${DRAFT_TOO_LARGE_PREFIX} (${toMb(bytes)} MB; the limit is ${toMb(MAX_DRAFT_JSON_BYTES)} MB). Remove an attachment.`;
+}
+
+/** Whether an error is the size refusal: permanent until the draft changes, so not retried. */
+export function isDraftTooLargeError(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith(DRAFT_TOO_LARGE_PREFIX);
 }
 
 /**
