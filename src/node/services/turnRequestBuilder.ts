@@ -278,7 +278,7 @@ export function resolveXumToolScope(
 
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ErrorEvent } from "@/common/types/stream";
-import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -1613,6 +1613,7 @@ export class TurnRequestBuilder {
       taskDepth,
       shouldDisableTaskToolsForDepth,
       effectiveToolPolicy,
+      switchableAgents,
     } = agentResult.data;
     // Explicit summaries remain recovery operations, not token-budget turns.
     // Inspect this request's last effective user row, never an older compact command.
@@ -1642,9 +1643,12 @@ export class TurnRequestBuilder {
     // config trust for sub-agent delegation.
     const sharedExecutionTrusted =
       isWorkspaceTrustedForSharedExecution(metadata, cfg.projects) && !projectAutomationDisabled();
-    const agentAdvisorEnabled = resolveAdvisorEnabledForAgent(
-      effectiveAgentId,
-      cfg.agentAiDefaults?.[effectiveAgentId]?.advisorEnabled
+    // #5253: register the advisor when any switchable agent enables it, so the
+    // tool block stays the same across switches; the active policy refuses it.
+    const agentAdvisorEnabled = (
+      switchableAgents?.map((agent) => agent.id) ?? [effectiveAgentId]
+    ).some((agentId) =>
+      resolveAdvisorEnabledForAgent(agentId, cfg.agentAiDefaults?.[agentId]?.advisorEnabled)
     );
     const advisorModelString = cfg.advisorModelString?.trim() ?? "";
     const advisorToolEligible =
@@ -2703,6 +2707,8 @@ export class TurnRequestBuilder {
           ),
           extraTools: this.dependencies.bindings.extraTools,
           effectiveToolPolicy,
+          switchableAgentToolPolicies: switchableAgents?.map((agent) => agent.toolPolicy),
+          activeAgentId: effectiveAgentId,
           experiments,
           emitNestedToolEvent: emitNestedPtcToolEvent,
           sandbox: {
@@ -2715,12 +2721,24 @@ export class TurnRequestBuilder {
           recordStartupPhaseTiming("applyToolPolicyAndExperimentsMs", applyPolicyStartedAt);
         }
 
-        // Intuition's internal memory_read must not bypass a policy denying memory.
+        // Intuition's internal memory_read must not bypass a policy denying memory
+        // (a denied memory is never a refusal stub, see toolAssembly).
         if (attemptTools.memory === undefined) delete attemptTools.intuition;
+        // #5253: the advertised union can hold refusal stubs, so presence no
+        // longer means the ACTIVE agent may use a tool; guidance follows the
+        // active policy.
+        const activeAgentAllows = (name: string): boolean =>
+          attemptTools[name] !== undefined &&
+          (switchableAgents === undefined ||
+            applyToolPolicyToNames([name], effectiveToolPolicy).length > 0);
 
         // Same predicate and model as the tools cache breakpoint
         // (applyCacheControlToTools), so "caches the tools block" and "keeps the
         // tool list stable" cannot disagree (#5250).
+        // #5253: classify by every switchable agent's require rules, like PTC
+        // promotion, so a tool required in one mode is not deferred in another.
+        const toolSearchPolicy =
+          switchableAgents?.flatMap((agent) => agent.toolPolicy) ?? effectiveToolPolicy;
         const toolSearchPromptCacheActive = supportsAnthropicCache(
           seed.rawModelString,
           seed.providersConfig
@@ -2731,7 +2749,7 @@ export class TurnRequestBuilder {
               tools: attemptTools,
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
-              toolPolicy: effectiveToolPolicy,
+              toolPolicy: toolSearchPolicy,
               ptcEnabled,
               promptCacheActive: toolSearchPromptCacheActive,
             });
@@ -2744,7 +2762,7 @@ export class TurnRequestBuilder {
               tools: attemptTools,
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
-              toolPolicy: effectiveToolPolicy,
+              toolPolicy: toolSearchPolicy,
               ptcEnabled,
               promptCacheActive: toolSearchPromptCacheActive,
             }).tools;
@@ -2754,8 +2772,9 @@ export class TurnRequestBuilder {
           }
         }
 
-        const intuitionToolAvailable = attemptTools.intuition !== undefined;
-        const advisorToolAvailable = attemptTools.advisor !== undefined;
+        const intuitionAdvertised = attemptTools.intuition !== undefined;
+        const intuitionToolAvailable = activeAgentAllows("intuition");
+        const advisorToolAvailable = activeAgentAllows("advisor");
         const memoryToolAvailable = attemptTools.memory !== undefined;
         const memoryContextForModel = await upgradeMemoryContextForModel(
           memoryToolAvailable,
@@ -2808,17 +2827,17 @@ export class TurnRequestBuilder {
               tools: attemptTools,
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
-              toolPolicy: effectiveToolPolicy,
+              toolPolicy: toolSearchPolicy,
               ptcEnabled,
               promptCacheActive: toolSearchPromptCacheActive,
             }).tools;
           }
           // Middleware may filter tools too, but must not restore policy-denied
           // recall or leave its private memory reader available without memory.
-          if (!intuitionToolAvailable || attemptTools.memory === undefined) {
+          if (!intuitionAdvertised || attemptTools.memory === undefined) {
             delete attemptTools.intuition;
           }
-          if (attemptTools.intuition === undefined) {
+          if (attemptTools.intuition === undefined || !activeAgentAllows("intuition")) {
             assembleCtx.systemMessage = removeIntuitionGuidance(
               assembleCtx.systemMessage,
               attemptTools.memory !== undefined,
