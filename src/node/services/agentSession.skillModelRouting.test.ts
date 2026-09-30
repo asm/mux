@@ -2088,7 +2088,6 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       {},
       false,
       undefined,
-      undefined,
       gate
     );
     expect(prepared).toHaveLength(1);
@@ -2143,7 +2142,8 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
 
     const result = await session.sendMessage(
       "Use skill done",
-      skillSendOptions({ experiments: { tokenBudget: true } })
+      // Token-budget windows require Agent Memory (the session checkpoint scope).
+      skillSendOptions({ experiments: { tokenBudget: true, memory: true } })
     );
     expect(result.success).toBe(true);
     expect(streamed).toHaveLength(1);

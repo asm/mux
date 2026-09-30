@@ -13,6 +13,7 @@ import {
   settleArchivedSharedDesktopTask,
 } from "@/node/services/desktop/DesktopInputCoordinator";
 import * as path from "path";
+import { isDeepStrictEqual } from "util";
 import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { SERVER_UPDATE_MONITOR_VERIFY_TIMEOUT_MS } from "@/constants/serverUpdate";
@@ -47,6 +48,7 @@ import {
   ProvidersConfigStore,
   SecretsStore,
   WorkspaceNameTakenError,
+  workspacesSharingPlanDirectory,
   type Config,
 } from "@/node/config";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
@@ -91,6 +93,7 @@ import {
   runFullInit,
 } from "@/node/runtime/runtimeFactory";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
+import { DockerRuntime, getContainerName } from "@/node/runtime/DockerRuntime";
 import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
@@ -128,7 +131,11 @@ import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import { generateGitStatusScript, parseGitStatusScriptOutput } from "@/common/utils/git/gitStatus";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
-import { getPlanFilePath, getLegacyPlanFilePath } from "@/common/utils/planStorage";
+import {
+  getPlanFilePath,
+  getLegacyPlanFilePath,
+  sharesPlanDirectory,
+} from "@/common/utils/planStorage";
 import { detectDefaultTrunkBranch, listLocalBranches } from "@/node/git";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { extractEditedFilePaths } from "@/common/utils/messages/extractEditedFiles";
@@ -140,6 +147,7 @@ import {
   sliceMessagesForProviderFromLatestContextBoundary,
 } from "@/common/utils/messages/compactionBoundary";
 import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
+import { HISTORY_PAGE_MAX_BYTES, HISTORY_PAGE_MAX_ROWS } from "@/constants/orpcSubscriptions";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { deriveTodoStatus } from "@/common/utils/todoList";
 import { createContextResetBoundaryMessageId } from "@/node/services/utils/messageIds";
@@ -180,7 +188,7 @@ import {
   type NameGenerationCandidate,
 } from "@/node/services/workspaceTitleGenerator";
 import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
-import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
+import { containerLabel, DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import {
   getDevcontainerContainerName,
@@ -218,6 +226,7 @@ import { PROJECT_METADATA_DIR_NAMES } from "@/common/compat/legacyMux";
 
 import type { PostCompactionExclusions } from "@/common/types/attachment";
 import type {
+  AcpPromptCorrelation,
   SendMessageOptions,
   DeleteMessage,
   FilePart,
@@ -236,6 +245,7 @@ import type {
   WorkspaceActivitySnapshot,
   WorkspaceMetadata,
   WorkspaceRemovalDescendant,
+  WorkspaceRemoveWarning,
 } from "@/common/types/workspace";
 import { isDynamicToolPart } from "@/common/types/toolParts";
 import { buildAskUserQuestionSummary } from "@/common/utils/tools/askUserQuestionSummary";
@@ -406,11 +416,13 @@ import {
   type DeliveredWakeRecord,
 } from "@/node/services/bashMonitorWakeReconciler";
 import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
+import { runProjectLifecycleHook } from "@/node/services/projectLifecycleHooks";
 import {
   areArchiveUntrackedPathListsEqual,
   normalizeArchiveUntrackedPaths,
   resolveTaskAgentIdForResume,
   type AgentTaskIntegration,
+  type ArchiveCascadePreflight,
   type ArchiveWorkspaceOptions,
   type QueueCutReceipt,
   type RemovalAttemptBinding,
@@ -438,6 +450,7 @@ import { secretsToRecord } from "@/common/types/secrets";
 import {
   copyPlanFileAcrossRuntimes,
   execBuffered,
+  getProjectName,
   movePlanFile,
 } from "@/node/utils/runtime/helpers";
 import {
@@ -513,31 +526,32 @@ export const STARTUP_RECOVERY_CONCURRENCY = 8;
 export const PLAN_FILE_DELETE_UNREACHABLE_MESSAGE =
   "History was not cleared: the plan file could not be deleted because the workspace's SSH host or container did not respond. Reconnect the host (or start the container) and try again.";
 
-/**
- * Where a runtime keeps its plan files, for "do these two workspaces share a plan path": the local
- * home for local and worktree runtimes, the host's home for SSH. Docker and devcontainer plans live
- * inside their own container and are never shared (undefined).
- */
-function planStorageOf(runtimeConfig: RuntimeConfig): string | undefined {
-  if (isDockerRuntime(runtimeConfig) || isDevcontainerRuntime(runtimeConfig)) return undefined;
-  return isSSHRuntime(runtimeConfig) ? `ssh:${runtimeConfig.host}` : "local";
-}
+/** Labels are free text; the About dialog shows them verbatim, so they are cut here. */
+const MAX_RESTART_BLOCKER_LABEL_CHARS = 40;
 
 /**
  * Sorted display names for a restart blocker's workspaces (#4770): title, else name, else ID. A
  * hand-edited config can hold a non-string title or name, so those count as missing. Titles may
  * repeat (across projects, repeated task titles), so a label two workspaces share gets the ID.
+ * Long labels are cut BEFORE that check and before the ID is appended (#5052): cutting the whole
+ * name afterwards dropped the ID, and two titles that differ only past the cut read the same.
  */
 export function nameRestartBlockerWorkspaces(
   workspaces: ReadonlyArray<{ id: string; title?: unknown; name?: unknown }>
 ): string[] {
-  const labeled = workspaces.map((workspace) => ({
-    id: workspace.id,
-    label:
+  const labeled = workspaces.map((workspace) => {
+    const label =
       [workspace.title, workspace.name].find(
         (value): value is string => typeof value === "string" && value.length > 0
-      ) ?? workspace.id,
-  }));
+      ) ?? workspace.id;
+    return {
+      id: workspace.id,
+      label:
+        label.length > MAX_RESTART_BLOCKER_LABEL_CHARS
+          ? `${label.slice(0, MAX_RESTART_BLOCKER_LABEL_CHARS - 1).trimEnd()}…`
+          : label,
+    };
+  });
   const labelCounts = new Map<string, number>();
   for (const { label } of labeled) labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
   return labeled
@@ -1302,6 +1316,7 @@ interface WorkspaceHistoryLoadMoreResult {
   messages: WorkspaceChatMessage[];
   nextCursor: WorkspaceHistoryLoadMoreCursor | null;
   hasOlder: boolean;
+  notPageable?: boolean;
 }
 
 function isCompactedSummaryMessage(message: MuxMessage): boolean {
@@ -3169,6 +3184,10 @@ export class WorkspaceService
   private workspaceGoalService?: WorkspaceGoalService;
   /** Narrow DevTools cleanup surface; wired by coreServices when a DevToolsService exists. */
   private devToolsService?: WorkspaceDevToolsCleanup;
+  /** Copies the composer draft into a fork (DraftService); wired by the service container. */
+  private draftForkCopier?: {
+    copyWorkspaceDraftForFork(sourceWorkspaceId: string, newWorkspaceId: string): Promise<void>;
+  };
   /** Cancels running /refine passes before removal deletes the session dir; wired post-construction (RefineService is built later). */
   private refinePassCanceller?: { cancelInFlightRefinePass(workspaceId: string): Promise<void> };
   /** Narrow overrides-cleanup surface; wired by ServiceContainer for stale plugin-key sanitization. */
@@ -3531,18 +3550,14 @@ export class WorkspaceService
         "a devcontainer creation must roll back through DevcontainerRuntime"
       );
     }
-    if (
-      rolledBack &&
-      !isWorktreeRuntime(args.runtimeConfig) &&
-      !devcontainer &&
-      args.runtimeConfig.type !== "local"
-    ) {
-      // Remote deletes can reach state this creation did not make (#4775).
-      log.warn("Left the checkout of an aborted creation on a non-worktree runtime", {
-        workspaceId,
-        runtime: args.runtimeConfig.type,
-      });
-    } else if (rolledBack && (isWorktreeRuntime(args.runtimeConfig) || devcontainer)) {
+    // SSH, Docker and Coder creations have made nothing to delete by now (#4775): createWorkspace
+    // only computes their path or container name (Docker also checks that the name is free), and
+    // the checkout, container or Coder workspace comes from init, which starts after publication,
+    // when no rollback point is left. Their runtime deletes would instead reach state this
+    // creation did not make: an existing remote directory, or a container or Coder workspace of
+    // the same name. So nothing is deleted. A new-mode Coder creation's provisioning token, which
+    // only init would consume, is released below (#5113).
+    if (rolledBack && (isWorktreeRuntime(args.runtimeConfig) || devcontainer)) {
       const force = checkout.startsWith("force-");
       const deleteOptions = { keepBranch: checkout.endsWith("-keep-branch") };
       // Worktree directories are named after the sanitized workspace name (branch names may
@@ -3576,6 +3591,8 @@ export class WorkspaceService
         leftovers.push(args.runtime.getWorkspacePath(args.projectPath, args.workspaceName));
       }
     }
+    // Init never runs for this creation, whether or not the entry is gone.
+    await args.runtime.releaseCreationSetup?.();
     // Tear down the in-memory state registered earlier in this creation
     // (session, init record, abort controller) exactly like workspace
     // removal would; without this every aborted retry against the same bad
@@ -3596,9 +3613,14 @@ export class WorkspaceService
     deleteResult: Awaited<ReturnType<Runtime["deleteWorkspace"]>>
   ): string[] {
     if (deleteResult.success) return [];
-    return runtime instanceof MultiProjectRuntime
-      ? (deleteResult.leftoverPaths ?? [])
-      : [runtime.getWorkspacePath(projectPath, workspaceName)];
+    if (runtime instanceof MultiProjectRuntime) return deleteResult.leftoverPaths ?? [];
+    // A devcontainer names its container this way too, which the workspace path is not (#5120).
+    if (deleteResult.leftoverPaths !== undefined) return deleteResult.leftoverPaths;
+    // A Docker workspace path is the in-container /src; what is left is the container (#5117).
+    if (runtime instanceof DockerRuntime) {
+      return [`Docker container ${getContainerName(projectPath, workspaceName)}`];
+    }
+    return [runtime.getWorkspacePath(projectPath, workspaceName)];
   }
 
   /**
@@ -3868,6 +3890,12 @@ export class WorkspaceService
   /** DevTools debug-log cleanup on archive/remove; wired by coreServices. */
   setDevToolsService(service: WorkspaceDevToolsCleanup): void {
     this.devToolsService = service;
+  }
+
+  setDraftForkCopier(service: {
+    copyWorkspaceDraftForFork(sourceWorkspaceId: string, newWorkspaceId: string): Promise<void>;
+  }): void {
+    this.draftForkCopier = service;
   }
 
   /** Refine-pass cancellation on remove; wired by the service container. */
@@ -4330,11 +4358,7 @@ export class WorkspaceService
 
     this.aiService.on("stream-end", (data: unknown) => {
       if (isStreamEndEvent(data)) {
-        void this.trackWorkspaceCleanup(() =>
-          this.handleStreamCompletion(data.workspaceId, {
-            hiddenFlush: data.metadata?.muxMetadata?.contextBudgetFlush === true,
-          })
-        );
+        void this.trackWorkspaceCleanup(() => this.handleStreamCompletion(data.workspaceId));
         this.scheduleBashMonitorWakeReconcile(data.workspaceId);
       }
     });
@@ -4378,7 +4402,11 @@ export class WorkspaceService
           return;
         }
 
-        void this.updateAgentStatus(data.workspaceId, agentStatus);
+        // Tracked like the stream-listener writes above so the shutdown join waits (#5059).
+        // The tracker calls the write synchronously, so writes still start in event order.
+        void this.trackWorkspaceCleanup(() =>
+          this.updateAgentStatus(data.workspaceId, agentStatus)
+        );
         return;
       }
 
@@ -4386,7 +4414,8 @@ export class WorkspaceService
         (data.toolName === "todo_write" || data.toolName === "propose_plan") &&
         isSuccessfulToolResult(data.result)
       ) {
-        void this.updateTodoStatusFromStorage(data.workspaceId);
+        // Same shutdown join (#5059); ordering stays with todoStatusUpdateQueue.
+        void this.trackWorkspaceCleanup(() => this.updateTodoStatusFromStorage(data.workspaceId));
       }
     });
   }
@@ -4880,10 +4909,7 @@ export class WorkspaceService
     return this.updateStreamingStatus(workspaceId, false, { generation });
   }
 
-  private async handleStreamCompletion(
-    workspaceId: string,
-    completion: { hiddenFlush?: boolean } = {}
-  ): Promise<void> {
+  private async handleStreamCompletion(workspaceId: string): Promise<void> {
     const generation = this.streamingGenerations.get(workspaceId) ?? 0;
     const isIdleCompaction = this.idleCompactingWorkspaces.has(workspaceId);
 
@@ -4894,10 +4920,8 @@ export class WorkspaceService
     // Idle compaction is maintenance work, so preserve the pre-existing recency.
     // That keeps the workspace from jumping to the top of the sidebar and also
     // prevents the background activity path from treating compaction as a fresh response.
-    // A token-budget flush is the same kind of maintenance: the transcript hides its output,
-    // so it must not mark the workspace unread or notify from the activity snapshot.
 
-    if (!isIdleCompaction && completion.hiddenFlush !== true) {
+    if (!isIdleCompaction) {
       // Always use Date.now() for stream-completion recency.
       // extractTimestamp() returns the message-creation timestamp from stream
       // metadata, which is effectively the same as the sendMessage recency and
@@ -5156,21 +5180,6 @@ export class WorkspaceService
         log.warn("Transient session disposal failed", { workspaceId, error })
       );
     for (const session of this.sessions.values()) session.beginShutdown();
-  }
-
-  /**
-   * Sub-agents share their task-tree owner's /memories/workspace store, so a
-   * workspace-scope write by one tree member stales the cached memory context
-   * of every live session in that tree, not just the acting one (which already
-   * clears its own cache on tool-call-end). `isAffected` decides membership.
-   */
-  invalidateMemoryContextWhere(isAffected: (workspaceId: string) => boolean): void {
-    // Startup-recovery sessions are live too and may be promoted with their cache.
-    for (const registry of [this.sessions, this.transientStartupRecoverySessions]) {
-      for (const [workspaceId, session] of registry) {
-        if (isAffected(workspaceId)) session.invalidateMemoryContext();
-      }
-    }
   }
 
   /**
@@ -5978,7 +5987,31 @@ export class WorkspaceService
     );
   }
 
-  async createScratch(title?: string): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>> {
+  async createScratch(
+    title?: string,
+    tags?: Record<string, string>,
+    /**
+     * Delegated task(kind:"workspace") targets from a scratch owner (see create()): only
+     * "caller-finalizes" and "none" apply, since scratch has no setup that must precede the
+     * default consent; omitted keeps the interactive default of granting it with the entry.
+     */
+    options?: {
+      defaultUnrelatedConsent?: "caller-finalizes" | "none";
+      delegatedCreation?: { handleId: string; ownerWorkspaceId: string };
+    }
+  ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>> {
+    const delegatedCreation = options?.delegatedCreation;
+    assert(
+      delegatedCreation == null ||
+        (delegatedCreation.handleId.length > 0 && delegatedCreation.ownerWorkspaceId.length > 0),
+      "createScratch: a delegated creation names its handle and owner"
+    );
+    if (tags != null) {
+      for (const [tagKey, tagValue] of Object.entries(tags)) {
+        assert(tagKey.trim().length > 0, "Workspace tag keys must be non-empty");
+        assert(typeof tagValue === "string", "Workspace tag values must be strings");
+      }
+    }
     // Scratch chats always run on the local runtime; locked-down deployments
     // that disallow local runtimes must not get a local tool-execution
     // workspace through the scratch path either.
@@ -6013,7 +6046,23 @@ export class WorkspaceService
           title,
           createdAt,
           runtimeConfig: { type: "local" },
-          unrelatedWorkspaceConsent: mintUnrelatedWorkspaceConsent(),
+          ...(tags != null && Object.keys(tags).length > 0 ? { tags } : {}),
+          // Same consent/crash-binding contract as create(): a delegated target's pending
+          // default is finalized by its creating turn (#4453), and the creation mark lands in
+          // the row's own write so a crash cannot leave the target unbound (#4983).
+          ...(options?.defaultUnrelatedConsent === "caller-finalizes"
+            ? { unrelatedWorkspaceConsentPending: true as const }
+            : options?.defaultUnrelatedConsent === "none"
+              ? {}
+              : { unrelatedWorkspaceConsent: mintUnrelatedWorkspaceConsent() }),
+          ...(delegatedCreation != null
+            ? {
+                delegatedCreation: {
+                  handleId: delegatedCreation.handleId,
+                  ownerWorkspaceId: delegatedCreation.ownerWorkspaceId,
+                },
+              }
+            : {}),
         });
         config.projects.set(SCRATCH_PROJECT_CONFIG_KEY, scratchProject);
         return config;
@@ -6062,9 +6111,21 @@ export class WorkspaceService
        * settles, #4453). "none" never marks or grants.
        */
       defaultUnrelatedConsent?: "after-setup" | "caller-finalizes" | "none";
+      /**
+       * The delegated handle creating this target (#4983): written into the row in its
+       * registration write, so a crash before the handle record persists leaves a row the
+       * startup resolver can bind to that handle and owner. Internal only; never from the API.
+       */
+      delegatedCreation?: { handleId: string; ownerWorkspaceId: string };
     }
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; createdBranch?: boolean }>> {
     const defaultConsent = options?.defaultUnrelatedConsent ?? "after-setup";
+    const delegatedCreation = options?.delegatedCreation;
+    assert(
+      delegatedCreation == null ||
+        (delegatedCreation.handleId.length > 0 && delegatedCreation.ownerWorkspaceId.length > 0),
+      "create: a delegated creation names its handle and owner"
+    );
     // A deferred checkout grants from materializeDeferredCheckout, which would bypass the caller.
     assert(
       defaultConsent !== "caller-finalizes" || options?.awaitMaterialization === true,
@@ -6102,6 +6163,28 @@ export class WorkspaceService
       );
     }
 
+    // Create runtime for workspace creation
+    // Default to worktree runtime for backward compatibility
+    let finalRuntimeConfig: RuntimeConfig = runtimeConfig ?? {
+      type: "worktree",
+      srcBaseDir: this.config.srcDir,
+    };
+
+    // Names whose plan file another workspace already uses: plans live at
+    // plans/<projectName>/<name>.md, and same-basename projects on the same plan storage share that
+    // directory (#5139). A new row under owningProjectPath reads back with its basename.
+    const planTarget = {
+      projectName: getProjectName(owningProjectPath),
+      runtimeConfig: finalRuntimeConfig,
+    };
+    const planDirectoryNames = new Set<string>();
+    for (const { workspace } of workspacesSharingPlanDirectory(
+      configSnapshot.projects,
+      planTarget
+    )) {
+      if (typeof workspace.name === "string") planDirectoryNames.add(workspace.name);
+    }
+
     // Auto-generate a branch name when the caller omits one (used by /new to
     // mirror /fork's seamless creation flow). Mirrors fork's auto-naming: scan
     // existing workspace names AND local git branches so numbering is stable.
@@ -6109,7 +6192,7 @@ export class WorkspaceService
     // owningProjectPath even when a sub-project initiated creation.
     let resolvedBranchName: string;
     if (branchName == null) {
-      const existingNamesSet = new Set<string>();
+      const existingNamesSet = new Set<string>(planDirectoryNames);
       for (const entry of projectConfig.workspaces ?? []) {
         if (typeof entry.name === "string") {
           existingNamesSet.add(entry.name);
@@ -6138,23 +6221,17 @@ export class WorkspaceService
     }
 
     const initialWorkspaceName = sanitizeBranchNameForWorkspace(resolvedBranchName);
-    // Sanitized collisions must fail so distinct Git branches cannot share one workspace identity.
-    const initialConflict = getBranchWorkspaceNameConflict(
-      resolvedBranchName,
-      (projectConfig.workspaces ?? []).map((workspace) => workspace.name)
-    );
+    // Sanitized collisions must fail so distinct Git branches cannot share one workspace identity,
+    // or one plan file (#5139). Checked before any per-workspace state exists.
+    const initialConflict = getBranchWorkspaceNameConflict(resolvedBranchName, [
+      ...(projectConfig.workspaces ?? []).map((workspace) => workspace.name),
+      ...planDirectoryNames,
+    ]);
     if (initialConflict) {
       return Err(initialConflict);
     }
 
     const workspaceId = this.config.generateStableId();
-
-    // Create runtime for workspace creation
-    // Default to worktree runtime for backward compatibility
-    let finalRuntimeConfig: RuntimeConfig = runtimeConfig ?? {
-      type: "worktree",
-      srcBaseDir: this.config.srcDir,
-    };
 
     if (this.policyService?.isEnforced()) {
       if (!this.policyService.isRuntimeAllowed(finalRuntimeConfig)) {
@@ -6212,14 +6289,18 @@ export class WorkspaceService
       const hasSanitizedWorkspaceName = finalBranchName !== finalWorkspaceName;
       let createResult: WorkspaceCreationResult;
 
-      // If runtime uses config-level collision detection (e.g., Coder - can't reach host),
-      // check against existing workspace names before createWorkspace.
+      // A name another workspace's plan file uses (#5139) is occupied on every runtime, like a
+      // taken checkout directory: it gets the same collision suffix (or, for a sanitized branch
+      // name, the same refusal). If runtime uses config-level collision detection (e.g., Coder -
+      // can't reach host), the project's existing workspace names are checked here too.
+      const existingNames = new Set<string | undefined>(planDirectoryNames);
       if (runtime.createFlags?.configLevelCollisionDetection) {
-        const existingNames = new Set(
-          (this.config.loadConfigOrDefault().projects.get(owningProjectPath)?.workspaces ?? []).map(
-            (w) => w.name
-          )
-        );
+        for (const w of this.config.loadConfigOrDefault().projects.get(owningProjectPath)
+          ?.workspaces ?? []) {
+          existingNames.add(w.name);
+        }
+      }
+      if (existingNames.size > 0) {
         const configConflict = getBranchWorkspaceNameConflict(finalBranchName, existingNames);
         if (configConflict) {
           initLogger.logComplete(-1);
@@ -6367,6 +6448,15 @@ export class WorkspaceService
             ...(defaultConsent === "none"
               ? {}
               : { unrelatedWorkspaceConsentPending: true as const }),
+            // Same write as the row itself: no crash can leave a delegated target unbound.
+            ...(delegatedCreation != null
+              ? {
+                  delegatedCreation: {
+                    handleId: delegatedCreation.handleId,
+                    ownerWorkspaceId: delegatedCreation.ownerWorkspaceId,
+                  },
+                }
+              : {}),
           });
           return config;
         });
@@ -7083,7 +7173,12 @@ export class WorkspaceService
       beforeRemove?: () => Promise<boolean | RemovalAttemptBinding>;
       acknowledgedDescendantIds?: string[];
     }
-  ): Promise<Result<void> & { descendants?: WorkspaceRemovalDescendant[] }> {
+  ): Promise<
+    Result<void> & {
+      descendants?: WorkspaceRemovalDescendant[];
+      warnings?: WorkspaceRemoveWarning[];
+    }
+  > {
     return await this.withTaskTreeLifecycleLock(workspaceId, async () => {
       const operation = async () => {
         const decision = options?.beforeRemove == null ? true : await options.beforeRemove();
@@ -7097,6 +7192,8 @@ export class WorkspaceService
           return { ...Err(error), ...(descendants?.length ? { descendants } : {}) };
         };
         let releaseTreeGate: (() => Promise<void>) | undefined;
+        // What the acknowledged descendants' forced removals left behind (#5143).
+        let descendantWarnings: WorkspaceRemoveWarning[] = [];
         try {
           if (options?.acknowledgedDescendantIds != null) {
             if (this.agentTaskIntegration == null) {
@@ -7126,6 +7223,7 @@ export class WorkspaceService
                 gatedIds
               );
             if (!descendantsResult.success) return failure(descendantsResult.error);
+            descendantWarnings = descendantsResult.warnings ?? [];
           }
           const result = await this.removeUnlocked(
             workspaceId,
@@ -7133,7 +7231,9 @@ export class WorkspaceService
             binding,
             releaseTreeGate != null ? { mutationGateHeld: true } : undefined
           );
-          return result.success ? result : failure(result.error);
+          if (!result.success) return failure(result.error);
+          const warnings = [...descendantWarnings, ...(result.warnings ?? [])];
+          return { ...result, ...(warnings.length > 0 ? { warnings } : {}) };
         } catch (error) {
           return failure(getErrorMessage(error));
         } finally {
@@ -7162,7 +7262,7 @@ export class WorkspaceService
     force = false,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void>> {
+  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
     return await this.removeUnlocked(workspaceId, force, binding, options);
   }
 
@@ -7245,7 +7345,7 @@ export class WorkspaceService
     force = false,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void>> {
+  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
     if (this.shuttingDown) return Err("Server is shutting down");
     // Only the checkout options reach the runtime.
     const { mutationGateHeld, ...checkoutOptions } = options ?? {};
@@ -7257,6 +7357,11 @@ export class WorkspaceService
     this.removingWorkspaces.add(workspaceId);
     let timelineClosed = false;
     let removedFromConfig = false;
+    // Set when the runtime deletion ran and succeeded; for a devcontainer that confirms its
+    // container, which holds the plan, is gone (#5043).
+    let containerRemovalConfirmed = false;
+    // What a forced removal left behind, returned with its success for the user (#5143).
+    let removalWarnings: WorkspaceRemoveWarning[] = [];
     // Set once this attempt published the durable removal tombstone (sealed
     // sub-agent handover, or the session-dir teardown). If the removal then
     // ends with the workspace STILL REGISTERED — a refused checkout deletion,
@@ -7368,6 +7473,10 @@ export class WorkspaceService
       // disposal at scope exit (after deregistration or its rollback) is safe
       // since a late renewal of a retained terminal marker is meaningless.
       using _tombstoneLease = startRemovalTombstoneLease(this.config.rootDir, workspaceId);
+      // #4967: background cleanup() below refuses new fg→bg migrations only while it runs, and
+      // the checkout is deleted after it returns. Keep them refused until this removal settles:
+      // a failed removal keeps the workspace, which can then background commands again.
+      using _migrationSeal = this.backgroundProcessManager.sealMigrations(workspaceId);
       // Forced removals too (routine task cleanup uses force): proceeding
       // while a stalled writer still owns the lock would let it resume after
       // the deletion and recreate the removed path. The acquisition is
@@ -7688,6 +7797,15 @@ export class WorkspaceService
             }
           }
 
+          await runProjectLifecycleHook({
+            hook: "delete",
+            workspaceId,
+            workspacePath: persistedWorkspacePath,
+            metadata,
+            config: this.config,
+            secretsStore: this.secretsStore,
+          });
+
           for (const projectRemoval of projectRemovals) {
             try {
               const deleteResult = await projectRemoval.runtime.deleteWorkspace(
@@ -7803,6 +7921,14 @@ export class WorkspaceService
           // and keep workspace in config so user can retry. This prevents orphaned directories.
           const trusted =
             configSnapshot.projects.get(stripTrailingSlashes(projectPath))?.trusted ?? false;
+          await runProjectLifecycleHook({
+            hook: "delete",
+            workspaceId,
+            workspacePath: persistedWorkspacePath,
+            metadata,
+            config: this.config,
+            secretsStore: this.secretsStore,
+          });
           const deleteResult = await runtime.deleteWorkspace(
             projectPath,
             metadata.name, // use branch name
@@ -7812,6 +7938,8 @@ export class WorkspaceService
             runtimeOptions
           );
 
+          // A devcontainer's delete succeeds only once its container is gone (#5126, #5124).
+          containerRemovalConfirmed = deleteResult.success;
           if (!deleteResult.success) {
             // If force is true, we continue to remove from config even if fs removal failed
             if (!force) {
@@ -7820,6 +7948,27 @@ export class WorkspaceService
             log.error(
               `Failed to delete workspace from disk, but force=true. Removing from config. Error: ${deleteResult.error}`
             );
+            // A container left behind still holds this workspace's plan (#5143): the plan step
+            // below cannot reach it once the worktree is gone. Name it for the user's logs, and
+            // return it as a warning: forced paths that skip the Force Delete dialog (bulk delete,
+            // cancel-creation, shift-click) never saw the non-forced error that names it.
+            if (deleteResult.leftoverPaths?.length) {
+              log.warn("Forced removal left these behind; a container may still hold the plan", {
+                workspaceId,
+                leftovers: deleteResult.leftoverPaths,
+              });
+              const planContainer =
+                runtime instanceof DevcontainerRuntime
+                  ? containerLabel(runtime.getWorkspacePath(projectPath, metadata.name))
+                  : undefined;
+              removalWarnings = deleteResult.leftoverPaths.map((leftover) => ({
+                kind: "leftover",
+                description:
+                  leftover === planContainer
+                    ? `The ${leftover} was left behind and may still hold this workspace's plan file; remove the container.`
+                    : `${leftover} was left behind; remove it manually.`,
+              }));
+            }
           }
 
           // Note: Coder workspace deletion is handled by CoderSSHRuntime.deleteWorkspace()
@@ -8066,7 +8215,11 @@ export class WorkspaceService
       // without its plan, like its already deleted session. Without captured metadata there is no
       // path to derive.
       if (removedMetadata)
-        await this.deletePlanFilesOfRemovedWorkspace(workspaceId, removedMetadata);
+        await this.deletePlanFilesOfRemovedWorkspace(
+          workspaceId,
+          removedMetadata,
+          containerRemovalConfirmed
+        );
 
       // Remove from config
       try {
@@ -8146,7 +8299,10 @@ export class WorkspaceService
         ...(parentWorkspaceId ? { removedParentWorkspaceId: parentWorkspaceId } : {}),
       });
 
-      return Ok(undefined);
+      return {
+        ...Ok(undefined),
+        ...(removalWarnings.length > 0 ? { warnings: removalWarnings } : {}),
+      };
     } catch (error) {
       // An abort before the workspace left the config leaves it usable, so undo the timeline close:
       // otherwise every later event for it would be dropped for the rest of the process.
@@ -8216,16 +8372,20 @@ export class WorkspaceService
    */
   private async deletePlanFilesOfRemovedWorkspace(
     workspaceId: string,
-    metadata: FrontendWorkspaceMetadata
+    metadata: FrontendWorkspaceMetadata,
+    containerRemovalConfirmed: boolean
   ): Promise<void> {
     const runtimeConfig = metadata.runtimeConfig;
     // Skipped where the plan is not at a path this process can safely delete: Docker keeps it in
-    // the container the removal deleted; a devcontainer keeps it inside the container, and the
-    // same host path is not this workspace's (#4775); a Coder workspace that Xum created is
-    // deleted with the workspace, and an exec would reach for a host that is gone.
+    // the container the removal deleted; a Coder workspace that Xum created is deleted with the
+    // workspace, and an exec would reach for a host that is gone. A devcontainer keeps it inside
+    // its container: skipped only once the removal confirmed that container gone (#5043).
+    // Otherwise (a forced removal that could not remove it, or a task that shares its parent's
+    // container) the container survives with the plan, and a later workspace at this path would
+    // reconnect to it, so the plan is deleted in there, never at the same host path (#4775).
     if (
       isDockerRuntime(runtimeConfig) ||
-      isDevcontainerRuntime(runtimeConfig) ||
+      (isDevcontainerRuntime(runtimeConfig) && containerRemovalConfirmed) ||
       (isSSHRuntime(runtimeConfig) &&
         runtimeConfig.coder != null &&
         runtimeConfig.coder.existingWorkspace !== true)
@@ -8235,13 +8395,11 @@ export class WorkspaceService
     try {
       // Plans key on the project basename: a same-named workspace in another project with that
       // basename, on the same plan storage, shares this path, and the plan may be its live one.
-      const storage = planStorageOf(runtimeConfig);
       const sharedWith = (await this.config.getAllWorkspaceMetadata()).find(
         (other) =>
           other.id !== workspaceId &&
           other.name === metadata.name &&
-          other.projectName === metadata.projectName &&
-          planStorageOf(other.runtimeConfig) === storage
+          sharesPlanDirectory(other, metadata)
       );
       if (sharedWith) {
         log.info("Keeping the removed workspace's plan path: another workspace shares it", {
@@ -8844,6 +9002,102 @@ export class WorkspaceService
         error: getErrorMessage(error),
       });
     }
+  }
+
+  /**
+   * Drop a delegated target's creation mark once its handle record persisted (#4983). Hygiene
+   * only: the record file is what the startup resolver trusts. Only this handle's unconfirmed
+   * mark is dropped; a flag the resolver set stays for the user. Never throws.
+   */
+  async clearDelegatedCreationMark(workspaceId: string, handleId: string): Promise<void> {
+    const isUnconfirmedMark = (entry: Workspace | undefined) =>
+      entry?.delegatedCreation?.handleId === handleId &&
+      entry.delegatedCreation.interruptedAt == null;
+    if (
+      !isUnconfirmedMark(
+        findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+      )
+    ) {
+      return;
+    }
+    try {
+      await this.config.editConfig((freshConfig) => {
+        const entry = findWorkspaceEntry(freshConfig, workspaceId)?.workspace;
+        if (entry != null && isUnconfirmedMark(entry)) delete entry.delegatedCreation;
+        return freshConfig;
+      });
+    } catch (error) {
+      log.warn("Failed to clear a delegated creation mark", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  /**
+   * Flag a delegated target whose creator died before its handle record persisted (#4983). The
+   * startup resolver calls this under the handle's live-owner lock, after it proved there is no
+   * record. Nothing is removed: the user decides. Compare-and-set, so a row that is gone, pending
+   * removal, or bound to another handle is left as it is. Returns whether it flagged the row.
+   */
+  async markDelegatedCreationInterrupted(workspaceId: string, handleId: string): Promise<boolean> {
+    let flagged = false;
+    await this.config.editConfig((freshConfig) => {
+      const entry = findWorkspaceEntry(freshConfig, workspaceId)?.workspace;
+      const mark = entry?.delegatedCreation;
+      if (
+        entry == null ||
+        mark?.handleId !== handleId ||
+        mark.interruptedAt != null ||
+        entry.pendingRemoval != null
+      ) {
+        return freshConfig;
+      }
+      entry.delegatedCreation = { ...mark, interruptedAt: new Date().toISOString() };
+      flagged = true;
+      return freshConfig;
+    });
+    // Not published here: building metadata probes every checkout, and a stalled mount must not
+    // hold up the startup pass (#4983). The flag reaches the UI with the next metadata load (the
+    // renderer's initial list, usually); #5189 tracks changes made after that load.
+    return flagged;
+  }
+
+  /**
+   * The user keeps a flagged delegated target as an ordinary workspace (#4983): drop its mark.
+   * Only a flagged mark is dropped, so no client can erase the binding of a creation that is
+   * still in progress. Idempotent.
+   */
+  async keepInterruptedDelegatedWorkspace(workspaceId: string): Promise<Result<void>> {
+    if (findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId) == null) {
+      return Err("Workspace not found");
+    }
+    try {
+      await this.config.editConfig((freshConfig) => {
+        const entry = findWorkspaceEntry(freshConfig, workspaceId)?.workspace;
+        if (entry?.delegatedCreation?.interruptedAt != null) {
+          delete entry.delegatedCreation;
+          // Without the mark no later startup trusts the row's tags, so a pending consent default
+          // the resolver failed to clear would never be cleared: drop it in the same write.
+          delete entry.unrelatedWorkspaceConsentPending;
+        }
+        return freshConfig;
+      });
+    } catch (error) {
+      return Err(`Failed to keep workspace: ${getErrorMessage(error)}`);
+    }
+    // Published even when the mark was already gone (#5199): another backend may have kept it, or
+    // an earlier publish failed, and a retry must still clear this renderer's banner.
+    try {
+      await this.emitCurrentWorkspaceMetadata(workspaceId);
+    } catch (error) {
+      // The mark is gone either way; the next metadata load shows it.
+      log.warn("Failed to publish a kept delegated workspace", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+    return Ok(undefined);
   }
 
   async setHeartbeatSettings(
@@ -10367,7 +10621,8 @@ export class WorkspaceService
    * rechecking, so hasExternalEditorOpen counts these alongside durable evidence — a
    * concurrent failed launch's rollback may collapse the shared marker and cache entry, and
    * without this count that collapse would make a still-recording sibling invisible to an
-   * archive that then removes the environment beneath the launching editor.
+   * archive that then removes the environment beneath the launching editor. For editors this
+   * backend launches itself, the count lasts until the launcher returns (launchExternalEditor).
    */
   private readonly pendingExternalEditorRecordings = new Map<string, number>();
 
@@ -10447,7 +10702,10 @@ export class WorkspaceService
     // Deep-link opens launch in the renderer immediately after this returns; the rollback
     // entry lets the renderer report a launch that provably never happened so the marker
     // cannot outlive it (see externalEditorLaunchRollbacks for why the token is
-    // client-generated).
+    // client-generated). The in-flight count has already ended here, so this backend's own
+    // rename or removal may still run before the client's hand-off. That is accepted (#4909):
+    // the launch runs in another process, and the editor opens the folder asynchronously even
+    // after the hand-off, which is the outcome those mutations already tolerate for an open editor.
     this.externalEditorLaunchRollbacks.set(launchToken, {
       workspaceId,
       rollback: admitted.data.rollbackAfterFailedLaunch,
@@ -10499,6 +10757,41 @@ export class WorkspaceService
   async recordExternalEditorOpenForLaunch(
     workspaceId: string
   ): Promise<Result<{ rollbackAfterFailedLaunch: () => Promise<void> }>> {
+    return this.withPendingExternalEditorOpen(workspaceId, () =>
+      this.recordExternalEditorOpenAdmitted(workspaceId)
+    );
+  }
+
+  /**
+   * Records an editor open that this backend launches itself (a custom command) and runs
+   * `launch` while the open still counts as in flight. This backend's own rename, removal and
+   * checkout-deleting archive ignore its editor lease, so without the count they could move or
+   * delete the checkout between the recording and the spawn (#4909), as for native terminals.
+   * Deep-link opens cannot use this: they launch in the client after recordExternalEditorOpen.
+   */
+  async launchExternalEditor(
+    workspaceId: string,
+    launch: () => Promise<Result<void>>
+  ): Promise<Result<void>> {
+    return this.withPendingExternalEditorOpen(workspaceId, async () => {
+      const recorded = await this.recordExternalEditorOpenAdmitted(workspaceId);
+      if (!recorded.success) {
+        // Refused (for example while a mutation holds the gate): never launch, never queue.
+        return recorded;
+      }
+      const launched = await launch();
+      if (!launched.success) {
+        // Pre-spawn failures must not leave a marker that permanently blocks later archives.
+        await recorded.data.rollbackAfterFailedLaunch();
+      }
+      return launched;
+    });
+  }
+
+  private async withPendingExternalEditorOpen<T>(
+    workspaceId: string,
+    run: () => Promise<T>
+  ): Promise<T> {
     // Pending-recording admission pairing (mirrors TerminalService.openNative): the count is
     // registered before any await — including the marker-lock wait, where a concurrent
     // failed launch's rollback may collapse the shared marker and cache entry — so
@@ -10509,7 +10802,7 @@ export class WorkspaceService
       (this.pendingExternalEditorRecordings.get(workspaceId) ?? 0) + 1
     );
     try {
-      return await this.recordExternalEditorOpenAdmitted(workspaceId);
+      return await run();
     } finally {
       const remaining = (this.pendingExternalEditorRecordings.get(workspaceId) ?? 1) - 1;
       if (remaining <= 0) {
@@ -11018,6 +11311,80 @@ export class WorkspaceService
     );
   }
 
+  /** Unarchived sub-agents of a workspace, deepest-first: the ones its archive cascades over. */
+  private listUnarchivedDescendants(workspaceId: string): WorkspaceRemovalDescendant[] {
+    const config = this.config.loadConfigOrDefault();
+    let listed: WorkspaceRemovalDescendant[];
+    try {
+      listed = this.agentTaskIntegration?.listWorkspaceRemovalDescendants(workspaceId) ?? [];
+    } catch (error) {
+      // Malformed persisted ancestry (a parentWorkspaceId cycle) must not make the workspace
+      // impossible to archive: archive it alone, as before the cascade existed.
+      log.warn("Archiving without sub-agents: their ancestry could not be read", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      listed = [];
+    }
+    return listed.filter((descendant) => {
+      const row = findWorkspaceEntry(config, descendant.workspaceId)?.workspace;
+      return row != null && !isWorkspaceArchived(row.archivedAt, row.unarchivedAt);
+    });
+  }
+
+  /**
+   * #4930: the model-facing archive cascades over sub-agents too, but no tool acknowledgement
+   * can approve losing work (#3950). Run before anything is interrupted or archived, this lists
+   * the untracked files each sub-agent's snapshot archive would lose, and refuses a sub-agent the
+   * delete policy would delete, as the lifecycle tool does for its target. When the tree has
+   * sub-agents, it also lists the target's own lossy paths: the cascade archives the sub-agents
+   * first, so the target's refusal at the sink would come after they were archived. The sink
+   * rechecks each workspace, so a file created after this scan still refuses.
+   */
+  async preflightArchiveCascade(
+    workspaceId: string,
+    worktreeArchiveBehavior: WorktreeArchiveBehavior
+  ): Promise<Result<ArchiveCascadePreflight>> {
+    const descendants = this.listUnarchivedDescendants(workspaceId);
+    if (descendants.length === 0) return Ok({ targetPaths: [], subagents: [] });
+    if (descendants.some((descendant) => descendant.active)) {
+      return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
+    }
+    const subagents: ArchiveCascadePreflight["subagents"] = [];
+    for (const descendant of descendants) {
+      const label = `sub-agent ${descendant.title} (${descendant.workspaceId})`;
+      if (worktreeArchiveBehavior === "delete") {
+        const metadata = await this.aiService.getWorkspaceMetadata(descendant.workspaceId);
+        if (!metadata.success) return Err(`Cannot archive ${label}: ${metadata.error}`);
+        if (archiveDeletesManagedWorktree(metadata.data, worktreeArchiveBehavior)) {
+          return Err(
+            `Worktree archive behavior is set to "Delete checkout", which would irreversibly delete the checkout of ${label} without user confirmation. Ask the user to archive this workspace manually or switch the archive behavior to "Keep" or "Snapshot".`
+          );
+        }
+        continue;
+      }
+      const preflight = await this.preflightArchive(descendant.workspaceId, {
+        worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
+      });
+      if (!preflight.success) return Err(`Cannot archive ${label}: ${preflight.error}`);
+      if (preflight.data.kind === "confirm-lossy-untracked-files") {
+        subagents.push({
+          workspaceId: descendant.workspaceId,
+          title: descendant.title,
+          paths: preflight.data.paths,
+        });
+      }
+    }
+    const target = await this.preflightArchive(workspaceId, {
+      worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
+    });
+    if (!target.success) return Err(target.error);
+    return Ok({
+      targetPaths: target.data.kind === "confirm-lossy-untracked-files" ? target.data.paths : [],
+      subagents,
+    });
+  }
+
   /**
    * #4477: archiving a parent archives its unarchived sub-agents first, deepest-first, with the
    * parent's worktree archive behavior: "keep" archives them without touching their checkouts,
@@ -11032,23 +11399,7 @@ export class WorkspaceService
     acknowledgedUntrackedPaths?: string[],
     options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
-    const config = this.config.loadConfigOrDefault();
-    let listed: WorkspaceRemovalDescendant[];
-    try {
-      listed = this.agentTaskIntegration?.listWorkspaceRemovalDescendants(workspaceId) ?? [];
-    } catch (error) {
-      // Malformed persisted ancestry (a parentWorkspaceId cycle) must not make the workspace
-      // impossible to archive: archive it alone, as before the cascade existed.
-      log.warn("Archiving without sub-agents: their ancestry could not be read", {
-        workspaceId,
-        error: getErrorMessage(error),
-      });
-      listed = [];
-    }
-    const descendants = listed.filter((descendant) => {
-      const row = findWorkspaceEntry(config, descendant.workspaceId)?.workspace;
-      return row != null && !isWorkspaceArchived(row.archivedAt, row.unarchivedAt);
-    });
+    const descendants = this.listUnarchivedDescendants(workspaceId);
     if (descendants.length === 0) {
       return await this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths, options);
     }
@@ -11085,6 +11436,11 @@ export class WorkspaceService
     try {
       for (const descendant of descendants) {
         const result = await this.archiveUnlocked(descendant.workspaceId, undefined, {
+          // A model-facing caller's fail-closed checks apply to every sub-agent (#4930); the
+          // user-facing archive passes none of them.
+          forbidWorktreeCheckoutDeletion: options?.forbidWorktreeCheckoutDeletion,
+          refuseLiveUserActivity: options?.refuseLiveUserActivity,
+          forbidCoderWorkspaceDeletion: options?.forbidCoderWorkspaceDeletion,
           worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
           coderWorkspaceArchiveBehaviorOverride: "keep",
           mutationGateHeld: true,
@@ -11121,14 +11477,15 @@ export class WorkspaceService
    * Internal entry point for task orchestration callers that already hold the task-tree lifecycle
    * lock. The model-facing workspace lifecycle path pre-acquires that lock before its own
    * lifecycle locks to preserve the global lock order (task-tree → task-creation mutex →
-   * workspace lifecycle), so the sink must not re-acquire it.
+   * workspace lifecycle), so the sink must not re-acquire it. It cascades over the workspace's
+   * sub-agents like archive() does (#4930).
    */
   async archiveWhileTaskTreeLocked(
     workspaceId: string,
     acknowledgedUntrackedPaths?: string[],
     options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
-    return await this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths, options);
+    return await this.archiveWithDescendants(workspaceId, acknowledgedUntrackedPaths, options);
   }
 
   /**
@@ -11441,6 +11798,16 @@ export class WorkspaceService
           return Ok(initialArchiveConfirmationResult.data);
         }
       }
+
+      // Project cleanup needs the checkout before runtime hooks stop or delete it.
+      await runProjectLifecycleHook({
+        hook: "archive",
+        workspaceId,
+        workspacePath,
+        metadata: beforeArchiveMetadata,
+        config: this.config,
+        secretsStore: this.secretsStore,
+      });
 
       // Lifecycle hooks run *before* we persist archivedAt.
       //
@@ -12764,11 +13131,19 @@ export class WorkspaceService
       // Fetch all metadata upfront for the branch name, title and explicit-name collision checks.
       // Registry fields suffice: probing checkouts could block on an unrelated stalled mount.
       const allMetadata = await this.config.getAllWorkspaceMetadata({ probeCheckouts: false });
+      // Names this fork cannot take: those in its project, and those of workspaces that keep their
+      // plans in the same plan directory (a same-basename project on the same plan storage, #5139),
+      // whose plan the fork's copy would overwrite. The fork's own runtime is known only after
+      // orchestration; its plan storage is the source's or narrower (a Coder fork onto a new host
+      // shares nothing), so the source's is the stricter test. The registration write re-checks
+      // with the fork's own runtime.
+      const planTarget = { projectName, runtimeConfig: sourceRuntimeConfig };
+      const namesTakenFrom = allMetadata.filter(
+        (m) => m.projectPath === foundProjectPath || sharesPlanDirectory(m, planTarget)
+      );
       let resolvedName: string;
       if (isAutoName) {
-        const existingNamesSet = new Set(
-          allMetadata.filter((m) => m.projectPath === foundProjectPath).map((m) => m.name)
-        );
+        const existingNamesSet = new Set(namesTakenFrom.map((m) => m.name));
         // Also include local branch names to avoid silently reusing stale branches that
         // were left behind on disk but no longer exist in config metadata.
         try {
@@ -12822,12 +13197,20 @@ export class WorkspaceService
         return Err(resolvedNameValidation.error ?? "Invalid workspace name");
       }
       // Plan files live at plans/<projectName>/<name>.md, so a fork reusing the name of a workspace
-      // in this project would overwrite that workspace's plan (#5009). Project-dir forks never
-      // fail on the name by themselves; refuse for every runtime here, before anything is created
-      // or copied. Concurrent forks can both pass this check; the registration write re-checks
-      // the name (#5026).
-      if (allMetadata.some((m) => m.projectPath === foundProjectPath && m.name === resolvedName)) {
-        return Err(new WorkspaceNameTakenError(resolvedName).message);
+      // in this project (#5009), or in a same-basename project on the same plan storage (#5139),
+      // would overwrite that workspace's plan. Project-dir forks never fail on the name by
+      // themselves; refuse for every runtime here, before anything is created or copied.
+      // Concurrent forks can both pass this check; the registration write re-checks the name
+      // (#5026). A workspace being removed stays registered until its plan is deleted, so a fork
+      // cannot copy to that path in between.
+      const nameTakenBy = namesTakenFrom.find((m) => m.name === resolvedName);
+      if (nameTakenBy) {
+        return Err(
+          new WorkspaceNameTakenError(
+            resolvedName,
+            nameTakenBy.projectPath === foundProjectPath ? undefined : nameTakenBy.projectPath
+          ).message
+        );
       }
 
       const sourceWorkspace = this.config.findWorkspace(sourceWorkspaceId);
@@ -13007,6 +13390,10 @@ export class WorkspaceService
             path.join(newSessionDir, fileName)
           );
         }
+        // The composer draft follows the fork like the other session files, minus staged
+        // attachments (they point into the source worktree). Through DraftService so its index
+        // and subscribers see the new draft.
+        await this.draftForkCopier?.copyWorkspaceDraftForFork(sourceWorkspaceId, newWorkspaceId);
 
         if (sourceMessageId) {
           const truncateResult = await this.historyService.truncateAfterMessage(
@@ -13176,13 +13563,7 @@ export class WorkspaceService
         );
       }
 
-      if (sourceRuntimeConfigUpdate) {
-        await this.config.updateWorkspaceMetadata(sourceWorkspaceId, {
-          runtimeConfig: sourceRuntimeConfigUpdate,
-        });
-      }
-
-      if (sourceRuntimeConfigUpdated) {
+      const emitSourceMetadata = async (): Promise<void> => {
         const allMetadataUpdated = await this.config.getAllWorkspaceMetadata();
         const updatedMetadata = allMetadataUpdated.find((m) => m.id === sourceWorkspaceId) ?? null;
         const enrichedMetadata = this.enrichMaybeFrontendMetadata(updatedMetadata);
@@ -13192,7 +13573,44 @@ export class WorkspaceService
         } else {
           this.emit("metadata", { workspaceId: sourceWorkspaceId, metadata: enrichedMetadata });
         }
-      }
+      };
+
+      // The fork's registration also marked its source as sharing the Coder workspace (#5114).
+      // Undo that once the child row is gone, but keep it on any uncertainty: while another row
+      // still uses that Coder workspace (a concurrent fork or task child of the source), or when
+      // the source's config changed since, deleting the source must still keep the workspace.
+      const restoreSourceRuntimeConfig = async (): Promise<void> => {
+        const update = sourceRuntimeConfigUpdate;
+        const coderWorkspaceName = update?.type === "ssh" ? update.coder?.workspaceName : undefined;
+        if (update == null || coderWorkspaceName == null) {
+          return;
+        }
+        // Persisted configs drop undefined fields, so compare JSON forms.
+        const asPersisted = (value: unknown): unknown => JSON.parse(JSON.stringify(value ?? null));
+        let restored = false;
+        await this.config.editConfig((config) => {
+          const rows = [...config.projects.values()].flatMap((p) => p.workspaces);
+          const source = rows.find((w) => w.id === sourceWorkspaceId);
+          const shared = rows.some(
+            (w) =>
+              w.id !== sourceWorkspaceId &&
+              w.runtimeConfig?.type === "ssh" &&
+              w.runtimeConfig.coder?.workspaceName === coderWorkspaceName
+          );
+          if (
+            source != null &&
+            !shared &&
+            isDeepStrictEqual(asPersisted(source.runtimeConfig), asPersisted(update))
+          ) {
+            source.runtimeConfig = sourceRuntimeConfig;
+            restored = true;
+          }
+          return config;
+        });
+        if (restored) {
+          await emitSourceMetadata();
+        }
+      };
 
       // Compute namedWorkspacePath for frontend metadata
       const namedWorkspacePath = targetRuntime.getWorkspacePath(foundProjectPath, resolvedName);
@@ -13238,10 +13656,33 @@ export class WorkspaceService
         initAbortController.abort();
         await initSettled;
         const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(newWorkspaceId);
+        if (rolledBack) {
+          // A failed restore leaves the source keeping the shared Coder workspace on delete, the
+          // safe side, so it is logged rather than reported as a leftover.
+          await restoreSourceRuntimeConfig().catch((error: unknown) => {
+            log.warn("Failed to restore the source runtime config of an aborted fork", {
+              newWorkspaceId,
+              sourceWorkspaceId,
+              error: getErrorMessage(error),
+            });
+          });
+        }
         const leftovers: string[] = [];
-        if (rolledBack && isWorktreeRuntime(forkedRuntimeConfig)) {
-          // Matches the copy-failure cleanup above: the fork's checkout
-          // is known fresh, so force-delete is safe here.
+        // These forks made their own checkout before registering: a new worktree (worktree,
+        // devcontainer), a remote worktree at a path the fork checked was free (SSH; Coder forks
+        // share the source's Coder workspace in existing mode, so the delete leaves that workspace
+        // alone), or a new container (Docker: its fork refuses a container name in use, #5117).
+        // Init was aborted and awaited above, so this is the same full delete as the copy-failure
+        // cleanup. For a devcontainer it also removes the container the fork's init may have
+        // started, which holds the fork's plan copy (#4775).
+        if (
+          rolledBack &&
+          (isWorktreeRuntime(forkedRuntimeConfig) ||
+            isDevcontainerRuntime(forkedRuntimeConfig) ||
+            isSSHRuntime(forkedRuntimeConfig) ||
+            isDockerRuntime(forkedRuntimeConfig))
+        ) {
+          // The fork's checkout is known fresh, so force-delete is safe here.
           const deleteResult = await targetRuntime
             .deleteWorkspace(
               foundProjectPath,
@@ -13272,13 +13713,15 @@ export class WorkspaceService
         }
         // A later workspace with this name would inherit the copy. Only once the entry is gone,
         // like the checkout: while it persists, the workspace still references its plan. Not for
-        // devcontainers: the copy is inside the container, and deletePlanFiles would remove the
-        // host file at the same path instead, which is not this fork's (#4775 keeps devcontainer
-        // fork rollback open).
+        // devcontainers or Docker: the copy is inside the container, which the delete above
+        // removed. For a devcontainer, deletePlanFiles would remove the host file at the same path
+        // instead, which is not this fork's; for Docker it would exec into the removed container
+        // and fail (#5117). A failed delete is already reported through the container it left.
         if (
           rolledBack &&
           copiedPlanPath !== undefined &&
-          !isDevcontainerRuntime(forkedRuntimeConfig)
+          !isDevcontainerRuntime(forkedRuntimeConfig) &&
+          !isDockerRuntime(forkedRuntimeConfig)
         ) {
           const planDeleted = await this.deletePlanFiles(
             targetRuntime,
@@ -13330,6 +13773,16 @@ export class WorkspaceService
             unrelatedWorkspaceConsentPending: true,
             // A concurrent fork may have registered this name since the early check (#5026).
             refuseTakenName: true,
+            // In the same write, so a failed registration never leaves the source marked and a
+            // failed mark never leaves an unregistered checkout (#5114).
+            ...(sourceRuntimeConfigUpdate
+              ? {
+                  sourceRuntimeConfigUpdate: {
+                    workspaceId: sourceWorkspaceId,
+                    runtimeConfig: sourceRuntimeConfigUpdate,
+                  },
+                }
+              : {}),
           })
           .catch(async (error: unknown) => {
             if (error instanceof WorkspaceNameTakenError) {
@@ -13354,6 +13807,10 @@ export class WorkspaceService
             new Set(["init"])
           );
         rollBackForkRegistration = abortForkRegistrationUnlessInUse;
+        // After the rollback is armed: a throwing metadata listener must still undo the fork.
+        if (sourceRuntimeConfigUpdated) {
+          await emitSourceMetadata();
+        }
         if (forkIsHostLocalCheckout) {
           const sanitizeError = await this.sanitizeStalePluginOverridesForNewWorkspace(
             newWorkspaceId,
@@ -14932,7 +15389,12 @@ export class WorkspaceService
           return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
         }
         const taskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
-        if (taskStatus === "interrupted") {
+        // Reactivation preserves the interrupted base status while a new continuation runs.
+        // Accept guidance for that live execution; the stop and attempt fences still apply.
+        if (
+          taskStatus === "interrupted" &&
+          !this.agentTaskIntegration?.hasLiveAgentTaskContinuation(workspaceId)
+        ) {
           return Err({
             type: "unknown",
             raw: "Interrupted task is still winding down. Wait until it is idle, then try again.",
@@ -16130,11 +16592,14 @@ export class WorkspaceService
    */
   async sendHeldInput(
     workspaceId: string,
-    heldInputId: string
+    heldInputId: string,
+    acpCorrelation?: AcpPromptCorrelation
   ): Promise<Result<void, SendMessageError>> {
     assert(heldInputId.length > 0, "sendHeldInput requires a heldInputId");
     const session = this.sessions.get(workspaceId.trim());
-    const claim = session?.claimHeldInputSend(heldInputId) ?? { kind: "missing" as const };
+    const claim = session?.claimHeldInputSend(heldInputId, acpCorrelation) ?? {
+      kind: "missing" as const,
+    };
     if (claim.kind === "missing") {
       return Err({ type: "unknown", raw: "This unsent message is no longer held." });
     }
@@ -16489,8 +16954,8 @@ export class WorkspaceService
   }
 
   /**
-   * Delete a plan file and its legacy path where `runtime` stores them: over exec for SSH and
-   * Docker, on the local filesystem otherwise. Missing files are fine; any other failure is
+   * Delete a plan file and its legacy path where `runtime` stores them: over exec for SSH, Docker
+   * and devcontainers, on the local filesystem otherwise. Missing files are fine; any other failure is
    * returned.
    */
   private async deletePlanFiles(
@@ -16499,7 +16964,13 @@ export class WorkspaceService
     planPath: string,
     legacyPlanPath: string
   ): Promise<Result<void, PlanFileDeletionError>> {
-    if (isDockerRuntime(runtimeConfig) || isSSHRuntime(runtimeConfig)) {
+    // A devcontainer's plan is inside its container: the same path on the host is not this
+    // workspace's (#4775, #5043).
+    if (
+      isDockerRuntime(runtimeConfig) ||
+      isDevcontainerRuntime(runtimeConfig) ||
+      isSSHRuntime(runtimeConfig)
+    ) {
       // Plan paths are absolute or home-relative, never relative to the cwd below.
       for (const remotePath of [planPath, legacyPlanPath]) {
         assert(
@@ -16528,11 +16999,13 @@ export class WorkspaceService
       }
       if (result.exitCode === 0) return Ok(undefined);
       // Fail closed either way (see PLAN_FILE_DELETE_UNREACHABLE_MESSAGE). ssh itself exits 255
-      // when it cannot connect; rm never does.
+      // when it cannot connect; rm never does. A container runtime's CLI exits nonzero for a
+      // stopped or missing container ("Dev container not found"), which its classifier knows.
       if (
         result.exitCode === EXIT_CODE_TIMEOUT ||
         result.exitCode === EXIT_CODE_ABORTED ||
-        (isSSHRuntime(runtimeConfig) && result.exitCode === 255)
+        (isSSHRuntime(runtimeConfig) && result.exitCode === 255) ||
+        runtime.isTransportFailureExit?.(result.exitCode, result.stderr) === true
       ) {
         return Err({
           type: "runtime_unreachable",
@@ -18454,7 +18927,8 @@ export class WorkspaceService
 
   async getHistoryLoadMore(
     workspaceId: string,
-    cursor: WorkspaceHistoryLoadMoreCursor | null | undefined
+    cursor: WorkspaceHistoryLoadMoreCursor | null | undefined,
+    options?: { windowed?: boolean }
   ): Promise<WorkspaceHistoryLoadMoreResult> {
     assert(
       typeof workspaceId === "string" && workspaceId.trim().length > 0,
@@ -18517,6 +18991,44 @@ export class WorkspaceService
         isNonNegativeInteger(beforeHistorySequence),
         "resolved beforeHistorySequence must be a non-negative integer"
       );
+
+      // A windowed client (#4961) pages inside the active epoch: a bounded page right before its
+      // oldest row (contract at readProviderHistoryPage). "before-epoch" continues below with
+      // today's older-epoch pages; "not-pageable" tells the client to do a full replay.
+      if (options?.windowed === true && cursor) {
+        const pageResult = await this.historyService.getHistoryPageFromLatestBoundary(
+          workspaceId,
+          { maxRows: HISTORY_PAGE_MAX_ROWS, maxBytes: HISTORY_PAGE_MAX_BYTES },
+          beforeHistorySequence
+        );
+        if (!pageResult.success) {
+          throw new Error(`workspace.history.loadMore: ${pageResult.error}`);
+        }
+        const page = pageResult.data;
+        if (page.kind === "not-pageable") return { ...emptyResult, notPageable: true };
+        if (page.kind === "page") {
+          // A partial page begins at a sequenced clean turn start and the next page ends right
+          // before it; at the epoch start, the next request pages older epochs as today.
+          const next = getOldestSequencedMessage(
+            page.reachedEpochStart ? page.messages : page.messages.slice(0, 1)
+          );
+          const hasOlder =
+            next !== null &&
+            (!page.reachedEpochStart ||
+              (await this.historyService.hasHistoryBeforeSequence(
+                workspaceId,
+                next.historySequence
+              )));
+          return {
+            messages: page.messages.map((message) => ({ ...message, type: "message" })),
+            nextCursor: next && {
+              beforeHistorySequence: next.historySequence,
+              beforeMessageId: next.message.id,
+            },
+            hasOlder,
+          };
+        }
+      }
 
       const historyWindowResult = await this.historyService.getHistoryBoundaryWindow(
         workspaceId,

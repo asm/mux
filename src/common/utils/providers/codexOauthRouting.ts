@@ -9,7 +9,7 @@
  * where requests actually route.
  */
 
-import { isCodexOauthAllowedModel, isCodexOauthRequiredModel } from "@/common/constants/codexOAuth";
+import { isCodexOauthAllowedModel } from "@/common/constants/codexOAuth";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { OpenAIWireFormat } from "@/common/types/providerOptions";
@@ -71,22 +71,13 @@ export function hasOpenAIApiKey(config: unknown): boolean {
 }
 
 /**
- * Would a direct-OpenAI request for this model route through Codex OAuth?
- *
- * Mirrors providerModelFactory: allowed model + stored OAuth tokens, then
- * Chat Completions with an API key never routes OAuth, required models always
- * route OAuth; otherwise OAuth wins when no API key is configured or when
- * `codexOauthDefaultAuth` prefers OAuth over a present key.
- */
-/**
  * Can a DIRECT OpenAI route serve this model with the credentials on hand?
  *
  * `isConfigured` alone over-reports: a Codex-OAuth-only config serves only the
  * OAuth-allowed model set. Mirrors providerModelFactory's credential outcome —
- * an API key always attempts (OAuth-required models fall back to the key and
- * let the API decide), while stored tokens without a key serve only allowed
- * models — so availability checks can't claim a direct route the factory
- * would reject with api_key_not_found.
+ * an API key always attempts, while stored tokens without a key serve only
+ * allowed models — so availability checks can't claim a direct route the
+ * factory would reject with api_key_not_found.
  */
 export function canDirectOpenAIServeModel(
   model: string,
@@ -119,6 +110,14 @@ export function canDirectOpenAIServeModel(
   );
 }
 
+/**
+ * Would a direct-OpenAI request for this model route through Codex OAuth?
+ *
+ * Mirrors providerModelFactory: allowed model + stored OAuth tokens, then
+ * Chat Completions with an API key never routes OAuth; otherwise OAuth wins
+ * when no API key is configured or when
+ * `codexOauthDefaultAuth` prefers OAuth over a present key.
+ */
 export function wouldRouteOpenAIThroughCodexOauth(
   model: string,
   providersConfig: ProvidersConfigMap | null | undefined,
@@ -136,9 +135,6 @@ export function wouldRouteOpenAIThroughCodexOauth(
   const wireFormat = asRecord(openAIConfig)?.wireFormat ?? options?.openaiWireFormat;
   if (wireFormat === "chatCompletions" && hasOpenAIApiKey(openAIConfig)) {
     return false;
-  }
-  if (isCodexOauthRequiredModel(model, providersConfig ?? null)) {
-    return true;
   }
   if (!hasOpenAIApiKey(openAIConfig)) {
     return true;

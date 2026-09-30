@@ -1,7 +1,10 @@
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { beforeEach, afterEach, describe, expect, mock, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
+import { QuotaLimitedStorage } from "../../../tests/ui/quotaLimitedStorage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { WorkspaceContext } from "./WorkspaceContext";
 import { WorkspaceProvider, useWorkspaceContext } from "./WorkspaceContext";
 import { ProjectProvider, useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -15,7 +18,7 @@ import {
   LAUNCH_BEHAVIOR_KEY,
   SELECTED_WORKSPACE_KEY,
   getAgentIdKey,
-  getInputKey,
+  getDraftScopeId,
   getModelKey,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
@@ -37,8 +40,17 @@ import {
 } from "@/browser/utils/aiSelectionIntent";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { resetWorkspaceStorageGcForTests } from "@/browser/utils/workspaceStorageGc";
+import { resetCreationDraftStorageGcForTests } from "@/browser/utils/creationDraftStorageGc";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import * as path from "path";
+// eslint-disable-next-line local/no-cross-boundary-imports -- test-only: drafts run against the real backend service
+import { Config } from "@/node/config";
+// eslint-disable-next-line local/no-cross-boundary-imports -- test-only: drafts run against the real backend service
+import { DraftService } from "@/node/services/draftService";
+// eslint-disable-next-line local/no-cross-boundary-imports -- test-only: drafts run against the real backend service
+import { TestTempDir } from "@/node/services/tools/testHelpers";
+import type { DraftEvent, DraftScope } from "@/common/orpc/schemas/drafts";
 
 let currentClientMock: TestApiOverrides<APIClient> = {};
 
@@ -72,6 +84,7 @@ const createProjectWorkspaceMetadata = (
 type NavigationType = "navigate" | "reload" | "back_forward" | "prerender";
 
 describe("WorkspaceContext", () => {
+  beforeEach(saveDomGlobals);
   afterEach(() => {
     cleanup();
     mock.restore();
@@ -79,9 +92,7 @@ describe("WorkspaceContext", () => {
     // Reset global workspace store to avoid cross-test leakage
     getWorkspaceStoreRaw().dispose();
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
 
     currentClientMock = {};
   });
@@ -2039,6 +2050,185 @@ describe("WorkspaceContext", () => {
     });
   });
 
+  test("collects the settings keys of creation drafts the backend no longer lists (#5053)", async () => {
+    using tempDir = new TestTempDir("ws-context-draft-storage-gc");
+    const config = new Config(path.join(tempDir.path, "xum-home"));
+    const projectPath = path.join(tempDir.path, "project");
+    await config.editConfig((current) => {
+      current.projects.set(projectPath, { workspaces: [] });
+      return current;
+    });
+    const service = new DraftService(config);
+    await service.putListEntry({
+      projectPath,
+      draftId: "listed",
+      subProjectPath: null,
+      createdAt: 1,
+    });
+    const listedKey = getModelKey(getDraftScopeId(projectPath, "listed"));
+    // Deleted in another window: only its settings are left in this origin.
+    const orphanKey = getModelKey(getDraftScopeId(projectPath, "deleted-elsewhere"));
+    resetCreationDraftStorageGcForTests();
+    createMockAPI({
+      projects: {
+        list: () =>
+          Promise.resolve([[projectPath, { workspaces: [] }]] as Awaited<
+            ReturnType<APIClient["projects"]["list"]>
+          >),
+      },
+      localStorage: { [listedKey]: JSON.stringify("m"), [orphanKey]: JSON.stringify("m") },
+      locationPath: "/settings",
+    });
+    currentClientMock.drafts = createDraftServiceClient(service);
+    getDraftStore().setClient(createTestApiClient(currentClientMock));
+    try {
+      await setup();
+      await waitFor(() => expect(localStorage.getItem(orphanKey)).toBeNull());
+      expect(localStorage.getItem(listedKey)).not.toBeNull();
+    } finally {
+      getDraftStore().forgetProject(projectPath);
+      getDraftStore().setClient(null);
+    }
+  });
+
+  test("never collects the settings of the draft a cold start routes to (#5053)", async () => {
+    using tempDir = new TestTempDir("ws-context-draft-storage-gc-route");
+    const config = new Config(path.join(tempDir.path, "xum-home"));
+    const projectPath = path.join(tempDir.path, "project");
+    await config.editConfig((current) => {
+      current.projects.set(projectPath, { workspaces: [] });
+      return current;
+    });
+    // Routed but unlisted (e.g. its list write never landed).
+    const routedKey = getModelKey(getDraftScopeId(projectPath, "routed"));
+    resetCreationDraftStorageGcForTests();
+    createMockAPI({
+      projects: {
+        list: () =>
+          Promise.resolve([[projectPath, { workspaces: [] }]] as Awaited<
+            ReturnType<APIClient["projects"]["list"]>
+          >),
+      },
+      localStorage: { [routedKey]: JSON.stringify("m") },
+      locationPath: `/project?project=${encodeURIComponent(getProjectRouteId(projectPath))}&draft=routed`,
+    });
+    const service = new DraftService(config);
+    currentClientMock.drafts = createDraftServiceClient(service);
+    const getList = mock(() => service.getList({ strict: true }));
+    currentClientMock.drafts.getList = getList;
+    getDraftStore().setClient(createTestApiClient(currentClientMock));
+    try {
+      await setup();
+      await waitFor(() => expect(getList).toHaveBeenCalled());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(localStorage.getItem(routedKey)).not.toBeNull();
+    } finally {
+      getDraftStore().forgetProject(projectPath);
+      getDraftStore().setClient(null);
+    }
+  });
+
+  test.each([
+    { name: "project", linkedPath: "/alpha", subProjectPath: null },
+    { name: "sub-project", linkedPath: "/alpha/sub", subProjectPath: "/alpha/sub" },
+  ])(
+    "a new_chat deep link lists its draft even when localStorage is full ($name)",
+    async ({ linkedPath, subProjectPath }) => {
+      const projectPath = "/alpha";
+      createMockAPI({
+        projects: {
+          list: () =>
+            Promise.resolve([
+              [projectPath, { workspaces: [] }],
+              ["/alpha/sub", { workspaces: [], parentProjectPath: projectPath }],
+            ]),
+        },
+        pendingDeepLinks: [{ type: "new_chat", projectPath: linkedPath, prompt: "from the link" }],
+        // An explicit route, so only the deep link navigates.
+        locationPath: "/settings",
+      });
+      // A full origin: the draft list no longer depends on localStorage (#5225).
+      Object.defineProperty(window, "localStorage", {
+        configurable: true,
+        value: new QuotaLimitedStorage(0),
+      });
+      try {
+        const ctx = await setup();
+
+        await waitFor(() => expect(ctx().workspaceDraftsByProject[projectPath]).toHaveLength(1));
+        const [draft] = ctx().workspaceDraftsByProject[projectPath];
+        expect(draft.subProjectPath).toBe(subProjectPath);
+        expect(ctx().pendingNewWorkspaceDraftId).toBe(draft.draftId);
+        expect(
+          getDraftStore().getText({ kind: "creation", projectPath, draftId: draft.draftId })
+        ).toBe("from the link");
+      } finally {
+        getDraftStore().forgetProject(projectPath);
+      }
+    }
+  );
+
+  test("keeps every creation draft listed across a restart when the list outgrows 32 KiB (#5225)", async () => {
+    using tempDir = new TestTempDir("ws-context-draft-list");
+    const config = new Config(path.join(tempDir.path, "xum-home"));
+    const projectPath = path.join(tempDir.path, "project");
+    // A long sub-project path makes each list entry large (#5225).
+    const subProjectPath = path.join(projectPath, "packages", "x".repeat(300));
+    await config.editConfig((current) => {
+      current.projects.set(projectPath, { workspaces: [] });
+      return current;
+    });
+    const projectList = () =>
+      Promise.resolve([
+        [projectPath, { workspaces: [] }],
+        [subProjectPath, { workspaces: [], parentProjectPath: projectPath }],
+      ] as Awaited<ReturnType<APIClient["projects"]["list"]>>);
+    const connect = () => {
+      currentClientMock.drafts = createDraftServiceClient(new DraftService(config));
+      getDraftStore().setClient(createTestApiClient(currentClientMock));
+    };
+    const count = 120;
+    createMockAPI({ projects: { list: projectList }, locationPath: "/settings" });
+    connect();
+    try {
+      const ctx = await setup();
+      await waitFor(() => expect(getDraftStore().isReady()).toBe(true));
+      const draftIds = new Set<string>();
+      for (let i = 0; i < count; i++) {
+        act(() => ctx().createWorkspaceDraft(projectPath, subProjectPath));
+        const draftId = ctx().pendingNewWorkspaceDraftId;
+        expect(draftId === null || draftIds.has(draftId)).toBe(false);
+        draftIds.add(draftId!);
+        // Non-empty, so the next create does not reuse it.
+        const scope: DraftScope = { kind: "creation", projectPath, draftId: draftId! };
+        getDraftStore().setText(scope, `draft ${i}`);
+        await getDraftStore().flush(scope);
+      }
+      await waitFor(() => expect(ctx().workspaceDraftsByProject[projectPath]).toHaveLength(count));
+
+      // Restart: a new window with what reached disk, a new backend process, a remount.
+      const persisted: Record<string, string> = {};
+      for (let index = 0; index < window.localStorage.length; index++) {
+        const key = window.localStorage.key(index)!;
+        persisted[key] = window.localStorage.getItem(key)!;
+      }
+      cleanup();
+      createMockAPI({ projects: { list: projectList }, localStorage: persisted });
+      connect();
+      const restarted = await setup();
+      await waitFor(
+        () =>
+          expect(
+            new Set(restarted().workspaceDraftsByProject[projectPath]?.map((d) => d.draftId))
+          ).toEqual(draftIds),
+        { timeout: 5_000 }
+      );
+    } finally {
+      getDraftStore().forgetProject(projectPath);
+      getDraftStore().setClient(null);
+    }
+  }, 30_000);
+
   describe("reorderPinnedWorkspaces", () => {
     // Three pinned chats in one project; pinnedAt ascending = a, b, c.
     const T1 = "2026-01-01T00:00:00.000Z";
@@ -2142,16 +2332,17 @@ describe("WorkspaceContext", () => {
           list: () => Promise.resolve([createProjectWorkspaceMetadata(ACTIVE_ID, "/alpha")]),
           listKnownIdsForStorageGc: () => Promise.resolve({ workspaceIds: [ACTIVE_ID] }),
         },
+        // Drafts live on the backend now; any registered workspace-scoped key shows the GC.
         localStorage: {
-          [getInputKey(ACTIVE_ID)]: JSON.stringify("live draft"),
-          [getInputKey(ORPHAN_ID)]: JSON.stringify("orphan draft"),
+          [getModelKey(ACTIVE_ID)]: JSON.stringify("live model"),
+          [getModelKey(ORPHAN_ID)]: JSON.stringify("orphan model"),
         },
       });
 
       await setup();
 
-      await waitFor(() => expect(localStorage.getItem(getInputKey(ORPHAN_ID))).toBeNull());
-      expect(localStorage.getItem(getInputKey(ACTIVE_ID))).not.toBeNull();
+      await waitFor(() => expect(localStorage.getItem(getModelKey(ORPHAN_ID))).toBeNull());
+      expect(localStorage.getItem(getModelKey(ACTIVE_ID))).not.toBeNull();
     });
 
     test("never runs after a failed startup load, even when a later refresh succeeds", async () => {
@@ -2165,7 +2356,7 @@ describe("WorkspaceContext", () => {
               : Promise.resolve([createProjectWorkspaceMetadata(ACTIVE_ID, "/alpha")]),
           listKnownIdsForStorageGc: () => Promise.resolve({ workspaceIds: [ACTIVE_ID] }),
         },
-        localStorage: { [getInputKey(ORPHAN_ID)]: JSON.stringify("draft") },
+        localStorage: { [getModelKey(ORPHAN_ID)]: JSON.stringify("draft") },
       });
 
       const ctx = await setup();
@@ -2175,10 +2366,51 @@ describe("WorkspaceContext", () => {
       await waitFor(() => expect(ctx().workspaceMetadata.has(ACTIVE_ID)).toBe(true));
 
       expect(workspaceApi.listKnownIdsForStorageGc).not.toHaveBeenCalled();
-      expect(localStorage.getItem(getInputKey(ORPHAN_ID))).not.toBeNull();
+      expect(localStorage.getItem(getModelKey(ORPHAN_ID))).not.toBeNull();
     });
   });
 });
+
+/** A drafts API backed by a real DraftService (real files), passing every call through. */
+function createDraftServiceClient(service: DraftService): TestApiOverrides<APIClient["drafts"]> {
+  return {
+    list: () => service.list(),
+    get: ({ scope }) => service.get(scope),
+    update: (input) => service.update(input),
+    delete: ({ scope }) => service.delete(scope),
+    importLegacy: (input) => service.importLegacy(input),
+    getList: () => service.getList({ strict: true }),
+    putListEntry: (input) => service.putListEntry(input),
+    importLegacyList: ({ entries }) => service.importLegacyList(entries),
+    subscribe: async (_input, opts) => {
+      const queue: DraftEvent[] = [];
+      let wake: (() => void) | null = null;
+      const listener = (event: DraftEvent) => {
+        queue.push(event);
+        wake?.();
+      };
+      service.on(DraftService.CHANGE_EVENT, listener);
+      queue.unshift(await service.getSnapshotEvent());
+      return (async function* () {
+        try {
+          while (!opts?.signal?.aborted) {
+            const next = queue.shift();
+            if (next) {
+              yield next;
+              continue;
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+              opts?.signal?.addEventListener("abort", () => resolve(), { once: true });
+            });
+          }
+        } finally {
+          service.off(DraftService.CHANGE_EVENT, listener);
+        }
+      })();
+    },
+  };
+}
 
 async function setup() {
   const contexts = await setupWithProjectContext();

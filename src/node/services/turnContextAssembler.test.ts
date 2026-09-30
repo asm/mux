@@ -22,10 +22,12 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createTestHistoryService } from "./testHistoryService";
+import { createContextBudgetWarning } from "./contextWindowRollover";
 import { extractToolInstructionsFromSources } from "./systemMessage";
 
 import {
   assemblePromptPayload,
+  measureVolatileSystemSuffix,
   buildPlanInstructions,
   buildStreamSystemContext,
   prepareProviderRequestMessages,
@@ -468,7 +470,7 @@ describe("assemblePromptPayload", () => {
     },
     {
       name: "uses an explicit system breakpoint for eligible OpenAI requests",
-      modelString: "openai:gpt-5.6-luna",
+      modelString: "openai:gpt-6-luna",
       providerForMessages: "openai",
       routeProvider: "openai",
       providersConfig: { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } },
@@ -502,6 +504,52 @@ describe("assemblePromptPayload", () => {
       }
     });
   }
+
+  test("puts a volatile system tail after each provider's cached stable block", async () => {
+    const stable = "stable instructions";
+    const withTail = (tail: string) => ({
+      systemMessage: stable + tail,
+      volatileSystemSuffixLength: tail.length,
+    });
+    const openai = {
+      modelString: "openai:gpt-6-luna",
+      providerForMessages: "openai",
+      routeProvider: "openai",
+      providersConfig: { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } },
+    };
+    const tails = ["\n\n[Warning: a]", "\n\n<hot_memories>b</hot_memories>"];
+
+    // The stable (cached) block is byte-identical whatever the tail says,
+    // and the tail block is delivered uncached right after it.
+    for (const tail of tails) {
+      const anthropic = await assemble({
+        modelString: "anthropic:claude-sonnet-4-5",
+        providerForMessages: "anthropic",
+        ...withTail(tail),
+      });
+      expect(anthropic.messages.slice(0, 2)).toEqual([
+        {
+          role: "system",
+          content: stable,
+          providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+        },
+        { role: "system", content: tail },
+      ]);
+
+      const structured = await assemble({ ...openai, ...withTail(tail) });
+      expect(structured.system).toEqual([
+        {
+          role: "system",
+          content: stable,
+          providerOptions: { openai: { promptCacheBreakpoint: { mode: "explicit" } } },
+        },
+        { role: "system", content: tail },
+      ]);
+
+      // No explicit breakpoints: one string, volatile text last.
+      expect((await assemble(withTail(tail))).system).toBe(stable + tail);
+    }
+  });
 
   test("injects an interrupted sentinel only when a partial assistant remains terminal", async () => {
     const partial = createMuxMessage("partial", "assistant", "working", { partial: true });
@@ -542,6 +590,79 @@ describe("assemblePromptPayload", () => {
 
     expect(payload.messages.map((message) => message.role)).toEqual(["assistant", "user"]);
     expect(JSON.stringify(payload.messages[1])).toContain("approved plan body");
+  });
+
+  test("token budget tags persisted user rows with their session_history item ID", async () => {
+    const request = createMuxMessage("request", "user", "fix the bug", { historySequence: 7 });
+    const reply = createMuxMessage("reply", "assistant", "on it", { historySequence: 8 });
+    const advisory = createContextBudgetWarning({
+      contextTokens: 80_000,
+      maxTokens: 128_000,
+      budgetTokens: 96_000,
+      sessionHistoryAvailable: true,
+      handoff: true,
+    });
+    advisory.metadata!.historySequence = 9;
+    const unsequenced = createMuxMessage("pending", "user", "follow-up");
+    const history = [request, reply, advisory, unsequenced];
+    const text = (payload: Awaited<ReturnType<typeof assemble>>) =>
+      JSON.stringify(payload.messages);
+
+    const tagged = text(await assemble({ history, tagHistoryItemIds: true }));
+    expect(tagged).toContain("[id: 7]");
+    expect(tagged).not.toContain("[id: 8]");
+    // Budget-internal rows and rows without a persisted sequence cannot be read back.
+    expect(tagged).not.toContain("[id: 9]");
+    expect(tagged).not.toContain("[id: m:");
+    expect(text(await assemble({ history }))).not.toContain("[id:");
+
+    // A tag depends only on its own row, so appending history keeps the cached prefix intact.
+    const shortPayload = await assemble({ history: [request, reply], tagHistoryItemIds: true });
+    const longPayload = await assemble({
+      history: [request, reply, createMuxMessage("next", "user", "next", { historySequence: 10 })],
+      tagHistoryItemIds: true,
+    });
+    expect(JSON.stringify(longPayload.messages.slice(0, shortPayload.messages.length))).toBe(
+      JSON.stringify(shortPayload.messages)
+    );
+  });
+
+  test("token budget tags survive user-row merging but skip rows session_history hides", async () => {
+    const snapshot = createMuxMessage("snapshot", "user", "file snapshot", {
+      historySequence: 11,
+      synthetic: true,
+    });
+    const request = createMuxMessage("request", "user", "fix the bug", { historySequence: 12 });
+    const payload = await assemble({ history: [snapshot, request], tagHistoryItemIds: true });
+    expect(JSON.stringify(payload.messages)).not.toContain("[id: 11]");
+    expect(JSON.stringify(payload.messages)).toContain("[id: 12]");
+  });
+});
+
+describe("measureVolatileSystemSuffix", () => {
+  const hot = "\n\n<hot_memories>h</hot_memories>";
+  const warning = "\n\n[Warning: w]";
+  const windowIds = "\n\n<context_window>c</context_window>";
+
+  test("covers the trailing run of known sections, skipping absent ones", () => {
+    expect(
+      measureVolatileSystemSuffix("base" + hot + warning + windowIds, [hot, warning, windowIds])
+    ).toBe((hot + warning + windowIds).length);
+    expect(measureVolatileSystemSuffix("base" + hot + windowIds, [hot, undefined, windowIds])).toBe(
+      (hot + windowIds).length
+    );
+    expect(measureVolatileSystemSuffix("base", [undefined, null, undefined])).toBe(0);
+  });
+
+  test("keeps sections that middleware moved or stripped in the stable part", () => {
+    // Middleware appended text after the warning: nothing trails any more.
+    expect(measureVolatileSystemSuffix("base" + hot + warning + " extra", [hot, warning])).toBe(0);
+    // The hot block was stripped (its separator stays): only the warning trails.
+    expect(measureVolatileSystemSuffix("base\n\n" + warning, [hot, warning])).toBe(warning.length);
+  });
+
+  test("never leaves an empty stable part", () => {
+    expect(measureVolatileSystemSuffix(hot + warning, [hot, warning])).toBe(0);
   });
 });
 
@@ -976,48 +1097,47 @@ describe("buildStreamSystemContext", () => {
     // not steer the agent toward a tool the toolset does not have.
     const withoutMemory = await buildSystemContextForTest(buildArgs);
     expect(withoutMemory.systemMessage).not.toContain("<memory-tool-guidance>");
-    const notesBlock = "<hot_memories>preloaded notebook evidence</hot_memories>";
-    const writableNotes = await buildSystemContextForTest({
+    const hotBlock = "<hot_memories>preloaded evidence</hot_memories>";
+    const writable = await buildSystemContextForTest({
       ...buildArgs,
       memoryToolAvailable: true,
       tokenBudgetEnabled: true,
       workspaceMemoryWritable: true,
-      hotMemoriesBlock: notesBlock,
+      hotMemoriesBlock: hotBlock,
     });
-    const readOnlyNotes = await buildSystemContextForTest({
+    const readOnly = await buildSystemContextForTest({
       ...buildArgs,
       memoryToolAvailable: true,
       tokenBudgetEnabled: true,
       workspaceMemoryWritable: false,
-      hotMemoriesBlock: notesBlock,
+      hotMemoriesBlock: hotBlock,
     });
-    const notesSection = (text: string) =>
-      text.split("<context-notes-guidance>")[1]?.split("</context-notes-guidance>")[0];
-    expect(notesSection(writableNotes.systemMessage)).toBeDefined();
-    expect(notesSection(readOnlyNotes.systemMessage)).toBeDefined();
-    expect(notesSection(readOnlyNotes.systemMessage)).not.toBe(
-      notesSection(writableNotes.systemMessage)
-    );
-    expect(memorySection(readOnlyNotes.systemMessage)).not.toEqual(
-      memorySection(writableNotes.systemMessage)
-    );
-    expect(readOnlyNotes.systemMessage).toContain(notesBlock);
-    expect(writableNotes.systemMessage).toContain(notesBlock);
-    expect(notesSection(withMemory.systemMessage)).toBeUndefined();
-    const deniedNotes = await buildSystemContextForTest({
+    const noMemory = await buildSystemContextForTest({
       ...buildArgs,
       memoryToolAvailable: false,
       tokenBudgetEnabled: true,
       workspaceMemoryWritable: true,
-      hotMemoriesBlock: notesBlock,
+      hotMemoriesBlock: hotBlock,
     });
-    expect(notesSection(deniedNotes.systemMessage)).toBeUndefined();
-    expect(deniedNotes.systemMessage).not.toContain(notesBlock);
-    for (const systemMessage of [readOnlyNotes.systemMessage, writableNotes.systemMessage]) {
-      const filtered = removeIntuitionGuidance(systemMessage + pluginContext, false, notesBlock);
-      expect(filtered).not.toContain(notesBlock);
-      expect(notesSection(filtered)).toBeUndefined();
+    const guidanceSection = (text: string) =>
+      text.split("<context-window-guidance>")[1]?.split("</context-window-guidance>")[0];
+    const guidance = guidanceSection(writable.systemMessage);
+    expect(guidance).toBeDefined();
+    // Every agent may write its session checkpoint, so read-only agents get the same guidance.
+    expect(guidanceSection(readOnly.systemMessage)).toBe(guidance);
+    // The checkpoint lives in memory, so the guidance leaves with the memory tool.
+    expect(guidanceSection(noMemory.systemMessage)).toBeUndefined();
+    expect(guidanceSection(withMemory.systemMessage)).toBeUndefined();
+    expect(memorySection(readOnly.systemMessage)).not.toEqual(
+      memorySection(writable.systemMessage)
+    );
+    expect(writable.systemMessage).toContain(hotBlock);
+    expect(noMemory.systemMessage).not.toContain(hotBlock);
+    for (const systemMessage of [readOnly.systemMessage, writable.systemMessage]) {
+      const filtered = removeIntuitionGuidance(systemMessage + pluginContext, false, hotBlock);
+      expect(filtered).not.toContain(hotBlock);
       expect(filtered).not.toContain("<memory-tool-guidance>");
+      expect(guidanceSection(filtered)).toBeUndefined();
       expect(filtered).toContain(pluginContext);
     }
   });

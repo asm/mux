@@ -37,6 +37,7 @@ import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { isExperimentEnabled } from "@/browser/hooks/useExperiments";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { Toast } from "@/browser/features/ChatInput/ChatInputToast";
 import {
   formatCompactionCommandLine,
@@ -65,7 +66,9 @@ import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/a
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import type { ChatAttachment } from "../features/ChatInput/ChatAttachments";
 import { dispatchWorkspaceSwitch } from "./workspaceEvents";
-import { getRuntimeKey, copyWorkspaceStorage } from "@/common/constants/storage";
+import { getRuntimeKey } from "@/common/constants/storage";
+import { copyWorkspaceStorage } from "@/browser/utils/workspaceStorage";
+import { readPersistedRawString } from "@/browser/hooks/usePersistedState";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
@@ -127,6 +130,12 @@ export interface ForkResult {
  */
 export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
   const { client } = options;
+  // The backend copies the source's draft file into the fork: save the latest (debounced) edit
+  // first. A failed save does not block the fork, which then copies the last saved draft; the
+  // source keeps the change and retries it.
+  await getDraftStore()
+    .flush({ kind: "workspace", workspaceId: options.sourceWorkspaceId })
+    .catch((error: unknown) => console.warn("Failed to save the draft before forking:", error));
   const result = await client.workspace.fork({
     sourceWorkspaceId: options.sourceWorkspaceId,
     newName: options.newName,
@@ -1403,7 +1412,7 @@ export async function createNewWorkspace(
   let effectiveRuntime = options.runtime;
   if (effectiveRuntime === undefined) {
     const runtimeKey = getRuntimeKey(options.projectPath);
-    const savedRuntime = localStorage.getItem(runtimeKey);
+    const savedRuntime = readPersistedRawString(runtimeKey);
     if (savedRuntime) {
       effectiveRuntime = savedRuntime;
     }

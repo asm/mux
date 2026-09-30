@@ -627,26 +627,34 @@ export class AgentStatusService {
     // are the only ones verified.
     const partial = await this.historyService.readPartial(workspaceId);
     // Sidebar status is a provider request too, so it reads the same context the agent's model
-    // sees: the suffix read starts at the latest compaction boundary (the summary row is kept,
-    // the conversation it replaced is not; #4421) or manual reset, and honors RAW reset floors,
-    // so a malformed reset row still discards everything before it (#4555). Only the trailing
-    // window is read: the suffix holds at least the last AGENT_STATUS_MAX_TRAILING_MESSAGES
-    // status rows of the active context, so the window below is unchanged without parsing the
-    // whole epoch under the history lock (#4720).
+    // sees: getHistoryFromLatestBoundary starts at the latest compaction boundary (the summary
+    // row is kept, the conversation it replaced is not; #4421) or manual reset. It honors RAW
+    // reset floors, so a malformed reset row still discards everything before it (#4555).
+    // Only the trailing window is read: the suffix holds at least the last
+    // AGENT_STATUS_MAX_TRAILING_MESSAGES status rows of that read, so the filtered window below
+    // is unchanged without parsing the whole epoch under the history lock (#4720). Rows over
+    // 1 MiB come back status-grade (null tool payloads, empty file URLs), which the formatter
+    // never reads (#4790).
     //
     // UI-only rows (plan-review snapshot/resolve/reopen records, workflow display-only rows)
     // must not leak into the request, and a readable reset marker is structure, not
     // conversation. The window is counted in VISIBLE rows: counting before filtering would let
     // a burst of hidden records (resolving many threads) evict the recent conversation, and
     // each hidden append would change the hash by evicting a visible row.
-    const tail = await this.historyService.getHistorySuffixFromLatestBoundary(
+    const history = await this.historyService.getStatusHistorySuffix(
       workspaceId,
       AGENT_STATUS_MAX_TRAILING_MESSAGES,
       isStatusTranscriptRow
     );
-    if (!tail.success) return { transcript: "", rowIds: [], trustedProjectContent: false };
+    if (!history.success) {
+      log.debug("Agent status: history read failed; skipping this run", {
+        workspaceId,
+        error: history.error,
+      });
+      return { transcript: "", rowIds: [], trustedProjectContent: false };
+    }
     const result = {
-      data: tail.data.filter(isStatusTranscriptRow).slice(-AGENT_STATUS_MAX_TRAILING_MESSAGES),
+      data: history.data.filter(isStatusTranscriptRow).slice(-AGENT_STATUS_MAX_TRAILING_MESSAGES),
     };
 
     const quarantine = await this.workspaceService.getQuarantinedRejectedRowIds(workspaceId);
@@ -845,7 +853,7 @@ export class AgentStatusService {
     if (rowIds.length === 0) return true;
     // The same bounded read the snapshot came from: a burst of hidden rows appended since
     // (plan-review records) must not push the snapshotted rows out of a last-N window.
-    const result = await this.historyService.getHistorySuffixFromLatestBoundary(
+    const result = await this.historyService.getStatusHistorySuffix(
       workspaceId,
       AGENT_STATUS_MAX_TRAILING_MESSAGES,
       isStatusTranscriptRow

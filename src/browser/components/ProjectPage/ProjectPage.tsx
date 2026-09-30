@@ -23,15 +23,16 @@ import {
   readPersistedState,
 } from "@/browser/hooks/usePersistedState";
 import {
+  ARCHIVED_WORKSPACES_CACHE_MAX_CHARS,
   getAgentIdKey,
   getAgentsInitNudgeKey,
   getArchivedWorkspacesKey,
   getArchivedWorkspacesExpandedKey,
-  getDraftScopeId,
-  getInputKey,
-  getPendingScopeId,
   getProjectScopeId,
 } from "@/common/constants/storage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
+import { trimArrayToChars } from "@/browser/utils/boundedPersistedValue";
+import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
 import { Button } from "@/browser/components/Button/Button";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
@@ -92,7 +93,11 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
     // Persist outside the state updater: a restore navigates away before its refresh
     // resolves, and an unmounted component's updater never runs, so the next mount
     // would otherwise start from a cache that still lists the restored workspace.
-    updatePersistedState(getArchivedWorkspacesKey(projectPath), next);
+    // The cache only seeds the first render, so keep just the leading entries that fit its budget.
+    updatePersistedState(
+      getArchivedWorkspacesKey(projectPath),
+      trimArrayToChars(next, ARCHIVED_WORKSPACES_CACHE_MAX_CHARS)
+    );
     setArchivedWorkspaces((prev) => (prev && archivedListsEqual(prev, next) ? prev : next));
   }, [projectPath]);
 
@@ -268,11 +273,15 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
       });
     } else {
       pendingAgentsInitSendRef.current = true;
-      const pendingScopeId =
-        typeof pendingDraftId === "string" && pendingDraftId.trim().length > 0
-          ? getDraftScopeId(projectPath, pendingDraftId)
-          : getPendingScopeId(projectPath);
-      updatePersistedState(getInputKey(pendingScopeId), "/init");
+      getDraftStore().setText(
+        getComposerDraftScope({
+          variant: "creation",
+          workspaceId: null,
+          creationProjectPath: projectPath,
+          pendingDraftId: pendingDraftId ?? undefined,
+        }),
+        "/init"
+      );
     }
 
     setShowAgentsInitNudge(false);

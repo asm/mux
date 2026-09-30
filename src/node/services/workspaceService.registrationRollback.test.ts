@@ -7,11 +7,15 @@ import * as path from "node:path";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { Result } from "@/common/types/result";
 import type { ExperimentsService } from "./experimentsService";
+import { CoderService } from "./coderService";
+import * as disposableExec from "@/node/utils/disposableExec";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { SSHRuntime } from "@/node/runtime/SSHRuntime";
+import { DockerRuntime, getContainerName } from "@/node/runtime/DockerRuntime";
 import * as devcontainerCli from "@/node/runtime/devcontainerCli";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import { ContainerManager } from "@/node/multiProject/containerManager";
@@ -270,6 +274,26 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       success: true,
       data: { metadata: { name: "fork-a" } },
     });
+  });
+
+  // A legacy `{ type: "local", srcBaseDir }` config is a worktree runtime, not a project-dir one.
+  test("fork of a legacy local-with-srcBaseDir workspace removes its worktree", async () => {
+    const source = await service.create(
+      projectPath,
+      "legacy-src",
+      "main",
+      undefined,
+      { type: "local", srcBaseDir },
+      undefined,
+      undefined,
+      undefined,
+      { awaitMaterialization: true }
+    );
+    if (!source.success) throw new Error(source.error);
+
+    await expectFailsWithSaveError(() => service.fork(source.data.metadata.id, "legacy-fork"));
+    expect(worktreePaths(projectPath).map((p) => path.basename(p))).not.toContain("legacy-fork");
+    expect(git(projectPath, "branch", "--list", "legacy-fork")).toBe("");
   });
 
   test("rename moves the checkout back and keeps the save error", async () => {
@@ -1015,7 +1039,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     // someone else's.
     test("devcontainer fork rollback leaves the host plan path alone", async () => {
       await withTempMuxRoot(async (root) => {
-        spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue(undefined);
+        spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue({ kind: "absent" });
         const source = await service.create(projectPath, "dc-src", "main", undefined, {
           type: "devcontainer",
           configPath: ".devcontainer/devcontainer.json",
@@ -1041,7 +1065,9 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       async ({ existingBranch }) => {
         await withTempMuxRoot(async () => {
           const tip = existingBranch ? branchWithOwnCommit(projectPath, "dc-a") : undefined;
-          const down = spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue(undefined);
+          const down = spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue({
+            kind: "absent",
+          });
           const createDevcontainer = () =>
             service.create(projectPath, "dc-a", "main", undefined, {
               type: "devcontainer",
@@ -1060,6 +1086,352 @@ describe("WorkspaceService registration rollback (#4745)", () => {
         });
       }
     );
+
+    // Item 2, devcontainer forks: the fork started its init, and so possibly its container, before
+    // it registered. Its rollback removes that container (which holds the fork's plan copy) with
+    // the checkout, and keeps a branch the fork reused.
+    test.each([
+      { label: "a branch it made", existingBranch: false },
+      { label: "an existing branch", existingBranch: true },
+    ])(
+      "devcontainer fork rollback on $label removes its checkout and container",
+      async ({ existingBranch }) => {
+        await withTempMuxRoot(async () => {
+          const down = spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue({
+            kind: "absent",
+          });
+          spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(undefined);
+          const source = await service.create(projectPath, "dcf-src", "main", undefined, {
+            type: "devcontainer",
+            configPath: ".devcontainer/devcontainer.json",
+          });
+          if (!source.success) throw new Error(source.error);
+          const tip = existingBranch ? branchWithOwnCommit(projectPath, "dcf") : undefined;
+
+          await expectFailsWithSaveError(() => service.fork(source.data.metadata.id, "dcf"));
+          expect(worktreePaths(projectPath).map((p) => path.basename(p))).not.toContain("dcf");
+          if (tip === undefined) {
+            expect(git(projectPath, "branch", "--list", "dcf")).toBe("");
+          } else {
+            expect(git(projectPath, "rev-parse", "dcf")).toBe(tip);
+          }
+          expect(down.mock.calls.map(([folder]) => path.basename(folder))).toEqual(["dcf"]);
+          expect((await service.fork(source.data.metadata.id, "dcf")).success).toBe(true);
+        });
+      }
+    );
+
+    // #5120: a container the rollback could not remove still holds the fork's plan copy, and a
+    // retry at the same path would reuse it, so the rollback names it.
+    test("devcontainer fork rollback names the container it could not remove", async () => {
+      await withTempMuxRoot(async () => {
+        spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(undefined);
+        const source = await service.create(projectPath, "dce-src", "main", undefined, {
+          type: "devcontainer",
+          configPath: ".devcontainer/devcontainer.json",
+        });
+        if (!source.success) throw new Error(source.error);
+        spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue({
+          kind: "error",
+          message: "Failed to remove container: daemon down",
+        });
+
+        const publish = failConfigPublish();
+        const result = await service
+          .fork(source.data.metadata.id, "dce")
+          .finally(() => publish.mockRestore());
+        const error = result.success ? "" : result.error;
+        expect(error).toContain("EACCES");
+        // The label names the fork's host checkout, which the rollback removed.
+        expect(error).toMatch(
+          /could not be fully cleaned up: devcontainer container labeled devcontainer\.local_folder=\S+\/dce; delete it before retrying\.$/
+        );
+      });
+    });
+
+    // Item 2, SSH forks (Coder forks too, in existing mode): the fork made its remote worktree at a
+    // path it checked was free, before registering. It is removed; the branch is kept unless the
+    // fork reports it made it (#5119), which this mock does not.
+    test("SSH fork rollback removes the fork's checkout", async () => {
+      const runtimeConfig = {
+        type: "ssh" as const,
+        host: "example.invalid",
+        srcBaseDir: "/remote/src",
+      };
+      const prototype = SSHRuntime.prototype;
+      await harness.config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push({
+          id: "fffffffff1",
+          name: "remote-src",
+          path: "/remote/src/project/remote-src",
+          runtimeConfig,
+        });
+        return cfg;
+      });
+      spyOn(prototype, "forkWorkspace").mockResolvedValue({
+        success: true,
+        workspacePath: "/remote/src/project/remote-fork",
+        sourceBranch: "remote-src",
+      });
+      const deleteWorkspace = spyOn(prototype, "deleteWorkspace").mockResolvedValue({
+        success: true,
+        deletedPath: "/remote/src/project/remote-fork",
+      });
+      spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(undefined);
+
+      await expectFailsWithSaveError(() => service.fork("fffffffff1", "remote-fork"));
+      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+      expect(deleteWorkspace.mock.calls[0].slice(0, 3)).toEqual([projectPath, "remote-fork", true]);
+      expect(deleteWorkspace.mock.calls[0][5]).toEqual({ keepBranch: true });
+      expect(persistedWorkspaceIds()).toEqual(["fffffffff1"]);
+    });
+
+    // #5114: a Coder fork marks its source as sharing the Coder workspace (existingWorkspace), so
+    // deleting the source no longer deletes it. That mark and the child's row form one rollback
+    // boundary: they are written together, and a rolled-back child undoes the mark.
+    describe("Coder fork source runtime update (#5114)", () => {
+      const sourceRuntimeConfig = {
+        type: "ssh" as const,
+        host: "coder-src.coder",
+        srcBaseDir: "/remote/src",
+        coder: { workspaceName: "coder-src", existingWorkspace: false },
+      };
+      const sourceId = "fffffffff5";
+      const forkId = "ddddddddd5";
+      const persistedRuntimeConfig = (id: string) =>
+        [...harness.config.loadConfigOrDefault().projects.values()]
+          .flatMap((project) => project.workspaces)
+          .find((workspace) => workspace.id === id)?.runtimeConfig;
+
+      /** Registers a new-mode Coder source and stubs the remote fork and delete. */
+      async function setUpCoderFork() {
+        const realCreateRuntime = runtimeFactory.createRuntime;
+        // Coder runtimes need a CoderService; nothing on these paths calls it.
+        const coderService = {} as unknown as CoderService;
+        spyOn(runtimeFactory, "createRuntime").mockImplementation((config, options) =>
+          realCreateRuntime(config, { ...options, coderService })
+        );
+        await harness.config.editConfig((cfg) => {
+          cfg.projects.get(projectPath)!.workspaces.push({
+            id: sourceId,
+            name: "coder-src",
+            path: "/remote/src/project/coder-src",
+            runtimeConfig: sourceRuntimeConfig,
+          });
+          return cfg;
+        });
+        spyOn(harness.config, "generateStableId").mockReturnValueOnce(forkId);
+        // CoderSSHRuntime.forkWorkspace wraps this and adds the shared (existingWorkspace) configs.
+        spyOn(SSHRuntime.prototype, "forkWorkspace").mockResolvedValue({
+          success: true,
+          workspacePath: "/remote/src/project/coder-fork",
+          sourceBranch: "coder-src",
+        });
+        spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(undefined);
+        return spyOn(SSHRuntime.prototype, "deleteWorkspace").mockResolvedValue({
+          success: true,
+          deletedPath: "/remote/src/project/coder-fork",
+        });
+      }
+
+      /** Forks the source with `duringSetup` run and then failing after the child registered. */
+      async function failCoderForkAfterRegistration(duringSetup?: () => Promise<void>) {
+        const deleteWorkspace = await setUpCoderFork();
+        const goals = new WorkspaceGoalService(
+          harness.config,
+          harness.historyService,
+          harness.extensionMetadata
+        );
+        service.setWorkspaceGoalService(goals);
+        spyOn(goals, "inheritFromFork").mockImplementationOnce(async () => {
+          // The child row and the source mark are persisted together at this point.
+          expect(persistedWorkspaceIds()).toContain(forkId);
+          expect(persistedRuntimeConfig(sourceId)).toMatchObject({
+            coder: { existingWorkspace: true },
+          });
+          await duringSetup?.();
+          throw new Error("goal store unavailable");
+        });
+        const result = await service.fork(sourceId, "coder-fork");
+        expect(result.success ? "" : result.error).toContain("goal store unavailable");
+        expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+        expect(persistedWorkspaceIds()).not.toContain(forkId);
+      }
+
+      test("a rejected registration write removes the fork's checkout and leaves the source unmarked", async () => {
+        const deleteWorkspace = await setUpCoderFork();
+
+        await expectFailsWithSaveError(() => service.fork(sourceId, "coder-fork"));
+
+        expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+        expect(deleteWorkspace.mock.calls[0].slice(0, 3)).toEqual([
+          projectPath,
+          "coder-fork",
+          true,
+        ]);
+        expect(persistedWorkspaceIds()).not.toContain(forkId);
+        expect(persistedRuntimeConfig(sourceId)).toEqual(sourceRuntimeConfig);
+      });
+
+      test("a fork rolled back after registration restores the source's runtime config", async () => {
+        await failCoderForkAfterRegistration();
+        expect(persistedRuntimeConfig(sourceId)).toEqual(sourceRuntimeConfig);
+      });
+
+      test("a throwing source-metadata listener still rolls the fork back", async () => {
+        const deleteWorkspace = await setUpCoderFork();
+        service.on("metadata", (event: { workspaceId: string }) => {
+          if (event.workspaceId === sourceId) throw new Error("listener failed");
+        });
+
+        const result = await service.fork(sourceId, "coder-fork");
+
+        expect(result.success ? "" : result.error).toContain("listener failed");
+        expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+        expect(persistedWorkspaceIds()).not.toContain(forkId);
+        expect(persistedRuntimeConfig(sourceId)).toEqual(sourceRuntimeConfig);
+      });
+
+      test("the source stays marked while another workspace shares its Coder workspace", async () => {
+        const sibling = {
+          ...sourceRuntimeConfig,
+          coder: { workspaceName: "coder-src", existingWorkspace: true },
+        };
+        await failCoderForkAfterRegistration(async () => {
+          await harness.config.editConfig((cfg) => {
+            cfg.projects.get(projectPath)!.workspaces.push({
+              id: "eeeeeeeee5",
+              name: "coder-sibling",
+              path: "/remote/src/project/coder-sibling",
+              runtimeConfig: sibling,
+            });
+            return cfg;
+          });
+        });
+        expect(persistedRuntimeConfig(sourceId)).toMatchObject({
+          coder: { workspaceName: "coder-src", existingWorkspace: true },
+        });
+      });
+
+      test("the source keeps a runtime config that changed since the fork marked it", async () => {
+        const changed = {
+          ...sourceRuntimeConfig,
+          coder: { workspaceName: "coder-src", existingWorkspace: true, template: "other" },
+        };
+        await failCoderForkAfterRegistration(() =>
+          harness.config.updateWorkspaceMetadata(sourceId, { runtimeConfig: changed })
+        );
+        expect(persistedRuntimeConfig(sourceId)).toEqual(changed);
+      });
+    });
+
+    // #5113: a new-mode Coder creation prepares a provisioning session (a short-lived deployment
+    // token) in finalizeConfig; only init consumes it. A creation rolled back before init disposes
+    // it, so the token does not linger and a retry cannot get it back.
+    test("new-mode Coder creation whose registration write rejects disposes its provisioning session", async () => {
+      const coderService = new CoderService();
+      spyOn(coderService, "verifyAuthenticatedSession").mockResolvedValue(undefined);
+      spyOn(coderService, "workspaceExists").mockResolvedValue(false);
+      const tokenCommands = spyOn(disposableExec, "execFileAsync").mockImplementation(((
+        file: string,
+        args: string[]
+      ) => {
+        if (file !== "coder" || args[0] !== "tokens") {
+          throw new Error(`Unexpected command: ${file} ${args.join(" ")}`);
+        }
+        const result = Promise.resolve({
+          stdout: args[1] === "create" ? "token-1\n" : "",
+          stderr: "",
+        });
+        return { result, child: {}, [Symbol.dispose]: () => undefined };
+      }) as unknown as typeof disposableExec.execFileAsync);
+      const realCreateRuntime = runtimeFactory.createRuntime;
+      spyOn(runtimeFactory, "createRuntime").mockImplementation((config, options) =>
+        realCreateRuntime(config, { ...options, coderService })
+      );
+
+      await expectFailsWithSaveError(() =>
+        service.create(projectPath, "coder-new", "main", undefined, {
+          type: "ssh",
+          host: "coder",
+          srcBaseDir: "/remote/src",
+          coder: { template: "tmpl" },
+        })
+      );
+
+      const tokenCalls = tokenCommands.mock.calls.map(([, args]) => args?.slice(0, 2).join(" "));
+      expect(tokenCalls).toEqual(["tokens create", "tokens delete"]);
+      expect(coderService.takeProvisioningSession("mux-coder-new")).toBeUndefined();
+    });
+
+    // #5117, Docker forks: the fork made its own container (DockerRuntime.forkWorkspace refuses a
+    // name in use) before registering. The rollback removes it, and with it the fork's plan copy,
+    // so no plan cleanup runs; a failed removal names the container, not the in-container path.
+    describe("Docker fork rollback (#5117)", () => {
+      const dockerFork = async (options: {
+        deleteResult: Awaited<ReturnType<DockerRuntime["deleteWorkspace"]>>;
+        copyFails?: boolean;
+      }) => {
+        const runtimeConfig = { type: "docker" as const, image: "ubuntu:24.04" };
+        await harness.config.editConfig((cfg) => {
+          cfg.projects.get(projectPath)!.workspaces.push({
+            id: "fffffffff2",
+            name: "docker-src",
+            path: "/src",
+            runtimeConfig,
+          });
+          return cfg;
+        });
+        const prototype = DockerRuntime.prototype;
+        spyOn(prototype, "forkWorkspace").mockResolvedValue({
+          success: true,
+          workspacePath: "/src",
+          sourceBranch: "docker-src",
+        });
+        const deleteWorkspace = spyOn(prototype, "deleteWorkspace").mockResolvedValue(
+          options.deleteResult
+        );
+        const copyPlan = spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes");
+        if (options.copyFails === true) {
+          copyPlan.mockRejectedValueOnce(new Error("plan unreadable"));
+        } else {
+          copyPlan.mockResolvedValue("/var/mux/plans/project/docker-fork.md");
+        }
+        const publish = failConfigPublish();
+        const result = await service
+          .fork("fffffffff2", "docker-fork")
+          .finally(() => publish.mockRestore());
+        return { error: result.success ? "" : result.error, deleteWorkspace };
+      };
+
+      test("removes the fork's container and nothing else", async () => {
+        const { error, deleteWorkspace } = await dockerFork({
+          deleteResult: { success: true, deletedPath: "/src" },
+        });
+        expect(error).toContain("EACCES");
+        expect(error).not.toContain("could not be fully cleaned up");
+        expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+        expect(deleteWorkspace.mock.calls[0].slice(0, 3)).toEqual([
+          projectPath,
+          "docker-fork",
+          true,
+        ]);
+        expect(persistedWorkspaceIds()).toEqual(["fffffffff2"]);
+      });
+
+      test.each([
+        { label: "registration rollback", copyFails: false },
+        { label: "copy-failure cleanup", copyFails: true },
+      ])("$label names the container it could not remove", async ({ copyFails }) => {
+        const { error } = await dockerFork({
+          deleteResult: { success: false, error: "Failed to remove container: daemon down" },
+          copyFails,
+        });
+        expect(error).toEndWith(
+          leftoverSentence([`Docker container ${getContainerName(projectPath, "docker-fork")}`])
+        );
+      });
+    });
 
     // #4936 gap 1: the multi-project runtime names the disposable paths it could not delete.
     test("multi-project fork names the checkout and container it could not delete", async () => {

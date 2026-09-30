@@ -13,6 +13,7 @@ import type {
 } from "@/common/orpc/schemas/memory";
 import type { APIClient } from "@/browser/contexts/API";
 import { createMockReviewStateApi } from "./reviewState";
+import { createMockDraftsApi } from "./drafts";
 import type {
   AgentDefinitionDescriptor,
   AgentDefinitionPackage,
@@ -29,6 +30,7 @@ import {
   type LayoutPresetsConfig,
 } from "@/common/types/uiLayouts";
 import type {
+  ModelCatalogSearchInput,
   WorkspaceChatMessage,
   ProvidersConfigMap,
   WorkspaceStatsSnapshot,
@@ -82,6 +84,7 @@ import {
 import type { z } from "zod";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 import {
   normalizeAutoModelRoutingConfig,
   type AutoModelRoutingConfig,
@@ -803,6 +806,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     // Stored in-memory for Storybook only.
     // Frontend code normalizes the response defensively, but we normalize here too so
     // stories remain stable even if they mutate the config.
+    drafts: createMockDraftsApi(),
     uiLayouts: {
       getAll: () => Promise.resolve(layoutPresets),
       saveAll: (input: { layoutPresets: unknown }) => {
@@ -1116,6 +1120,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       list: () => Promise.resolve(providersList),
       getConfig: () => Promise.resolve(providersConfig),
       discoverModels: () => Promise.resolve({ status: "unsupported" }),
+      searchModelCatalog: (input: ModelCatalogSearchInput) =>
+        Promise.resolve(searchModelCatalog(input)),
       setProviderConfig: () => Promise.resolve({ success: true, data: undefined }),
       setModels: () => Promise.resolve({ success: true, data: undefined }),
     },

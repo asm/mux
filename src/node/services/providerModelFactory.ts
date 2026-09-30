@@ -21,7 +21,7 @@ import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { wrapLanguageModel, type LanguageModel } from "ai";
 import {
   anthropicRejectsDisabledThinking,
-  isGpt6SolOrLunaModel,
+  isGpt6LunaModel,
   isGrokFrontierModel,
   type ThinkingLevel,
 } from "@/common/types/thinking";
@@ -47,7 +47,6 @@ import {
   CODEX_ENDPOINT,
   CODEX_OAUTH_ROUTED_HEADER,
   isCodexOauthAllowedModel,
-  isCodexOauthRequiredModel,
 } from "@/common/constants/codexOAuth";
 import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
 import type { Config, ProviderConfig, ProvidersConfig } from "@/node/config";
@@ -55,7 +54,11 @@ import { ProvidersConfigStore } from "@/node/config";
 import type { MuxProviderOptions, OpenAIWireFormat } from "@/common/types/providerOptions";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { ServiceTierSchema, type XAIServiceTier } from "@/common/config/schemas/providersConfig";
-import { openaiServiceTierAvailable } from "@/common/utils/ai/openaiProviderOptionsAvailability";
+import {
+  openaiModelSupportsServiceTier,
+  openaiServiceTierAvailable,
+} from "@/common/utils/ai/openaiProviderOptionsAvailability";
+import { anthropicFastModeAvailable } from "@/common/utils/ai/anthropicFastMode";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import {
@@ -383,13 +386,13 @@ function createOpenAIModelWithPreservedOptions(
 ): LanguageModelV4 {
   const model = createModel(baseFetch);
   // @ai-sdk/openai (through at least 4.0.72) allowlists GPT-6 reasoning efforts
-  // without "none" and silently strips it, but Sol/Luna accept "none" and OpenAI
-  // requires it for Chat Completions function calling (Astra genuinely rejects it,
-  // and Xum never requests it there). Without this, Chat agent turns fail and
-  // Responses "off" silently runs at the API default effort. This lives in Xum
+  // without "none" and silently strips it, but Luna accepts "none" and OpenAI
+  // requires it for Chat Completions function calling (Astra and GPT-6.1 Sol
+  // genuinely reject it, and Xum never requests it there). Without this, Chat
+  // agent turns fail and Responses "off" silently runs at the API default effort. This lives in Xum
   // runtime code rather than a bun patch because npm installs of the published
   // package would not apply a bun patch.
-  const preserveNoneEffort = isGpt6SolOrLunaModel(options.wireModelId);
+  const preserveNoneEffort = isGpt6LunaModel(options.wireModelId);
   if (!options.serviceTierAvailable && !preserveNoneEffort) return model;
 
   const createPreservingCall = (params: LanguageModelV4CallOptions) => {
@@ -439,7 +442,7 @@ function createOpenAIModelWithPreservedOptions(
 }
 
 /**
- * GPT-6 Sol/Luna Chat Completions accepts function calling only with
+ * GPT-6 Luna Chat Completions accepts function calling only with
  * reasoning_effort "none". buildProviderOptions clamps the options agent turns
  * record and send, but headless tool loops (Dream consolidation, memory
  * harvest, refine, sidebar status) call streamText with tools and no provider
@@ -454,7 +457,7 @@ export function clampGpt6ChatCompletionsToolReasoning(
   model: LanguageModelV4,
   capabilityModel: string
 ): LanguageModelV4 {
-  if (!isGpt6SolOrLunaModel(capabilityModel)) return model;
+  if (!isGpt6LunaModel(capabilityModel)) return model;
   return wrapLanguageModel({
     model,
     middleware: {
@@ -1531,6 +1534,7 @@ export class ProviderModelFactory {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     let serviceTierDefault: { namespace: string; option: string; value: string } | undefined;
+    let anthropicFastModePinned = false;
     // The explicit annotation restores the contextual typing the old async
     // signature provided, so the wire-error literals below stay narrowed.
     const pipeline: Effect.Effect<Result<LanguageModel, SendMessageError>> = Effect.gen(
@@ -1650,11 +1654,17 @@ export class ProviderModelFactory {
         const serviceTier = ServiceTierSchema.safeParse(
           muxProviderOptions?.openai?.serviceTier ?? providersConfig.openai?.serviceTier
         );
+        const serviceTierProvidersConfig = self.providerService.getConfig(providersConfig);
         const serviceTierAvailable = openaiServiceTierAvailable(modelString, {
-          providersConfig: self.providerService.getConfig(providersConfig),
+          providersConfig: serviceTierProvidersConfig,
           openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
         });
-        if (serviceTier.success && serviceTierAvailable) {
+        if (
+          serviceTier.success &&
+          serviceTierAvailable &&
+          // Ultrafast is model-gated: drop it rather than send a tier the model rejects.
+          openaiModelSupportsServiceTier(modelString, serviceTier.data, serviceTierProvidersConfig)
+        ) {
           serviceTierDefault = {
             namespace: "openai",
             option: "serviceTier",
@@ -1668,6 +1678,18 @@ export class ProviderModelFactory {
         } else if (muxProviderOptions?.openai) {
           delete muxProviderOptions.openai.serviceTier;
         }
+
+        // Anthropic Fast mode is a first-party-API-only beta. Pin it at creation
+        // like the OpenAI tier so fallbacks and headless callers cannot drift, and
+        // never send `speed` where it is unsupported (the API rejects it).
+        anthropicFastModePinned =
+          providerName === "anthropic" &&
+          !providerIsCustom &&
+          providersConfig.anthropic?.speed === "fast" &&
+          muxProviderOptions?.anthropic?.disableBetaFeatures !== true &&
+          anthropicFastModeAvailable(modelString, {
+            providersConfig: self.providerService.getConfig(providersConfig),
+          });
 
         // OpenAI-specific: merge global store setting into muxProviderOptions.
         // Coder instances classify by the instance's exact TYPE ("openai" =
@@ -1843,8 +1865,6 @@ export class ProviderModelFactory {
           const fullModelId = `${providerName}:${modelId}`;
 
           const codexOauthAllowed = isCodexOauthAllowedModel(fullModelId, providersConfig);
-          const codexOauthRequired = isCodexOauthRequiredModel(fullModelId, providersConfig);
-
           const storedCodexOauth = parseCodexOauthAuth(
             (providerConfig as { codexOauth?: unknown }).codexOauth
           );
@@ -1852,13 +1872,6 @@ export class ProviderModelFactory {
           // Resolve credentials from config + env so we can decide whether to
           // route through Codex OAuth or fall back to API key auth.
           const creds = resolveProviderCredentials("openai", providerConfig);
-
-          // When a model requires Codex OAuth but the user hasn't connected it,
-          // fall back to their API key instead of blocking entirely.  If the model
-          // truly only works through OAuth, OpenAI's API will return a clear error.
-          if (codexOauthRequired && !storedCodexOauth && !creds.isConfigured) {
-            return Err({ type: "oauth_not_connected", provider: providerName });
-          }
 
           const codexOauthDefaultAuthRaw = (providerConfig as { codexOauthDefaultAuth?: unknown })
             .codexOauthDefaultAuth;
@@ -1873,7 +1886,6 @@ export class ProviderModelFactory {
 
           // Codex OAuth routing:
           // - Chat Completions never routes through OAuth when an API key exists.
-          // - Required models route through ChatGPT OAuth when connected.
           // - If OAuth is not connected, fall back to API key (if available).
           // - Allowed models route through OAuth only when:
           //   - no API key is configured, OR
@@ -1885,10 +1897,6 @@ export class ProviderModelFactory {
 
             if (earlyWireFormat === "chatCompletions" && creds.isConfigured) {
               return false;
-            }
-
-            if (codexOauthRequired) {
-              return true;
             }
 
             if (!creds.isConfigured) {
@@ -2844,6 +2852,10 @@ export class ProviderModelFactory {
             [serviceTierDefault.option]: serviceTierDefault.value,
           });
         }
+        if (result.success && anthropicFastModePinned && typeof result.data !== "string") {
+          // @ai-sdk/anthropic adds the fast-mode beta header for this option.
+          injectProviderOptionsDefaults(result.data, "anthropic", { speed: "fast" });
+        }
         return result;
       }),
       // Parity with the pre-Effect whole-pipeline try/catch: any throw —
@@ -3068,7 +3080,6 @@ export class ProviderModelFactory {
         // switched to the API key.
         const fullModelId = `${providerName}:${modelId}`;
         const codexOauthAllowed = isCodexOauthAllowedModel(fullModelId, providersConfig);
-        const codexOauthRequired = isCodexOauthRequiredModel(fullModelId, providersConfig);
         const storedCodexOauth = parseCodexOauthAuth(providerConfig.codexOauth);
         const codexOauthDefaultAuth =
           providerConfig.codexOauthDefaultAuth === "apiKey" ? "apiKey" : "oauth";
@@ -3079,9 +3090,6 @@ export class ProviderModelFactory {
           }
           if (configWireFormat === "chatCompletions" && creds.isConfigured) {
             return false;
-          }
-          if (codexOauthRequired) {
-            return true;
           }
           if (!creds.isConfigured) {
             return true;

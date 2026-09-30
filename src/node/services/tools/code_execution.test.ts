@@ -1030,6 +1030,8 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-offload");
     });
 
+    // Native insert/replace tools are direct-only. The legacy line-edit fixture
+    // keeps nested edit capture/budget coverage without re-exposing those tools.
     it("keeps results on persistence-critical records (file_edit_*/agent_skill_read) in kernel mode", async () => {
       // Post-compaction persistence extractors mine nested file_edit_* diffs
       // (extractEditedFileDiffs) and agent_skill_read snapshots
@@ -1038,8 +1040,8 @@ describe("createCodeExecutionTool", () => {
       using tmp = new DisposableTempDir("code-exec-persist-records");
       const host = new SandboxHostService();
       const tools: Record<string, Tool> = {
-        file_edit_insert: createMockTool(
-          "file_edit_insert",
+        file_edit_replace_lines: createMockTool(
+          "file_edit_replace_lines",
           z.object({ path: z.string() }),
           () => ({
             success: true,
@@ -1064,12 +1066,12 @@ describe("createCodeExecutionTool", () => {
 
       const result = (await tool.execute!(
         {
-          code: 'mux.file_edit_insert({path: "/a.ts"}); mux.agent_skill_read({name: "demo"}); return true;',
+          code: 'mux.file_edit_replace_lines({path: "/a.ts"}); mux.agent_skill_read({name: "demo"}); return true;',
         },
         mockToolCallOptions
       )) as PTCExecutionResult;
       expect(result.success).toBe(true);
-      const editRecord = result.toolCalls.find((r) => r.toolName === "file_edit_insert");
+      const editRecord = result.toolCalls.find((r) => r.toolName === "file_edit_replace_lines");
       expect((editRecord?.result as { diff?: string })?.diff).toContain("+hello");
       const skillRecord = result.toolCalls.find((r) => r.toolName === "agent_skill_read");
       const skill = (skillRecord?.result as { skill?: { body?: string } })?.skill;
@@ -1086,8 +1088,8 @@ describe("createCodeExecutionTool", () => {
       const bigDiff = `@@ -0,0 +1 @@\n+${"x".repeat(20_000)}`;
       const mediaData = "aGVsbG8=";
       const tools: Record<string, Tool> = {
-        file_edit_replace_string: createMockTool(
-          "file_edit_replace_string",
+        file_edit_replace_lines: createMockTool(
+          "file_edit_replace_lines",
           z.object({ path: z.string() }),
           () => ({ success: true, diff: bigDiff })
         ),
@@ -1108,13 +1110,13 @@ describe("createCodeExecutionTool", () => {
 
       const result = (await tool.execute!(
         {
-          code: 'mux.file_edit_replace_string({path: "/big.ts"}); mux.mcp__shots__take({}); return true;',
+          code: 'mux.file_edit_replace_lines({path: "/big.ts"}); mux.mcp__shots__take({}); return true;',
         },
         mockToolCallOptions
       )) as PTCExecutionResult;
       expect(result.success).toBe(true);
 
-      const editRecord = result.toolCalls.find((r) => r.toolName === "file_edit_replace_string");
+      const editRecord = result.toolCalls.find((r) => r.toolName === "file_edit_replace_lines");
       expect((editRecord?.result as { diff?: string })?.diff).toBe(bigDiff);
 
       const shotRecord = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
@@ -1139,8 +1141,8 @@ describe("createCodeExecutionTool", () => {
       const hunk2 = `@@ -5,0 +7,1 @@\n+${"b".repeat(30_000)}\n`;
       const hugeDiff = `${hunk1}${hunk2}`;
       const tools: Record<string, Tool> = {
-        file_edit_insert: createMockTool(
-          "file_edit_insert",
+        file_edit_replace_lines: createMockTool(
+          "file_edit_replace_lines",
           z.object({ path: z.string() }),
           () => ({
             success: true,
@@ -1156,11 +1158,11 @@ describe("createCodeExecutionTool", () => {
       );
 
       const result = (await tool.execute!(
-        { code: 'mux.file_edit_insert({path: "/huge.ts"}); return true;' },
+        { code: 'mux.file_edit_replace_lines({path: "/huge.ts"}); return true;' },
         mockToolCallOptions
       )) as PTCExecutionResult;
       expect(result.success).toBe(true);
-      const record = result.toolCalls.find((r) => r.toolName === "file_edit_insert");
+      const record = result.toolCalls.find((r) => r.toolName === "file_edit_replace_lines");
       const retained = record?.result as { diff?: string; diffTruncated?: boolean };
       // The first whole hunk is retained; the second (which would cross the
       // cap) is dropped, and the truncation is flagged for the extractor.
@@ -1177,8 +1179,8 @@ describe("createCodeExecutionTool", () => {
       using tmp = new DisposableTempDir("code-exec-bounded-edit-args");
       const host = new SandboxHostService();
       const tools: Record<string, Tool> = {
-        file_edit_insert: createMockTool(
-          "file_edit_insert",
+        file_edit_replace_lines: createMockTool(
+          "file_edit_replace_lines",
           z.object({ path: z.string(), content: z.string() }),
           () => ({ success: true, diff: "@@ -1,0 +1,1 @@\n+hello\n" })
         ),
@@ -1192,12 +1194,12 @@ describe("createCodeExecutionTool", () => {
 
       const result = (await tool.execute!(
         {
-          code: 'mux.file_edit_insert({path: "/kept.ts", content: "x".repeat(5000)}); return true;',
+          code: 'mux.file_edit_replace_lines({path: "/kept.ts", content: "x".repeat(5000)}); return true;',
         },
         mockToolCallOptions
       )) as PTCExecutionResult;
       expect(result.success).toBe(true);
-      const record = result.toolCalls.find((r) => r.toolName === "file_edit_insert");
+      const record = result.toolCalls.find((r) => r.toolName === "file_edit_replace_lines");
       const args = record?.args as {
         __kernelBounded?: boolean;
         path?: string;
@@ -1358,18 +1360,13 @@ describe("createCodeExecutionTool", () => {
             value: [{ type: "media", mediaType: "image/png", data: imageData }],
           },
         })),
-        file_edit_insert: createMockTool(
-          "file_edit_insert",
+        file_edit_replace_lines: createMockTool(
+          "file_edit_replace_lines",
           z.object({ path: z.string() }),
-          () => ({
-            success: true,
+          (args) => ({
+            success: !(args as { path: string }).path.endsWith("failed.ts"),
             diff: bigDiff,
           })
-        ),
-        file_edit_replace_string: createMockTool(
-          "file_edit_replace_string",
-          z.object({ path: z.string() }),
-          () => ({ success: false, diff: bigDiff })
         ),
       };
       const tool = await createCodeExecutionTool(
@@ -1383,8 +1380,8 @@ describe("createCodeExecutionTool", () => {
         {
           code:
             "for (let i = 0; i < 5; i++) { mux.mcp__shots__take({}); } " +
-            'mux.file_edit_insert({path: "/after-budget.ts"}); ' +
-            'mux.file_edit_replace_string({path: "/after-budget-failed.ts"}); return true;',
+            'mux.file_edit_replace_lines({path: "/after-budget.ts"}); ' +
+            'mux.file_edit_replace_lines({path: "/after-budget-failed.ts"}); return true;',
         },
         mockToolCallOptions
       )) as PTCExecutionResult;
@@ -1409,11 +1406,12 @@ describe("createCodeExecutionTool", () => {
       // compaction emits the normal {ok, bytes} summary so edit extractors
       // keep PATH attribution (round 12), and a FAILED edit's success bit
       // survives through the marker instead of misreporting ok:true.
-      const editOk = result.toolCalls.find((r) => r.toolName === "file_edit_insert");
+      const edits = result.toolCalls.filter((r) => r.toolName === "file_edit_replace_lines");
+      expect(edits).toHaveLength(2);
+      const [editOk, editFailed] = edits;
       expect(editOk?.result).toBeUndefined();
       expect(editOk?.ok).toBe(true);
       expect((editOk?.args as { path?: string })?.path).toBe("/after-budget.ts");
-      const editFailed = result.toolCalls.find((r) => r.toolName === "file_edit_replace_string");
       expect(editFailed?.result).toBeUndefined();
       expect(editFailed?.ok).toBe(false);
       await host.disposeScope("ws-exec-budget");

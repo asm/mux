@@ -2,6 +2,7 @@ import "../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { Profiler } from "react";
 
 import { installDom } from "../../../tests/ui/dom";
 import { readPersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
@@ -97,14 +98,18 @@ async function clearProvidersConfig(bridge: TestBridge): Promise<void> {
   await refreshed;
 }
 
-async function selectWorkspace(bridge: TestBridge, history: unknown[] = []): Promise<void> {
+async function selectWorkspace(
+  bridge: TestBridge,
+  history: unknown[] = [],
+  workspace: UiWorkspace = WORKSPACE
+): Promise<void> {
   await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
-  await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE] });
-  await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
+  await bridge.emit({ type: "workspaces", workspaces: [workspace] });
+  await bridge.emit({ type: "setSelectedWorkspace", workspaceId: workspace.id });
   for (const event of history) {
-    await bridge.emit({ type: "chatEvent", workspaceId: WORKSPACE.id, event });
+    await bridge.emit({ type: "chatEvent", workspaceId: workspace.id, event });
   }
-  await bridge.emit({ type: "chatEvent", workspaceId: WORKSPACE.id, event: { type: "caught-up" } });
+  await bridge.emit({ type: "chatEvent", workspaceId: workspace.id, event: { type: "caught-up" } });
 }
 
 function toolMessage(
@@ -258,6 +263,84 @@ describe("vscode webview transcript auto-scroll", () => {
     // ...so rows become anchor candidates again and the reading position is preserved.
     expect(content.style.overflowAnchor).toBe("");
     expect(sentinel.style.overflowAnchor).toBe("auto");
+  });
+});
+
+describe("vscode webview initial bottom pin", () => {
+  let cleanupDom: (() => void) | null = null;
+  // Observed elements -> observer callbacks, so a test can deliver a resize for one element the
+  // way a browser does: only observers watching that element hear about it.
+  const resizeCallbacks = new Map<Element, Set<ResizeObserverCallback>>();
+  let originalResizeObserver: typeof ResizeObserver | undefined;
+
+  class RecordingResizeObserver {
+    private readonly observed = new Set<Element>();
+    constructor(private readonly callback: ResizeObserverCallback) {}
+    observe(target: Element): void {
+      this.observed.add(target);
+      const callbacks = resizeCallbacks.get(target) ?? new Set();
+      callbacks.add(this.callback);
+      resizeCallbacks.set(target, callbacks);
+    }
+    unobserve(target: Element): void {
+      this.observed.delete(target);
+      resizeCallbacks.get(target)?.delete(this.callback);
+    }
+    disconnect(): void {
+      for (const target of this.observed) {
+        resizeCallbacks.get(target)?.delete(this.callback);
+      }
+      this.observed.clear();
+    }
+  }
+
+  function resize(target: Element): void {
+    for (const callback of resizeCallbacks.get(target) ?? []) {
+      callback([], {} as ResizeObserver);
+    }
+  }
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+    originalResizeObserver = window.ResizeObserver;
+    window.ResizeObserver = RecordingResizeObserver as unknown as typeof ResizeObserver;
+  });
+
+  afterEach(() => {
+    cleanup();
+    resizeCallbacks.clear();
+    if (originalResizeObserver) window.ResizeObserver = originalResizeObserver;
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("stays pinned to the bottom as the transcript loads after the first connectionStatus", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    // The host's first connectionStatus arrives after the webview mounted (#5231).
+    await selectWorkspace(bridge, [
+      {
+        type: "message",
+        id: "m-1",
+        role: "user",
+        parts: [{ type: "text", text: "a long transcript" }],
+        metadata: { historySequence: 1, timestamp: 1 },
+      },
+    ]);
+
+    const scrollport = view.getByTestId("transcript-bottom-sentinel").parentElement;
+    if (!scrollport) throw new Error("sentinel must live inside the transcript scrollport");
+    // The loaded rows grow the transcript: the browser reports a resize of the scrollport's
+    // content, and the locked transcript must follow it to the bottom.
+    setScrollGeometry(scrollport, { scrollTop: 0 });
+    const content = scrollport.firstElementChild;
+    if (!content) throw new Error("transcript content must precede the sentinel");
+    await act(async () => {
+      resize(content);
+      await Promise.resolve();
+    });
+
+    expect(scrollport.scrollTop).toBe(800);
   });
 });
 
@@ -1266,13 +1349,13 @@ describe("vscode webview workspace AI settings", () => {
       },
     });
 
-    // Pick Sonnet 5 for Plan from the model dropdown (the list shows every suggested model).
+    // Pick Sonnet 5.5 for Plan from the model dropdown (the list shows every suggested model).
     await act(async () => {
       fireEvent.click(view.getByRole("combobox"));
       await Promise.resolve();
     });
     await act(async () => {
-      fireEvent.click(view.getByText("Sonnet 5"));
+      fireEvent.click(view.getByText("Sonnet 5.5"));
       await Promise.resolve();
     });
     await bridge.answer("agents.list", AGENT_DESCRIPTORS);
@@ -1329,7 +1412,7 @@ describe("vscode webview workspace AI settings", () => {
       await Promise.resolve();
     });
     await act(async () => {
-      fireEvent.click(view.getByText("Sonnet 5"));
+      fireEvent.click(view.getByText("Sonnet 5.5"));
       await Promise.resolve();
     });
     // A sub-agent follows its backend settings on every refresh, except a deliberate unsent pick.
@@ -1486,7 +1569,7 @@ describe("vscode webview policy-excluded model", () => {
 
   test("sends with the first allowed model, says so, and keeps the stored choice", async () => {
     const { bridge, view } = await renderWithPolicy(
-      enforcedPolicy([{ id: "openai", allowedModels: ["gpt-5.6-terra"] }])
+      enforcedPolicy([{ id: "openai", allowedModels: ["gpt-6-luna"] }])
     );
     await bridge.answer("providers.getConfig", {
       openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
@@ -1497,7 +1580,7 @@ describe("vscode webview policy-excluded model", () => {
     const sends = bridge.orpcCalls("workspace.sendMessage");
     expect(sends).toHaveLength(1);
     const input = sends[0].input as { options: Record<string, unknown> };
-    expect(input.options.model).toBe("openai:gpt-5.6-terra");
+    expect(input.options.model).toBe("openai:gpt-6-luna");
     // Local fallback only: nothing is written, locally or to the workspace.
     expect(readPersistedState(getModelKey(WORKSPACE.id), "")).toBe("anthropic:claude-opus-5-5");
     expect(bridge.orpcCalls("workspace.updateAgentAISettings")).toHaveLength(0);
@@ -1803,7 +1886,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
 
   test("persists only the last of several rapid picks", async () => {
     const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
     await pickModel(view, "Opus 5.5");
 
     const options = await send(bridge, view);
@@ -1832,7 +1915,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
 
   test("never persists for a workspace without loaded AI settings", async () => {
     const { bridge, view } = await open([WORKSPACE]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
 
     const options = await send(bridge, view);
     expect(String(options.model)).toContain("sonnet");
@@ -1853,7 +1936,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
       status: { state: "enforced" },
       policy: {
         policyFormatVersion: "0.1",
-        providerAccess: [{ id: "openai", allowedModels: ["gpt-5.6-terra"] }],
+        providerAccess: [{ id: "openai", allowedModels: ["gpt-6-luna"] }],
         mcp: { allowUserDefined: { stdio: true, remote: true } },
         runtimes: null,
       },
@@ -1865,7 +1948,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
       await pickThinking(view, "High");
 
       const options = await send(bridge, view);
-      expect(options.model).toBe("openai:gpt-5.6-terra");
+      expect(options.model).toBe("openai:gpt-6-luna");
       expect(options.skipAiSettingsPersistence).toBe(true);
       expect(options.aiSelectionIntent).toBeUndefined();
       await reply(bridge, OK);
@@ -1878,7 +1961,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
     // Until policy.get answers, the model list is unfiltered and the policy looks disabled, so a
     // pick could be a model the policy forbids.
     const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)], "pending");
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
 
     const options = await send(bridge, view);
     expect(String(options.model)).toContain("sonnet");
@@ -1900,7 +1983,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
         },
       },
     ]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
 
     expect(agentPicker(view).disabled).toBe(true);
     const options = await send(bridge, view);
@@ -1916,7 +1999,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
   test("keeps one persisting send per workspace in flight; the next send writes the latest pick", async () => {
     const other = mainWorkspace(TERRA_HIGH, "ws-2");
     const { bridge, view } = await open([mainWorkspace(TERRA_HIGH), other]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
     const first = await send(bridge, view);
     expect(first.skipAiSettingsPersistence).toBe(false);
 
@@ -1951,7 +2034,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
   test("stops persisting for a workspace after a send ends without a server result", async () => {
     // Own workspace ID: the unknown outcome lasts for this webview session.
     const { bridge, view } = await open([mainWorkspace(TERRA_HIGH, "ws-unknown-outcome")]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
     const first = await send(bridge, view);
     expect(first.skipAiSettingsPersistence).toBe(false);
     const call = bridge.orpcCalls("workspace.sendMessage")[0];
@@ -1966,7 +2049,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
 
   test("keeps a pick pending after a server-reported send failure", async () => {
     const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)]);
-    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Sonnet 5.5");
     const first = await send(bridge, view);
     expect(first.skipAiSettingsPersistence).toBe(false);
     await reply(bridge, { success: false, error: { type: "policy_denied", message: "denied" } });
@@ -2105,5 +2188,656 @@ describe("vscode webview message rows", () => {
       await Promise.resolve();
     });
     expect(view.queryByText("reply number 0")).not.toBeNull();
+  });
+
+  // ChatPane-level derivations the webview shares with desktop (#5002).
+  test("prompt arrows skip machine wakes and scroll the neighboring prompt into view", async () => {
+    const scrolled: Element[] = [];
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (this: Element) {
+      scrolled.push(this);
+    };
+    try {
+      const bridge = new TestBridge();
+      const view = render(<App bridge={bridge} />);
+      await selectWorkspace(bridge, [
+        historyMessage("first", "user", "first prompt", { historySequence: 1 }),
+        historyMessage("wake", "user", "A monitor matched.", {
+          historySequence: 2,
+          synthetic: true,
+          uiVisible: true,
+          muxMetadata: {
+            type: "bash-monitor-wake",
+            records: [{ kind: "match", displayName: "Dev", filter: "ready", filterExclude: false }],
+          },
+        }),
+        historyMessage("second", "user", "second prompt", { historySequence: 3 }),
+      ]);
+
+      const firstRow = view.container.querySelector('[data-message-id="first"]');
+      const next = firstRow?.querySelector<HTMLButtonElement>('button[aria-label="Next message"]');
+      expect(next).not.toBeNull();
+      expect(
+        firstRow?.querySelector<HTMLButtonElement>('button[aria-label="Previous message"]')
+          ?.disabled
+      ).toBe(true);
+
+      await act(async () => {
+        fireEvent.click(next!);
+        await Promise.resolve();
+      });
+      // Compare IDs, not elements: a failing toEqual on DOM nodes can exhaust memory while diffing.
+      expect(scrolled.map((element) => element.getAttribute("data-message-id"))).toEqual(["second"]);
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+    }
+  });
+
+  test("consecutive bash_output polls of one process collapse behind a toggle", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(
+      bridge,
+      ["out-1", "out-2", "out-3"].map((id, index) =>
+        toolMessage(
+          id,
+          index + 1,
+          "bash_output",
+          { process_id: "proc-1", timeout_secs: 5 },
+          { success: true, status: "running", output: `poll ${index + 1}`, elapsed_ms: 10 }
+        )
+      )
+    );
+
+    // A boolean, so a failure does not print the whole row element.
+    const middleRowRendered = () => view.container.querySelector('[data-message-id="out-2"]') !== null;
+    expect(view.container.querySelector('[data-message-id="out-1"]')).not.toBeNull();
+    expect(view.container.querySelector('[data-message-id="out-3"]')).not.toBeNull();
+    expect(middleRowRendered()).toBe(false);
+
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: /Show 1 more output check for proc-1/ }));
+      await Promise.resolve();
+    });
+    expect(middleRowRendered()).toBe(true);
+    expect(view.queryByRole("button", { name: /Hide 1 more output check/ })).not.toBeNull();
+  });
+
+  test("task_await rows name a linked background bash by its spawn intent", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [
+      toolMessage(
+        "spawn",
+        1,
+        "bash",
+        {
+          script: "./scripts/wait_pr_ready.sh 27330",
+          display_name: "PR ready watcher",
+          model_intent: "Watching PR 27330 until it is ready",
+          timeout_secs: 30,
+          run_in_background: true,
+        },
+        {
+          success: true,
+          output: "Started",
+          exitCode: 0,
+          wall_duration_ms: 10,
+          taskId: "bash:pr-ready-watcher-a1b2",
+          backgroundProcessId: "pr-ready-watcher-a1b2",
+        }
+      ),
+      toolMessage(
+        "await",
+        2,
+        "task_await",
+        { task_ids: ["bash:pr-ready-watcher-a1b2"] },
+        {
+          results: [
+            {
+              status: "completed",
+              taskId: "bash:pr-ready-watcher-a1b2",
+              title: "PR ready watcher",
+              reportMarkdown: "exit 0",
+            },
+          ],
+        }
+      ),
+    ]);
+
+    expect(view.queryByText(/bash · Watching PR 27330 until it is ready/)).not.toBeNull();
+  });
+});
+
+describe("vscode webview retry barrier (#5092)", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  const userRow = (id: string, sequence: number) => ({
+    ...createMuxMessage(id, "user", "Hello", { historySequence: sequence, timestamp: sequence }),
+    type: "message",
+  });
+  // A persisted failed turn: renders as a stream-error row, like desktop's.
+  const failedTurn = (errorType: "network" | "context_exceeded" | "authentication") => [
+    userRow("u1", 1),
+    {
+      type: "message",
+      id: "a1",
+      role: "assistant",
+      parts: [],
+      metadata: { historySequence: 2, timestamp: 2, error: "provider exploded", errorType },
+    },
+  ];
+  // Scheduled at call time: a countdown that already ran out shows "Retrying..." instead.
+  const scheduledRetry = () => ({
+    type: "auto-retry-scheduled",
+    attempt: 2,
+    delayMs: 60_000,
+    scheduledAt: Date.now(),
+  });
+  const chatEvent = (bridge: TestBridge, event: unknown, workspaceId = WORKSPACE.id) =>
+    bridge.emit({ type: "chatEvent", workspaceId, event });
+  // A live stream the user stops after its first token.
+  const stopMidStream = async (bridge: TestBridge, workspaceId = WORKSPACE.id) => {
+    await chatEvent(
+      bridge,
+      {
+        type: "stream-start",
+        workspaceId,
+        messageId: "a1",
+        model: "anthropic:claude-sonnet-4-5",
+        historySequence: 2,
+        startTime: 2,
+      },
+      workspaceId
+    );
+    await chatEvent(
+      bridge,
+      {
+        type: "stream-delta",
+        workspaceId,
+        messageId: "a1",
+        delta: "Half an answer",
+        tokens: 3,
+        timestamp: 3,
+      },
+      workspaceId
+    );
+    await chatEvent(
+      bridge,
+      { type: "stream-abort", workspaceId, messageId: "a1", abortReason: "user" },
+      workspaceId
+    );
+  };
+  const click = async (element: HTMLElement) => {
+    await act(async () => {
+      fireEvent.click(element);
+      await Promise.resolve();
+    });
+  };
+
+  test("Retry after a stream error resumes the stream without toggling auto-retry", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, failedTurn("network"));
+
+    expect(view.container.textContent).toContain("Stream interrupted");
+    await click(view.getByRole("button", { name: "Retry" }));
+
+    const resumes = bridge.orpcCalls("workspace.resumeStream");
+    expect(resumes).toHaveLength(1);
+    expect(resumes[0].input).toMatchObject({ workspaceId: WORKSPACE.id });
+    expect(bridge.orpcCalls("workspace.setAutoRetryEnabled")).toHaveLength(0);
+
+    // A refused resume is reported on the barrier.
+    await bridge.emit({
+      type: "orpcResponse",
+      requestId: resumes[0].requestId,
+      ok: true,
+      kind: "value",
+      value: { success: false, error: { type: "runtime_not_ready", message: "resume refused" } },
+    });
+    expect(view.container.textContent).toContain("Retry failed:");
+  });
+
+  test("while the backend has a retry scheduled, the barrier shows its countdown and offers no Retry or Stop", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    // The replayed status snapshot arrives before caught-up, after the failed turn.
+    await selectWorkspace(bridge, [...failedTurn("network"), scheduledRetry()]);
+
+    expect(view.container.textContent).toContain("Retrying in");
+    expect(view.container.textContent).toContain("(attempt 2)");
+    // A manual Retry would race the armed backoff; the webview never stops auto-retry either.
+    expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(view.queryByRole("button", { name: /^Stop/ })).toBeNull();
+
+    // The status belongs to this workspace: another failed workspace offers Retry again.
+    const other: UiWorkspace = { ...WORKSPACE, id: "ws-2", workspaceName: "other" };
+    await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE, other] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: other.id });
+    for (const event of [...failedTurn("network"), { type: "caught-up" }]) {
+      await chatEvent(bridge, event, other.id);
+    }
+    expect(view.container.textContent).not.toContain("Retrying");
+    expect(view.getByRole("button", { name: "Retry" })).toBeTruthy();
+  });
+
+  test("repeated identical stream errors render as one card with a count, as on desktop", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    const failedAttempt = (id: string, sequence: number) => ({
+      type: "message",
+      id,
+      role: "assistant",
+      parts: [],
+      metadata: {
+        historySequence: sequence,
+        timestamp: sequence,
+        error: "provider exploded",
+        errorType: "network",
+      },
+    });
+    await selectWorkspace(bridge, [
+      userRow("u1", 1),
+      failedAttempt("a1", 2),
+      failedAttempt("a2", 3),
+      failedAttempt("a3", 4),
+    ]);
+
+    expect(view.container.textContent?.match(/provider exploded/g)).toHaveLength(1);
+    expect(view.container.textContent).toContain("×3");
+    // The merged card is still the retry candidate.
+    expect(view.getByRole("button", { name: "Retry" })).toBeTruthy();
+  });
+
+  test("a context_exceeded error shows no retry barrier", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, failedTurn("context_exceeded"));
+
+    expect(view.container.textContent).toContain("provider exploded");
+    expect(view.container.textContent).not.toContain("Stream interrupted");
+    expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  test("a replayed terminal context_exceeded error survives history loading and shows no Retry", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    // The backend replays the turn's terminal error before caught-up (pre-stream failure).
+    await selectWorkspace(bridge, [
+      userRow("u1", 1),
+      {
+        type: "stream-error",
+        messageId: "a1",
+        error: "prompt is too long",
+        errorType: "context_exceeded",
+      },
+    ]);
+
+    expect(view.container.textContent).toContain("prompt is too long");
+    expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  test("without a server connection the retry barrier is not offered", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, failedTurn("network"));
+    expect(view.getByRole("button", { name: "Retry" })).toBeTruthy();
+
+    // File mode keeps the transcript, but the host refuses every bridged action.
+    await bridge.emit({ type: "connectionStatus", status: { mode: "file", error: "offline" } });
+
+    expect(view.container.textContent).toContain("provider exploded");
+    expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  test("a user-stopped stream shows the interrupted divider; its button and Shift+R resume it", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [userRow("u1", 1)]);
+    await stopMidStream(bridge);
+
+    // A user stop is not an error: no retry barrier, only the divider.
+    expect(view.container.textContent).not.toContain("Stream interrupted");
+    await click(view.getByRole("button", { name: "Continue interrupted response" }));
+    expect(bridge.orpcCalls("workspace.resumeStream")).toHaveLength(1);
+    await bridge.answer("workspace.resumeStream", { success: true, data: { started: true } });
+
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "R", shiftKey: true });
+      await Promise.resolve();
+    });
+    const resumes = bridge.orpcCalls("workspace.resumeStream");
+    expect(resumes).toHaveLength(2);
+    expect(resumes[1].input).toMatchObject({ workspaceId: WORKSPACE.id });
+    // Resuming a user stop never flips the auto-retry preference.
+    expect(bridge.orpcCalls("workspace.setAutoRetryEnabled")).toHaveLength(0);
+  });
+
+  // #4738: a child task keeps its assigned agent (agentType), even when a stale stored pick says
+  // otherwise; Retry and resume must send it, as the composer does.
+  const subAgent: UiWorkspace = {
+    ...WORKSPACE,
+    ai: { parentWorkspaceId: "ws-parent", agentId: "plan", agentType: "exec" },
+  };
+  const resumedAgentId = (bridge: TestBridge) => {
+    const resumes = bridge.orpcCalls("workspace.resumeStream");
+    expect(resumes).toHaveLength(1);
+    return (resumes[0].input as { options?: { agentId?: string } }).options?.agentId;
+  };
+
+  test("a sub-agent's Retry sends its locked agent, not a stale stored pick", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, failedTurn("network"), subAgent);
+    await act(async () => {
+      updatePersistedState(getAgentIdKey(subAgent.id), "plan");
+      await Promise.resolve();
+    });
+
+    await click(view.getByRole("button", { name: "Retry" }));
+    expect(resumedAgentId(bridge)).toBe("exec");
+  });
+
+  test("a sub-agent's interrupted-divider resume sends its locked agent, not a stale stored pick", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [userRow("u1", 1)], subAgent);
+    await stopMidStream(bridge);
+    await act(async () => {
+      updatePersistedState(getAgentIdKey(subAgent.id), "plan");
+      await Promise.resolve();
+    });
+
+    await click(view.getByRole("button", { name: "Continue interrupted response" }));
+    expect(resumedAgentId(bridge)).toBe("exec");
+  });
+
+});
+
+describe("vscode webview background processes strip (#5092)", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  // The background bash store is an app-wide singleton that keeps each workspace's last-known
+  // processes, so these tests use workspaces no other test selects.
+  const workspaceA: UiWorkspace = { ...WORKSPACE, id: "ws-bash-a", workspaceName: "bash-a" };
+  const workspaceB: UiWorkspace = { ...WORKSPACE, id: "ws-bash-b", workspaceName: "bash-b" };
+  const runningProcess = {
+    id: "bash-1",
+    pid: 4242,
+    script: "sleep 600",
+    startTime: Date.now(),
+    status: "running",
+  };
+  // The oRPC client reaches the bridge after a few promise hops.
+  const settle = () =>
+    act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  // Plays the host opening the subscription's stream and emitting one state.
+  const emitProcesses = async (
+    bridge: TestBridge,
+    call: { requestId: string },
+    streamId: string,
+    processes: unknown[]
+  ) => {
+    await bridge.emit({
+      type: "orpcResponse",
+      requestId: call.requestId,
+      ok: true,
+      kind: "stream",
+      streamId,
+    });
+    await bridge.emit({
+      type: "orpcStreamData",
+      streamId,
+      value: { processes, foregroundToolCallIds: [] },
+    });
+    await settle();
+  };
+  const click = async (element: Element) => {
+    await act(async () => {
+      fireEvent.click(element);
+      await Promise.resolve();
+    });
+  };
+
+  test("shows the selected workspace's running processes in the dock and terminates them", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], workspaceA);
+    await settle();
+
+    const subscriptions = bridge.orpcCalls("workspace.backgroundBashes.subscribe");
+    expect(subscriptions.map((call) => call.input)).toEqual([{ workspaceId: workspaceA.id }]);
+    await emitProcesses(bridge, subscriptions[0], "stream-a", [runningProcess]);
+
+    await click(view.getByRole("button", { name: /1 background bash/ }));
+    const script = view.container.querySelector('[title="sleep 600"]');
+    if (!script) throw new Error("the expanded strip does not list the process");
+    // The output dialog (it polls getOutput) is not offered in the webview (#5196).
+    expect(view.queryByRole("button", { name: "View output" })).toBeNull();
+    // Each row ends with its Terminate button.
+    const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
+    await click(rowButtons[rowButtons.length - 1]);
+    await settle();
+
+    expect(
+      bridge.orpcCalls("workspace.backgroundBashes.terminate").map((call) => call.input)
+    ).toEqual([{ workspaceId: workspaceA.id, processId: "bash-1" }]);
+    // Re-renders (history caught up, expanding, terminating) keep the one backend stream.
+    expect(bridge.orpcCalls("workspace.backgroundBashes.subscribe")).toHaveLength(1);
+  });
+
+  test("does not offer sending a running foreground bash to the background", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-fg", workspaceName: "bash-fg" };
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], workspace);
+    await settle();
+    const chat = (event: Record<string, unknown>) =>
+      bridge.emit({ type: "chatEvent", workspaceId: workspace.id, event });
+    await chat({
+      type: "stream-start",
+      workspaceId: workspace.id,
+      messageId: "a1",
+      model: "anthropic:claude-sonnet-4-5",
+      historySequence: 1,
+      startTime: 1,
+    });
+    await chat({
+      type: "tool-call-start",
+      workspaceId: workspace.id,
+      messageId: "a1",
+      toolCallId: "call-fg",
+      toolName: "bash",
+      args: { script: "make build", timeout_secs: 60, display_name: "Build" },
+      tokens: 1,
+      timestamp: 2,
+    });
+    // The backend reports the call as a foreground bash that could be backgrounded, but the
+    // bridge refuses sendToBackground (bashForegroundControls is unsupported in the webview).
+    const call = bridge.orpcCalls("workspace.backgroundBashes.subscribe")[0];
+    await bridge.emit({
+      type: "orpcResponse",
+      requestId: call.requestId,
+      ok: true,
+      kind: "stream",
+      streamId: "stream-fg",
+    });
+    await bridge.emit({
+      type: "orpcStreamData",
+      streamId: "stream-fg",
+      value: { processes: [], foregroundToolCallIds: ["call-fg"] },
+    });
+    await settle();
+
+    expect(view.container.textContent).toContain("make build");
+    expect(view.queryByRole("button", { name: "Send to background" })).toBeNull();
+  });
+
+  test("a terminate failure that arrives after a workspace switch is not shown over the new chat", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-late", workspaceName: "bash-late" };
+    const other: UiWorkspace = { ...WORKSPACE, id: "ws-bash-late-2", workspaceName: "bash-late-2" };
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], workspace);
+    await settle();
+    await emitProcesses(
+      bridge,
+      bridge.orpcCalls("workspace.backgroundBashes.subscribe")[0],
+      "stream-late",
+      [runningProcess]
+    );
+    await click(view.getByRole("button", { name: /1 background bash/ }));
+    const script = view.container.querySelector('[title="sleep 600"]');
+    if (!script) throw new Error("the expanded strip does not list the process");
+    const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
+    await click(rowButtons[rowButtons.length - 1]);
+    await settle();
+    expect(bridge.orpcCalls("workspace.backgroundBashes.terminate")).toHaveLength(1);
+
+    // Switch before the host answers, then the terminate fails.
+    await bridge.emit({ type: "workspaces", workspaces: [workspace, other] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: other.id });
+    await bridge.emit({ type: "chatEvent", workspaceId: other.id, event: { type: "caught-up" } });
+    await settle();
+    await bridge.answer("workspace.backgroundBashes.terminate", {
+      success: false,
+      error: "terminate refused",
+    });
+    await settle();
+
+    // PopoverError renders in a portal, so check the whole document.
+    expect(document.body.textContent).not.toContain("terminate refused");
+  });
+
+  // The terminate failure either lands on server A before the switch (already shown) or arrives
+  // late, after it; neither may show over server B.
+  test.each([
+    ["an already-shown", true],
+    ["a late", false],
+  ])("switching servers shows neither the previous server's rows nor %s error over the new connection", async (_label, answerBeforeSwitch) => {
+    // Both servers expose a workspace with this ID.
+    const workspace: UiWorkspace = {
+      ...WORKSPACE,
+      id: "ws-bash-server",
+      workspaceName: "bash-server",
+    };
+    const bridge = new TestBridge();
+    // Snapshot the document after every commit, before passive effects run.
+    const commits: Array<{ rows: boolean; error: boolean }> = [];
+    const onRender = () => {
+      const text = document.body.textContent ?? "";
+      commits.push({
+        rows: text.includes("background bash"),
+        error: text.includes("terminate refused"),
+      });
+    };
+    const view = render(
+      <Profiler id="app" onRender={onRender}>
+        <App bridge={bridge} />
+      </Profiler>
+    );
+    await selectWorkspace(bridge, [], workspace);
+    await settle();
+    await emitProcesses(
+      bridge,
+      bridge.orpcCalls("workspace.backgroundBashes.subscribe")[0],
+      "stream-server-1",
+      [runningProcess]
+    );
+    await click(view.getByRole("button", { name: /1 background bash/ }));
+    const script = view.container.querySelector('[title="sleep 600"]');
+    if (!script) throw new Error("the expanded strip does not list the process");
+    const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
+    // Terminate on server A.
+    await click(rowButtons[rowButtons.length - 1]);
+    await settle();
+    const answerTerminate = () =>
+      bridge.answer("workspace.backgroundBashes.terminate", {
+        success: false,
+        error: "terminate refused",
+      });
+    if (answerBeforeSwitch) {
+      await answerTerminate();
+      await settle();
+      expect(view.getByText(/terminate refused/)).toBeTruthy();
+    }
+
+    commits.length = 0;
+    await bridge.emit({
+      type: "connectionStatus",
+      status: { mode: "api", baseUrl: "http://other" },
+    });
+    if (!answerBeforeSwitch) {
+      await answerTerminate();
+    }
+    await settle();
+
+    expect(commits.length).toBeGreaterThan(0);
+    expect(commits.filter((commit) => commit.rows)).toEqual([]);
+    // An already-shown error can remain in the commits of the synchronous store resets that
+    // precede the render showing the new connection; once gone it never comes back. A late error
+    // arrives after the first (error-free) commit, so it must never show.
+    const firstErrorFree = commits.findIndex((commit) => !commit.error);
+    expect(firstErrorFree).toBeGreaterThanOrEqual(0);
+    expect(commits.slice(firstErrorFree).filter((commit) => commit.error)).toEqual([]);
+    const subscriptions = bridge.orpcCalls("workspace.backgroundBashes.subscribe");
+    expect(subscriptions.length).toBeGreaterThan(1);
+
+    // Server B runs a process too: its strip starts collapsed, never with server A's expanded list.
+    await emitProcesses(bridge, subscriptions[subscriptions.length - 1], "stream-server-2", [
+      runningProcess,
+    ]);
+    expect(view.getByRole("button", { name: /1 background bash/ })).toBeTruthy();
+    expect(view.container.querySelectorAll('[title="sleep 600"]')).toHaveLength(0);
+  });
+
+  test("does not show another workspace's processes after a switch", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], workspaceA);
+    await settle();
+    await emitProcesses(
+      bridge,
+      bridge.orpcCalls("workspace.backgroundBashes.subscribe")[0],
+      "stream-a",
+      [runningProcess]
+    );
+    expect(view.getByRole("button", { name: /1 background bash/ })).toBeTruthy();
+
+    await bridge.emit({ type: "workspaces", workspaces: [workspaceA, workspaceB] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: workspaceB.id });
+    await bridge.emit({
+      type: "chatEvent",
+      workspaceId: workspaceB.id,
+      event: { type: "caught-up" },
+    });
+    await settle();
+
+    expect(view.queryByRole("button", { name: /background bash/ })).toBeNull();
+    const subscriptions = bridge.orpcCalls("workspace.backgroundBashes.subscribe");
+    expect(subscriptions.map((call) => call.input)).toContainEqual({ workspaceId: workspaceB.id });
   });
 });

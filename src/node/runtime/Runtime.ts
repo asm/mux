@@ -581,6 +581,17 @@ export interface Runtime {
   ): Promise<Result<void, string>>;
 
   /**
+   * Release what finalizeConfig/validateBeforePersist prepared for a creation that is rolled
+   * back before init, so postCreateSetup never consumes it.
+   *
+   * Use cases:
+   * - Coder: dispose the provisioning session (a short-lived deployment token) (#5113)
+   *
+   * Best-effort: must not throw.
+   */
+  releaseCreationSetup?(): Promise<void>;
+
+  /**
    * Optional long-running setup that runs after mux persists workspace metadata.
    * Used for provisioning steps that must happen before initWorkspace but after
    * the workspace is registered (e.g., creating Coder workspaces, pulling Docker images).
@@ -669,8 +680,9 @@ export interface Runtime {
         success: false;
         error: string;
         /**
-         * Set by a runtime that deletes several paths (MultiProjectRuntime): the disposable ones it
-         * could not delete, so a rollback can name them (#4936).
+         * Set by a runtime that deletes several things (MultiProjectRuntime, and a devcontainer's
+         * container plus worktree): the disposable ones it could not delete, so a rollback can
+         * name them (#4936, #5120).
          */
         leftoverPaths?: string[];
       }
@@ -689,6 +701,9 @@ export interface Runtime {
    * @returns Result indicating ready or failure with error type for retry decisions
    */
   ensureReady(options?: EnsureReadyOptions): Promise<EnsureReadyResult>;
+
+  /** Check availability without starting runtimes whose SSH connection can start them. */
+  isRunningWithoutStart?(abortSignal: AbortSignal): Promise<boolean>;
 
   /**
    * Fork an existing workspace to create a new one.
@@ -785,7 +800,11 @@ const PERMANENT_SSH_FAILURE_TEXTS = [
   "SSH2 authentication failed", // SSH2ConnectionPool after the last key
 ] as const;
 
-function isPermanentSSHFailure(error: unknown): boolean {
+/**
+ * True for an SSH failure that another attempt cannot fix: a rejected key or password, or a
+ * failed host-key check. Both SSH pools stop their backoff wait loop on it (#5063).
+ */
+export function isPermanentSSHFailure(error: unknown): boolean {
   for (let current = error, depth = 0; current instanceof Error && depth < 4; depth++) {
     // ssh2 tags authentication errors with a level (see SSH2ConnectionPool's isAuthFailure).
     if ((current as { level?: unknown }).level === "client-authentication") return true;

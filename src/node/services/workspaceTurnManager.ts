@@ -84,8 +84,9 @@ import {
 } from "@/node/services/utils/messageIds";
 import { defaultModel } from "@/common/utils/ai/models";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
-import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
 import { normalizeAgentId } from "@/common/utils/agentIds";
@@ -624,22 +625,51 @@ async function runtimePathExists(runtime: Runtime, path: string): Promise<boolea
   }
 }
 
-function isContextBudgetFlushMetadata(muxMetadata: unknown): boolean {
-  return (
-    typeof muxMetadata === "object" &&
-    muxMetadata !== null &&
-    (muxMetadata as { contextBudgetFlush?: unknown }).contextBudgetFlush === true
-  );
+interface LiveWorkspaceTurnRegistration {
+  handleId: string;
+  ownerWorkspaceId: string;
+  accepted: boolean;
+}
+
+/**
+ * Live delegated-turn registrations keyed by target workspace. Releasing one is the settlement
+ * signal for peer messages that wait for the delegated turn to finish (#4997). Every settle,
+ * recovery and stale-cleanup path releases through delete(), so hooking delete() here cannot miss
+ * a path. Replacing a registration with set() is not a release: the next turn is still running.
+ * Every registration goes through set(), so hooking it reports each new turn even when that turn
+ * also settles before anyone looks (#5271).
+ */
+class LiveWorkspaceTurnRegistrations extends Map<string, LiveWorkspaceTurnRegistration> {
+  constructor(
+    private readonly onRegistered: (workspaceId: string) => void,
+    private readonly onReleased: (workspaceId: string) => void
+  ) {
+    super();
+  }
+
+  override set(workspaceId: string, registration: LiveWorkspaceTurnRegistration): this {
+    // An update of the live turn (e.g. marking it accepted) is not a new turn.
+    const isNewTurn = super.get(workspaceId)?.handleId !== registration.handleId;
+    super.set(workspaceId, registration);
+    if (isNewTurn) this.onRegistered(workspaceId);
+    return this;
+  }
+
+  override delete(workspaceId: string): boolean {
+    const deleted = super.delete(workspaceId);
+    if (deleted) this.onReleased(workspaceId);
+    return deleted;
+  }
 }
 
 export class WorkspaceTurnManager {
   private readonly workspaceTurnSettlementLocks = new MutexMap<string>();
   private readonly workspaceLifecycleLocks = new MutexMap<string>();
   private readonly pendingWorkspaceTurnWaitersByHandleId = new Map<string, WorkspaceTurnWaiter[]>();
-  private readonly activeWorkspaceTurnHandleByWorkspaceId = new Map<
-    string,
-    { handleId: string; ownerWorkspaceId: string; accepted: boolean }
-  >();
+  private readonly activeWorkspaceTurnHandleByWorkspaceId = new LiveWorkspaceTurnRegistrations(
+    (workspaceId) => this.taskHost.onWorkspaceTurnRegistered(workspaceId),
+    (workspaceId) => this.taskHost.onWorkspaceTurnRegistrationReleased(workspaceId)
+  );
   private lastWorkspaceTurnCreatedAtMs = 0;
   private readonly taskHandleStore: TaskHandleStore;
 
@@ -784,20 +814,32 @@ export class WorkspaceTurnManager {
   }
 
   /**
-   * Startup resolver (#4453): a delegated target whose creator died before settling its creating
-   * turn (crash between create() and the handle record, or between the terminal write and the
-   * grant) keeps its pending mark. Clear such marks; never grant. A handle whose live-owner lock
-   * has a live holder, here or in another backend, is still being created and is left alone.
-   * Never throws: startup must not fail.
+   * Startup resolver for delegated targets whose creator died. Never throws: startup must not
+   * fail. A handle whose live-owner lock has a live holder, here or in another backend, is still
+   * being created and is left alone.
+   * - #4453: a creator that died before settling its creating turn (crash between create() and
+   *   the handle record, or between the terminal write and the grant) leaves the pending mark.
+   *   Clear such marks; never grant.
+   * - #4983: a crash between create() and the handle record also leaves the target itself, which
+   *   its owner can no longer reach (a mode "existing" retry is invalid_scope). Flag it for the
+   *   user (flagInterruptedDelegatedCreation). Nothing is removed automatically: a wrong
+   *   automatic removal costs more than a visible, clean workspace the user can remove.
    */
-  async clearOrphanedDelegatedConsentDefaults(): Promise<void> {
+  async resolveOrphanedDelegatedTargets(): Promise<void> {
     for (const project of this.config.loadConfigOrDefault().projects.values()) {
       for (const workspace of project.workspaces) {
         const tags = workspace.tags ?? {};
-        const handleId = tags[WORKSPACE_TURN_TASK_TAGS.handle] ?? "";
-        const ownerId = tags[WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId] ?? "";
+        // The creator's own mark, which the public create API cannot write, outranks the tags.
+        // A flagged mark still binds the row (a later pass may owe it a consent clear); only an
+        // unconfirmed one is flagged.
+        const bindingMark = workspace.delegatedCreation;
+        const creationMark = bindingMark?.interruptedAt == null ? bindingMark : undefined;
+        const handleId = bindingMark?.handleId ?? tags[WORKSPACE_TURN_TASK_TAGS.handle] ?? "";
+        const ownerId =
+          bindingMark?.ownerWorkspaceId ?? tags[WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId] ?? "";
         const workspaceId = workspace.id;
-        if (workspace.unrelatedWorkspaceConsentPending !== true || workspaceId == null) continue;
+        const pending = workspace.unrelatedWorkspaceConsentPending === true;
+        if ((!pending && creationMark == null) || workspaceId == null) continue;
         if (!isWorkspaceTurnTaskId(handleId) || ownerId === "") continue;
         try {
           await this.workspaceTurnSettlementLocks.withLock(handleId, async () => {
@@ -805,32 +847,85 @@ export class WorkspaceTurnManager {
             if (this.turnOwnerLocks.has(handleId) || this.creationConsentFinalizers.has(handleId)) {
               return;
             }
-            // Tags are caller-supplied (workspace.create accepts any), so the handle must be real:
-            // its creator locked it before create(), and the lock outlives the creator until the
-            // record settles. Without a lock only a record that created this target counts.
-            const lockPath = workspaceTurnOwnerLockPath(this.config.rootDir, handleId);
-            const locked = await fsPromises.access(lockPath).then(
-              () => true,
-              () => false
-            );
-            if (!locked) {
-              const record = await this.taskHandleStore.getWorkspaceTurn(ownerId, handleId);
-              if (record?.createdWorkspace !== true || record.workspaceId !== workspaceId) return;
+            // Tags are caller-supplied (workspace.create accepts any), so without the creator's
+            // mark the handle must be real: its creator locked it before create(), and the lock
+            // outlives the creator until the record settles. Without a lock only a record that
+            // created this target counts.
+            if (bindingMark == null) {
+              const lockPath = workspaceTurnOwnerLockPath(this.config.rootDir, handleId);
+              const locked = await fsPromises.access(lockPath).then(
+                () => true,
+                () => false
+              );
+              if (!locked) {
+                const record = await this.taskHandleStore.getWorkspaceTurn(ownerId, handleId);
+                if (record?.createdWorkspace !== true || record.workspaceId !== workspaceId) return;
+              }
             }
             if ((await this.acquireTurnOwnerLock(handleId)) !== "held") return;
             try {
-              await this.workspaceService.clearPendingDefaultUnrelatedConsent(workspaceId);
+              if (pending) {
+                await this.workspaceService.clearPendingDefaultUnrelatedConsent(workspaceId);
+              }
+              if (creationMark != null) {
+                await this.flagInterruptedDelegatedCreation(workspaceId, ownerId, handleId);
+              }
             } finally {
               await this.releaseTurnOwnerLock(handleId);
             }
           });
         } catch (error: unknown) {
-          log.warn("Failed to clear an orphaned delegated consent default", {
+          log.warn("Failed to resolve an orphaned delegated target", {
             workspaceId,
             error: getErrorMessage(error),
           });
         }
       }
+    }
+  }
+
+  /**
+   * #4983: flag a delegated target whose creator died before its handle record persisted. The
+   * caller holds the handle's live-owner lock, so no live backend is creating or settling it.
+   * Reads only config and file metadata, never the target's runtime: an unreachable SSH host or a
+   * stopped Coder workspace must not slow startup or be started by it.
+   */
+  private async flagInterruptedDelegatedCreation(
+    workspaceId: string,
+    ownerId: string,
+    handleId: string
+  ): Promise<void> {
+    // Any record file, even one that reads as null (corrupt, or a newer build's schema), means the
+    // handle persisted: the target is not an orphan. Drop the leftover mark (the creator died
+    // before clearing it) only when the record itself binds this target; an unreadable record
+    // cannot, so the mark stays as the remaining evidence of the binding.
+    if (await this.taskHandleStore.hasWorkspaceTurnFile(ownerId, handleId)) {
+      const record = await this.taskHandleStore.getWorkspaceTurn(ownerId, handleId);
+      if (record?.createdWorkspace === true && record.workspaceId === workspaceId) {
+        await this.workspaceService.clearDelegatedCreationMark(workspaceId, handleId);
+      }
+      return;
+    }
+    // Records live in the owner's session dir and are deleted only with it, so a removed owner
+    // explains a missing record without a crash.
+    const ownerSessionDirExists = await fsPromises
+      .stat(path.join(this.config.sessionsDir, ownerId))
+      .then(
+        (stat) => stat.isDirectory(),
+        () => false
+      );
+    if (
+      !ownerSessionDirExists ||
+      findWorkspaceEntry(this.config.loadConfigOrDefault(), ownerId) == null
+    ) {
+      log.info("Leaving an unflagged delegated target: its owner workspace is gone", {
+        workspaceId,
+        handleId,
+      });
+      return;
+    }
+    if (await this.workspaceService.markDelegatedCreationInterrupted(workspaceId, handleId)) {
+      log.info("Flagged a delegated target whose setup did not finish", { workspaceId, handleId });
     }
   }
 
@@ -843,9 +938,7 @@ export class WorkspaceTurnManager {
    * ISO timestamp would otherwise fall back to filesystem readdir order.
    */
 
-  getLiveWorkspaceTurnRegistration(
-    workspaceId: string
-  ): { handleId: string; ownerWorkspaceId: string; accepted: boolean } | undefined {
+  getLiveWorkspaceTurnRegistration(workspaceId: string): LiveWorkspaceTurnRegistration | undefined {
     return this.activeWorkspaceTurnHandleByWorkspaceId.get(workspaceId);
   }
 
@@ -1226,10 +1319,24 @@ export class WorkspaceTurnManager {
     const cfg = this.config.loadConfigOrDefault();
     const taskSettings = cfg.taskSettings ?? DEFAULT_TASK_SETTINGS;
     const parentEntry = findWorkspaceEntry(cfg, ownerWorkspaceId);
-    if (parentEntry?.workspace.kind === "scratch") {
-      return Err("Task.createWorkspaceTurn: scratch workspace turns are not supported yet");
+    // Scratch (project-less) owners have no project or branch: mode="new" creates a fresh
+    // scratch chat (createScratch) and mode="existing" continues their own targets, including
+    // reawakening inactive sub-agents. Their trust lives in the scratch config bucket
+    // (parentMeta.projectPath is the scratch workdir), as in Task.create.
+    const ownerIsScratch = parentEntry?.workspace.kind === "scratch";
+    if (
+      ownerIsScratch &&
+      mode === "new" &&
+      (coerceNonEmptyString(args.workspace?.branchName) != null ||
+        coerceNonEmptyString(args.workspace?.trunkBranch) != null)
+    ) {
+      return Err(
+        "Task.createWorkspaceTurn: workspace.branchName/trunkBranch are not supported from a scratch workspace (scratch chats have no git branch)"
+      );
     }
-    const taskProjectConfig = cfg.projects.get(stripTrailingSlashes(parentMeta.projectPath));
+    const taskProjectConfig = cfg.projects.get(
+      ownerIsScratch ? SCRATCH_PROJECT_CONFIG_KEY : stripTrailingSlashes(parentMeta.projectPath)
+    );
     if ((parentMeta.projects?.length ?? 0) > 1) {
       // The host's create() only materializes one project checkout; fail loudly instead of
       // silently dropping secondary repos from a multi-project caller's task context.
@@ -1551,24 +1658,37 @@ export class WorkspaceTurnManager {
         [WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId]: ownerWorkspaceId,
         [WORKSPACE_TURN_TASK_TAGS.turn]: turnId,
       };
-      const createResult = await this.workspaceService.create(
-        parentMeta.projectPath,
-        args.workspace?.branchName,
-        args.workspace?.trunkBranch ?? parentMeta.name,
-        title,
-        parentMeta.runtimeConfig,
-        parentMeta.subProjectPath,
-        false,
-        tags,
-        // The agentId validation below reads the target checkout under the task mutex, so
-        // a local worktree must be populated before create() resolves. The default consent is
-        // granted when this turn settles (afterHandleWrite); disposable targets never get it.
-        {
-          awaitMaterialization: true,
-          defaultUnrelatedConsent:
-            args.workspace?.disposable === true ? "none" : "caller-finalizes",
-        }
-      );
+      const delegatedCreation = { handleId, ownerWorkspaceId };
+      const defaultUnrelatedConsent =
+        args.workspace?.disposable === true ? ("none" as const) : ("caller-finalizes" as const);
+      const createResult: Result<
+        { metadata: FrontendWorkspaceMetadata; createdBranch?: boolean },
+        string
+      > = ownerIsScratch
+        ? // A scratch chat is materialized once createScratch resolves (plain directory, no init).
+          await this.workspaceService.createScratch(title, tags, {
+            defaultUnrelatedConsent,
+            delegatedCreation,
+          })
+        : await this.workspaceService.create(
+            parentMeta.projectPath,
+            args.workspace?.branchName,
+            args.workspace?.trunkBranch ?? parentMeta.name,
+            title,
+            parentMeta.runtimeConfig,
+            parentMeta.subProjectPath,
+            false,
+            tags,
+            // The agentId validation below reads the target checkout under the task mutex, so
+            // a local worktree must be populated before create() resolves. The default consent is
+            // granted when this turn settles (afterHandleWrite); disposable targets never get it.
+            {
+              awaitMaterialization: true,
+              defaultUnrelatedConsent,
+              // Binds the row to this handle and owner until the record below persists (#4983).
+              delegatedCreation,
+            }
+          );
       if (!createResult.success) {
         return Err(`Task.createWorkspaceTurn: workspace create failed (${createResult.error})`);
       }
@@ -1791,6 +1911,10 @@ export class WorkspaceTurnManager {
         });
       }
     ).catch((error: unknown) => ({ error: getErrorMessage(error) }));
+    // The record now binds the target (#4983); its creation mark is only hygiene from here on.
+    if (persistedHandle && createdWorkspace) {
+      await this.workspaceService.clearDelegatedCreationMark(targetWorkspaceId, handleId);
+    }
     if (typeof persisted === "object") {
       if (persistedHandle) {
         await this.settleWorkspaceTurn({
@@ -3870,6 +3994,45 @@ export class WorkspaceTurnManager {
             });
           }
 
+          // #4930: the archive cascades over the target's unarchived sub-agents. Refuse before
+          // anything is interrupted or archived when a sub-agent is active, the delete policy
+          // would delete its checkout, or its (or the target's) snapshot archive would lose
+          // untracked files: no tool acknowledgement can approve that loss (#3950), so list the
+          // paths instead.
+          const cascadePreflight = await this.workspaceService.preflightArchiveCascade(
+            resolved.workspaceId,
+            worktreeArchiveBehavior
+          );
+          if (!cascadePreflight.success) {
+            return Ok({
+              status: "error",
+              action: "archive",
+              ...this.lifecycleTargetFields(resolved),
+              error: cascadePreflight.error,
+            });
+          }
+          const { subagents, targetPaths } = cascadePreflight.data;
+          if (subagents.length > 0) {
+            return Ok({
+              status: "error",
+              action: "archive",
+              ...this.lifecycleTargetFields(resolved),
+              // Prefixed with the sub-agent's workspace ID: each path is relative to its checkout.
+              paths: subagents.flatMap((subagent) =>
+                subagent.paths.map((p) => `${subagent.workspaceId}: ${p}`)
+              ),
+              error:
+                `Archiving this workspace also archives its sub-agents, and that would permanently delete the untracked files listed in paths from sub-agent(s) ${subagents
+                  .map((subagent) => `${subagent.title} (${subagent.workspaceId})`)
+                  .join(", ")}, because the snapshot archive behavior cannot preserve them. ` +
+                "This tool cannot approve that loss, and you must not delete the files to get around it. " +
+                "Ask the user to archive those sub-agents manually first; the archive dialog lists the files and asks for confirmation.",
+            });
+          }
+          if (targetPaths.length > 0) {
+            return Ok(this.lossySnapshotArchiveRefusal(resolved, targetPaths));
+          }
+
           // Held (when interrupting) from before the first turn interruption through the
           // archive sink so user activity cannot be admitted between turn destruction and
           // the sink's refuseLiveUserActivity gate (see acquirePreInterruptionArchiveHold).
@@ -5256,14 +5419,6 @@ export class WorkspaceTurnManager {
     if (this.isDeferredWorkspaceTurnMessage(record, event.messageId)) {
       return true;
     }
-    // A context-budget final flush is housekeeping inside the delegated turn, never its outcome:
-    // defer regardless of whether its paired continuation is still queued (a cleared queue must
-    // not turn the notes-only finish into the task's completion; the next stream settles it).
-    if (isContextBudgetFlushMetadata(event.metadata.muxMetadata)) {
-      await this.markWorkspaceTurnStreamEndDeferred(event);
-      return true;
-    }
-
     // Check runtime state before history. A finishing successor commits history before it disappears.
     // Parent guidance and report wake-ups continue the exact delegated turn. This includes
     // turn-end guidance: don't publish an early report before the queued guidance runs.

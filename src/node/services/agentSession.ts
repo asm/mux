@@ -6,6 +6,13 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { EventLoopYielder } from "@/node/utils/concurrency/eventLoopYielder";
 import { computePriorHistoryFingerprintAsync } from "./priorHistoryFingerprintAsync";
 import { STARTUP_RECOVERY_PROBE_TIMEOUT_MS } from "@/constants/startupRecovery";
+import {
+  ONCHAT_REPLAY_BATCH_MAX_ROWS,
+  ONCHAT_REPLAY_BATCH_MAX_TEXT_BYTES,
+  ONCHAT_REPLAY_BATCH_ROW_TEXT_LIMIT,
+  ONCHAT_REPLAY_WINDOW_MAX_BYTES,
+  ONCHAT_REPLAY_WINDOW_MAX_ROWS,
+} from "@/constants/orpcSubscriptions";
 import type { AIService } from "./aiService";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { GoalRecordV1 } from "@/common/types/goal";
@@ -21,10 +28,7 @@ import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
 import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelope";
-import {
-  prepareFreshRequestTokenCount,
-  resolveContextBudgetFlushThinking,
-} from "@/common/utils/compaction/contextBudget";
+import { prepareFreshRequestTokenCount } from "@/common/utils/compaction/contextBudget";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import type { TurnStreamHandle } from "./streamManager";
 import type { StreamManager } from "./streamManager";
@@ -87,6 +91,7 @@ import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import { createOnChatReplayTimer, logOnChatReplayTiming } from "@/node/services/onChatReplayTiming";
 import type {
+  ChatMuxMessage,
   HeldInput,
   WorkspaceChatMessage,
   SendMessageOptions,
@@ -94,10 +99,14 @@ import type {
   OnChatMode,
   OnChatCursor,
   OnChatDowngradeReason,
+  CaughtUpMessage,
   ProvidersConfigMap,
   StreamErrorMessage,
+  AcpPromptCorrelation,
 } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
+import { readAssistedReviewForSessionDir } from "@/node/services/reviewPane/assistedReviewStorage";
 import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview";
 import {
   GOAL_BUDGET_LIMIT_KIND,
@@ -413,8 +422,7 @@ interface AutoRetryResumeRequest {
   requestAssemblySnapshot?: RequestAssemblySnapshot;
   /**
    * The request already is an admitted context reset, so a budget failure on retry must not
-   * reset again. Distinct from the snapshot: an admitted final flush pins its chain too, yet
-   * its emergency reset stays available.
+   * reset again.
    */
   contextBudgetRetried?: boolean;
   agentInitiated?: boolean;
@@ -946,9 +954,35 @@ function withAuthoritativeSkillScopes(
   return next;
 }
 
+/**
+ * Summed text length of a replay row that may join an onChat replay batch (#4868): every part is
+ * text or reasoning with string text, within the per-row limit. Undefined for any other row, which
+ * is sent alone.
+ */
+function getBatchableRowTextLength(row: ChatMuxMessage): number | undefined {
+  let textLength = 0;
+  for (const part of row.parts) {
+    if (part.type !== "text" && part.type !== "reasoning") return undefined;
+    if (typeof part.text !== "string") return undefined;
+    textLength += part.text.length;
+    if (textLength > ONCHAT_REPLAY_BATCH_ROW_TEXT_LIMIT) return undefined;
+  }
+  return textLength;
+}
+
 export interface AgentSessionChatEvent {
   workspaceId: string;
   message: WorkspaceChatMessage;
+  /**
+   * Set only by history replay for rows that passed the wire-schema self-healing check: the
+   * schema's parse output for `message`, which onChat sends as-is instead of validating the row a
+   * second time (#4868). `message` stays the persisted row for every other listener.
+   *
+   * With replayHistory's `batchReplay`, consecutive rows may instead arrive as one
+   * `message-batch` event; batch mode is only requested by the self-validating onChat path, so
+   * there `message` and `wireMessage` are both parse output.
+   */
+  wireMessage?: WorkspaceChatMessage;
 }
 
 export interface AgentSessionMetadataEvent {
@@ -1023,12 +1057,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   buildMemorySessionContext?(
     workspaceId: string,
     modelString: string,
-    options?: {
-      includeHotMemories?: boolean;
-      tokenBudgetActive?: boolean;
-      onlyContextNotes?: boolean;
-      excludeProjectSkillContent?: boolean;
-    }
+    options?: { includeHotMemories?: boolean; excludeProjectSkillContent?: boolean }
   ): Promise<MemorySessionContext | null>;
   isClaudeSkillsCompatEnabled?(): boolean;
   isAgentPluginsEnabled?(): boolean;
@@ -1122,7 +1151,6 @@ interface AgentSessionOptions {
 interface CachedMemoryContext {
   context: MemorySessionContext | null;
   includesHotMemories: boolean;
-  tokenBudgetActive: boolean;
   memoryEnabled: boolean;
   hotSetEnabled: boolean;
   excludesProjectSkillContent: boolean;
@@ -1545,27 +1573,18 @@ export class AgentSession {
    * the memory tool description plus an optional hot-memories block, keyed by
    * model because the hot set is token-budgeted with the active model's
    * tokenizer. Index-only entries can be upgraded once final tool policy keeps
-   * the memory tool; compaction clears the map so repeated turns keep
-   * prompt-cache-stable bytes without preserving stale files forever.
+   * the memory tool.
+   *
+   * Frozen per context window (#5248, user-requested prompt-cache stability):
+   * only a new window (compaction, rollover, reset) or a new session clears
+   * it. Memory writes do not, neither this session's nor other sessions' or
+   * Dream's. Rebuilding after every write rewrote the memory tool description
+   * and system prompt, so the next turn missed the provider cache for the
+   * whole transcript; 37% of measured turns carry a write. Freshness
+   * trade-off: the agent sees its own writes through the memory tool results
+   * and live `memory view`; other writers' notes appear at the next window.
    */
   private memoryContextByModelString = new Map<string, CachedMemoryContext>();
-
-  /**
-   * Drop the cached memory context so the next stream rebuilds the index and
-   * hot set from disk. Own memory tool calls clear it on tool-call-end; this
-   * entry point is for writes by OTHER sessions to a store this session also
-   * reads (a sub-agent editing the task tree's shared workspace notes).
-   */
-  invalidateMemoryContext(): void {
-    this.memoryContextByModelString.clear();
-    // A build already awaiting buildMemorySessionContext read the pre-write
-    // files, and a rollover candidate stages its cache in a separate map that
-    // is installed later: bumping the generation stops both from
-    // (re)populating the cache with the stale snapshot.
-    this.memoryContextGeneration++;
-  }
-
-  private memoryContextGeneration = 0;
 
   /**
    * Cache the last-known experiment state so we don't spam metadata refresh
@@ -1686,8 +1705,6 @@ export class AgentSession {
     /** Goal identity matching goalKind, so mid-stream compaction follow-ups stay goal-scoped. */
     goalId?: string;
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
-    /** The active stream is a context-budget final-flush turn (bounded to one provider step). */
-    contextBudgetFlushTurn?: boolean;
     /**
      * Pre-skill-routing options for compaction requests spawned off this
      * stream. A turn routed to a small class model must never compact on that
@@ -2066,15 +2083,28 @@ export class AgentSession {
     return unsubscribe;
   }
 
+  /**
+   * `batchReplay` groups consecutive text-only history rows into `message-batch` events holding
+   * their parse output (#4868). Only the self-validating onChat path requests it, for clients that
+   * unpack batches; every other caller gets one `message` event per row. `replayWindow` limits
+   * a full replay to the newest rows (#4961); see emitHistoricalEvents.
+   */
   async replayHistory(
     listener: (event: AgentSessionChatEvent) => void,
     mode?: OnChatMode,
-    beforeReplayCompletion?: () => void
+    beforeReplayCompletion?: () => void,
+    options?: { batchReplay?: boolean; replayWindow?: boolean }
   ): Promise<void> {
     this.assertNotDisposed("replayHistory");
     assert(typeof listener === "function", "listener must be a function");
     await this.replayPublication.run({ listener, emittedStreamEvents: false }, () =>
-      this.emitHistoricalEvents(listener, mode, beforeReplayCompletion)
+      this.emitHistoricalEvents(
+        listener,
+        mode,
+        beforeReplayCompletion,
+        options?.batchReplay,
+        options?.replayWindow
+      )
     );
   }
 
@@ -3697,16 +3727,21 @@ export class AgentSession {
   private async emitHistoricalEvents(
     listener: (event: AgentSessionChatEvent) => void,
     mode?: OnChatMode,
-    beforeReplayCompletion?: () => void
+    beforeReplayCompletion?: () => void,
+    batchReplay = false,
+    replayWindow = false
   ): Promise<void> {
     let replayMode: "full" | "since" | "live" = "full";
     let hasOlderHistory: boolean | undefined;
+    // Set when a windowed full replay (#4961) was accepted after its older-history check.
+    let windowHasOlderHistory = false;
     let serverCursor: OnChatCursor | undefined;
     // Silent since→full downgrades caused full-history re-transfers on nearly every
     // workspace switch-back for months. Keep every downgrade observable: classified
     // reason on the caught-up payload plus a log line with row counts.
     let downgradeReason: OnChatDowngradeReason | undefined;
     let epochRowCount: number | undefined;
+    let windowSeed: CaughtUpMessage["windowSeed"];
     let sentRowCount = 0;
     let emittedReplayMessages = false;
     // caught-up is emitted from `finally` so the client never hangs; this flag makes it say
@@ -3719,10 +3754,39 @@ export class AgentSession {
     let streamReplayed = false;
 
     // Self-healing: persisted rows can fail the current wire schema (older
-    // writers, schema drift, corruption). oRPC validates every event yielded to
-    // onChat subscribers and a single invalid row terminates the iterator,
-    // which would permanently brick workspace fetch. Skip such rows instead of
-    // letting one bad line take down the whole transcript.
+    // writers, schema drift, corruption). onChat validates every event it yields
+    // and a single invalid row terminates the iterator, which would permanently
+    // brick workspace fetch. Skip such rows instead of letting one bad line take
+    // down the whole transcript.
+    //
+    // Also hand over the parse OUTPUT as `wireMessage` so onChat can send it
+    // without parsing every replayed row a second time (#4868). The bytes on the
+    // wire stay identical: this schema is the wire union's `message` member, and
+    // the union's parse output is exactly what oRPC used to send. Other listeners
+    // (getFullReplay, subscribeChat) keep receiving the persisted row.
+    //
+    // Batch mode (#4868): one event per row costs a frame, serialization and dispatch on both
+    // ends, so consecutive batchable rows are grouped. Only text-only rows are batched: their size
+    // is the text length (free), while tool/file rows are large and sizing them would need a
+    // stringify per row. Turned off after the history loop so the partial and every later
+    // emission stay single and in order.
+    let batchingRows = batchReplay;
+    let pendingBatch: ChatMuxMessage[] = [];
+    let pendingBatchTextLength = 0;
+    const flushReplayBatch = (): void => {
+      if (pendingBatch.length === 0) return;
+      // Detach before emitting: if the listener throws, the finally-block flush must not resend.
+      const messages = pendingBatch;
+      pendingBatch = [];
+      pendingBatchTextLength = 0;
+      if (messages.length === 1) {
+        // A 1-row batch saves nothing; send the plain row every client already understands.
+        listener({ workspaceId: this.workspaceId, message: messages[0], wireMessage: messages[0] });
+        return;
+      }
+      const batch: WorkspaceChatMessage = { type: "message-batch", messages };
+      listener({ workspaceId: this.workspaceId, message: batch, wireMessage: batch });
+    };
     const emitReplayMessage = (message: WorkspaceChatMessage): boolean => {
       const validation = ChatMuxMessageSchema.safeParse(message);
       if (!validation.success) {
@@ -3736,7 +3800,21 @@ export class AgentSession {
         return false;
       }
       emittedReplayMessages = true;
-      listener({ workspaceId: this.workspaceId, message });
+      if (batchingRows) {
+        const textLength = getBatchableRowTextLength(validation.data);
+        if (textLength !== undefined) {
+          if (pendingBatchTextLength + textLength > ONCHAT_REPLAY_BATCH_MAX_TEXT_BYTES) {
+            flushReplayBatch();
+          }
+          pendingBatch.push(validation.data);
+          pendingBatchTextLength += textLength;
+          if (pendingBatch.length >= ONCHAT_REPLAY_BATCH_MAX_ROWS) flushReplayBatch();
+          return true;
+        }
+        // Keep row order: everything batched before this row goes out first.
+        flushReplayBatch();
+      }
+      listener({ workspaceId: this.workspaceId, message, wireMessage: validation.data });
       return true;
     };
 
@@ -3833,19 +3911,102 @@ export class AgentSession {
       );
       const partialHistorySequence = partial?.metadata?.historySequence;
 
+      // Windowed replay (#4961). What a subscriber that sent `replayWindow: true` receives:
+      // - A full replay sends only the newest rows of the active epoch: at most
+      //   ONCHAT_REPLAY_WINDOW_MAX_ROWS rows and _MAX_BYTES bytes, a suffix of the full read that
+      //   starts at a clean turn start (readProviderHistoryWindow). Everything after the read is
+      //   unchanged: the cursor covers the window (oldest = its floor W), and `hasOlderHistory`
+      //   is the existing check below W, so it is true whenever older rows exist.
+      // - A full replay falls back to today's full replay when the window read fails, is
+      //   "not-windowable", or stops short of the epoch start without older rows found by the
+      //   check below its floor (legacy rows without a sequence cannot be paged).
+      // - A since replay reads only the client's range: the rows from the cursor's floor row
+      //   (oldestHistorySequence) to EOF, bounded by readProviderHistorySince (two windows, the
+      //   delta after the anchor row one). The since checks below run on that range only: the
+      //   anchor row (id + sequence) is in it, its oldest sequence equals the cursor's, and the
+      //   fingerprint of its rows before the anchor matches. So an edit or delete in the range
+      //   fails a check; rows older than the floor are never read or checked.
+      // - Every doubt in since mode downgrades to a fresh windowed full replay (as above), never
+      //   to today's full-epoch since read: a range read that fails or is "not-in-range" (a
+      //   compaction or reset since, a floor row gone or too far back, a delta over one window, a
+      //   duplicated anchor sequence), and every failed since check.
+      // Subscribers without the flag take exactly today's path.
+      // Persisted rows can predate writer validation. Never coerce malformed
+      // sequences into pagination arguments or reconnect cursor anchors.
+      const oldestSequenceOf = (rows: readonly MuxMessage[]): number | undefined => {
+        let oldest: number | undefined;
+        for (const message of rows) {
+          const historySequence = message.metadata?.historySequence;
+          if (!isNonNegativeInteger(historySequence)) {
+            continue;
+          }
+
+          if (oldest === undefined || historySequence < oldest) {
+            oldest = historySequence;
+          }
+        }
+        return oldest;
+      };
+      const windowCaps = {
+        maxRows: ONCHAT_REPLAY_WINDOW_MAX_ROWS,
+        maxBytes: ONCHAT_REPLAY_WINDOW_MAX_BYTES,
+      };
+      const readReplayWindow = async (): Promise<Result<MuxMessage[]> | undefined> => {
+        const window = await replayTimer.time("historyRead", () =>
+          this.historyService.getHistoryWindowFromLatestBoundary(this.workspaceId, windowCaps)
+        );
+        if (!window.success || window.data.kind !== "window") return undefined;
+        if (window.data.reachedEpochStart) return Ok(window.data.messages);
+        const floor = oldestSequenceOf(window.data.messages);
+        if (
+          floor === undefined ||
+          !(await replayTimer.time("olderHistoryCheck", () =>
+            this.historyService.hasHistoryBeforeSequence(this.workspaceId, floor)
+          ))
+        ) {
+          return undefined;
+        }
+        windowHasOlderHistory = true;
+        return Ok(window.data.messages);
+      };
       // Load chat history from the latest compaction boundary onward (skip=0).
       // Older compaction epochs are fetched on demand through workspace.history.loadMore.
-      const historyResult = await replayTimer.timeLocked(
-        "historyLockWait",
-        "historyRead",
-        (onLockAcquired) =>
+      const readFullHistory = () =>
+        replayTimer.timeLocked("historyLockWait", "historyRead", (onLockAcquired) =>
           this.historyService.getHistoryFromLatestBoundary(this.workspaceId, 0, {
             onLockAcquired,
             onBytesRead: (bytes) => {
               historyBytesRead += bytes;
             },
           })
-      );
+        );
+      let historyResult: Result<MuxMessage[]> | undefined;
+      // True when history is a windowed client's since range, not the active epoch.
+      let sinceRange = false;
+      if (replayWindow && mode?.type === "since") {
+        const floor = mode.cursor.history.oldestHistorySequence;
+        const anchor = mode.cursor.history.historySequence;
+        const range =
+          isNonNegativeInteger(floor) && isNonNegativeInteger(anchor)
+            ? await replayTimer.time("historyRead", () =>
+                this.historyService.getHistorySinceFromLatestBoundary(
+                  this.workspaceId,
+                  windowCaps,
+                  {
+                    floor,
+                    anchor,
+                  }
+                )
+              )
+            : undefined;
+        if (range?.success && range.data.kind === "range") {
+          historyResult = Ok(range.data.messages);
+          sinceRange = true;
+        } else
+          downgradeReason = range?.success === false ? "history-read-failed" : "outside-window";
+      }
+      if (replayWindow && !sinceRange) historyResult = await readReplayWindow();
+      historyResult ??= await readFullHistory();
 
       let sinceHistorySequence: number | undefined;
       let afterTimestamp: number | undefined;
@@ -3856,26 +4017,16 @@ export class AgentSession {
       }
 
       if (historyResult.success) {
-        const history = historyResult.data;
+        let history = historyResult.data;
         epochRowCount = history.length;
 
         // Cursor-based replay: only use incremental mode when all provided cursor segments are valid.
-        const historyCursor = mode?.type === "since" ? mode.cursor.history : undefined;
+        // A windowed client whose range was not read has already downgraded (downgradeReason).
+        const historyCursor =
+          mode?.type === "since" && (!replayWindow || sinceRange) ? mode.cursor.history : undefined;
         const streamCursor = mode?.type === "since" ? mode.cursor.stream : undefined;
 
-        // Persisted rows can predate writer validation. Never coerce malformed
-        // sequences into pagination arguments or reconnect cursor anchors.
-        let oldestHistorySequence: number | undefined;
-        for (const message of history) {
-          const historySequence = message.metadata?.historySequence;
-          if (!isNonNegativeInteger(historySequence)) {
-            continue;
-          }
-
-          if (oldestHistorySequence === undefined || historySequence < oldestHistorySequence) {
-            oldestHistorySequence = historySequence;
-          }
-        }
+        let oldestHistorySequence = oldestSequenceOf(history);
         // The fingerprint is a pure function of (history, anchor) and serializes every prior
         // row's parts, so it dominates the since-replay cost on large transcripts. Remember the
         // client-anchor computation: on an unchanged revisit the server cursor anchors at the
@@ -3951,9 +4102,21 @@ export class AgentSession {
         } else {
           sinceHistorySequence = undefined;
           afterTimestamp = undefined;
+          if (sinceRange) {
+            // A since check failed on the client's range: a fresh windowed full replay.
+            const downgrade = (await readReplayWindow()) ?? (await readFullHistory());
+            if (!downgrade.success) throw new Error(downgrade.error);
+            history = downgrade.data;
+            epochRowCount = history.length;
+            oldestHistorySequence = oldestSequenceOf(history);
+            anchorFingerprint = undefined;
+          }
         }
 
-        if (replayMode === "full") {
+        if (replayMode === "full" && windowHasOlderHistory) {
+          // Checked when the window was accepted.
+          hasOlderHistory = true;
+        } else if (replayMode === "full") {
           if (oldestHistorySequence === undefined) {
             // Empty full replay means there is no older page to request.
             hasOlderHistory = false;
@@ -3970,7 +4133,11 @@ export class AgentSession {
         // while the rest are still being validated (#4506).
         const emitYielder = new EventLoopYielder();
         for (const message of history) {
-          if (emitYielder.isDue()) await emitYielder.yield();
+          if (emitYielder.isDue()) {
+            // A batch never waits longer than one emit slice for more rows.
+            flushReplayBatch();
+            await emitYielder.yield();
+          }
           // Skip the placeholder message if we have a partial with the same historySequence.
           // The placeholder has empty parts; the partial has the actual content.
           // Without this, both get loaded and the empty placeholder may be shown as "last message".
@@ -4000,6 +4167,8 @@ export class AgentSession {
             sentRowCount += 1;
           }
         }
+        flushReplayBatch();
+        batchingRows = false;
         stopEmitRows();
 
         for (let index = history.length - 1; index >= 0; index -= 1) {
@@ -4026,6 +4195,18 @@ export class AgentSession {
             },
           };
           break;
+        }
+
+        if (replayMode === "full" && windowHasOlderHistory) {
+          // The window missed the epoch start, so it may miss the last todo_write or
+          // review_pane_update too. Send the files the agent reads (both readers return [] on
+          // any read error) as the client's baseline (#4961).
+          const sessionDir = path.join(this.config.sessionsDir, this.workspaceId);
+          const [todos, assistedReview] = await Promise.all([
+            readTodosForSessionDir(sessionDir),
+            readAssistedReviewForSessionDir(sessionDir),
+          ]);
+          windowSeed = { todos, assistedReview };
         }
       }
 
@@ -4085,6 +4266,10 @@ export class AgentSession {
       // Replay failed, so do not advertise a trustworthy reconnect cursor.
       serverCursor = undefined;
     } finally {
+      // A failure mid-loop must not lose or reorder rows already batched: deliver them before
+      // the live-event flush, final snapshots and caught-up.
+      flushReplayBatch();
+      batchingRows = false;
       // Flush overlapping live events before authoritative final snapshots, including on replay failure.
       beforeReplayCompletion?.();
       if (shouldReplayTerminalState) {
@@ -4154,6 +4339,7 @@ export class AgentSession {
           historyReplayStatus: historyReplayFailed ? "failed" : "complete",
           ...(wasDowngraded && downgradeReason !== undefined ? { downgradeReason } : {}),
           ...(hasOlderHistory !== undefined ? { hasOlderHistory } : {}),
+          ...(windowSeed && !historyReplayFailed ? { windowSeed } : {}),
           cursor: serverCursor,
         },
       });
@@ -5602,11 +5788,7 @@ export class AgentSession {
     // contains the new prompt, then replay it again post-compaction).
     let autoCompactionMessage: MuxMessage | null = null;
     const tokenBudgetActive = this.contextController.isTokenBudgetActive(optionsForStream);
-    optionsForStream = this.contextController.normalizeSend(
-      userMessage,
-      optionsForStream,
-      tokenBudgetActive
-    );
+    if (!tokenBudgetActive) this.contextController.dropPendingRollover();
     // Await rejection at each return so the execution lease owns persistence and goal safety.
     const rejectBudgetSend = async (error: SendMessageError) => {
       if (isManualUserMessage) {
@@ -6266,19 +6448,10 @@ export class AgentSession {
           requestPreludeMessageIds: requestPrelude.map((row) => row.id),
         };
       }
-      const publication = this.contextController.preparePublication({
-        userMessage,
-        prefixRows: contextBudgetPrefix,
-        options: optionsForStream,
-        assemblySnapshot: requestAssemblySnapshot,
-      });
-      contextBudgetPrefix = publication.prefixRows;
-      optionsForStream = publication.options;
-      requestAssemblySnapshot = publication.assemblySnapshot;
       const batch = [...contextBudgetPrefix, ...requestPrelude, userMessage];
       if (contextRollover) {
         assert(requestAssemblySnapshot != null, "Rollover must pin request assembly");
-        const receipt = publication.receipt;
+        const receipt = this.contextController.capturePreparation();
         const rolloverMemoryConsent = await this.createRoutedMemoryConsent(streamConsentRejection);
         const candidate = await this.prepareRolloverRequest(
           batch,
@@ -6287,9 +6460,6 @@ export class AgentSession {
           requestAssemblySnapshot,
           agentInitiated,
           cancelSignal,
-          manualGoalInterventionPolicy != null
-            ? { enqueuedAtMs: internal?.enqueuedAtMs }
-            : undefined,
           // A prepared request bakes its turn options in NOW, not at start():
           // the gate streamWithHistory passes later cannot be added to it, so
           // the routed turn's consent gate rides the preparation itself.
@@ -7411,7 +7581,7 @@ export class AgentSession {
       | {
           snapshot: RequestAssemblySnapshot;
           request: PreparedStreamMessage;
-          /** Send options for the retry (a flush trigger's marker is stripped). */
+          /** Send options for the retry. */
           options: SendMessageOptions | undefined;
         }
       | undefined,
@@ -7554,7 +7724,6 @@ export class AgentSession {
         assemblySnapshot,
         context.agentInitiated,
         undefined,
-        undefined,
         // The fresh window copies the routed turn's snapshot rows: the class
         // provider must not receive them without the turn's consent verdict.
         this.bindRolloverConsentGate(context.routedConsentRejection, rows, retryMemoryConsent),
@@ -7644,7 +7813,6 @@ export class AgentSession {
     snapshot: RequestAssemblySnapshot,
     agentInitiated?: boolean,
     signal?: AbortSignal,
-    manualIntervention?: { enqueuedAtMs?: number },
     // The request is built NOW (turn options included), not at start(): a
     // routed turn's consent gate must be part of the preparation.
     preDispatchConsentGate?: StreamMessageOptions["preDispatchConsentGate"],
@@ -7657,17 +7825,6 @@ export class AgentSession {
         message: "Full request preparation is unavailable; use /compact or restart.",
       });
     const cache = new Map<string, CachedMemoryContext>();
-    const cacheGeneration = this.memoryContextGeneration;
-    // Admission must not pause the goal yet, but the pinned tools must match the later manual pause.
-    let prospectiveGoalStatusForToolAvailability: StreamMessageOptions["prospectiveGoalStatusForToolAvailability"];
-    if (manualIntervention && this.workspaceGoalService) {
-      const goal = await this.workspaceGoalService.getGoal(this.workspaceId);
-      prospectiveGoalStatusForToolAvailability =
-        goal?.status === "active" &&
-        !manualSendPreservesGoalActivation(goal, manualIntervention.enqueuedAtMs)
-          ? "paused"
-          : (goal?.status ?? null);
-    }
 
     const providersConfig = this.getProvidersConfigSafe();
     const minThinkingLevel = resolveMinimumThinkingLevel(
@@ -7731,7 +7888,6 @@ export class AgentSession {
             model,
             {
               ...memoryOptions,
-              tokenBudgetActive: this.contextController.isTokenBudgetActive(options),
               excludeProjectSkillContent: memoryConsent?.excludeProjectSkillContent === true,
             },
             cache
@@ -7748,7 +7904,6 @@ export class AgentSession {
             ? () => this.isRoutedProjectSkillTurnStillTrusted()
             : undefined,
         workspaceGoalService: this.workspaceGoalService,
-        prospectiveGoalStatusForToolAvailability,
         allowAgentSetGoal: options?.allowAgentSetGoal === true,
         experiments: options?.experiments,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
@@ -7779,14 +7934,8 @@ export class AgentSession {
         : prepared;
     return Ok({
       start: (startOptions) => {
-        // A shared-notebook write by another tree session while this
-        // candidate was prepared invalidated the installed map only; the
-        // staged one is then unavoidably stale for this request and must
-        // not be reused by later turns.
-        this.memoryContextByModelString =
-          cacheGeneration === this.memoryContextGeneration
-            ? cache
-            : new Map<string, CachedMemoryContext>();
+        // The candidate's snapshot is the new window's frozen memory context.
+        this.memoryContextByModelString = cache;
         return prepared.data.start(startOptions);
       },
       [Symbol.asyncDispose]: () => prepared.data[Symbol.asyncDispose](),
@@ -9450,23 +9599,7 @@ export class AgentSession {
         return await refuseRejectedResume(lastUserMessage);
       }
 
-      const restoration = this.contextController.restoreStream({
-        history: historyResult.data,
-        userMessage: lastUserMessage,
-        options,
-        model: modelString,
-        autoModelRouting: options?.autoModelRoutingRecord,
-        admissionCapture,
-        goalKind,
-        goalId,
-        isAborted: isStreamStartAborted,
-      });
-      // Claim hydration is synchronous. Only actual flush preparation may yield here.
-      const restoredContext = restoration instanceof Promise ? await restoration : restoration;
-      if (!restoredContext.success) return await fail(restoredContext.error);
-      if (restoredContext.data == null) return Ok(undefined);
-      const resumedFlushSnapshot = restoredContext.data.assemblySnapshot;
-      const resumedFlushCannotWrite = restoredContext.data.cannotWrite;
+      this.contextController.restoreStream({ history: historyResult.data, options });
 
       // A crash between snapshot and user-row appends can leave orphaned prompt
       // expansions on disk; exclude them from every provider request.
@@ -9595,38 +9728,11 @@ export class AgentSession {
         lastUserMessage?.metadata?.muxMetadata,
         requestMessages
       );
-      // A final-flush trigger (fresh dispatch or resumed after restart) keeps its flag so the
-      // request builder applies the memory-only ceiling regardless of the caller's current send
-      // options; the flag is request-local and never becomes the workspace-turn correlation.
-      const contextBudgetFlushTurn =
-        lastUserMessage?.metadata?.muxMetadata?.contextBudgetFlush === true;
-      // The flush is one mechanical memory call: lowest thinking the model allows (the user's
-      // configured floor is for real work) and a bounded cap sized for that level, so an
-      // inherited medium/high level cannot make the only preservation step fail or overrun.
-      const flushThinking = contextBudgetFlushTurn
-        ? resolveContextBudgetFlushThinking(modelString, providersConfig)
-        : undefined;
-      // The flush turn is bounded to one provider step. If a crash left that step's completed
-      // memory call on disk (committed above), the resumed request gets no tools at all so the
-      // turn can only end, after which the queued rollover seals the window.
-      const flushAlreadyStepped =
-        contextBudgetFlushTurn &&
-        lastUserMessage != null &&
-        historyResult.data.slice(historyResult.data.indexOf(lastUserMessage) + 1).some(
-          (row) =>
-            row.role === "assistant" &&
-            // An empty placeholder is appended before streaming; only a settled tool call
-            // proves the single flush step actually happened.
-            row.parts.some(
-              (part) => part.type === "dynamic-tool" && part.state === "output-available"
-            )
-        );
       // Mid-stream compaction runs after the original send options have already been resolved against
       // history (notably bash-monitor wakes). Persist the actual correlation used by this stream so the
       // post-compaction continuation remains the same delegated workspace turn.
       if (this.activeStreamContext != null) {
         this.activeStreamContext.workspaceTurnMetadata = streamMuxMetadata;
-        this.activeStreamContext.contextBudgetFlushTurn = contextBudgetFlushTurn;
       }
       const acpPromptId =
         normalizeAcpPromptId(options?.acpPromptId) ?? extractAcpPromptId(optionsMuxMetadata);
@@ -9759,28 +9865,20 @@ export class AgentSession {
         workspaceId: this.workspaceId,
         modelString,
         abortSignal,
-        thinkingLevel: flushThinking?.level ?? effectiveThinkingLevel,
+        thinkingLevel: effectiveThinkingLevel,
         // Orthogonal to thinking level; buildRequestHeaders gates it per model.
         reasoningMode: options?.reasoningMode,
-        toolPolicy:
-          flushAlreadyStepped || resumedFlushCannotWrite
-            ? [...(options?.toolPolicy ?? []), { regex_match: ".*", action: "disable" }]
-            : options?.toolPolicy,
+        toolPolicy: options?.toolPolicy,
         additionalSystemContext: options?.additionalSystemContext,
         additionalSystemInstructions: options?.additionalSystemInstructions,
-        // The flush step gets its own bounded cap: a terse caller cap could cut the notes payload
-        // short and waste the single step, while an unbounded one would let transcript-influenced
-        // text run to a model-sized reply. The paired continuation keeps the caller's cap.
-        maxOutputTokens: flushThinking?.maxOutputTokens ?? options?.maxOutputTokens,
+        maxOutputTokens: options?.maxOutputTokens,
         muxProviderOptions: options?.providerOptions,
         agentInitiated,
         agentId: options?.agentId,
         acpPromptId,
         delegatedToolNames,
         autoModelRouting: options?.autoModelRoutingRecord,
-        muxMetadata: contextBudgetFlushTurn
-          ? { ...(streamMuxMetadata ?? { type: "normal" }), contextBudgetFlush: true }
-          : streamMuxMetadata,
+        muxMetadata: streamMuxMetadata,
         recordFileState,
         recordProposedPlan: this.recordProposedPlan,
         postCompactionAttachments,
@@ -9791,7 +9889,6 @@ export class AgentSession {
         resolveMemoryContext: async (forModelString, memoryOptions) => {
           const memoryContext = await this.resolveMemoryContext(forModelString, {
             ...memoryOptions,
-            tokenBudgetActive: this.contextController.isTokenBudgetActive(options),
             excludeProjectSkillContent: memoryConsent?.excludeProjectSkillContent === true,
           });
           if (memoryConsent && memoryContext?.carriesProjectSkillContent === true) {
@@ -9818,19 +9915,16 @@ export class AgentSession {
         contextBudgetRolloverAvailable:
           this.contextController.isTokenBudgetActive(options) &&
           this.contextController.autoCompactionThreshold(modelString) < 1,
-        requestAssemblySnapshot: requestAssemblySnapshot ?? resumedFlushSnapshot,
-        // A flush turn stays bounded to one step even when token-budget mode was disabled
-        // after its trigger was persisted (the callback then only stops it).
+        requestAssemblySnapshot,
         onStepSettled: this.contextController.stepSettlement({
           kind: "starting",
-          stream: { options, contextBudgetFlushTurn },
+          stream: { options },
         }),
         openaiTruncationModeOverride,
         // Mid-turn thinking overrides clamp against the same floor as the
         // send-time level above (single source of truth for the floor).
         minThinkingLevel,
-        // A mid-turn thinking raise must not push the flush's budget past its bounded cap.
-        activeTurnThinkingOverride: contextBudgetFlushTurn ? undefined : activeTurnThinkingOverride,
+        activeTurnThinkingOverride,
         onPreStartError: ({ workspaceId: _workspaceId, ...payload }) =>
           preStartErrors.push(payload),
         onStreamStarting: (messageId) => {
@@ -10400,11 +10494,6 @@ export class AgentSession {
     if (!this.workspaceGoalService) {
       return;
     }
-    // Housekeeping flush turns are excluded from goal accounting (see
-    // recordGoalAccountingFromUsage); their usage must not leak into the live preview either.
-    if (this.activeStreamContext?.contextBudgetFlushTurn === true) {
-      return;
-    }
     const displayUsage = createDisplayUsage(
       input.usage,
       input.model,
@@ -10470,13 +10559,6 @@ export class AgentSession {
     if (!this.workspaceGoalService) {
       return;
     }
-    // The context-budget final flush is housekeeping, like compaction: it must not consume a
-    // goal turn or charge the goal's cost cap. Its row keeps the goal attribution on purpose,
-    // because a restart re-derives the paired continuation's goalKind/goalId from that row.
-    if (this.activeStreamContext?.contextBudgetFlushTurn === true) {
-      return;
-    }
-
     const displayUsage = createDisplayUsage(
       input.usage,
       input.model,
@@ -10955,10 +11037,6 @@ export class AgentSession {
     const activeStreamOptions = this.activeStreamContext?.options;
     const activeStreamRouted = this.activeStreamContext?.compactionBaseOptions != null;
     const activeStreamPreRoutingOptions = this.activeStreamContext?.preRoutingOptions;
-    // A final-flush turn is housekeeping, not the goal's work: its text-only finish must never
-    // count as an implicit complete_goal.
-    const activeStreamWasContextBudgetFlush =
-      this.activeStreamContext?.contextBudgetFlushTurn === true;
 
     let goalContinuationRequest: {
       sendOptions: SendMessageOptions;
@@ -11143,10 +11221,7 @@ export class AgentSession {
           // user's first manual turn answered with text is never
           // mistaken for completion. `requestContinuationAfterStreamEnd`
           // below safely no-ops once the goal flips to `complete`.
-          if (
-            activeStreamGoalKind === GOAL_CONTINUATION_KIND &&
-            !activeStreamWasContextBudgetFlush
-          ) {
+          if (activeStreamGoalKind === GOAL_CONTINUATION_KIND) {
             await this.maybeAutoCompleteGoalFromSilentContinuation(streamEndPayload);
             if (
               !this.coordinator.isCurrentTurn(turn) ||
@@ -11297,17 +11372,8 @@ export class AgentSession {
       }
 
       if (payload.type === "tool-call-end" && payload.replay !== true) {
-        // Includes nested PTC calls and directory/rename mutations that affect notes.
-        // Reads can also change hot-set ranking; rebuild at the next request, not mid-step.
-        if (
-          payload.toolName === "memory" &&
-          typeof payload.result === "object" &&
-          payload.result != null &&
-          "success" in payload.result &&
-          payload.result.success === true
-        ) {
-          this.memoryContextByModelString.clear();
-        }
+        // Memory writes leave the cached memory context alone: it is frozen per
+        // context window (see memoryContextByModelString).
         this.activeToolCallIds.delete(payload.toolCallId);
         if (payload.providerExecuted === true && this.activeToolCallIds.size === 0) {
           await this.requestQueuedProviderToolEndDispatch();
@@ -12390,6 +12456,7 @@ export class AgentSession {
         displayText: send.displayText,
         attachmentCount: send.attachmentCount,
         reviewCount: send.reviewCount,
+        ...(send.options.acpPromptId != null ? { acpPromptId: send.options.acpPromptId } : {}),
       })),
     };
   }
@@ -12416,13 +12483,35 @@ export class AgentSession {
    * double-click cannot send it twice; the caller must {@link releaseHeldInputSend} afterwards.
    */
   claimHeldInputSend(
-    id: string
+    id: string,
+    acpCorrelation?: AcpPromptCorrelation
   ): { kind: "claimed"; send: RefusedManualSend } | { kind: "missing" } | { kind: "busy" } {
     const held = this.heldInputs.find((input) => input.id === id);
     if (held == null) return { kind: "missing" };
     if (this.sendingHeldInputIds.has(id)) return { kind: "busy" };
     this.sendingHeldInputIds.add(id);
-    return { kind: "claimed", send: held.send };
+    if (acpCorrelation == null) return { kind: "claimed", send: held.send };
+    // An ACP /send-held re-sends as a NEW prompt (#5170): replace the correlation the input was
+    // queued with, in options and in the metadata fallback that stream correlation also reads,
+    // on a copy. The held copy stays exactly as queued, so a failed re-send keeps the original.
+    const heldMetadata: unknown = held.send.options.muxMetadata;
+    const muxMetadata: Record<string, unknown> = {
+      ...(typeof heldMetadata === "object" && heldMetadata != null && !Array.isArray(heldMetadata)
+        ? (heldMetadata as Record<string, unknown>)
+        : {}),
+      [ACP_PROMPT_ID_METADATA_KEY]: acpCorrelation.acpPromptId,
+    };
+    delete muxMetadata[ACP_DELEGATED_TOOLS_METADATA_KEY];
+    if (acpCorrelation.delegatedToolNames != null) {
+      muxMetadata[ACP_DELEGATED_TOOLS_METADATA_KEY] = [...acpCorrelation.delegatedToolNames];
+    }
+    const options = {
+      ...held.send.options,
+      acpPromptId: acpCorrelation.acpPromptId,
+      delegatedToolNames: acpCorrelation.delegatedToolNames,
+      muxMetadata,
+    };
+    return { kind: "claimed", send: { ...held.send, options } };
   }
 
   releaseHeldInputSend(id: string): void {
@@ -13531,8 +13620,6 @@ export class AgentSession {
     modelString: string,
     options?: {
       includeHotMemories?: boolean;
-      tokenBudgetActive?: boolean;
-      onlyContextNotes?: boolean;
       /** Routed turn without Project Trust: withhold memories carrying project skill provenance. */
       excludeProjectSkillContent?: boolean;
     },
@@ -13540,30 +13627,14 @@ export class AgentSession {
   ): Promise<MemorySessionContext | undefined> {
     assert(modelString.length > 0, "resolveMemoryContext requires a model string");
     const includeHotMemories = options?.includeHotMemories !== false;
-    const tokenBudgetActive = options?.tokenBudgetActive === true;
     const excludeProjectSkillContent = options?.excludeProjectSkillContent === true;
-    if (options?.onlyContextNotes === true) {
-      // SECURITY: a final-flush turn must not see other memories (index or preloaded
-      // contents); this narrowed context is never cached for ordinary turns.
-      const narrowed =
-        typeof this.aiService.buildMemorySessionContext === "function"
-          ? await this.aiService.buildMemorySessionContext(this.workspaceId, modelString, {
-              includeHotMemories,
-              tokenBudgetActive,
-              onlyContextNotes: true,
-              excludeProjectSkillContent,
-            })
-          : null;
-      return narrowed ?? undefined;
-    }
     const enabled = (id: ExperimentId) => this.aiService.isExperimentEnabled(id);
     const memoryEnabled = enabled(EXPERIMENT_IDS.MEMORY);
     const hotSetEnabled = enabled(EXPERIMENT_IDS.MEMORY_HOT_SET);
     const cached = cache.get(modelString);
-    // Policy changes must not retain a previously injected extra (including index-only lookups).
+    // Memory/HotSet gate changes must not reuse a context built under the old gates.
     if (
-      cached?.tokenBudgetActive === tokenBudgetActive &&
-      cached.memoryEnabled === memoryEnabled &&
+      cached?.memoryEnabled === memoryEnabled &&
       cached.hotSetEnabled === hotSetEnabled &&
       cached.excludesProjectSkillContent === excludeProjectSkillContent &&
       (cached.includesHotMemories || !includeHotMemories)
@@ -13571,27 +13642,21 @@ export class AgentSession {
       return cached.context ?? undefined;
     }
 
-    const generation = this.memoryContextGeneration;
     // buildMemorySessionContext is an optional AgentSessionAIService capability.
     const context =
       typeof this.aiService.buildMemorySessionContext === "function"
         ? await this.aiService.buildMemorySessionContext(this.workspaceId, modelString, {
             includeHotMemories,
-            tokenBudgetActive,
             excludeProjectSkillContent,
           })
         : null;
-    // Invalidated mid-build: serve this snapshot once, do not cache it.
-    if (generation === this.memoryContextGeneration) {
-      cache.set(modelString, {
-        context,
-        includesHotMemories: includeHotMemories,
-        tokenBudgetActive,
-        memoryEnabled,
-        hotSetEnabled,
-        excludesProjectSkillContent: excludeProjectSkillContent,
-      });
-    }
+    cache.set(modelString, {
+      context,
+      includesHotMemories: includeHotMemories,
+      memoryEnabled,
+      hotSetEnabled,
+      excludesProjectSkillContent: excludeProjectSkillContent,
+    });
     return context ?? undefined;
   }
 

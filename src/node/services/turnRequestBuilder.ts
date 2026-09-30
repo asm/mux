@@ -7,20 +7,22 @@ import type { OnStepSettled } from "./streamManager";
 import { checkAssembledRequestBudgetForModel } from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
-import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
+import {
+  anthropicBetweenToolsRouteAvailable,
+  isAnthropic1MEffectivelyEnabled,
+} from "@/common/utils/ai/providerOptions";
 import * as path from "path";
+import { ensureWorkspaceScratchDir } from "@/node/runtime/workspaceScratchDir";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import {
   MEMORY_INTUITION_MAX_USES_PER_TURN,
   type MemoryScopeAccess,
 } from "@/common/constants/memory";
-import { CONTEXT_NOTES_MEMORY_PATH } from "@/common/constants/contextBudget";
-import { getContextBudgetFlushMaxOutputTokens } from "@/common/utils/compaction/contextBudget";
 import {
   resolveHeadlessAgentDefinition,
   resolveHeadlessAgentSettings,
 } from "@/node/services/memoryConsolidationService";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, isTokenBudgetActive } from "@/common/constants/experiments";
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
 
@@ -38,7 +40,6 @@ import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 
 import type { SendMessageError } from "@/common/types/errors";
 import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
-import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import type { PreDispatchConsentGate } from "@/node/services/streamManager";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
@@ -46,7 +47,7 @@ import { createMuxMessage } from "@/common/types/message";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { secretsToRecord } from "@/common/types/secrets";
 import type { XumToolScope } from "@/common/types/toolScope";
-import { getGoalToolAvailability } from "@/common/utils/tools/toolAvailability";
+import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import {
   deriveToolHookConfig,
   getForcedXaiSearchToolNames,
@@ -142,7 +143,7 @@ import {
   toolExcludesProjectSkillContent,
   withToolDescriptionProvenance,
 } from "@/node/services/tools/projectSkillContentGate";
-import { resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
+import { resolveMemoryAccessPolicy, resolveMemoryScopes } from "@/node/services/tools/memory";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import {
   MCP_OVERRIDES_READ_TIMEOUT_MS,
@@ -160,6 +161,8 @@ import {
   enforceThinkingPolicy,
   isXaiGrokFastVariantSwap,
   lookupMinThinkingLevelOverride,
+  assistantThinkingLevels,
+  resolveBetweenToolsThinkingLevel,
   resolveEffectiveThinkingLevel,
   resolveMinimumThinkingLevel,
 } from "@/common/utils/thinking/policy";
@@ -207,18 +210,22 @@ import {
 import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
-import { getAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
+import { getAnthropicCacheTtl, supportsAnthropicCache } from "@/common/utils/ai/cacheStrategy";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
 import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
 import type { OauthServiceBindings, ProviderModelFactory } from "./providerModelFactory";
 import {
   assemblePromptPayload,
   buildPlanInstructions,
+  buildContextWindowSection,
   buildStreamSystemContext,
-  formatMcpWarningPrefix,
+  formatMcpWarningSection,
+  measureVolatileSystemSuffix,
   prepareProviderRequestMessages,
   removeIntuitionGuidance,
+  selectActiveContextMessages,
 } from "./turnContextAssembler";
+import { resolveContextWindowIds } from "./contextWindowRollover";
 export { prepareProviderRequestMessages };
 import {
   simulateContextLimitError,
@@ -279,7 +286,7 @@ export function resolveXumToolScope(
 
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ErrorEvent } from "@/common/types/stream";
-import { withContextBudgetFlushToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -345,7 +352,7 @@ export interface StreamMessageOptions {
    */
   resolveMemoryContext?: (
     modelString: string,
-    options?: { includeHotMemories?: boolean; onlyContextNotes?: boolean }
+    options?: { includeHotMemories?: boolean }
   ) => Promise<MemorySessionContext | undefined>;
   /**
    * The request's rows or attachments carry project skill content: memory
@@ -360,8 +367,6 @@ export interface StreamMessageOptions {
   experiments?: SendMessageOptions["experiments"];
   allowAgentSetGoal?: boolean;
   workspaceGoalService?: WorkspaceGoalService;
-  /** Candidate admission previews tool availability only; executions keep the real goal service. */
-  prospectiveGoalStatusForToolAvailability?: GoalRecordV1["status"] | null;
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
@@ -721,9 +726,11 @@ interface PreparedModelAttempt {
   requestHeaders: Record<string, string> | undefined;
   resolvedOverrides: ReturnType<typeof resolveModelParameterOverrides>;
   currentEffectiveLevelRef: { current: ThinkingLevel };
+  /** `beforeFirstStep`: folding a pre-stream override, before any provider call ran. */
   computeRebuiltProviderOptions: (
     level: ThinkingLevel,
-    currentLevel: ThinkingLevel
+    currentLevel: ThinkingLevel,
+    beforeFirstStep?: boolean
   ) => { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null;
   rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel;
 }
@@ -829,7 +836,8 @@ export class TurnRequestBuilder {
     const currentEffectiveLevelRef = { current: options.effectiveThinkingLevel };
     const computeRebuiltProviderOptions = (
       level: ThinkingLevel,
-      currentLevel: ThinkingLevel
+      currentLevel: ThinkingLevel,
+      beforeFirstStep = false
     ): { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null => {
       const clamped = enforceThinkingPolicy(
         options.rawModelString,
@@ -837,10 +845,23 @@ export class TurnRequestBuilder {
         options.minThinkingLevel,
         options.providersConfigSnapshot
       );
-      const effective = resolveEffectiveThinkingLevel(
-        options.rawModelString,
-        clamped,
-        options.providersConfigSnapshot
+      // Sonnet 5.5 effort pin (#5086). Before the first provider call only the history
+      // counts, as at turn start; once a step ran, a switch to "off" changes the effort
+      // within the conversation, so it runs as "low" adaptive.
+      const effective = resolveBetweenToolsThinkingLevel(
+        resolveModelForMetadata(options.rawModelString, options.providersConfigSnapshot ?? null),
+        resolveEffectiveThinkingLevel(
+          options.rawModelString,
+          clamped,
+          options.providersConfigSnapshot
+        ),
+        beforeFirstStep &&
+          anthropicBetweenToolsRouteAvailable(
+            options.optionsModelString,
+            options.routeProvider,
+            options.providersConfigSnapshot
+          ),
+        assistantThinkingLevels(options.providerRequestMessages)
       );
       if (
         effective === currentLevel ||
@@ -864,9 +885,14 @@ export class TurnRequestBuilder {
       return { effectiveLevel: effective, providerOptions: mergeExtras(rebuilt) };
     };
     const rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel = (
-      level
+      level,
+      beforeFirstStep = false
     ) => {
-      const result = computeRebuiltProviderOptions(level, currentEffectiveLevelRef.current);
+      const result = computeRebuiltProviderOptions(
+        level,
+        currentEffectiveLevelRef.current,
+        beforeFirstStep
+      );
       if (result != null) {
         currentEffectiveLevelRef.current = result.effectiveLevel;
       }
@@ -1027,19 +1053,11 @@ export class TurnRequestBuilder {
     let modelString = opts.modelString;
     let autoModelRouting = opts.autoModelRouting;
     let activeTurnThinkingOverride = opts.activeTurnThinkingOverride;
-    // SECURITY: the context-budget final flush is a hidden automatic turn whose only job is
-    // writing the workspace context notes, on a transcript that may carry injected tool output.
-    // It must not gain synthesized code execution (PTC) or run repository tool hooks, and its
-    // memory writes are pinned to the notes file below.
-    const contextBudgetFlushTurn = muxMetadata?.contextBudgetFlush === true;
-    const gatedExperiments = resolveBackendGatedPtcExperiments(
+    const experiments: StreamMessageOptions["experiments"] = resolveBackendGatedPtcExperiments(
       experimentsFromOptions,
       (experimentId) =>
         this.dependencies.experimentsService?.isExperimentEnabled(experimentId) === true
     );
-    const experiments: StreamMessageOptions["experiments"] = contextBudgetFlushTurn
-      ? { ...gatedExperiments, programmaticToolCalling: false }
-      : gatedExperiments;
     const combinedAbortSignal = context.abortSignal;
     const syntheticMessageId = context.syntheticMessageId;
     const startTime = context.startTime;
@@ -1209,7 +1227,7 @@ export class TurnRequestBuilder {
         options.minimumThinkingLevelOverride,
         providersConfig
       );
-      const effectiveThinkingLevel = options.enforceMinimum
+      const policyThinkingLevel = options.enforceMinimum
         ? enforceThinkingPolicy(
             options.rawModelString,
             requestedThinkingLevel,
@@ -1240,18 +1258,35 @@ export class TurnRequestBuilder {
         };
       }
 
+      const capabilityModelString = resolveModelForMetadata(
+        options.rawModelString.startsWith("coder:")
+          ? options.rawModelString
+          : resolved.data.canonicalModelString,
+        providersConfig
+      );
+      // Sonnet 5.5 "off" is `between_tools`, pinned to effort low for the conversation
+      // (#5086). Decide here, not in buildProviderOptions, so the recorded level, message
+      // preparation and provider options all agree when it falls back to "low".
+      const effectiveThinkingLevel = resolveBetweenToolsThinkingLevel(
+        capabilityModelString,
+        policyThinkingLevel,
+        anthropicBetweenToolsRouteAvailable(
+          optionsModelString,
+          resolved.data.routeProvider,
+          providersConfig
+        ),
+        // The rows message preparation can send, not only the boundary slice: a
+        // model-hidden row or an excluded keep-recent tail never reaches the provider.
+        assistantThinkingLevels(selectActiveContextMessages(messages))
+      );
+
       return Ok({
         ...resolved.data,
         rawModelString: options.rawModelString,
         providersConfig,
         minThinkingLevel,
         effectiveThinkingLevel,
-        capabilityModelString: resolveModelForMetadata(
-          options.rawModelString.startsWith("coder:")
-            ? options.rawModelString
-            : resolved.data.canonicalModelString,
-          providersConfig
-        ),
+        capabilityModelString,
         toolsModelString: toolsIdentity.modelString,
         optionsModelString,
       });
@@ -1521,13 +1556,8 @@ export class TurnRequestBuilder {
     // project-scope listing sees a running runtime (a stopped Docker/remote
     // workspace would yield an empty/partial context, and AgentSession caches
     // the result per model/session segment).
-    // Flush turns only ever see the context notes (index and preload): other memories must
-    // not be disclosed to, or laundered through, the hidden prompt-influenced turn.
     const memoryContext = resolveMemoryContext
-      ? await resolveMemoryContext(modelString, {
-          includeHotMemories: false,
-          onlyContextNotes: contextBudgetFlushTurn,
-        })
+      ? await resolveMemoryContext(modelString, { includeHotMemories: false })
       : undefined;
 
     const cfg = this.dependencies.config.loadConfigOrDefault();
@@ -1545,8 +1575,7 @@ export class TurnRequestBuilder {
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) === true;
     const isExperimentEnabled = (id: Parameters<ExperimentsService["isExperimentEnabled"]>[0]) =>
       this.dependencies.experimentsService?.isExperimentEnabled(id) === true;
-    const sessionHistoryEnabled =
-      experiments?.tokenBudget ?? isExperimentEnabled(EXPERIMENT_IDS.TOKEN_BUDGET);
+    const sessionHistoryEnabled = isTokenBudgetActive(experiments, isExperimentEnabled);
     const timelineExperimentEnabled =
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE) === true;
     const workspaceHeartbeatsExperimentEnabled =
@@ -1582,10 +1611,7 @@ export class TurnRequestBuilder {
       memoryToolAvailableForModel &&
       memoryHotSetExperimentEnabled &&
       resolveMemoryContext !== undefined
-        ? await resolveMemoryContext(modelStringForContext, {
-            includeHotMemories: true,
-            onlyContextNotes: contextBudgetFlushTurn,
-          })
+        ? await resolveMemoryContext(modelStringForContext, { includeHotMemories: true })
         : memoryContext;
     emitStartupBreadcrumb("loading_workspace_context");
     // One cache per request: resolution, plan handoff, prompt body, and
@@ -1600,11 +1626,7 @@ export class TurnRequestBuilder {
       requestedAgentId: agentId,
       strictAgentResolution,
       disableWorkspaceAgents: disableWorkspaceAgents ?? false,
-      // Flush turns get the memory-only ceiling here, independent of caller options, so a
-      // resumed or retried stream cannot widen the hidden turn's toolset.
-      callerToolPolicy: contextBudgetFlushTurn
-        ? withContextBudgetFlushToolPolicy(toolPolicy)
-        : toolPolicy,
+      callerToolPolicy: toolPolicy,
       cfg,
       emitError: (event) => {
         if (!context.admissionOnly) this.dependencies.emit("error", event);
@@ -1631,6 +1653,7 @@ export class TurnRequestBuilder {
       taskDepth,
       shouldDisableTaskToolsForDepth,
       effectiveToolPolicy,
+      switchableAgents,
     } = agentResult.data;
     // Explicit summaries remain recovery operations, not token-budget turns.
     // Inspect this request's last effective user row, never an older compact command.
@@ -1650,48 +1673,39 @@ export class TurnRequestBuilder {
       ) &&
       !isRlmModeEnabled(experiments, isExperimentEnabled);
     const legacyModeForMetadata = getLegacyModeForAgentMetadata(effectiveAgentId, effectiveMode);
-    const agentMemoryAccess = resolveMemoryAccessPolicy({
+    const memoryAccess: MemoryScopeAccess = resolveMemoryAccessPolicy({
       planLike: agentIsPlanLike,
       editingCapable: isExecLikeEditingCapableInResolvedChain(agentInheritanceChain),
     });
-    // Flush turns: keep global/project stores read-only and pin mutations to the notes file
-    // (memoryWritePath below) so injected transcript content cannot reach other memory.
-    const memoryAccess: MemoryScopeAccess = contextBudgetFlushTurn
-      ? { global: "read", project: "read", workspace: agentMemoryAccess.workspace }
-      : agentMemoryAccess;
     const projectTrusted = isWorkspaceProjectTrusted(this.dependencies.config, metadata);
     // projectAutomationDisabled: benchmark harnesses opt out of automatic
     // repo hook execution (tool_env/tool_pre/tool_post) while keeping
     // config trust for sub-agent delegation.
     const sharedExecutionTrusted =
       isWorkspaceTrustedForSharedExecution(metadata, cfg.projects) && !projectAutomationDisabled();
-    const agentAdvisorEnabled = resolveAdvisorEnabledForAgent(
-      effectiveAgentId,
-      cfg.agentAiDefaults?.[effectiveAgentId]?.advisorEnabled
+    // #5253: register the advisor when any switchable agent enables it, so the
+    // tool block stays the same across switches; the active policy refuses it.
+    const agentAdvisorEnabled = (
+      switchableAgents?.map((agent) => agent.id) ?? [effectiveAgentId]
+    ).some((agentId) =>
+      resolveAdvisorEnabledForAgent(agentId, cfg.agentAiDefaults?.[agentId]?.advisorEnabled)
     );
     const advisorModelString = cfg.advisorModelString?.trim() ?? "";
     const advisorToolEligible =
       advisorExperimentEnabled && agentAdvisorEnabled && advisorModelString.length > 0;
 
-    // Goals graduated to GA: tools are gated solely on the workspace's
-    // current goal status + agent capability, not on an experiment flag.
-    let currentGoalForTools: GoalRecordV1 | null = null;
-    if (workspaceGoalService) {
-      currentGoalForTools = await workspaceGoalService.getGoal(workspaceId);
-    }
     const effectiveGoalDefaults = mergeGoalDefaults(
       normalizeGoalDefaults(cfg.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
       metadata.goalDefaults ?? null
     );
-    const goalToolAvailability = getGoalToolAvailability({
-      goalStatus:
-        opts.prospectiveGoalStatusForToolAvailability !== undefined
-          ? opts.prospectiveGoalStatusForToolAvailability
-          : (currentGoalForTools?.status ?? null),
+    // Goal tools are registered whenever a goal service exists and gate at
+    // execution time on these per-turn inputs plus the live goal status, so the
+    // tool block does not change when the goal does (prompt caching, #5247).
+    const goalToolContext: GoalToolContext = {
       parentWorkspaceId: metadata.parentWorkspaceId,
       allowAgentSetGoal,
       agentInheritanceChain,
-    });
+    };
 
     // Fetch workspace MCP overrides (for filtering servers and tools)
     // NOTE: Stored in <workspace>/.xum/mcp.local.jsonc (not ~/.xum/config.json).
@@ -1958,9 +1972,7 @@ export class TurnRequestBuilder {
     let mcpPromptRuntime: MCPPromptRuntime | undefined;
     let mcpSetupDurationMs = 0;
 
-    // SECURITY: the memory-only flush turn filters every MCP tool out anyway, so never start
-    // repository-configured servers (with project secrets) for this hidden automatic turn.
-    if (this.dependencies.bindings.mcpServerManager && !contextBudgetFlushTurn) {
+    if (this.dependencies.bindings.mcpServerManager) {
       const mcpServerManager = this.dependencies.bindings.mcpServerManager;
       const mcpToolSetupStartedAt = Date.now();
       try {
@@ -2194,11 +2206,17 @@ export class TurnRequestBuilder {
       this.dependencies.providerService.getConfig()
     );
     const runtimeType = getRuntimeType(metadata.runtimeConfig);
+    // Only local/worktree commands run on this host, where the session dir lives.
+    const scratchDir =
+      runtimeType === "local" || runtimeType === "worktree"
+        ? await ensureWorkspaceScratchDir(this.dependencies.config.sessionsDir, workspaceId)
+        : undefined;
     const xumEnv = getXumEnv(metadata.projectPath, runtimeType, metadata.name, {
       workspaceId,
       modelString,
       thinkingLevel: thinkingLevel ?? "off",
       costsUsd: sessionCostsUsd,
+      scratchDir,
     });
     const getWorkflowProjectTrusted = () =>
       isWorkspaceProjectTrusted(this.dependencies.config, metadata);
@@ -2508,7 +2526,7 @@ export class TurnRequestBuilder {
       goalService: workspaceGoalService,
       goalDefaults: effectiveGoalDefaults,
       goalKickoffModel: modelString,
-      enableGoalTools: goalToolAvailability,
+      goalToolContext,
       // Only child workspaces (tasks) can report to a parent.
       enableAgentReport: Boolean(metadata.parentWorkspaceId),
       // RLM family messaging: gate on the flags persisted on the task record at
@@ -2645,7 +2663,7 @@ export class TurnRequestBuilder {
       historyService: this.dependencies.historyService,
       memoryService: this.dependencies.bindings.memoryService,
       memoryAccess,
-      ...(contextBudgetFlushTurn ? { memoryWritePath: CONTEXT_NOTES_MEMORY_PATH } : {}),
+      memoryScopes: resolveMemoryScopes(tokenBudgetEnabled),
       // Write provenance: the request's own project content, or a preloaded /
       // indexed memory that already carries it.
       memoryWriteCarriesProjectSkillContent:
@@ -2673,8 +2691,7 @@ export class TurnRequestBuilder {
       // description (same disclosure mechanic as skills).
       memoryIndexEntries: memoryContext?.indexEntries,
       // Trust gating: only run hooks/scripts when the full shared workspace runtime is trusted.
-      // Flush turns never run repository tool hooks around their pinned memory write.
-      trusted: sharedExecutionTrusted && !contextBudgetFlushTurn,
+      trusted: sharedExecutionTrusted,
     };
     const emitNestedPtcToolEvent = (event: PTCEventWithParent) => {
       if (event.type === "tool-call-start" || event.type === "tool-call-end") {
@@ -2687,10 +2704,10 @@ export class TurnRequestBuilder {
       hooks: deriveToolHookConfig(toolsForModelConfig) ?? undefined,
     });
     const ptcEnabled = experiments?.programmaticToolCalling === true;
-    const mcpWarningPrefix = mcpStats
-      ? formatMcpWarningPrefix(mcpStats.failedServerCount, mcpStats.failedServerNames)
+    const mcpWarningSection = mcpStats
+      ? formatMcpWarningSection(mcpStats.failedServerCount, mcpStats.failedServerNames)
       : undefined;
-    if (mcpWarningPrefix != null) {
+    if (mcpWarningSection != null) {
       workspaceLog.warn("MCP servers failed to start", {
         failedNames: mcpStats?.failedServerNames.join(", "),
       });
@@ -2756,6 +2773,8 @@ export class TurnRequestBuilder {
           ),
           extraTools: this.dependencies.bindings.extraTools,
           effectiveToolPolicy,
+          switchableAgentToolPolicies: switchableAgents?.map((agent) => agent.toolPolicy),
+          activeAgentId: effectiveAgentId,
           experiments,
           emitNestedToolEvent: emitNestedPtcToolEvent,
           sandbox: {
@@ -2772,17 +2791,37 @@ export class TurnRequestBuilder {
           recordStartupPhaseTiming("applyToolPolicyAndExperimentsMs", applyPolicyStartedAt);
         }
 
-        // Intuition's internal memory_read must not bypass a policy denying memory.
+        // Intuition's internal memory_read must not bypass a policy denying memory
+        // (a denied memory is never a refusal stub, see toolAssembly).
         if (attemptTools.memory === undefined) delete attemptTools.intuition;
+        // #5253: the advertised union can hold refusal stubs, so presence no
+        // longer means the ACTIVE agent may use a tool; guidance follows the
+        // active policy.
+        const activeAgentAllows = (name: string): boolean =>
+          attemptTools[name] !== undefined &&
+          (switchableAgents === undefined ||
+            applyToolPolicyToNames([name], effectiveToolPolicy).length > 0);
 
+        // Same predicate and model as the tools cache breakpoint
+        // (applyCacheControlToTools), so "caches the tools block" and "keeps the
+        // tool list stable" cannot disagree (#5250).
+        // #5253: classify by every switchable agent's require rules, like PTC
+        // promotion, so a tool required in one mode is not deferred in another.
+        const toolSearchPolicy =
+          switchableAgents?.flatMap((agent) => agent.toolPolicy) ?? effectiveToolPolicy;
+        const toolSearchPromptCacheActive = supportsAnthropicCache(
+          seed.rawModelString,
+          seed.providersConfig
+        );
         if (toolSearchRuntime) {
           if (options.initializeToolSearch) {
             const preparedSearch = prepareToolSearch({
               tools: attemptTools,
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
-              toolPolicy: effectiveToolPolicy,
+              toolPolicy: toolSearchPolicy,
               ptcEnabled,
+              promptCacheActive: toolSearchPromptCacheActive,
             });
             attemptTools = preparedSearch.tools;
             if (preparedSearch.state) {
@@ -2793,8 +2832,9 @@ export class TurnRequestBuilder {
               tools: attemptTools,
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
-              toolPolicy: effectiveToolPolicy,
+              toolPolicy: toolSearchPolicy,
               ptcEnabled,
+              promptCacheActive: toolSearchPromptCacheActive,
             }).tools;
           } else if (!(mcpTools && TOOL_SEARCH_TOOL_NAME in mcpTools)) {
             const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = attemptTools;
@@ -2802,8 +2842,9 @@ export class TurnRequestBuilder {
           }
         }
 
-        const intuitionToolAvailable = attemptTools.intuition !== undefined;
-        const advisorToolAvailable = attemptTools.advisor !== undefined;
+        const intuitionAdvertised = attemptTools.intuition !== undefined;
+        const intuitionToolAvailable = activeAgentAllows("intuition");
+        const advisorToolAvailable = activeAgentAllows("advisor");
         const memoryToolAvailable = attemptTools.memory !== undefined;
         const memoryContextForModel = await upgradeMemoryContextForModel(
           memoryToolAvailable,
@@ -2829,8 +2870,10 @@ export class TurnRequestBuilder {
         }
         let attemptSystem = systemContext.systemMessage;
         let attemptSystemTokens = systemContext.systemMessageTokens;
-        if (mcpWarningPrefix != null) {
-          attemptSystem = mcpWarningPrefix + attemptSystem;
+        // Volatile sections (hot memories, this warning, the context-window
+        // ids) go last so the stable prefix stays cacheable (#5251).
+        if (mcpWarningSection != null) {
+          attemptSystem = attemptSystem + mcpWarningSection;
           const tokenizer = await getTokenizerForModel(
             seed.rawModelString,
             seed.capabilityModelString
@@ -2854,16 +2897,17 @@ export class TurnRequestBuilder {
               tools: attemptTools,
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
-              toolPolicy: effectiveToolPolicy,
+              toolPolicy: toolSearchPolicy,
               ptcEnabled,
+              promptCacheActive: toolSearchPromptCacheActive,
             }).tools;
           }
           // Middleware may filter tools too, but must not restore policy-denied
           // recall or leave its private memory reader available without memory.
-          if (!intuitionToolAvailable || attemptTools.memory === undefined) {
+          if (!intuitionAdvertised || attemptTools.memory === undefined) {
             delete attemptTools.intuition;
           }
-          if (attemptTools.intuition === undefined) {
+          if (attemptTools.intuition === undefined || !activeAgentAllows("intuition")) {
             assembleCtx.systemMessage = removeIntuitionGuidance(
               assembleCtx.systemMessage,
               attemptTools.memory !== undefined,
@@ -2880,7 +2924,40 @@ export class TurnRequestBuilder {
           }
         }
 
-        if (options.initializeToolSearch && toolSearchRuntime?.state) {
+        // The window section goes last, resolved from the rows being sent, so start() can
+        // re-render it without rerunning assembly middleware or tool construction.
+        const baseSystem = attemptSystem;
+        const baseSystemTokens = attemptSystemTokens;
+        let attemptVolatileSystemSuffixLength = 0;
+        const renderContextWindowSection = async () => {
+          const ids = tokenBudgetEnabled
+            ? resolveContextWindowIds(options.sourceMessages)
+            : undefined;
+          attemptSystem = baseSystem;
+          attemptSystemTokens = baseSystemTokens;
+          const section = ids == null ? undefined : `\n\n${buildContextWindowSection(ids)}`;
+          if (section != null) {
+            attemptSystem += section;
+            const tokenizer = await getTokenizerForModel(
+              seed.rawModelString,
+              seed.capabilityModelString
+            );
+            attemptSystemTokens += await tokenizer.countTokens(section);
+          }
+          // Re-measured on every render: the window section can change length.
+          attemptVolatileSystemSuffixLength = measureVolatileSystemSuffix(attemptSystem, [
+            systemContext.hotMemoriesSection,
+            mcpWarningSection,
+            section,
+          ]);
+        };
+        await renderContextWindowSection();
+
+        // Also on fallbacks: a primary with prompt caching seeds nothing into
+        // its inactive state, so a fallback that turns deferral on must seed
+        // prior-turn activations itself. Seeding only adds names, so repeating
+        // it is harmless.
+        if (toolSearchRuntime?.state) {
           seedToolSearchActivationsFromMessages(
             toolSearchRuntime.state,
             attemptProviderRequestMessages
@@ -2932,6 +3009,7 @@ export class TurnRequestBuilder {
             {
               history: options.sourceMessages,
               systemMessage: attemptSystem,
+              volatileSystemSuffixLength: attemptVolatileSystemSuffixLength,
               tools: attemptTools,
               modelString: seed.rawModelString,
               routeProvider: seed.routeProvider,
@@ -2946,6 +3024,7 @@ export class TurnRequestBuilder {
               providersConfig: seed.providersConfig,
               anthropicCacheTtl: effectiveAnthropicCacheTtl,
               workspaceId,
+              tagHistoryItemIds: tokenBudgetEnabled,
             },
             {
               enabled: tokenBudgetEnabled,
@@ -2970,6 +3049,7 @@ export class TurnRequestBuilder {
             journal: this.dependencies.durableEventJournalFor(workspaceId),
             workspaceId,
             systemMessage: attemptSystem,
+            systemVolatileSuffixLength: attemptVolatileSystemSuffixLength,
             tools: Object.fromEntries(
               Object.entries(attemptTools).filter(([name]) => firstStepToolNames.has(name))
             ),
@@ -3008,8 +3088,6 @@ export class TurnRequestBuilder {
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
           systemMessageTokens: attemptSystemTokens,
           tools: attemptTools,
-          contextBudgetMemoryWritable:
-            memoryAccess.workspace === "readwrite" && attemptTools.memory !== undefined,
           engineTools: attemptPayload.tools ?? attemptTools,
           toolNamesForSentinel,
           forcedFirstStepToolNames,
@@ -3025,6 +3103,17 @@ export class TurnRequestBuilder {
           onStreamConstructed: () =>
             emitEnvelopeWith(seed.effectiveThinkingLevel, preparedAttempt.providerOptions),
           rebuildFirstStepForThinkingLevel,
+          rebuildAfterSequencing: async () => {
+            await renderContextWindowSection();
+            const payload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
+            return {
+              system: attemptSystem,
+              systemMessageTokens: attemptSystemTokens,
+              engineSystem: payload.system,
+              messages: payload.messages,
+              contextBudgetLimit: payload.contextBudgetLimit,
+            };
+          },
         };
       } catch (error) {
         if (options.cleanupModelOnError) {
@@ -3060,15 +3149,6 @@ export class TurnRequestBuilder {
     const tools = primaryRequest.tools;
     systemMessage = primaryRequest.system;
     systemMessageTokens = primaryRequest.systemMessageTokens;
-    const finalMessages = primaryRequest.messages;
-    // Debug sinks pair systemMessage with the message list, so when the
-    // assembler embedded the system prompt as a leading cached row
-    // (engineSystem undefined), drop that row to keep the system prompt
-    // single-sourced in captures.
-    const debugViewMessages =
-      primaryRequest.engineSystem == null && finalMessages[0]?.role === "system"
-        ? finalMessages.slice(1)
-        : finalMessages;
 
     captureMcpToolTelemetry({
       telemetryService: this.dependencies.telemetryService,
@@ -3099,11 +3179,38 @@ export class TurnRequestBuilder {
       assert(!started && !transferred, "Prepared request must be started once before disposal");
       started = true;
       activeTurnThinkingOverride = thinkingOverride;
-      if (context.admissionOnly)
+      if (context.admissionOnly) {
         requestHistorySequence = messages.reduce(
           (latest, row) => Math.max(latest, row.metadata?.historySequence ?? -1),
           -1
         );
+        // Rollover admission prepared before append sequenced these same rows, so the prompt
+        // lacked the window IDs and [id] markers. The re-assembly budget-checks them too.
+        try {
+          primaryRequest = {
+            ...primaryRequest,
+            ...(await primaryRequest.rebuildAfterSequencing()),
+          };
+        } catch (error) {
+          if (error instanceof ContextBudgetExceededError) {
+            runLanguageModelCleanup(modelResult.data.model);
+            return { type: "finished", result: Err(error.details) };
+          }
+          throw error;
+        }
+        systemMessage = primaryRequest.system;
+        systemMessageTokens = primaryRequest.systemMessageTokens;
+      }
+      const finalMessages = primaryRequest.messages;
+      // Debug sinks pair systemMessage with the message list, so when the
+      // assembler embedded the system prompt as leading rows (engineSystem
+      // undefined; a cached stable row plus an optional volatile row), drop
+      // them to keep the system prompt single-sourced in captures.
+      const leadingSystemRows = finalMessages.findIndex((message) => message.role !== "system");
+      const debugViewMessages =
+        primaryRequest.engineSystem == null
+          ? finalMessages.slice(leadingSystemRows === -1 ? finalMessages.length : leadingSystemRows)
+          : finalMessages;
       if (combinedAbortSignal.aborted)
         return {
           type: "finished",
@@ -3326,21 +3433,14 @@ export class TurnRequestBuilder {
                       prepareOptions.continuation.assistantMessage
                     )
                   : messages;
-                // The flush is housekeeping: it runs at the fallback model's own inherent
-                // minimum (no user floor, no mid-turn override), mirroring the primary flush
-                // request, and gets a cap sized for THAT level below.
-                const requestedThinkingLevel = contextBudgetFlushTurn
-                  ? THINKING_LEVEL_OFF
-                  : (prepareOptions?.thinkingLevelOverride ?? effectiveThinkingLevel);
                 const nextSeedResult = await prepareModelSeed({
                   rawModelString: nextModelString,
-                  requestedThinkingLevel,
-                  minimumThinkingLevelOverride: contextBudgetFlushTurn
-                    ? undefined
-                    : lookupMinThinkingLevelOverride(
-                        this.dependencies.config.loadConfigOrDefault().minThinkingLevelByModel,
-                        nextModelString
-                      ),
+                  requestedThinkingLevel:
+                    prepareOptions?.thinkingLevelOverride ?? effectiveThinkingLevel,
+                  minimumThinkingLevelOverride: lookupMinThinkingLevelOverride(
+                    this.dependencies.config.loadConfigOrDefault().minThinkingLevelByModel,
+                    nextModelString
+                  ),
                   enforceMinimum: true,
                 });
                 if (!nextSeedResult.success) {
@@ -3378,22 +3478,11 @@ export class TurnRequestBuilder {
                   messages: nextRequest.messages,
                   system: nextRequest.engineSystem,
                   tools: nextRequest.engineTools,
-                  contextBudgetMemoryWritable: nextRequest.contextBudgetMemoryWritable,
                   contextBudgetLimit: nextRequest.contextBudgetLimit,
                   providerOptions: nextRequest.providerOptions,
                   headers: nextHeaders,
                   callSettingsOverrides: nextRequest.resolvedOverrides.standard,
                   thinkingLevel: nextRequest.effectiveThinkingLevel,
-                  // A fallback with a higher thinking minimum than the primary would be
-                  // rejected under the primary's flush cap (thinking budget must stay below
-                  // max_tokens), losing the only notes-preserving step.
-                  ...(contextBudgetFlushTurn
-                    ? {
-                        maxOutputTokens: getContextBudgetFlushMaxOutputTokens(
-                          nextRequest.effectiveThinkingLevel
-                        ),
-                      }
-                    : {}),
                   forcedFirstStepToolNames: nextRequest.forcedFirstStepToolNames,
                   rebuildProviderOptionsForThinkingLevel:
                     nextRequest.rebuildProviderOptionsForThinkingLevel,
@@ -3430,7 +3519,11 @@ export class TurnRequestBuilder {
       while (activeTurnThinkingOverride?.pending != null) {
         const pendingPreparingLevel = activeTurnThinkingOverride.pending;
         activeTurnThinkingOverride.pending = undefined;
-        const folded = computeRebuiltProviderOptions(pendingPreparingLevel, streamThinkingLevel);
+        const folded = computeRebuiltProviderOptions(
+          pendingPreparingLevel,
+          streamThinkingLevel,
+          true
+        );
         if (folded == null) {
           // No-op fold (same effective level / non-foldable variant swap):
           // re-check pending — a change may have raced the previous rebuild.
@@ -3489,7 +3582,6 @@ export class TurnRequestBuilder {
         messageId: assistantMessageId,
         abortSignal: combinedAbortSignal,
         tools: toolsForStream,
-        contextBudgetMemoryWritable: primaryRequest.contextBudgetMemoryWritable,
         contextBudgetLimit: primaryRequest.contextBudgetLimit,
         initialMetadata: {
           ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),

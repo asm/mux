@@ -169,6 +169,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
+  isDockerRuntime,
   isLocalProjectRuntime,
   isWorktreeRuntime,
   runtimeModeSupportsSharedTaskWorkspace,
@@ -178,6 +179,7 @@ import type {
   ProjectRef,
   WorkspaceMetadata,
   WorkspaceRemovalDescendant,
+  WorkspaceRemoveWarning,
 } from "@/common/types/workspace";
 import { getRuntimeType } from "@/node/runtime/initHook";
 import { AgentIdSchema } from "@/common/orpc/schemas";
@@ -313,6 +315,18 @@ export interface SubagentRemovalOptions {
   lossyWorkPolicy?: "refuse";
   /** The caller holds the sub-agent's mutation gate (a parent removal gates its tree, #4477). */
   mutationGateHeld?: boolean;
+  /** Receives what the forced removal left behind, for the parent removal's result (#5143). */
+  onRemovalWarnings?: (warnings: WorkspaceRemoveWarning[]) => void;
+  /**
+   * #5106: the unpreserved work the user confirmed in the preview. Removal refuses if the work
+   * found under the locks differs, so it never deletes what the confirmation did not list.
+   */
+  acknowledgedWork?: SubagentRemovalPreview;
+}
+
+export interface SubagentRemovalPreview {
+  summary: string | null;
+  paths: string[];
 }
 
 interface TaskParentAiMeta {
@@ -872,6 +886,11 @@ export type TaskMessageQueueDispatchMode = "tool-end" | "turn-end";
 export interface SendAgentTaskMessageResult {
   delivery: "accepted" | "queued" | "reactivated";
   queueDispatchMode?: TaskMessageQueueDispatchMode;
+  /**
+   * Queued until the target's running delegated workspace turn, owned by another workspace,
+   * finishes; it then runs as its own turn (#4997).
+   */
+  awaitsDelegatedTurn?: true;
   executionTaskId?: string;
 }
 
@@ -938,6 +957,8 @@ type TreeMessageSpec =
       queueDispatchMode?: TaskMessageQueueDispatchMode;
       /** The sender's context carried project skill content: stamped on the payload and trigger rows. */
       carriesProjectSkillContent?: boolean;
+      /** Set on the retry of a message that waited for a delegated turn (#4997). */
+      awaitedDelegatedTurn?: PeerDelegatedTurnWait;
     }
   | {
       relation: "parent-family";
@@ -961,6 +982,30 @@ type TreeMessagePipelineResult =
   | (SendAgentTaskMessageResult & { relation: AgentTreeTargetRelation });
 
 type TreeMessagePipelineError = SendAgentTreeMessageError | SendParentAgentMessageError;
+
+/**
+ * What a peer message's first admission established, kept while it waits for the target's
+ * delegated turn (#4997). Its retry re-runs the whole peer path against these baselines.
+ */
+interface PeerDelegatedTurnWait {
+  /** Recipient consent at first admission: an off/on cycle must not revive the message. */
+  unrelatedConsent: string | undefined;
+  /**
+   * The target's delegated-turn registration count when the message parked. Any later
+   * registration is a replacement turn, which the message never waits through, even one that
+   * already settled (#5271). See onWorkspaceTurnRegistered.
+   */
+  registrationEpoch: number;
+  /**
+   * Stop generations from first admission; a stop since then refuses the message. The target's
+   * entry is refreshed once when the drain starts (see flushParkedPeerSends).
+   */
+  stopEpochs: Map<string, number>;
+}
+
+type ParkedPeerSend = Extract<TreeMessageSpec, { relation: "peer" }> & {
+  awaitedDelegatedTurn: PeerDelegatedTurnWait;
+};
 
 /** The caller-relative relationship tag on task_list scope:"tree" rows. */
 export type TreeAgentRelationship = "self" | "ancestor" | "sibling" | "descendant";
@@ -2050,6 +2095,20 @@ export class TaskService implements AgentTaskIntegration {
    */
   private readonly workspaceStopEpochs = new Map<string, number>();
   /**
+   * #4997: peer messages to a root whose running delegated workspace turn the sender does not
+   * own, in arrival order per target. The delegated turn stays owner-only, so they wait here and
+   * are delivered as ordinary new turns once its live registration is released (see
+   * flushParkedPeerSends). They wait outside the target's MessageQueue on purpose: a queued
+   * uncorrelated entry would supersede the delegated turn or strip the owner's continuations
+   * (MessageQueue.hasAllWorkspaceTurnContinuations), and a "hold" dispatch decision blocks every
+   * entry behind it, including the continuations that turn is waiting for. In-memory and
+   * process-local, like the queue.
+   */
+  private readonly parkedPeerSendsByTarget = new Map<string, ParkedPeerSend[]>();
+  private readonly parkedPeerSendFlushLocks = new MutexMap<string>();
+  /** #5271: new delegated-turn registrations per target (see onWorkspaceTurnRegistered). */
+  private readonly workspaceTurnRegistrationEpochs = new Map<string, number>();
+  /**
    * Child stream ends cut by a host-selected continuation (queued input or context-budget
    * hand-over) whose successor has not yet streamed or been withdrawn. Keyed by task; settled
    * from the recorded successor outcome (QueueCutReceipt), never from an idle probe, and cleared
@@ -2442,6 +2501,105 @@ export class TaskService implements AgentTaskIntegration {
     return this.workspaceStopEpochs.get(workspaceId) ?? 0;
   }
 
+  /** WorkspaceTurnTaskHost: a delegated turn's registration release (#4997). */
+  onWorkspaceTurnRegistrationReleased(workspaceId: string): void {
+    this.scheduleParkedPeerSendFlush(workspaceId);
+  }
+
+  /**
+   * WorkspaceTurnTaskHost: a new delegated turn registered (#5271). A message waits once, for the
+   * turn it was parked behind. Counting registrations, like the stop epochs, lets the retry's
+   * admission gate see a replacement turn even after it settled, at any point before admission.
+   */
+  onWorkspaceTurnRegistered(workspaceId: string): void {
+    this.workspaceTurnRegistrationEpochs.set(
+      workspaceId,
+      (this.workspaceTurnRegistrationEpochs.get(workspaceId) ?? 0) + 1
+    );
+  }
+
+  /**
+   * Park a peer message behind the target's delegated turn, then schedule a flush. Park first,
+   * check second: the registration may have been released between the caller's synchronous
+   * check and this call, and that release found nothing to flush. Only first attempts park: a
+   * message that already waited is delivered once or dropped.
+   */
+  private parkPeerSend(send: ParkedPeerSend): void {
+    const parked = this.parkedPeerSendsByTarget.get(send.targetId) ?? [];
+    parked.push(send);
+    this.parkedPeerSendsByTarget.set(send.targetId, parked);
+    this.scheduleParkedPeerSendFlush(send.targetId);
+  }
+
+  /**
+   * Triggered by the delegated turn's registration release and by the stop-latch release (an
+   * explicit interrupt releases the registration while its latch is still held), never by a
+   * timer. Flushes of one target run one at a time, in park order.
+   */
+  private scheduleParkedPeerSendFlush(targetId: string): void {
+    if (!this.parkedPeerSendsByTarget.has(targetId)) return;
+    this.parkedPeerSendFlushLocks
+      .withLock(targetId, () => this.flushParkedPeerSends(targetId))
+      .catch((error: unknown) => {
+        log.error("Failed to deliver peer messages that waited for a delegated turn", {
+          targetId,
+          error: getErrorMessage(error),
+        });
+      });
+  }
+
+  private async flushParkedPeerSends(targetId: string): Promise<void> {
+    // While a registration or stop latch is held, stop: its release schedules the next flush.
+    // The list stays registered while it drains, so a fresh send parks behind it instead of
+    // overtaking the rest (see sendTreeMessage), and a user Stop that drops it ends the drain.
+    const parked = this.parkedPeerSendsByTarget.get(targetId);
+    let drainStarted = false;
+    while (parked != null && this.parkedPeerSendsByTarget.get(targetId) === parked) {
+      // Messages that waited for an earlier turn are dropped by their retry's admission gate.
+      if (
+        this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId) != null ||
+        this.isWorkspaceStopInProgress(targetId)
+      ) {
+        return;
+      }
+      if (!drainStarted) {
+        drainStarted = true;
+        // The owner's explicit interrupt of the delegated turn bumps the target's stop epoch (so
+        // sends admitted during its wind-down cannot outlive that stop), and these messages
+        // waited for the turn on purpose. Take a new target baseline once, here, not per retry:
+        // a user Stop after this point still refuses a retry that is already in flight, and one
+        // before it dropped the list (markParentWorkspaceInterrupted).
+        const epoch = this.getWorkspaceStopEpoch(targetId);
+        for (const waiting of parked) waiting.awaitedDelegatedTurn.stopEpochs.set(targetId, epoch);
+      }
+      const spec = parked.shift();
+      if (spec == null) {
+        this.parkedPeerSendsByTarget.delete(targetId);
+        return;
+      }
+      // The retry re-runs the full peer path under the target's event lock. A withdrawn message
+      // (consent revoked, sender stopped, runtime change, target archived) is dropped and
+      // touches no turn state, and so is one that meets another delegated turn.
+      // Each message is handled on its own, so one failure cannot discard the rest.
+      try {
+        const result = await this.sendTreeMessage(spec);
+        if (!result.success) {
+          log.debug("Dropped a peer message that waited for a delegated turn", {
+            senderWorkspaceId: spec.senderWorkspaceId,
+            targetId,
+            code: result.error.code,
+          });
+        }
+      } catch (error) {
+        log.error("Failed to deliver a peer message that waited for a delegated turn", {
+          senderWorkspaceId: spec.senderWorkspaceId,
+          targetId,
+          error: getErrorMessage(error),
+        });
+      }
+    }
+  }
+
   /**
    * Hold a stop-in-progress latch for the given workspaces until the returned release runs.
    * Callers latch synchronously with the epoch bump and release only after the cascade has
@@ -2460,6 +2618,8 @@ export class TaskService implements AgentTaskIntegration {
             this.scheduleMaybeStartQueuedTasks();
           }
           this.notifyAttemptSettlementListeners(id);
+          // An interrupted delegated turn releases its registration while this latch is held.
+          this.scheduleParkedPeerSendFlush(id);
         } else {
           this.workspaceStopsInProgress.set(id, count - 1);
         }
@@ -4441,7 +4601,12 @@ export class TaskService implements AgentTaskIntegration {
     terminalAttentionStore?: TerminalAttentionStore,
     private readonly desktopInputCoordinator = new DesktopInputCoordinator(config)
   ) {
-    this.agentPeerMessageBroker = new AgentPeerMessageBroker(workspaceService);
+    this.agentPeerMessageBroker = new AgentPeerMessageBroker({
+      // Parked sends count against the recipient's queue cap like queued ones.
+      countQueuedAgentPeerMessages: (targetId) =>
+        workspaceService.countQueuedAgentPeerMessages(targetId) +
+        (this.parkedPeerSendsByTarget.get(targetId)?.length ?? 0),
+    });
     this.terminalAttentionStore = terminalAttentionStore ?? new TerminalAttentionStore(config);
     this.gitPatchArtifactService = new GitPatchArtifactService(config);
 
@@ -5507,7 +5672,7 @@ export class TaskService implements AgentTaskIntegration {
       this.workflowAttentionSweepTimer.unref?.();
     }
     if (cancelled()) return;
-    await this.getWorkspaceTurnManager().clearOrphanedDelegatedConsentDefaults();
+    await this.getWorkspaceTurnManager().resolveOrphanedDelegatedTargets();
     const recoveredTerminalWorkspaceTurnNotificationCount =
       await this.getWorkspaceTurnManager().recoverTerminalWorkspaceTurnAttentionNotifications();
     const terminalAttentionDrainStartedAt = Date.now();
@@ -8110,6 +8275,9 @@ export class TaskService implements AgentTaskIntegration {
       let runtimeForTaskWorkspace: Runtime;
       let forkedFromSource: boolean;
       let inheritedProjects: ProjectRef[] | undefined;
+      // Written with the task's row below, never before it: a fork rollback elsewhere restores
+      // this parent mark only while no row uses the shared workspace (#5114).
+      let sourceRuntimeConfigUpdate: RuntimeConfig | undefined;
 
       if (useSharedWorkspace) {
         // isolation: "none" — run the sub-agent directly in the parent workspace's checkout instead
@@ -8164,14 +8332,6 @@ export class TaskService implements AgentTaskIntegration {
           ),
         });
 
-        if (forkResult.success && forkResult.data.sourceRuntimeConfigUpdate) {
-          await this.config.updateWorkspaceMetadata(parentWorkspaceId, {
-            runtimeConfig: forkResult.data.sourceRuntimeConfigUpdate,
-          });
-          // Ensure UI gets the updated runtimeConfig for the parent workspace.
-          await this.emitWorkspaceMetadata(parentWorkspaceId);
-        }
-
         if (!forkResult.success) {
           initLogger.logComplete(-1);
           return Err(`Task fork failed: ${forkResult.error}`);
@@ -8180,6 +8340,7 @@ export class TaskService implements AgentTaskIntegration {
         workspacePath = forkResult.data.workspacePath;
         trunkBranch = forkResult.data.trunkBranch;
         forkedRuntimeConfig = forkResult.data.forkedRuntimeConfig;
+        sourceRuntimeConfigUpdate = forkResult.data.sourceRuntimeConfigUpdate;
         runtimeForTaskWorkspace = forkResult.data.targetRuntime;
         forkedFromSource = forkResult.data.forkedFromSource;
         inheritedProjects = forkResult.data.projects;
@@ -8216,6 +8377,15 @@ export class TaskService implements AgentTaskIntegration {
           requireRow: parentEntry != null,
           legacyRow: legacyParentRow,
         });
+        if (sourceRuntimeConfigUpdate != null) {
+          const parentRow = Array.from(config.projects.values())
+            .flatMap((project) => project.workspaces)
+            .find((workspace) => workspace.id === parentWorkspaceId);
+          if (parentRow == null) {
+            throw new Error(`Workspace ${parentWorkspaceId} not found in config`);
+          }
+          parentRow.runtimeConfig = sourceRuntimeConfigUpdate;
+        }
         let projectConfig = config.projects.get(configProjectPath);
         if (!projectConfig) {
           projectConfig = { workspaces: [] };
@@ -8271,6 +8441,10 @@ export class TaskService implements AgentTaskIntegration {
         attemptId,
         receiptEligible: true,
       });
+      if (sourceRuntimeConfigUpdate != null) {
+        // Ensure UI gets the updated runtimeConfig for the parent workspace.
+        await this.emitWorkspaceMetadata(parentWorkspaceId);
+      }
 
       return Ok({
         initLogger,
@@ -9494,7 +9668,7 @@ export class TaskService implements AgentTaskIntegration {
       return this.sendFamilyTreeMessage(spec, message);
     }
 
-    const { senderWorkspaceId, targetId, targetRelation: relation } = spec;
+    const { senderWorkspaceId, targetId, targetRelation: relation, awaitedDelegatedTurn } = spec;
     return this.workspaceEventLocks.withLock(targetId, async () => {
       const cfg = this.config.loadConfigOrDefault();
       const targetEntry = findWorkspaceEntry(cfg, targetId);
@@ -9517,7 +9691,14 @@ export class TaskService implements AgentTaskIntegration {
       const unrelatedConsent = getValidUnrelatedWorkspaceConsent(
         targetEntry.workspace.unrelatedWorkspaceConsent
       );
-      if (relation === "target_unrelated" && unrelatedConsent == null) {
+      // A retry after a delegated turn needs the grant it was first admitted under: an off/on
+      // cycle is a new grant, not permission to revive input admitted before it.
+      if (
+        relation === "target_unrelated" &&
+        (unrelatedConsent == null ||
+          (awaitedDelegatedTurn != null &&
+            unrelatedConsent !== awaitedDelegatedTurn.unrelatedConsent))
+      ) {
         return Err({ code: "not_found" as const });
       }
 
@@ -9541,22 +9722,6 @@ export class TaskService implements AgentTaskIntegration {
         code: "refused" as const,
         reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
       };
-      // A persisted running mirror can outlive its handle after a crash. Requiring the matching
-      // accepted registration prevents stale mirrors and creation-time reservations from
-      // peer-reactivating a terminal task.
-      const hasLiveRunningExecution = (
-        workspace: WorkspaceConfigEntry,
-        workspaceId: string
-      ): boolean => {
-        const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(workspaceId);
-        return (
-          workspace.taskExecutionStatus === "running" &&
-          workspace.taskExecutionId != null &&
-          live != null &&
-          live.handleId === workspace.taskExecutionId &&
-          live.accepted
-        );
-      };
       const isInactivePeerSender = (workspace: WorkspaceConfigEntry): boolean => {
         // Unrelated roots can send here too; archive must win before the root lifecycle shortcut.
         if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) return true;
@@ -9566,7 +9731,7 @@ export class TaskService implements AgentTaskIntegration {
         }
         const status = workspace.taskStatus ?? "running";
         return (
-          !hasLiveRunningExecution(workspace, senderWorkspaceId) &&
+          !this.hasLiveRunningExecution(workspace, senderWorkspaceId) &&
           status !== "running" &&
           status !== "awaiting_report"
         );
@@ -9617,15 +9782,18 @@ export class TaskService implements AgentTaskIntegration {
       const targetIsAgentTask =
         coerceNonEmptyString(targetEntry.workspace.parentWorkspaceId) != null;
       const unrelatedRoot = relation === "target_unrelated" && !targetIsAgentTask;
-      // An unrelated root running a delegated workspace turn accepts peer input only from that
-      // turn's OWNER: the owner already steers the turn through follow-ups, so its message may
-      // CONTINUE the turn (correlation resolved below), the same way same-tree sends do. Any
-      // other unrelated sender is refused: its continuation would run under the recipient's saved
-      // agent rather than the owner's per-turn override (handle records do not store it) and land
-      // in the owner's result. Even the owner is refused while the turn is only reserved (its
-      // requireIdle send has not passed admission) or when the live handle no longer matches the
-      // resolved correlation: dispatched uncorrelated, such a wake would steal the reserved turn
-      // or settle the owner's turn as superseded.
+      // A root running a delegated workspace turn stays owner-only (#4997). Only the turn's OWNER
+      // may CONTINUE it (correlation resolved below): the owner already steers the turn through
+      // follow-ups. Any other sender, an opted-in unrelated root or a same-tree descendant, waits
+      // until the turn settles and then runs as its own turn under the recipient's saved agent:
+      // continuing the turn would run under the recipient's saved agent rather than the owner's
+      // per-turn override (handle records do not store it) and land in the owner's result. Even
+      // the owner is refused while the turn is only reserved (its requireIdle send has not passed
+      // admission) or when the live handle no longer matches the resolved correlation:
+      // dispatched uncorrelated, such a wake would steal the reserved turn or settle the owner's
+      // turn as superseded. Agent-task targets are excluded: a reawakened child's execution is its
+      // own task run under its own agent, and once it settles the child is terminal, which peers
+      // cannot reactivate.
       // Process-local courtesy: another backend's delegated turn is invisible here (#4446; see
       // CONCURRENT BACKENDS in processLiveness.ts).
       // "unresolved" until the correlation lookup below runs; undefined means no correlation.
@@ -9637,18 +9805,33 @@ export class TaskService implements AgentTaskIntegration {
         code: "refused" as const,
         reason: "The target is starting or switching a delegated workspace turn; retry shortly.",
       };
-      const delegatedRootForeignRefusal = {
+      // Marks a message that waits for the delegated turn. Returned to the sender only when the
+      // turn started while the send was already being admitted and its rows may be durable.
+      const awaitDelegatedTurn = {
         code: "refused" as const,
-        reason: "Retry after the target's delegated workspace turn finishes.",
+        reason:
+          "The target started a delegated workspace turn that another workspace owns; retry after it finishes.",
       };
       const getDelegatedRootRefusal = ():
         | typeof delegatedRootStartingRefusal
-        | typeof delegatedRootForeignRefusal
+        | typeof awaitDelegatedTurn
         | null => {
-        if (!unrelatedRoot) return null;
+        if (targetIsAgentTask) return null;
+        // A retry is dropped once any delegated turn registered after it parked, even one that
+        // settled again before this check (#5271).
+        if (
+          awaitedDelegatedTurn != null &&
+          (this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0) !==
+            awaitedDelegatedTurn.registrationEpoch
+        ) {
+          return awaitDelegatedTurn;
+        }
         const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId);
         if (live == null) return null;
-        if (live.ownerWorkspaceId !== senderWorkspaceId) return delegatedRootForeignRefusal;
+        // A retry never joins a delegated turn, not even one its own sender started meanwhile.
+        if (live.ownerWorkspaceId !== senderWorkspaceId || awaitedDelegatedTurn != null) {
+          return awaitDelegatedTurn;
+        }
         if (!live.accepted) return delegatedRootStartingRefusal;
         // Before the correlation lookup, the owner's accepted turn is a continuation candidate.
         if (delegatedTurnCorrelation === "unresolved") return null;
@@ -9657,13 +9840,14 @@ export class TaskService implements AgentTaskIntegration {
           ? delegatedRootStartingRefusal
           : null;
       };
-      const initialDelegatedRootRefusal = getDelegatedRootRefusal();
-      if (initialDelegatedRootRefusal != null) return Err(initialDelegatedRootRefusal);
+      if (getDelegatedRootRefusal() === delegatedRootStartingRefusal) {
+        return Err(delegatedRootStartingRefusal);
+      }
       if (targetIsAgentTask) {
         const targetStatus = targetEntry.workspace.taskStatus ?? "running";
         // Match task_list's effective-running overlay, but require accepted correlation so a
         // queued reawakening cannot be converted into an unowned peer continuation.
-        const targetExecutionActive = hasLiveRunningExecution(targetEntry.workspace, targetId);
+        const targetExecutionActive = this.hasLiveRunningExecution(targetEntry.workspace, targetId);
         if (!targetExecutionActive) {
           if (targetStatus === "queued" || targetStatus === "starting") {
             return Err({
@@ -9741,8 +9925,17 @@ export class TaskService implements AgentTaskIntegration {
       // bump after this capture keeps the send stale forever — the resumed workspace belongs to
       // the user, not to a wake admitted before the stop. Both endpoints' chains are captured;
       // the per-chain probes attribute the refusal to the stopped side.
+      // A retry after a delegated turn keeps its first admission's generations; the target's was
+      // refreshed when the drain started (see flushParkedPeerSends).
+      assert(
+        awaitedDelegatedTurn == null || (targetChainIds.length === 1 && !targetIsAgentTask),
+        "only root targets wait for a delegated turn"
+      );
       const capturedStopEpochs = new Map(
-        [...senderChainIds, ...targetChainIds].map((id) => [id, this.getWorkspaceStopEpoch(id)])
+        [...senderChainIds, ...targetChainIds].map((id) => [
+          id,
+          awaitedDelegatedTurn?.stopEpochs.get(id) ?? this.getWorkspaceStopEpoch(id),
+        ])
       );
       const chainStopEpochChanged = (chainIds: string[]): boolean =>
         chainIds.some((id) => this.getWorkspaceStopEpoch(id) !== capturedStopEpochs.get(id));
@@ -9767,11 +9960,11 @@ export class TaskService implements AgentTaskIntegration {
         });
       }
 
-      const throttleError = this.agentPeerMessageBroker.checkPeerAdmission(
-        senderWorkspaceId,
-        targetId,
-        message
-      );
+      // A retry after a delegated turn was already admitted and counted once.
+      const throttleError =
+        awaitedDelegatedTurn == null
+          ? this.agentPeerMessageBroker.checkPeerAdmission(senderWorkspaceId, targetId, message)
+          : null;
       if (throttleError != null) {
         return Err(throttleError);
       }
@@ -9822,11 +10015,14 @@ export class TaskService implements AgentTaskIntegration {
       // stream end settles the owner's delegated turn as interrupted/superseded. Peer
       // attribution stays on the assistant payload row, so no provenance is lost; the queue
       // still counts these entries by their dedupe-key prefix.
+      // A retry after a delegated turn never carries a correlation (#4997).
       const workspaceTurnMuxMetadata =
-        await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
-          targetId,
-          { requireAcceptedRegistration: true }
-        );
+        awaitedDelegatedTurn == null
+          ? await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
+              targetId,
+              { requireAcceptedRegistration: true }
+            )
+          : undefined;
       delegatedTurnCorrelation = workspaceTurnMuxMetadata;
       // Keep the explicit trigger marker alongside the correlation: displayedMessageBuilder
       // renders machine notifications from metadata, so a bare workspace-turn replacement would
@@ -9837,7 +10033,7 @@ export class TaskService implements AgentTaskIntegration {
           : { type: "agent-peer-message", ...peerTriggerMeta };
 
       let sendOptions: SendMessageOptions;
-      if (relation === "target_ancestor") {
+      if (relation === "target_ancestor" && awaitedDelegatedTurn == null) {
         const resumeOptions = await this.resolveParentAutoResumeOptions(
           targetId,
           targetEntry,
@@ -9850,14 +10046,18 @@ export class TaskService implements AgentTaskIntegration {
           reasoningMode: resumeOptions.reasoningMode,
           muxMetadata: triggerMuxMetadata,
         };
-      } else if (unrelatedRoot) {
+      } else if (unrelatedRoot || awaitedDelegatedTurn != null) {
         assert(!targetIsAgentTask);
         // Honor the recipient's selected identity (including plan), not the sender's or an
         // older history row. Without a selection, the shared history → exec fallback applies.
-        // Known tradeoff: a continuation of a delegated turn also uses these persisted settings,
-        // not a per-turn agent override the owner chose (handle records do not store it). The
-        // ancestor path and manual input into a delegated turn behave the same way.
-        const persistedAgentId = resolvePersistedAgentIdCandidates(targetEntry.workspace)[0];
+        // Known tradeoff: the owner's continuation of its delegated turn also uses these
+        // persisted settings, not its per-turn agent override (handle records do not store it).
+        // A retry after a delegated turn never falls back to history, whose newest agent is that
+        // turn's override: it takes the recipient's saved agent or the workspace default.
+        const persistedAgentId =
+          awaitedDelegatedTurn != null
+            ? resolvePersistedAgentId(targetEntry.workspace)
+            : resolvePersistedAgentIdCandidates(targetEntry.workspace)[0];
         const resumeOptions = await this.resolveParentAutoResumeOptions(
           targetId,
           targetEntry,
@@ -9909,6 +10109,11 @@ export class TaskService implements AgentTaskIntegration {
       // gates, so a stop in those windows refuses the send instead of queueing a wake or
       // resurrecting the stopped task via markInterruptedTaskRunning.
       let admissionRefusal: SendAgentTreeMessageError | null = null;
+      // Registration count when a delegated turn first refused this attempt. The message waits
+      // for that turn only: the session's final admission gate awaits its rollback before
+      // onCanceled parks the message, and a turn registering during that await must not count as
+      // the awaited one (#5277).
+      let refusedAtRegistrationEpoch: number | undefined;
       const admissionStale = (): boolean => {
         // Latched stop checks first: unlike the level-triggered probes below, a generation bump
         // stays observable even when a user resume already cleared suppression and restored
@@ -9930,6 +10135,9 @@ export class TaskService implements AgentTaskIntegration {
         }
         const delegatedRootRefusal = getDelegatedRootRefusal();
         if (delegatedRootRefusal != null) {
+          if (delegatedRootRefusal === awaitDelegatedTurn) {
+            refusedAtRegistrationEpoch ??= this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0;
+          }
           admissionRefusal = delegatedRootRefusal;
           return true;
         }
@@ -9991,7 +10199,7 @@ export class TaskService implements AgentTaskIntegration {
           // always wins the race.
           const freshStatus = freshEntry.workspace.taskStatus ?? "running";
           if (
-            !hasLiveRunningExecution(freshEntry.workspace, targetId) &&
+            !this.hasLiveRunningExecution(freshEntry.workspace, targetId) &&
             freshStatus !== "running" &&
             freshStatus !== "awaiting_report"
           ) {
@@ -10006,10 +10214,49 @@ export class TaskService implements AgentTaskIntegration {
         }
         return false;
       };
+      // A non-owner's message waits for the delegated turn and retries this whole path once the
+      // turn's registration is released (#4997). It never carries the turn's correlation, so it
+      // can neither defer nor settle the owner's handle, and dropping it changes no turn state.
+      // It waits at most once: a retry that meets another delegated turn, or that the queue
+      // withdraws, is dropped like any other withdrawn message. A dropped retry is only logged;
+      // its sender already got a queued result (best-effort peer delivery).
+      // Once per attempt: more than one refusal path below can observe the wait.
+      const firstAttempt = awaitedDelegatedTurn == null;
+      let parkedThisAttempt = false;
+      const park = (): void => {
+        assert(firstAttempt, "sendTreeMessage: a retry after a delegated turn never waits again");
+        if (parkedThisAttempt) return;
+        parkedThisAttempt = true;
+        this.parkPeerSend({
+          ...spec,
+          awaitedDelegatedTurn: {
+            unrelatedConsent,
+            registrationEpoch:
+              refusedAtRegistrationEpoch ?? this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0,
+            stopEpochs: new Map(capturedStopEpochs),
+          },
+        });
+      };
+      const waitForDelegatedTurn = () => {
+        park();
+        this.agentPeerMessageBroker.recordPeerSend(senderWorkspaceId, targetId, message);
+        return Ok({ delivery: "queued" as const, relation, awaitsDelegatedTurn: true as const });
+      };
       // Recheck immediately before dispatch: resolveParentAutoResumeOptions and the
       // workspace-turn lookup awaited since the first check.
       if (admissionStale()) {
+        if (firstAttempt && admissionRefusal === awaitDelegatedTurn) return waitForDelegatedTurn();
         return Err(admissionRefusal ?? interruptedRefusal);
+      }
+      // Messages that waited for a delegated turn are still draining: queue behind them rather
+      // than overtake them. The owner's continuation of a live turn is not affected.
+      if (
+        firstAttempt &&
+        !targetIsAgentTask &&
+        this.parkedPeerSendsByTarget.has(targetId) &&
+        this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId) == null
+      ) {
+        return waitForDelegatedTurn();
       }
       // Resolved after the awaits above so a preference change acknowledged meanwhile applies.
       const effectiveDispatchMode = this.resolveRecipientDispatchMode(
@@ -10044,8 +10291,20 @@ export class TaskService implements AgentTaskIntegration {
         onAccepted: () => {
           accepted = true;
         },
+        // A first attempt withdrawn because another workspace's delegated turn started meanwhile
+        // waits for that turn instead. Any other withdrawal (stop, revoked consent, archive, or
+        // a retry's) drops it as before. onCanceled fires only when the rows were never written
+        // or were verifiably rolled back, so waiting cannot duplicate them; a failure after
+        // durable rows only refuses.
+        onCanceled: () => {
+          if (firstAttempt && admissionRefusal === awaitDelegatedTurn) park();
+        },
       });
       if (!sendResult.success) {
+        if (admissionRefusal === awaitDelegatedTurn) {
+          if (parkedThisAttempt) return waitForDelegatedTurn();
+          return Err(awaitDelegatedTurn);
+        }
         // A probe-triggered rejection surfaces the precise refusal (stop won the race), not a
         // generic transport failure.
         if (admissionRefusal != null) {
@@ -10057,7 +10316,9 @@ export class TaskService implements AgentTaskIntegration {
         });
       }
 
-      this.agentPeerMessageBroker.recordPeerSend(senderWorkspaceId, targetId, message);
+      if (firstAttempt) {
+        this.agentPeerMessageBroker.recordPeerSend(senderWorkspaceId, targetId, message);
+      }
       return Ok(
         accepted
           ? { delivery: "accepted" as const, relation }
@@ -13794,6 +14055,24 @@ export class TaskService implements AgentTaskIntegration {
     return null;
   }
 
+  private hasLiveRunningExecution(workspace: WorkspaceConfigEntry, workspaceId: string): boolean {
+    // A persisted running mirror can outlive its handle after a crash.
+    // Require a matching accepted registration to exclude stale mirrors and unaccepted reservations.
+    const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(workspaceId);
+    return (
+      workspace.taskExecutionStatus === "running" &&
+      workspace.taskExecutionId != null &&
+      live != null &&
+      live.handleId === workspace.taskExecutionId &&
+      live.accepted
+    );
+  }
+
+  hasLiveAgentTaskContinuation(workspaceId: string): boolean {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    return entry != null && this.hasLiveRunningExecution(entry.workspace, workspaceId);
+  }
+
   getAgentTaskStatus(taskId: string): AgentTaskStatus | null {
     assert(taskId.length > 0, "getAgentTaskStatus: taskId must be non-empty");
 
@@ -14078,6 +14357,25 @@ export class TaskService implements AgentTaskIntegration {
         if (refusal != null)
           return Ok({ status: "error", action: "remove", ...target, ...refusal });
       }
+      if (options?.acknowledgedWork != null) {
+        const current = await this.describeSubagentRemovalPreview(
+          taskId,
+          entry,
+          patchArtifact ?? null
+        );
+        if (
+          current.summary !== options.acknowledgedWork.summary ||
+          current.paths.join("\0") !== options.acknowledgedWork.paths.join("\0")
+        ) {
+          return Ok({
+            status: "error",
+            action: "remove",
+            ...target,
+            error:
+              "The sub-agent's unsaved work changed after the confirmation was shown, so it was not removed. Review it again.",
+          });
+        }
+      }
 
       const tombstoneResult = await this.persistRemovedAgentTaskTombstones(taskId);
       if (!tombstoneResult.success) {
@@ -14091,6 +14389,7 @@ export class TaskService implements AgentTaskIntegration {
         { expectedAttemptId: entry.workspace.taskAttemptId },
         options?.mutationGateHeld === true ? { mutationGateHeld: true } : undefined
       );
+      if (result.success && result.warnings?.length) options?.onRemovalWarnings?.(result.warnings);
       return Ok(
         result.success
           ? { status: "removed", action: "remove", ...target }
@@ -14108,6 +14407,29 @@ export class TaskService implements AgentTaskIntegration {
     entry: { projectPath: string; workspace: WorkspaceConfigEntry },
     patchArtifact: SubagentGitPatchArtifact | null
   ): Promise<{ error: string; paths?: string[] } | null> {
+    const lost = await this.describeUnpreservedSubagentWork(taskId, entry, patchArtifact);
+    if (lost == null) return null;
+    const guidance =
+      "This tool cannot approve losing a sub-agent's work, and you must not delete that work to get around it. " +
+      "Leave the sub-agent in place and tell the user what it holds; the user can save or clear it and ask you to retry, " +
+      "or remove the sub-agent themselves from the command palette (Remove Current Sub-agent or Remove Workspace), whose confirmation lists this work.";
+    return {
+      error: `${lost.summary} ${guidance}`,
+      ...(lost.paths.length > 0 ? { paths: lost.paths } : {}),
+    };
+  }
+
+  /**
+   * What removing this sub-agent would permanently delete, or null when nothing. Shared by the
+   * model's refusal and the user's confirmation (#5106), so both report the same work.
+   */
+  private async describeUnpreservedSubagentWork(
+    taskId: string,
+    entry: { projectPath: string; workspace: WorkspaceConfigEntry },
+    patchArtifact: SubagentGitPatchArtifact | null,
+    /** Where the reader finds the paths: the model gets a `paths` field, the dialog a list. */
+    pathsLocation = "listed in paths"
+  ): Promise<{ summary: string; paths: string[] } | null> {
     const ws = entry.workspace;
     const runtimeConfig = ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
     if (subagentRemovalPreservesCheckout(ws)) return null;
@@ -14143,31 +14465,113 @@ export class TaskService implements AgentTaskIntegration {
               taskBaseCommitSha: coerceNonEmptyString(ws.taskBaseCommitSha),
               taskBaseCommitShaByProjectPath: ws.taskBaseCommitShaByProjectPath,
             }),
+            removalDeletesBundleClone: isDockerRuntime(runtimeConfig),
           });
-    // No per-sub-agent removal with a dirty-checkout confirmation exists in the UI today; the
-    // parent deletion dialog is the user-confirmed path that removes sub-agents.
-    const guidance =
-      "This tool cannot approve losing a sub-agent's work, and you must not delete that work to get around it. " +
-      "Leave the sub-agent in place and tell the user what it holds; the user can save or clear it and ask you to retry, " +
-      "or delete the parent workspace, whose confirmation dialog lists the sub-agents it removes.";
     if (!check.success) {
       return {
-        error: `Cannot verify that removing this sub-agent keeps its work (${check.error}), so it was not removed. ${guidance}`,
+        summary: `Cannot verify that removing this sub-agent keeps its work (${check.error}).`,
+        paths: [],
       };
     }
     const work = check.data;
     if (work.kind === "none") return null;
+    const otherRefCommitCount = work.otherRefCommitCount ?? 0;
     const lost = [
-      ...(work.paths.length > 0 ? ["the uncommitted or untracked files listed in paths"] : []),
+      ...(work.paths.length > 0 ? [`the uncommitted or untracked files ${pathsLocation}`] : []),
       ...(work.uncapturedCommitCount > 0
         ? [`${work.uncapturedCommitCount} commit(s) not captured by a ready patch artifact`]
+        : []),
+      ...(otherRefCommitCount > 0
+        ? // Copies without a source record count every other branch (#5105), so do not claim the
+          // commits exist nowhere else; only that nothing proves they do.
+          [
+            `${otherRefCommitCount} commit(s) on other local branches or in the stash that nothing shows exist outside this checkout`,
+          ]
+        : []),
+      ...(work.commitCheckError != null
+        ? [`any commits, which could not be checked (${work.commitCheckError})`]
         : []),
     ];
     assert(lost.length > 0, "a lossy removal result must name what would be lost");
     return {
-      error: `Removing this sub-agent would permanently delete ${lost.join(" and ")}. ${guidance}`,
-      ...(work.paths.length > 0 ? { paths: work.paths } : {}),
+      summary: `Removing this sub-agent would permanently delete ${lost.join(" and ")}.`,
+      paths: work.paths,
     };
+  }
+
+  /** #5106: what a user-confirmed removal would lose, for the confirmation dialog. */
+  async previewSubagentRemoval(taskId: string): Promise<Result<SubagentRemovalPreview, string>> {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
+    if (entry == null) return Err("This sub-agent no longer exists.");
+    const parentWorkspaceId = entry.workspace.parentWorkspaceId;
+    if (parentWorkspaceId == null) return Err("This is not a sub-agent.");
+    // Refuse up front what removal would refuse, rather than asking the user to confirm a removal
+    // that cannot happen (and listing files a running sub-agent is still changing).
+    if (
+      this.isActiveAgentTaskEntry({ ...entry.workspace, projectPath: entry.projectPath }) ||
+      this.aiService.isStreaming(taskId)
+    ) {
+      return Err("Stop the sub-agent before removing it.");
+    }
+    if (this.listDescendantAgentTasks(taskId).length > 0) {
+      return Err("Cannot remove a sub-agent while descendant sub-agents remain.");
+    }
+    const patchArtifact = await readSubagentGitPatchArtifact(
+      path.join(this.config.sessionsDir, parentWorkspaceId),
+      taskId
+    );
+    if (patchArtifact?.status === "pending") {
+      return Err("Cannot remove the sub-agent while its git patch artifact is still pending.");
+    }
+    return Ok(await this.describeSubagentRemovalPreview(taskId, entry, patchArtifact));
+  }
+
+  private async describeSubagentRemovalPreview(
+    taskId: string,
+    entry: { projectPath: string; workspace: WorkspaceConfigEntry },
+    patchArtifact: SubagentGitPatchArtifact | null
+  ): Promise<SubagentRemovalPreview> {
+    const lost = await this.describeUnpreservedSubagentWork(
+      taskId,
+      entry,
+      patchArtifact,
+      "listed below"
+    );
+    return { summary: lost?.summary ?? null, paths: lost?.paths ?? [] };
+  }
+
+  /**
+   * #5106: removal the user confirmed after seeing the preview. It takes the same path as the
+   * parent deletion cascade (no lossy-work refusal), so it still refuses active sub-agents,
+   * sub-agents with descendants and pending patch artifacts.
+   */
+  async removeSubagentForUser(
+    taskId: string,
+    acknowledgedWork: SubagentRemovalPreview
+  ): Promise<Result<{ warnings?: WorkspaceRemoveWarning[] }, string>> {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
+    if (entry == null) return Err("This sub-agent no longer exists.");
+    const parentWorkspaceId = entry.workspace.parentWorkspaceId;
+    if (parentWorkspaceId == null) return Err("This is not a sub-agent.");
+    const warnings: WorkspaceRemoveWarning[] = [];
+    const result = await this.removeInactiveDescendantAgentTask(parentWorkspaceId, taskId, {
+      acknowledgedWork,
+      onRemovalWarnings: (removalWarnings) => warnings.push(...removalWarnings),
+    });
+    if (!result.success) return Err(result.error);
+    switch (result.data.status) {
+      case "removed":
+      case "already_removed":
+        return Ok(warnings.length > 0 ? { warnings } : {});
+      case "active":
+        return Err("Stop the sub-agent before removing it.");
+      case "invalid_scope":
+        return Err("This is not a sub-agent.");
+      default:
+        return Err(
+          ("error" in result.data ? result.data.error : undefined) ?? "Sub-agent removal failed."
+        );
+    }
   }
 
   listWorkspaceRemovalDescendants(workspaceId: string): WorkspaceRemovalDescendant[] {
@@ -14192,7 +14596,7 @@ export class TaskService implements AgentTaskIntegration {
     workspaceId: string,
     acknowledgedIds: string[],
     gatedIds?: ReadonlySet<string>
-  ): Promise<Result<void>> {
+  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
     const descendants = this.listWorkspaceRemovalDescendants(workspaceId);
     const acknowledged = new Set(acknowledgedIds);
     const current = new Set(descendants.map((descendant) => descendant.workspaceId));
@@ -14213,6 +14617,7 @@ export class TaskService implements AgentTaskIntegration {
     if (descendants.some((descendant) => descendant.active)) {
       return Err("Stop active descendant sub-agents before removing this workspace.");
     }
+    const warnings: WorkspaceRemoveWarning[] = [];
     for (const descendant of descendants) {
       const failure = (error: string) =>
         Err(`Cannot remove ${descendant.title} (${descendant.workspaceId}): ${error}`);
@@ -14220,7 +14625,10 @@ export class TaskService implements AgentTaskIntegration {
         const result = await this.removeInactiveDescendantAgentTaskWhileTaskTreeLocked(
           workspaceId,
           descendant.workspaceId,
-          { mutationGateHeld: gatedIds?.has(descendant.workspaceId) === true }
+          {
+            mutationGateHeld: gatedIds?.has(descendant.workspaceId) === true,
+            onRemovalWarnings: (descendantWarnings) => warnings.push(...descendantWarnings),
+          }
         );
         if (!result.success) return failure(result.error);
         if (result.data.status !== "removed" && result.data.status !== "already_removed") {
@@ -14234,7 +14642,7 @@ export class TaskService implements AgentTaskIntegration {
         return failure(getErrorMessage(error));
       }
     }
-    return Ok(undefined);
+    return { ...Ok(undefined), ...(warnings.length > 0 ? { warnings } : {}) };
   }
 
   private removedAgentTaskTombstonePath(ownerWorkspaceId: string, taskId: string): string {
@@ -15703,6 +16111,14 @@ export class TaskService implements AgentTaskIntegration {
     // Latch the stop: the suppression entry above is level-triggered and cleared by resume, so
     // in-flight peer-send admission also needs the monotonic generation to observe the stop.
     this.bumpWorkspaceStopEpoch(workspaceId);
+    // A user Stop refuses agent messages that were not admitted yet, including those waiting
+    // for a delegated turn: their retry takes a new baseline for the target's stop epoch (see
+    // sendTreeMessage), so drop them here rather than let them run after a resume.
+    if (this.parkedPeerSendsByTarget.delete(workspaceId)) {
+      log.debug("Dropped peer messages waiting for a delegated turn after a user stop", {
+        workspaceId,
+      });
+    }
   }
 
   /**

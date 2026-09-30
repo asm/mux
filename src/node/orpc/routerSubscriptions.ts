@@ -16,8 +16,13 @@ import type { TimelineSubscriptionEvent } from "@/common/orpc/schemas/timeline";
 import type { DevToolsEvent } from "@/common/types/devtools";
 import type { ReviewStateEvent } from "@/common/orpc/schemas/reviewState";
 import { ReviewStateService, type ReviewStateChange } from "@/node/services/reviewStateService";
+import type { DraftEvent } from "@/common/orpc/schemas/drafts";
+import { DraftService } from "@/node/services/draftService";
 import { createCoalescedReader } from "@/common/utils/coalescedReader";
 import { getErrorMessage } from "@/common/utils/errors";
+import { ORPCError, ValidationError } from "@orpc/server";
+import assert from "@/common/utils/assert";
+import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
 import { subscriptionIterable, type SubscriptionStreamOptions } from "./streamBridge";
 import { createReplayBufferedStreamMessageRelay } from "@/node/services/replayBufferedStreamMessageRelay";
@@ -44,6 +49,8 @@ interface WorkspaceChatSubscriptionInput {
   workspaceId: string;
   mode?: OnChatMode;
   legacyAutoRetryEnabled?: boolean;
+  batchReplay?: boolean;
+  replayWindow?: boolean;
 }
 
 type WorkspaceActivityEvent =
@@ -136,6 +143,24 @@ export function subscribeReviewState(
       type: "snapshot" as const,
       ...(await service.getSnapshotWithRevision(workspaceId)),
     }),
+  });
+}
+
+export function subscribeDrafts(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<DraftEvent> {
+  const service = context.draftService;
+  return runtimeSubscription<DraftEvent>(context, {
+    signal,
+    // Keep every event: each one describes a different scope. Events fired while the snapshot
+    // is computed are delivered after it; clients skip those at or below the snapshot revision.
+    subscribe: (emit) => {
+      const listener = (event: DraftEvent) => emit.push(event);
+      service.on(DraftService.CHANGE_EVENT, listener);
+      return () => service.off(DraftService.CHANGE_EVENT, listener);
+    },
+    initial: () => service.getSnapshotEvent(),
   });
 }
 
@@ -233,6 +258,9 @@ export function subscribeMemoryChanges(
           )
             return;
           if (event.scope === "project" && event.projectPath !== projectPath) return;
+          // Session stores are private to the acting workspace, and every
+          // workspace uses the same virtual session paths.
+          if (event.scope === "session" && event.workspaceId !== workspaceId) return;
           emit.push(event);
         };
         const onStatusChange = (event: MemoryConsolidationStatusChangeEventPayload) =>
@@ -314,20 +342,61 @@ export function subscribeTimeline(
   });
 }
 
+/**
+ * The output validation oRPC's `eventIterator(WorkspaceChatMessageSchema)` applies to each yielded
+ * onChat event, with the same transform (the schema's parse output is what goes on the wire) and
+ * the same error, so disabling it on the procedure changes nothing observable (#4868).
+ *
+ * No onChat producer attaches oRPC event meta (`withEventMeta`). If one ever does, carry it over
+ * with `getEventMeta` like oRPC's `wrapAsyncIteratorPreservingEventMeta`.
+ */
+function validateChatEvent(event: WorkspaceChatMessage): WorkspaceChatMessage {
+  const result = WorkspaceChatMessageSchema["~standard"].validate(event);
+  // The chat schema has no async refinements; a Promise here would silently skip validation.
+  assert(!(result instanceof Promise), "WorkspaceChatMessageSchema validation must be synchronous");
+  if (result.issues) {
+    throw new ORPCError("ASYNC_ITERATOR_OBJECT_VALIDATION_FAILED", {
+      message: "AsyncIteratorObject validation failed",
+      cause: new ValidationError({
+        issues: result.issues,
+        message: "AsyncIteratorObject validation failed",
+        invalidData: event,
+      }),
+    });
+  }
+  return result.value;
+}
+
 export function subscribeWorkspaceChat(
   context: ORPCContext,
   input: WorkspaceChatSubscriptionInput,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  /**
+   * Set by the onChat procedure, which disables oRPC output validation (#4868): yield the wire
+   * schema's parse output, sending the replay's already-parsed rows (`wireMessage`) as-is and
+   * validating every other event. Direct callers keep receiving the unvalidated events, as they
+   * did when oRPC validated at the procedure boundary.
+   */
+  options?: { validateOutput?: boolean }
 ): AsyncGenerator<WorkspaceChatMessage> {
   const session = context.workspaceService.getOrCreateSession(input.workspaceId);
   if (typeof input.legacyAutoRetryEnabled === "boolean") {
     session.setLegacyAutoRetryEnabledHint(input.legacyAutoRetryEnabled);
   }
   let replayRelay: ReturnType<typeof createReplayBufferedStreamMessageRelay>;
+  // Replay rows the session already parsed with the wire schema (#4868). A WeakSet rather than a
+  // Set: `initialize` keeps replaying after a client disconnect, so entries must die with their
+  // rows instead of accumulating until the replay finishes.
+  const validatedReplayRows = new WeakSet<WorkspaceChatMessage>();
   // Subscribe before replay so the relay can buffer overlapping live deltas.
   return runtimeSubscription<WorkspaceChatMessage>(context, {
     signal,
     heartbeat: { value: { type: "heartbeat" as const } },
+    // Replay rows are parsed once (#4868); every other event (live, stream replay, heartbeat,
+    // caught-up, queue) is validated here instead of by oRPC.
+    mapValue: options?.validateOutput
+      ? (event) => (validatedReplayRows.has(event) ? event : validateChatEvent(event))
+      : undefined,
     // Replay can take seconds on large epochs: stream rows as they are produced and keep the
     // client's stall watchdog fed with heartbeats meanwhile (#4506).
     progressiveInitialize: true,
@@ -337,9 +406,24 @@ export function subscribeWorkspaceChat(
     },
     initialize: async () => {
       await session.replayHistory(
-        ({ message }) => replayRelay.handleReplayMessage(message),
+        ({ message, wireMessage }) => {
+          if (options?.validateOutput && wireMessage) {
+            validatedReplayRows.add(wireMessage);
+            replayRelay.handleReplayMessage(wireMessage);
+          } else {
+            replayRelay.handleReplayMessage(message);
+          }
+        },
         input.mode,
-        replayRelay.finishReplay
+        replayRelay.finishReplay,
+        // Batches (#4868) only travel the self-validating path: there the listener above adds a
+        // batch's `wireMessage` (parse output of every row) to validatedReplayRows, so mapValue
+        // does not validate it again. Direct callers (no validateOutput) always get single rows.
+        // The replay window (#4961) is gated the same way: only the renderer path opts in.
+        {
+          batchReplay: options?.validateOutput === true && input.batchReplay === true,
+          replayWindow: options?.validateOutput === true && input.replayWindow === true,
+        }
       );
       replayRelay.finishReplay();
       session.scheduleStartupRecovery();

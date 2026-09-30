@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { installDom } from "../../../tests/ui/dom";
 
 import {
   applyLocalPreferenceWrite,
@@ -12,6 +13,7 @@ import {
   retryUserPreferenceHydration,
   shouldBackfillLocalPreferences,
 } from "./UserPreferencesContext";
+import { getPersistedStateStorage, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   LAUNCH_BEHAVIOR_KEY,
   PROJECT_ORDER_KEY,
@@ -174,6 +176,29 @@ describe("UserPreferencesProvider bridge helpers", () => {
     expect(JSON.parse(storage.getItem(LAUNCH_BEHAVIOR_KEY) ?? "null")).toBe("last-workspace");
   });
 
+  // Production passes no storage: writes must be routed to the helpers because the default storage
+  // is the (write-refusing) persisted-state view, recognized by identity.
+  test("hydrates into the real localStorage through the default persisted-state view", async () => {
+    const cleanupDom = installDom();
+    try {
+      await hydrateUserPreferencesLocalCache({
+        configClient: {
+          getConfig: () =>
+            Promise.resolve({
+              userPreferences: { navigation: { launchBehavior: "last-workspace" } },
+            }),
+          saveConfig: () => Promise.resolve(),
+        },
+      });
+
+      expect(JSON.parse(window.localStorage.getItem(LAUNCH_BEHAVIOR_KEY) ?? "null")).toBe(
+        "last-workspace"
+      );
+    } finally {
+      cleanupDom();
+    }
+  });
+
   test("does not backfill stale local cache after backend preferences are initialized", async () => {
     const storage = new MemoryStorage();
     storage.setJSON(UI_THEME_KEY, "dark");
@@ -274,6 +299,26 @@ describe("UserPreferencesProvider bridge helpers", () => {
     ).toEqual({
       appearance: { theme: "flexoki-dark" },
     });
+  });
+
+  // A value over its key budget lives only in memory for the session; reading the raw on-disk value
+  // here would overlay (and save) the user's previous value instead of the one just set.
+  test("overlays a dirty value that is over its budget from the session copy", () => {
+    const cleanupDom = installDom();
+    try {
+      const order = Array.from(
+        { length: 1200 },
+        (_, index) => `/Users/someone/src/project-${index}`
+      );
+      expect(updatePersistedState(PROJECT_ORDER_KEY, order)).toBe(true);
+      expect(window.localStorage.getItem(PROJECT_ORDER_KEY)).toBeNull();
+
+      const next = overlayDirtyLocalValues({}, [PROJECT_ORDER_KEY], getPersistedStateStorage()!);
+
+      expect(JSON.stringify(next)).toContain("/Users/someone/src/project-1199");
+    } finally {
+      cleanupDom();
+    }
   });
 
   test("only prunes scoped preferences after successful project and workspace loads", () => {

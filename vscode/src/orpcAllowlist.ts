@@ -35,6 +35,9 @@ const ALLOWED_PROCEDURES = {
     // sanitizeWebviewOrpcInput.
     "sendHeldInput",
     "discardHeldInput",
+    // The retry barrier's Retry and the interrupted divider's resume (#5092); limited to shown
+    // workspaces by sanitizeWebviewOrpcInput.
+    "resumeStream",
   ]),
   // redactWebviewOrpcResult strips URL and key-file fields from providers.getConfig (#4766).
   providers: new Set(["list", "getConfig", "onConfigChanged", "setModels"]),
@@ -52,6 +55,16 @@ const ALLOWED_PROCEDURES = {
   policy: new Set(["get", "onChanged"]),
 } as const;
 
+// The only nested procedures the webview may call: the background processes strip lists
+// (subscribe) and terminates a workspace's background bashes (#5092). sendToBackground stays
+// blocked (bashForegroundControls is unsupported), and so does getOutput: the output dialog is not
+// offered in the webview (backgroundBashOutput is unsupported, #5196).
+// sanitizeWebviewOrpcInput limits each to workspaces the extension sent.
+const ALLOWED_NESTED_PROCEDURES = new Set([
+  "workspace.backgroundBashes.subscribe",
+  "workspace.backgroundBashes.terminate",
+]);
+
 export function isAllowedOrpcPath(path: string[]): boolean {
   assert(Array.isArray(path), "isAllowedOrpcPath requires path array");
 
@@ -59,8 +72,11 @@ export function isAllowedOrpcPath(path: string[]): boolean {
     return false;
   }
 
-  // We only support direct procedure access from the VS Code webview.
-  // Nested routers expand the surface area and aren't needed for the sidebar.
+  // We only support direct procedure access from the VS Code webview, plus the few nested
+  // procedures listed above. Other nested routers expand the surface area and aren't needed.
+  if (path.length === 3) {
+    return ALLOWED_NESTED_PROCEDURES.has(path.join("."));
+  }
   if (path.length !== 2) {
     return false;
   }
@@ -111,6 +127,9 @@ export function redactWebviewOrpcResult(path: string[], value: unknown): unknown
   }
   if (procedure === "providers.getConfig") {
     return redactProvidersConfig(value);
+  }
+  if (procedure === "workspace.backgroundBashes.subscribe") {
+    return redactBackgroundBashState(value);
   }
   if (procedure !== "policy.get") {
     return value;
@@ -230,6 +249,13 @@ export type SanitizedOrpcInput = { ok: true; input: unknown } | { ok: false; err
  *
  * workspace.sendHeldInput / discardHeldInput (#4771): only for a workspace the extension sent, and
  * only {workspaceId, heldInputId} is forwarded.
+ *
+ * workspace.resumeStream (#5092): only for a workspace the extension sent, and only
+ * {workspaceId, options} is forwarded.
+ *
+ * workspace.backgroundBashes.subscribe / terminate (#5092): only for a workspace the extension sent.
+ * subscribe forwards {workspaceId} and terminate {workspaceId, processId}. The backend refuses a
+ * processId of another workspace.
  */
 export function sanitizeWebviewOrpcInput(
   path: string[],
@@ -241,6 +267,12 @@ export function sanitizeWebviewOrpcInput(
   const procedure = path.join(".");
   if (procedure === "workspace.sendHeldInput" || procedure === "workspace.discardHeldInput") {
     return sanitizeHeldInputAction(procedure, input, knownWorkspaceIds);
+  }
+  if (procedure === "workspace.resumeStream") {
+    return sanitizeResumeStream(input, knownWorkspaceIds);
+  }
+  if (ALLOWED_NESTED_PROCEDURES.has(procedure)) {
+    return sanitizeBackgroundBashAction(procedure, input, knownWorkspaceIds);
   }
 
   if (procedure !== "agents.list") {
@@ -281,4 +313,71 @@ function sanitizeHeldInputAction(
     return { ok: false, error: `${procedure} requires a heldInputId` };
   }
   return { ok: true, input: { workspaceId, heldInputId: record.heldInputId } };
+}
+
+function sanitizeResumeStream(
+  input: unknown,
+  knownWorkspaceIds: ReadonlySet<string>
+): SanitizedOrpcInput {
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: "workspace.resumeStream requires an input object" };
+  }
+  const record = input as Record<string, unknown>;
+  const workspaceId = record.workspaceId;
+  if (typeof workspaceId !== "string" || !knownWorkspaceIds.has(workspaceId)) {
+    return { ok: false, error: "workspace.resumeStream is limited to known workspaces" };
+  }
+  return { ok: true, input: { workspaceId, options: record.options } };
+}
+
+function sanitizeBackgroundBashAction(
+  procedure: string,
+  input: unknown,
+  knownWorkspaceIds: ReadonlySet<string>
+): SanitizedOrpcInput {
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: `${procedure} requires an input object` };
+  }
+  const record = input as Record<string, unknown>;
+  const workspaceId = record.workspaceId;
+  if (typeof workspaceId !== "string" || !knownWorkspaceIds.has(workspaceId)) {
+    return { ok: false, error: `${procedure} is limited to known workspaces` };
+  }
+  if (procedure === "workspace.backgroundBashes.subscribe") {
+    return { ok: true, input: { workspaceId } };
+  }
+  if (typeof record.processId !== "string") {
+    return { ok: false, error: `${procedure} requires a processId` };
+  }
+  assert(procedure === "workspace.backgroundBashes.terminate", `unexpected procedure ${procedure}`);
+  return { ok: true, input: { workspaceId, processId: record.processId } };
+}
+
+/**
+ * workspace.backgroundBashes.subscribe (#5092): a process's monitor carries up to 20 matched
+ * stdout/stderr lines (monitor.lastLines). The strip never shows them, and the webview cannot read
+ * process output otherwise (getOutput is not bridged), so they are emptied before the state crosses
+ * the bridge. Everything else in each state passes through; the input is not mutated.
+ */
+function redactBackgroundBashState(value: unknown): unknown {
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+  const state = value as { processes?: unknown };
+  if (!Array.isArray(state.processes)) {
+    return value;
+  }
+  return {
+    ...state,
+    processes: state.processes.map((process: unknown) => {
+      if (typeof process !== "object" || process === null) {
+        return process;
+      }
+      const record = process as { monitor?: unknown };
+      if (typeof record.monitor !== "object" || record.monitor === null) {
+        return process;
+      }
+      return { ...record, monitor: { ...(record.monitor as object), lastLines: [] } };
+    }),
+  };
 }

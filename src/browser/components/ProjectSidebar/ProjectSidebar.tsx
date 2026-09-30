@@ -20,10 +20,12 @@ import {
   SIDEBAR_FLAT_MODE_KEY,
   SIDEBAR_HIDE_SUBAGENTS_KEY,
   getDraftScopeId,
-  getInputAttachmentsKey,
-  getInputKey,
   getWorkspaceLastReadKey,
   getWorkspaceNameStateKey,
+  EXPANDED_OLD_WORKSPACES_KEY,
+  EXPANDED_SECTIONS_KEY,
+  EXPANDED_COMPLETED_SUB_AGENTS_KEY,
+  EXPANDED_TASK_GROUPS_KEY,
 } from "@/common/constants/storage";
 import { getDisplayTitleFromPersistedState } from "@/browser/hooks/useWorkspaceName";
 import { DndProvider } from "react-dnd";
@@ -34,7 +36,8 @@ import {
   reorderProjects,
   normalizeOrder,
 } from "@/common/utils/projectOrdering";
-import { PROJECT_ORDER_KEY } from "@/common/constants/storage";
+import { PROJECT_ORDER_KEY, SIDEBAR_EXPANSION_MAP_MAX_CHARS } from "@/common/constants/storage";
+import { withRecordEntry } from "@/browser/utils/boundedPersistedValue";
 import {
   matchesKeybind,
   formatKeybind,
@@ -127,6 +130,7 @@ import {
 import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
+import { formatWorkspaceRemoveWarnings } from "@/browser/utils/workspace";
 import { forkWorkspace } from "@/browser/utils/chatCommands";
 import { PopoverError } from "../PopoverError/PopoverError";
 import { SectionHeader } from "../SectionHeader/SectionHeader";
@@ -139,6 +143,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
+import { getDraftStore, useDraft } from "@/browser/stores/DraftStore";
 import {
   MULTI_PROJECT_CONFIG_KEY,
   MULTI_PROJECT_SIDEBAR_SECTION_ID,
@@ -473,19 +478,20 @@ function isDraftVisible(
   values?: {
     draftPrompt?: string;
     workspaceNameState?: unknown;
-    draftAttachments?: unknown[];
+    draftAttachmentCount?: number;
   }
 ): boolean {
   const scopeId = getDraftScopeId(projectPath, draftId);
-  const draftPrompt = values?.draftPrompt ?? readPersistedState<string>(getInputKey(scopeId), "");
+  // Text and attachments come from the backend-backed draft store.
+  const draft = getDraftStore().getView({ kind: "creation", projectPath, draftId });
+  const draftPrompt = values?.draftPrompt ?? draft.text;
   const workspaceNameState =
     values?.workspaceNameState ??
     readPersistedState<unknown>(getWorkspaceNameStateKey(scopeId), null);
-  const draftAttachments =
-    values?.draftAttachments ?? readPersistedState<unknown[]>(getInputAttachmentsKey(scopeId), []);
+  const draftAttachmentCount = values?.draftAttachmentCount ?? draft.attachmentCount;
 
   const hasTextContent = typeof draftPrompt === "string" && draftPrompt.trim().length > 0;
-  const hasAttachments = Array.isArray(draftAttachments) && draftAttachments.length > 0;
+  const hasAttachments = draftAttachmentCount > 0;
   const hasNameState = workspaceNameState !== null;
   return hasTextContent || hasAttachments || hasNameState;
 }
@@ -494,14 +500,14 @@ function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
   const scopeId = getDraftScopeId(props.projectPath, props.draftId);
   const onVisibilityChange = props.onVisibilityChange;
 
-  const [draftPrompt] = usePersistedState<string>(getInputKey(scopeId), "", {
-    listener: true,
+  const draft = useDraft({
+    kind: "creation",
+    projectPath: props.projectPath,
+    draftId: props.draftId,
   });
+  const draftPrompt = draft.text;
 
   const [workspaceNameState] = usePersistedState<unknown>(getWorkspaceNameStateKey(scopeId), null, {
-    listener: true,
-  });
-  const [draftAttachments] = usePersistedState<unknown[]>(getInputAttachmentsKey(scopeId), [], {
     listener: true,
   });
 
@@ -518,7 +524,7 @@ function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
   const isVisible = isDraftVisible(props.projectPath, props.draftId, {
     draftPrompt,
     workspaceNameState,
-    draftAttachments: Array.isArray(draftAttachments) ? draftAttachments : [],
+    draftAttachmentCount: draft.attachmentCount,
   });
 
   useEffect(() => {
@@ -865,7 +871,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   // Key format: getTierKey(projectPath, tierIndex) where tierIndex is 0, 1, 2 for 1/7/30 days
   const [expandedOldWorkspaces, setExpandedOldWorkspaces] = usePersistedState<
     Record<string, boolean>
-  >("expandedOldWorkspaces", {});
+  >(EXPANDED_OLD_WORKSPACES_KEY, {});
 
   // Whether workspaces are grouped under collapsible "Older than X days" tiers.
   // Toggled from Settings → General; listener keeps the sidebar live-updated.
@@ -884,20 +890,24 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   // Track which sections are expanded
   const [expandedSections, setExpandedSections] = usePersistedState<Record<string, boolean>>(
-    "expandedSections",
+    EXPANDED_SECTIONS_KEY,
     {}
   );
 
   // Track parent workspaces whose reported child tasks are expanded.
   const [expandedCompletedSubAgents, setExpandedCompletedSubAgents] = usePersistedState<
     Record<string, boolean>
-  >("expandedCompletedSubAgents", {});
+  >(EXPANDED_COMPLETED_SUB_AGENTS_KEY, {});
   const toggleCompletedChildrenExpansion = useCallback(
     (workspaceId: string) => {
-      setExpandedCompletedSubAgents((prev) => ({
-        ...prev,
-        [workspaceId]: !(prev[workspaceId] ?? false),
-      }));
+      setExpandedCompletedSubAgents((prev) =>
+        withRecordEntry(
+          prev,
+          workspaceId,
+          !(prev[workspaceId] ?? false),
+          SIDEBAR_EXPANSION_MAP_MAX_CHARS
+        )
+      );
     },
     [setExpandedCompletedSubAgents]
   );
@@ -915,7 +925,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   // Task-group expansion survives reloads (D7). Keys are namespaced per group
   // kind: task:<parentWorkspaceId>:<groupId> / workflow:<parentWorkspaceId>:<runId>.
   const [expandedTaskGroups, setExpandedTaskGroups] = usePersistedState<Record<string, boolean>>(
-    "expandedTaskGroups",
+    EXPANDED_TASK_GROUPS_KEY,
     {}
   );
   // D6: a workflow group that is (or was, this session) active defaults to
@@ -933,10 +943,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     new Map()
   );
   const toggleTaskGroupExpansion = (storageKey: string, isCurrentlyExpanded: boolean) => {
-    setExpandedTaskGroups((prev) => ({
-      ...prev,
-      [storageKey]: !isCurrentlyExpanded,
-    }));
+    setExpandedTaskGroups((prev) =>
+      withRecordEntry(prev, storageKey, !isCurrentlyExpanded, SIDEBAR_EXPANSION_MAP_MAX_CHARS)
+    );
   };
 
   const [removingWorkspaceIds, setRemovingWorkspaceIds] = useState<Set<string>>(new Set());
@@ -947,6 +956,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const workspaceForkError = usePopoverError();
   const workspaceStopRuntimeError = usePopoverError();
   const workspaceRemoveError = usePopoverError();
+  // Stays until dismissed: the cancelled row is gone, so the user could not reread it (#5143).
+  const workspaceRemoveWarning = usePopoverError(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState<{
     projectPath: string;
     projectName: string;
@@ -1047,10 +1058,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const toggleSection = (projectPath: string, sectionId: string) => {
     const key = getSectionExpandedKey(projectPath, sectionId);
-    setExpandedSections((prev) => ({
-      ...prev,
-      [key]: !prev[key],
-    }));
+    setExpandedSections((prev) =>
+      withRecordEntry(prev, key, !prev[key], SIDEBAR_EXPANSION_MAP_MAX_CHARS)
+    );
   };
 
   const handleForkWorkspace = useCallback(
@@ -1268,6 +1278,13 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             workspaceId,
             result.error ?? "Failed to cancel workspace creation"
           );
+        } else if (result.warnings?.length) {
+          // This forced removal skips the Force Delete dialog, so show what it left behind
+          // (#5143), e.g. a devcontainer that may still hold the plan.
+          workspaceRemoveWarning.showError(
+            workspaceId,
+            formatWorkspaceRemoveWarnings(result.warnings)
+          );
         }
       } finally {
         setRemovingWorkspaceIds((prev) => {
@@ -1277,7 +1294,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         });
       }
     },
-    [removeWorkspace, workspaceRemoveError]
+    [removeWorkspace, workspaceRemoveError, workspaceRemoveWarning]
   );
 
   const handleRemoveSection = async (
@@ -2351,10 +2368,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         <React.Fragment key={tierKey}>
           <button
             onClick={() => {
-              setExpandedOldWorkspaces((prev) => ({
-                ...prev,
-                [tierKey]: !prev[tierKey],
-              }));
+              setExpandedOldWorkspaces((prev) =>
+                withRecordEntry(prev, tierKey, !prev[tierKey], SIDEBAR_EXPANSION_MAP_MAX_CHARS)
+              );
             }}
             aria-label={
               isTierExpanded
@@ -3737,6 +3753,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             error={workspaceRemoveError.error}
             prefix="Failed to cancel workspace creation"
             onDismiss={workspaceRemoveError.clearError}
+          />
+          <PopoverError
+            error={workspaceRemoveWarning.error}
+            prefix="Workspace creation cancelled, but something was left behind"
+            onDismiss={workspaceRemoveWarning.clearError}
           />
           <PopoverError
             error={projectRemoveError.error}

@@ -540,6 +540,87 @@ const localPlugin = {
         };
       },
     },
+    "no-clear-dom-global": {
+      meta: {
+        type: "problem",
+        docs: {
+          description: "Disallow clearing DOM globals (globalThis.window = undefined) in tests",
+        },
+        messages: {
+          clear:
+            "Clearing globalThis.{{name}} leaks into every later test file in the same bun process: tests/ui/dom installs the DOM globals only once per process (#5084). Call saveDomGlobals() from tests/ui/domGlobals in beforeEach, before replacing them, and restoreDomGlobals() in afterEach.",
+        },
+      },
+      create(context) {
+        // Must match DOM_GLOBAL_KEYS in tests/ui/domGlobals.ts (scripts/noClearDomGlobal.test.ts
+        // checks that every key there is reported).
+        const DOM_GLOBALS = new Set([
+          "window",
+          "document",
+          "navigator",
+          "localStorage",
+          "CustomEvent",
+          "DocumentFragment",
+          "Element",
+          "HTMLInputElement",
+          "HTMLElement",
+          "NodeFilter",
+          "Node",
+          "Image",
+          "requestAnimationFrame",
+          "cancelAnimationFrame",
+          "getComputedStyle",
+          "ResizeObserver",
+          "IntersectionObserver",
+          "MutationObserver",
+        ]);
+        const unwrap = (node) => {
+          while (
+            node.type === "TSAsExpression" ||
+            node.type === "TSTypeAssertion" ||
+            node.type === "TSNonNullExpression" ||
+            node.type === "TSSatisfiesExpression"
+          ) {
+            node = node.expression;
+          }
+          return node;
+        };
+        // Returns the DOM global name for `globalThis.X` / `(globalThis as T).X` / `global["X"]`.
+        const domGlobalName = (member) => {
+          if (member.type !== "MemberExpression") {
+            return null;
+          }
+          const object = unwrap(member.object);
+          if (object.type !== "Identifier" || !["globalThis", "global"].includes(object.name)) {
+            return null;
+          }
+          const name = member.computed
+            ? member.property.type === "Literal"
+              ? member.property.value
+              : null
+            : member.property.name;
+          return DOM_GLOBALS.has(name) ? name : null;
+        };
+        // `delete globalThis.X` is not reported: tests also use it to put back a global that
+        // was absent before (`if (original) { restore } else { delete }`), and telling the
+        // two apart needs flow analysis.
+        const isUndefined = (node) => {
+          node = unwrap(node);
+          return (
+            (node.type === "Identifier" && node.name === "undefined") ||
+            (node.type === "UnaryExpression" && node.operator === "void")
+          );
+        };
+        return {
+          AssignmentExpression(node) {
+            const name = domGlobalName(node.left);
+            if (node.operator === "=" && name != null && isUndefined(node.right)) {
+              context.report({ node, messageId: "clear", data: { name } });
+            }
+          },
+        };
+      },
+    },
     "require-module-mock-restore": {
       meta: {
         type: "problem",
@@ -1081,6 +1162,85 @@ const localPlugin = {
                 if (!covered && !allowed.has(specifier)) {
                   context.report({ node, messageId: "unrestored", data: { specifier } });
                 }
+              }
+            }
+          },
+        };
+      },
+    },
+    "no-direct-web-storage": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            "Disallow direct localStorage/sessionStorage access outside the persisted-state helpers",
+        },
+        messages: {
+          direct:
+            "Do not access {{name}} directly. Use the persisted-state helpers in src/browser/hooks/usePersistedState.ts: every write must go through the shared write path, which evicts caches on quota errors and enforces the key registry.",
+        },
+      },
+      create(context) {
+        // localStorage is one ~5 MB origin quota shared by every feature. Direct access bypassed
+        // the key registry and filled the quota (drafts stopped persisting), so all access goes
+        // through usePersistedState.ts. A local variable or parameter named `storage` is fine.
+        const STORAGE_GLOBALS = new Set(["localStorage", "sessionStorage"]);
+        const GLOBAL_OBJECTS = new Set(["window", "globalThis", "self"]);
+        const report = (node, name) =>
+          context.report({ node, messageId: "direct", data: { name } });
+        const memberName = (node) => {
+          if (!node.computed && node.property.type === "Identifier") return node.property.name;
+          if (node.computed && node.property.type === "Literal") return node.property.value;
+          return null;
+        };
+        // `const { localStorage } = window` reads the property without a MemberExpression, and the
+        // new binding has a declaration, so the reference check below would not see it.
+        // `window as Window`, `window!` and `window satisfies ...` still name the global object.
+        const checkDestructuring = (pattern, rawSource) => {
+          const source = rawSource ? unwrapAssertions(rawSource) : rawSource;
+          if (pattern.type !== "ObjectPattern" || source?.type !== "Identifier") return;
+          if (!GLOBAL_OBJECTS.has(source.name)) return;
+          for (const property of pattern.properties) {
+            if (property.type !== "Property") continue;
+            const name =
+              !property.computed && property.key.type === "Identifier"
+                ? property.key.name
+                : property.key.type === "Literal"
+                  ? property.key.value
+                  : null;
+            if (STORAGE_GLOBALS.has(name)) report(property, `${source.name}.${name}`);
+          }
+        };
+        return {
+          MemberExpression(node) {
+            const name = memberName(node);
+            const object = unwrapAssertions(node.object);
+            if (
+              STORAGE_GLOBALS.has(name) &&
+              object.type === "Identifier" &&
+              GLOBAL_OBJECTS.has(object.name)
+            ) {
+              report(node, `${object.name}.${name}`);
+            }
+          },
+          VariableDeclarator(node) {
+            checkDestructuring(node.id, node.init);
+          },
+          AssignmentExpression(node) {
+            checkDestructuring(node.left, node.right);
+          },
+          "Program:exit"(program) {
+            const globalScope = context.sourceCode.getScope(program);
+            // Bare references resolve to no declaration (or to an implicit/configured global).
+            const references = [...globalScope.through];
+            for (const variable of globalScope.variables) {
+              if (STORAGE_GLOBALS.has(variable.name) && variable.defs.length === 0) {
+                references.push(...variable.references);
+              }
+            }
+            for (const reference of references) {
+              if (STORAGE_GLOBALS.has(reference.identifier.name)) {
+                report(reference.identifier, reference.identifier.name);
               }
             }
           },
@@ -2179,6 +2339,25 @@ export default defineConfig([
     },
   },
   {
+    // Web storage goes through the persisted-state helpers (see local/no-direct-web-storage).
+    // Tests, stories and story utilities seed and inspect storage directly.
+    files: ["src/**/*.{ts,tsx}"],
+    ignores: [
+      "src/browser/hooks/usePersistedState.ts",
+      "**/*.test.ts",
+      "**/*.test.tsx",
+      "**/*.stories.ts",
+      "**/*.stories.tsx",
+      "src/browser/stories/**",
+      "src/**/*StoryUtils.tsx",
+      "**/*.testHarness.ts",
+      "src/**/test[A-Z]*.ts",
+    ],
+    rules: {
+      "local/no-direct-web-storage": "error",
+    },
+  },
+  {
     // Backend production code: required-member typeof guards only exist to tolerate partial
     // test doubles; tests must complete the doubles instead (see the rule's docs).
     files: ["src/node/services/**/*.ts"],
@@ -2512,6 +2691,7 @@ export default defineConfig([
     files: ["**/*.test.ts", "**/*.test.tsx"],
     rules: {
       "local/no-cast-to-api-client": "error",
+      "local/no-clear-dom-global": "error",
       "local/require-module-mock-restore": [
         "error",
         {

@@ -6,6 +6,8 @@ import * as path from "path";
 import * as devcontainerCli from "./devcontainerCli";
 import { DevcontainerRuntime } from "./DevcontainerRuntime";
 import type { ExecOptions, ExecStream } from "./Runtime";
+import { MISSING_CWD_COMMANDS, MULTI_LINE_COMMAND_CASES } from "./testRemoteRuntime";
+import { execBuffered } from "@/node/utils/runtime/helpers";
 
 interface RuntimeState {
   remoteHomeDir?: string;
@@ -192,6 +194,24 @@ describe("DevcontainerRuntime.exec pathEnv", () => {
     await fs.rm(binDir, { recursive: true, force: true });
   });
 
+  it.skipIf(process.platform === "win32")(
+    "uses the CLI workspace directory without starting the container to discover its path",
+    async () => {
+      const stream = await createRuntime({ currentWorkspacePath: binDir }).exec("./.xum/archive", {
+        cwd: binDir,
+        timeout: 10,
+      });
+      const [argv, exitCode] = await Promise.all([
+        new Response(stream.stdout).text(),
+        stream.exitCode,
+      ]);
+      expect(exitCode).toBe(0);
+      expect(argv).toContain("exec\n--workspace-folder\n");
+      expect(argv).toContain("cd '.' || exit; ./.xum/archive");
+      expect(argv).not.toContain(`cd '${binDir}'`);
+    }
+  );
+
   async function remoteEnvFor(state: RuntimeState, pathEnv: Record<string, string>) {
     const stream = await createRuntime(state).exec("true", {
       cwd: state.currentWorkspacePath!,
@@ -227,6 +247,74 @@ describe("DevcontainerRuntime.exec pathEnv", () => {
       expect(unknown).toContain(`XUM_TEST_INSIDE=${hostWorkspace}/nested/file`);
     }
   );
+});
+
+describe("DevcontainerRuntime.exec multi-line commands", () => {
+  // A fake `devcontainer` CLI that runs the command after `--` from its own cwd. exec spawns it
+  // with the host workspace as cwd, which stands in for the container's workspace folder, where
+  // `devcontainer exec` starts commands.
+  let binDir: string;
+  let originalPath: string | undefined;
+
+  beforeEach(async () => {
+    binDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "fake-devcontainer-")));
+    await fs.writeFile(
+      path.join(binDir, "devcontainer"),
+      '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"\n',
+      { mode: 0o755 }
+    );
+    await fs.mkdir(path.join(binDir, "workspace"));
+    originalPath = process.env.PATH;
+    process.env.PATH = `${binDir}${path.delimiter}${originalPath ?? ""}`;
+  });
+
+  afterEach(async () => {
+    process.env.PATH = originalPath;
+    await fs.rm(binDir, { recursive: true, force: true });
+  });
+
+  const run = (command: string, cwd: string) =>
+    execBuffered(createRuntime({ currentWorkspacePath: binDir }), command, {
+      cwd,
+      pathEnv: { XUM_TEST_PATH: "relative" },
+      timeout: 10,
+    });
+
+  it.skipIf(process.platform === "win32")(
+    "a missing cwd fails the command instead of running later lines in the workspace folder",
+    async () => {
+      for (const command of MISSING_CWD_COMMANDS) {
+        const result = await run(command, `${binDir}/missing`);
+        expect({ command, failed: result.exitCode !== 0, stdout: result.stdout }).toEqual({
+          command,
+          failed: true,
+          stdout: "",
+        });
+      }
+    }
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "later lines run in the cwd with the exported path env",
+    async () => {
+      const cwd = `${binDir}/workspace`;
+      const result = await run('true\npwd\necho "path=$XUM_TEST_PATH"', cwd);
+      expect({ exitCode: result.exitCode, stdout: result.stdout }).toEqual({
+        exitCode: 0,
+        stdout: `${cwd}\npath=${cwd}/relative\n`,
+      });
+    }
+  );
+
+  for (const c of MULTI_LINE_COMMAND_CASES) {
+    it.skipIf(process.platform === "win32")(`keeps output and exit code: ${c.name}`, async () => {
+      const result = await run(c.command, `${binDir}/workspace`);
+      expect({ exitCode: result.exitCode, stdout: result.stdout }).toEqual({
+        exitCode: c.exitCode,
+        stdout: c.stdout,
+      });
+    });
+  }
 });
 
 describe("DevcontainerRuntime.mapHostPathToContainer", () => {
@@ -395,6 +483,38 @@ describe("DevcontainerRuntime.getContainerEnv", () => {
   });
 });
 
+/**
+ * Put a fake `docker` first on PATH. Its `ps` lists "stopped1" only with -a and "running2" always;
+ * `rm` succeeds. Every call is appended to the returned log.
+ */
+async function installFakeDocker(root: string) {
+  const binDir = path.join(root, "bin");
+  const dockerLog = path.join(root, "docker.log");
+  await fs.mkdir(binDir);
+  await fs.writeFile(
+    path.join(binDir, "docker"),
+    [
+      "#!/bin/sh",
+      `echo "$*" >> '${dockerLog}'`,
+      'if [ "$1" = ps ]; then',
+      '  case " $* " in *" -a "*|*" -aq "*) echo stopped1 ;; esac',
+      "  echo running2",
+      "fi",
+      "exit 0",
+      "",
+    ].join("\n"),
+    { mode: 0o755 }
+  );
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${binDir}${path.delimiter}${originalPath ?? ""}`;
+  return {
+    dockerLog,
+    restorePath: () => {
+      process.env.PATH = originalPath;
+    },
+  };
+}
+
 describe("DevcontainerRuntime.deleteWorkspace", () => {
   let root: string;
   beforeEach(async () => {
@@ -407,7 +527,7 @@ describe("DevcontainerRuntime.deleteWorkspace", () => {
 
   // #4819: undoing a creation that reused a branch removes the host worktree but not the branch.
   it("keeps the branch on a forced delete with keepBranch", async () => {
-    spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue(undefined);
+    spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue({ kind: "absent" });
     const projectPath = path.join(root, "repo");
     await fs.mkdir(projectPath);
     const git = (...args: string[]) =>
@@ -450,5 +570,174 @@ describe("DevcontainerRuntime.deleteWorkspace", () => {
     expect(result.success).toBe(true);
     expect(git("rev-parse", "reused")).toBe(tip);
     expect(await fs.stat(workspacePath).catch(() => null)).toBeNull();
+  });
+
+  // #5120: a container that could not be removed is a failure the caller can name, not a success.
+  it("reports a failed container teardown and names the container", async () => {
+    spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue({
+      kind: "error",
+      message: "Docker is not available: spawn docker ENOENT",
+    });
+    const projectPath = path.join(root, "repo");
+    await fs.mkdir(projectPath);
+    const git = (...args: string[]) =>
+      execFileSync("git", args, { cwd: projectPath, encoding: "utf8" }).trim();
+    git("init", "-b", "main");
+    git(
+      "-c",
+      "user.email=t@example.com",
+      "-c",
+      "user.name=T",
+      "commit",
+      "--allow-empty",
+      "-m",
+      "i"
+    );
+    const runtime = new DevcontainerRuntime({
+      srcBaseDir: path.join(root, "src"),
+      configPath: ".devcontainer/devcontainer.json",
+    });
+    const workspacePath = runtime.getWorkspacePath(projectPath, "ws");
+    git("worktree", "add", "-b", "ws", workspacePath);
+
+    const result = await runtime.deleteWorkspace(projectPath, "ws", true, undefined, true);
+
+    expect(result).toEqual({
+      success: false,
+      error: expect.stringContaining("spawn docker ENOENT") as unknown as string,
+      leftoverPaths: [`devcontainer container labeled devcontainer.local_folder=${workspacePath}`],
+    });
+    // A forced delete (rollbacks, forced removal) still removes the host worktree, as before.
+    expect(await fs.stat(workspacePath).catch(() => null)).toBeNull();
+
+    // A non-forced delete keeps the worktree, and with it the branch mapping a retry needs.
+    git("worktree", "add", "-b", "ws2", runtime.getWorkspacePath(projectPath, "ws2"));
+    const kept = await runtime.deleteWorkspace(projectPath, "ws2", false, undefined, true);
+    expect(kept.success).toBe(false);
+    expect(await fs.stat(runtime.getWorkspacePath(projectPath, "ws2"))).toBeTruthy();
+    expect(git("branch", "--list", "ws2")).not.toBe("");
+  });
+
+  // #5124: a stopped container (after a daemon restart or a manual `docker stop`) still holds the
+  // workspace's files, including its plan, and a later workspace at this path would reuse it.
+  it("removes a stopped container as well as a running one", async () => {
+    const { dockerLog, restorePath } = await installFakeDocker(root);
+    try {
+      const projectPath = path.join(root, "repo");
+      await fs.mkdir(projectPath);
+      const git = (...args: string[]) =>
+        execFileSync("git", args, { cwd: projectPath, encoding: "utf8" }).trim();
+      git("init", "-b", "main");
+      git(
+        "-c",
+        "user.email=t@example.com",
+        "-c",
+        "user.name=T",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "i"
+      );
+      const runtime = new DevcontainerRuntime({
+        srcBaseDir: path.join(root, "src"),
+        configPath: ".devcontainer/devcontainer.json",
+      });
+      const workspacePath = runtime.getWorkspacePath(projectPath, "ws");
+      git("worktree", "add", "-b", "ws", workspacePath);
+
+      const result = await runtime.deleteWorkspace(projectPath, "ws", false, undefined, true);
+
+      expect(result.success).toBe(true);
+      const removed = (await fs.readFile(dockerLog, "utf8"))
+        .split("\n")
+        .filter((line) => line.startsWith("rm "));
+      expect(removed).toEqual(["rm -f stopped1 running2"]);
+
+      // "Stop runtime" (the same helper without the delete option) still matches running
+      // containers only: it is not a deletion, and a stopped container is already stopped.
+      await fs.rm(dockerLog);
+      expect(await devcontainerCli.stopDevcontainer(workspacePath)).toEqual({ kind: "stopped" });
+      expect(
+        (await fs.readFile(dockerLog, "utf8")).split("\n").filter((l) => l.startsWith("rm "))
+      ).toEqual(["rm -f running2"]);
+    } finally {
+      restorePath();
+    }
+  });
+});
+
+describe("DevcontainerRuntime.renameWorkspace", () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "mux-devcontainer-rename-"));
+  });
+  afterEach(async () => {
+    mock.restore();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  const setupWorktree = async () => {
+    const projectPath = path.join(root, "repo");
+    await fs.mkdir(projectPath);
+    const git = (...args: string[]) =>
+      execFileSync("git", args, { cwd: projectPath, encoding: "utf8" }).trim();
+    git("init", "-b", "main");
+    git(
+      "-c",
+      "user.email=t@example.com",
+      "-c",
+      "user.name=T",
+      "commit",
+      "--allow-empty",
+      "-m",
+      "i"
+    );
+    const runtime = new DevcontainerRuntime({
+      srcBaseDir: path.join(root, "src"),
+      configPath: ".devcontainer/devcontainer.json",
+    });
+    const oldPath = runtime.getWorkspacePath(projectPath, "old");
+    git("worktree", "add", "-b", "old", oldPath);
+    return { projectPath, runtime, oldPath, git };
+  };
+
+  // #5137: the container is labeled with the old path. A stopped one would survive the rename
+  // with the renamed workspace's files, and a later workspace at the old path would reuse it.
+  it("removes a stopped container labeled with the old path", async () => {
+    const { dockerLog, restorePath } = await installFakeDocker(root);
+    try {
+      const { projectPath, runtime } = await setupWorktree();
+
+      const result = await runtime.renameWorkspace(projectPath, "old", "new", undefined, true);
+
+      expect(result.success).toBe(true);
+      expect(
+        (await fs.readFile(dockerLog, "utf8")).split("\n").filter((l) => l.startsWith("rm "))
+      ).toEqual(["rm -f stopped1 running2"]);
+    } finally {
+      restorePath();
+    }
+  });
+
+  it("refuses the rename before moving the worktree when the container cannot be removed", async () => {
+    spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue({
+      kind: "error",
+      message: "Failed to remove container: daemon down",
+    });
+    const { projectPath, runtime, oldPath, git } = await setupWorktree();
+
+    const result = await runtime.renameWorkspace(projectPath, "old", "new", undefined, true, {
+      renameBranch: true,
+    });
+
+    expect(result.success).toBe(false);
+    const error = result.success ? "" : result.error;
+    expect(error).toContain("daemon down");
+    expect(error).toContain(`devcontainer container labeled devcontainer.local_folder=${oldPath}`);
+    expect(await fs.stat(oldPath)).toBeTruthy();
+    expect(
+      await fs.stat(runtime.getWorkspacePath(projectPath, "new")).catch(() => null)
+    ).toBeNull();
+    expect(git("branch", "--list", "old")).not.toBe("");
   });
 });

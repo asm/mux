@@ -12,7 +12,6 @@ import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 /** The original session object is the identity receipt; never clone it across an awaited hook. */
 export interface StreamContextSnapshot {
   contextBudgetRetried?: boolean;
-  contextBudgetFlushTurn?: boolean;
   admissionCapture?: CompactionReplacementCapture;
   modelString: string;
   options?: SendMessageOptions;
@@ -140,30 +139,7 @@ export interface ContinuationEntry {
 
 export interface RestoreContextStreamInput {
   history: MuxMessage[];
-  userMessage?: MuxMessage;
   options?: SendMessageOptions;
-  model: string;
-  autoModelRouting?: AutoModelRoutingRecord;
-  admissionCapture?: CompactionReplacementCapture;
-  goalKind?: GoalSyntheticMessageKind;
-  goalId?: string;
-  isAborted(): boolean;
-}
-export interface RestoredContextStream {
-  assemblySnapshot?: RequestAssemblySnapshot;
-  cannotWrite: boolean;
-}
-export interface ContextPublicationInput {
-  userMessage: MuxMessage;
-  prefixRows: MuxMessage[];
-  options: SendMessageOptions;
-  assemblySnapshot?: RequestAssemblySnapshot;
-}
-export interface ContextPublication {
-  prefixRows: MuxMessage[];
-  options: SendMessageOptions;
-  assemblySnapshot?: RequestAssemblySnapshot;
-  receipt: PreparationReceipt;
 }
 export interface ContextRecoveryInput {
   userMessage: MuxMessage;

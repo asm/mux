@@ -1103,7 +1103,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
             JSON.stringify({
               id: "resp_test",
               created_at: 0,
-              model: "gpt-5.3-codex",
+              model: "gpt-6.1-sol",
               output: [
                 {
                   type: "message",
@@ -1149,7 +1149,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
       };
 
       try {
-        const result = await factory.createModel("openai:gpt-5.3-codex");
+        const result = await factory.createModel("openai:gpt-6.1-sol");
         expect(result.success).toBe(true);
         if (!result.success) {
           return;
@@ -1160,7 +1160,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
         }
 
         const originalBody = JSON.stringify({
-          model: "gpt-5.3-codex",
+          model: "gpt-6.1-sol",
           input: [
             { role: "user", content: [{ type: "input_text", text: "Ship the fix." }] },
             { type: "item_reference", id: "rs_123" },
@@ -1214,7 +1214,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
               method: "POST",
               headers: cacheHeaders,
               body: JSON.stringify({
-                model: "gpt-5.3-codex",
+                model: "gpt-6.1-sol",
                 input: [{ role: "user", content: `Turn ${turn}` }],
                 prompt_cache_key: promptCacheKey,
                 store: true,
@@ -1545,21 +1545,55 @@ describe("ProviderModelFactory native OpenAI alias tiers", () => {
       });
     }
   );
+
+  it.each([
+    ["gpt-6-astra", "ultrafast"],
+    // Ultrafast is model-gated: other models drop the tier instead of sending one
+    // OpenAI rejects (and never fall back to the separately billed Fast tier).
+    ["gpt-6.1-sol", undefined],
+    ["gpt-6-sol", undefined],
+  ] as const)(
+    "sends the configured Ultrafast tier for %s only when supported",
+    async (model, tier) => {
+      await withTempConfig(async (_config, factory, _oauth, store) => {
+        store.saveProvidersConfig({
+          openai: {
+            apiKey: "native-key",
+            baseUrl: "https://native.example.com/v1",
+            serviceTier: "ultrafast",
+          },
+        });
+        const { calls, fakeFetch } = createCapturingFetch();
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+        try {
+          const result = await factory.createModel(`openai:${model}`);
+          if (!result.success) throw new Error(result.error.type);
+          await generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
+            () => undefined
+          );
+          expect(calls.length).toBe(1);
+          expect(parseSentBody(calls[0]).service_tier).toBe(tier);
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      });
+    }
+  );
 });
 
 describe("ProviderModelFactory GPT-6 Chat Completions tool reasoning", () => {
   // Headless tool loops (Dream, harvest, refine, sidebar status) call
-  // streamText with tools and no provider options. Sol/Luna Chat Completions
+  // streamText with tools and no provider options. Luna Chat Completions
   // accepts function calling only with reasoning_effort "none", so the model
   // itself must fill it in for tool-bearing requests that asked for no effort;
   // Responses, tool-free requests and Astra keep the provider default, and an
   // explicit caller effort is preserved (covered by the "requested effort"
-  // cases in "GPT-6 Sol/Luna reasoning effort none").
+  // cases in "GPT-6 Luna reasoning effort none").
   it.each([
-    ["chatCompletions", "gpt-6-sol", true],
+    ["chatCompletions", "gpt-6-luna", true],
     ["chatCompletions", "team-luna", true],
     ["chatCompletions", "gpt-6-astra", false],
-    ["responses", "gpt-6-sol", false],
+    ["responses", "gpt-6-luna", false],
   ] as const)(
     "clamps %s tool requests for %s at the model boundary (%p)",
     async (wireFormat, modelId, clamped) => {
@@ -1726,7 +1760,7 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
         },
       });
 
-      const result = await factory.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+      const result = await factory.createModel(KNOWN_MODELS.GPT.id);
 
       expect(result.success).toBe(true);
       if (!result.success) {
@@ -1848,7 +1882,7 @@ describe("ProviderModelFactory Codex authentication", () => {
         },
       });
 
-      const result = await factory.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+      const result = await factory.createModel(KNOWN_MODELS.GPT.id);
       expect(result.success).toBe(true);
       if (!result.success) {
         return;
@@ -1869,7 +1903,7 @@ describe("ProviderModelFactory Codex authentication", () => {
             expires: Date.now() + 60_000,
             accountId: "test-account-id",
           },
-          models: [{ id: "team-codex", mappedToModel: KNOWN_MODELS.GPT_53_CODEX.id }],
+          models: [{ id: "team-codex", mappedToModel: KNOWN_MODELS.GPT.id }],
         },
       });
 
@@ -1916,7 +1950,7 @@ describe("ProviderModelFactory Codex authentication", () => {
       try {
         // Codex OAuth serves only the Responses API, so the factory must hand the
         // SDK the real key instead of the "codex-oauth" placeholder.
-        const result = await factory.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+        const result = await factory.createModel(KNOWN_MODELS.GPT.id);
         expect(result.success).toBe(true);
         expect(capturedApiKey).toBe("sk-test");
       } finally {
@@ -1933,7 +1967,7 @@ describe("ProviderModelFactory Codex authentication", () => {
         },
       });
 
-      const result = await factory.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+      const result = await factory.createModel(KNOWN_MODELS.GPT.id);
       expect(result.success).toBe(true);
       if (!result.success) {
         return;
@@ -2483,9 +2517,9 @@ describe("ProviderModelFactory routing", () => {
 
         // Direct OpenAI should win because Codex OAuth makes it available for routing.
         // Use a model from CODEX_OAUTH_ALLOWED_MODELS so createModel can route through OAuth.
-        const result = await factory.resolveAndCreateModel("openai:gpt-5.2", "off");
+        const result = await factory.resolveAndCreateModel("openai:gpt-6-luna", "off");
         expectSuccessfulRouteResult(result, {
-          effectiveModelString: "openai:gpt-5.2",
+          effectiveModelString: "openai:gpt-6-luna",
           routeProvider: "openai",
           routedThroughGateway: false,
         });
@@ -2683,19 +2717,68 @@ function parseSentBody(call: CapturedFetchCall): Record<string, unknown> {
   return JSON.parse(call.init.body as string) as Record<string, unknown>;
 }
 
+describe("ProviderModelFactory Anthropic Fast mode", () => {
+  const sendOnce = async (
+    anthropicConfig: Record<string, unknown>,
+    modelString: string
+  ): Promise<CapturedFetchCall> => {
+    let captured: CapturedFetchCall | undefined;
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ anthropic: { apiKey: "test-key", ...anthropicConfig } });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel(modelString);
+        if (!result.success) throw new Error(result.error.type);
+        await generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
+          () => undefined
+        );
+        expect(calls).toHaveLength(1);
+        captured = calls[0];
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+    if (captured == null) throw new Error("expected a captured request");
+    return captured;
+  };
+  const betaHeader = (call: CapturedFetchCall) =>
+    new Headers(call.init.headers).get("anthropic-beta") ?? "";
+
+  it("pins speed=fast and the beta header for supported direct models", async () => {
+    const call = await sendOnce({ speed: "fast" }, "anthropic:claude-opus-5-5");
+    expect(parseSentBody(call)).toMatchObject({ speed: "fast" });
+    expect(betaHeader(call)).toContain("fast-mode-2026-02-01");
+  });
+
+  it.each([
+    ["unsupported model", { speed: "fast" }, "anthropic:claude-opus-4-7"],
+    ["ZDR beta opt-out", { speed: "fast", disableBetaFeatures: true }, "anthropic:claude-opus-5-5"],
+    ["preference unset", {}, "anthropic:claude-opus-5-5"],
+    [
+      "non-first-party base URL",
+      { speed: "fast", baseUrl: "https://llm-proxy.example.com/anthropic" },
+      "anthropic:claude-opus-5-5",
+    ],
+  ] as const)("omits speed for %s", async (_label, anthropicConfig, modelString) => {
+    const call = await sendOnce(anthropicConfig, modelString);
+    expect(parseSentBody(call)).not.toHaveProperty("speed");
+    expect(betaHeader(call)).not.toContain("fast-mode-2026-02-01");
+  });
+});
+
 // @ai-sdk/openai strips reasoningEffort "none" for every gpt-6-* ID; Xum must still
-// serialize it for Sol/Luna (Chat Completions function calling requires it).
-describe("ProviderModelFactory GPT-6 Sol/Luna reasoning effort none", () => {
+// serialize it for Luna (Chat Completions function calling requires it).
+describe("ProviderModelFactory GPT-6 Luna reasoning effort none", () => {
   const cases = [
-    ["gpt-6-sol", "none", "none"],
     ["gpt-6-luna", "none", "none"],
-    ["gpt-6-sol-2026-09-22", "none", "none"],
-    ["gpt-6-sol", "high", "high"],
+    ["gpt-6-luna-2026-09-22", "none", "none"],
+    ["gpt-6-luna", "high", "high"],
     // Astra genuinely rejects "none"; keep the SDK's gating for it.
     ["gpt-6-astra", "none", undefined],
   ] as const;
   // The SDK gates effort on the raw wire ID, so on Chat Completions an opaque alias
-  // mapped to Sol already keeps "none" (and so its tool calls) without the rewrite.
+  // mapped to Luna already keeps "none" (and so its tool calls) without the rewrite.
   // On Responses the SDK treats opaque aliases as non-reasoning and drops every
   // effort, a pre-existing alias limitation not specific to "none" or GPT-6.
   const chatOnlyCases = [["team-model", "none", "none"]] as const;
@@ -2709,7 +2792,7 @@ describe("ProviderModelFactory GPT-6 Sol/Luna reasoning effort none", () => {
               apiKey: "native-key",
               wireFormat,
               webSocketTransportEnabled: false,
-              models: [{ id: "team-model", mappedToModel: "openai:gpt-6-sol" }],
+              models: [{ id: "team-model", mappedToModel: "openai:gpt-6-luna" }],
             },
           });
           const { calls, fakeFetch } = createCapturingFetch();
@@ -3240,7 +3323,7 @@ describe("ProviderModelFactory Coder", () => {
   // the only capability identity such an alias has; the raw origin id is not.
   it.each([
     ["coder:chat-proxy/team-luna", true],
-    ["coder:chat-proxy/gpt-6-sol", true],
+    ["coder:chat-proxy/gpt-6-luna", true],
     ["coder:chat-proxy/team-astra", false],
   ])(
     "clamps %s tool requests through a Coder openai-compat instance (%p)",
@@ -4934,7 +5017,7 @@ describe("withAnthropicEvaluationEffort", () => {
     ]);
   });
 
-  it("stops the SDK from sending disabled thinking to Opus 5.5", async () => {
+  it("keeps evaluation calls on low adaptive thinking for always-thinking models", async () => {
     const bodies: Array<Record<string, unknown>> = [];
     const captureFetch = Object.assign(
       (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -4955,21 +5038,31 @@ describe("withAnthropicEvaluationEffort", () => {
       { preconnect: fetch.preconnect.bind(fetch) }
     );
     const { createAnthropic } = await PROVIDER_REGISTRY.anthropic();
-    const raw = createAnthropic({ apiKey: "test", fetch: captureFetch }).evaluationModel(
-      "claude-opus-5-5"
-    );
+    const evaluationModel = (modelId: string) =>
+      createAnthropic({ apiKey: "test", fetch: captureFetch }).evaluationModel(modelId);
 
-    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-    await expect(raw.doEvaluate({ state: "x", questions })).rejects.toThrow();
+    // Unwrapped, @ai-sdk/anthropic 4.0.67+ maps the evaluation's reasoning "none" to
+    // `between_tools` on Sonnet 5.5. #5086 keeps evaluation calls on low adaptive
+    // thinking, which the wrapper's explicit effort preserves.
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(
-      withAnthropicEvaluationEffort(raw, "claude-opus-5-5").doEvaluate({ state: "x", questions })
+      evaluationModel("claude-sonnet-5-5").doEvaluate({ state: "x", questions })
     ).rejects.toThrow();
+    expect(bodies[0].thinking).toEqual({ type: "between_tools" });
 
-    expect(bodies).toHaveLength(2);
-    expect(bodies[0].thinking).toEqual({ type: "disabled" });
-    expect(bodies[1]).not.toHaveProperty("thinking");
-    expect(bodies[1].output_config).toMatchObject({ effort: "low" });
+    for (const modelId of ["claude-sonnet-5-5", "claude-opus-5-5"]) {
+      bodies.length = 0;
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(
+        withAnthropicEvaluationEffort(evaluationModel(modelId), modelId).doEvaluate({
+          state: "x",
+          questions,
+        })
+      ).rejects.toThrow();
+      expect(bodies).toHaveLength(1);
+      expect({ modelId, thinking: bodies[0].thinking }).toEqual({ modelId, thinking: undefined });
+      expect(bodies[0].output_config).toMatchObject({ effort: "low" });
+    }
   });
 });
 
@@ -5237,17 +5330,18 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
     };
     // OAuth only (no API key): the chat path would reroute to chatgpt.com.
     await withEvaluationFixture({ openai: { codexOauth } }, async (_c, factory) => {
-      expect(
-        expectRejected(await factory.createEvaluationModel(KNOWN_MODELS.GPT_53_CODEX.id))
-      ).toEqual({ reason: "unsupported-route", routeKind: "codex-oauth", providerName: "openai" });
+      expect(expectRejected(await factory.createEvaluationModel(KNOWN_MODELS.GPT.id))).toEqual({
+        reason: "unsupported-route",
+        routeKind: "codex-oauth",
+        providerName: "openai",
+      });
     });
     // Both credentials, OAuth preferred: still rerouted by the chat path, so rejected.
     await withEvaluationFixture(
       { openai: { apiKey: "sk-test", codexOauth, codexOauthDefaultAuth: "oauth" } },
       async (_c, factory) => {
         expect(
-          expectRejected(await factory.createEvaluationModel(KNOWN_MODELS.GPT_53_CODEX.id))
-            .routeKind
+          expectRejected(await factory.createEvaluationModel(KNOWN_MODELS.GPT.id)).routeKind
         ).toBe("codex-oauth");
       }
     );
@@ -5255,7 +5349,7 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
     await withEvaluationFixture(
       { openai: { apiKey: "sk-test", codexOauth, codexOauthDefaultAuth: "apiKey" } },
       async (_c, factory) => {
-        expectResolved(await factory.createEvaluationModel(KNOWN_MODELS.GPT_53_CODEX.id));
+        expectResolved(await factory.createEvaluationModel(KNOWN_MODELS.GPT.id));
       }
     );
   });

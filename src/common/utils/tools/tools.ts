@@ -73,9 +73,13 @@ import { createAgentReportTool } from "@/node/services/tools/agent_report";
 import { wrapWithInitWait } from "@/node/services/tools/wrapWithInitWait";
 import { deriveToolHookConfig, withHooks } from "@/node/services/tools/withHooks";
 import { log } from "@/node/services/log";
-import { attachModelOnlyToolNotifications } from "@/common/utils/tools/internalToolResultFields";
+import {
+  attachModelOnlyToolNotifications,
+  canCarryModelOnlyToolNotifications,
+} from "@/common/utils/tools/internalToolResultFields";
 import { NotificationEngine } from "@/node/services/agentNotifications/NotificationEngine";
 import { TodoListReminderSource } from "@/node/services/agentNotifications/sources/TodoListReminderSource";
+import { HomeClutterReminderSource } from "@/node/services/agentNotifications/sources/HomeClutterReminderSource";
 import {
   getAvailableTools,
   supportsGoogleNativeToolsWithFunctionTools,
@@ -86,6 +90,7 @@ import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 
 import type { Result } from "@/common/types/result";
 import type { Runtime } from "@/node/runtime/Runtime";
+import * as os from "os";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
@@ -94,9 +99,10 @@ import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager"
 import type { MemoryIndexEntry, MemoryService } from "@/node/services/memoryService";
 import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
 import type { ProviderModelFactory } from "@/node/services/providerModelFactory";
-import type { MemoryScopeAccess } from "@/common/constants/memory";
+import type { MemoryScope, MemoryScopeAccess } from "@/common/constants/memory";
 import { createMemoryTool } from "@/node/services/tools/memory";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
+import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import type { TimelineService } from "@/node/services/timelineService";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { FileState } from "@/node/services/agentSession";
@@ -242,6 +248,8 @@ export interface ToolConfiguration {
    * wait for the next step's consent gate. Undefined for unrouted turns.
    */
   projectSkillContentStillReadable?: () => Promise<boolean>;
+  /** Memory scopes the tool serves (see resolveMemoryScopes); defaults to no session scope. */
+  memoryScopes?: readonly MemoryScope[];
   /** Callback to record file state for external edit detection (plan files) */
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
   /**
@@ -331,12 +339,12 @@ export interface ToolConfiguration {
    * differ (one-shot model sends, delegated turns with per-turn overrides).
    */
   goalKickoffModel?: string;
-  /** Per-request goal tool gates derived from goal status and agent capabilities. */
-  enableGoalTools?: {
-    setGoal: boolean;
-    getGoal: boolean;
-    completeGoal: boolean;
-  };
+  /**
+   * Per-turn inputs to the goal tool gates (workspace kind, allowAgentSetGoal,
+   * agent chain). The goal tools are registered whenever goalService exists and
+   * check these plus the live goal status at execution time (#5247).
+   */
+  goalToolContext?: GoalToolContext;
   /** Optional JSON Schema subset required by a workflow-spawned task report. */
   workflowAgentOutputSchema?: unknown;
   /** Allow pre-upgrade workflow child tasks with schemas now rejected by strict validation. */
@@ -530,6 +538,7 @@ function wrapToolExecuteWithModelOnlyNotifications(
         notifications = await engine.pollAfterToolCall({
           toolName,
           toolSucceeded: true,
+          resultCanCarryNotifications: canCarryModelOnlyToolNotifications(result),
           now: Date.now(),
         });
       } catch (error) {
@@ -565,6 +574,19 @@ function wrapToolsWithModelOnlyNotifications(
 
   const engine = new NotificationEngine([
     new TodoListReminderSource({ workspaceSessionDir: config.workspaceSessionDir }),
+    // Only commands on this host can clutter this host's home dir. XUM_SCRATCH_DIR is exported
+    // exactly for local/worktree runtimes (turnRequestBuilder), including multi-project ones
+    // whose MultiProjectRuntime wrapper is not a LocalBaseRuntime.
+    ...(config.xumEnv?.XUM_SCRATCH_DIR != null
+      ? [
+          new HomeClutterReminderSource({
+            // The host user's real home is where clutter piles up. A HOME override (project
+            // secret, .xum/tool_env) already sends writes elsewhere, so it is not tracked.
+            homeDir: os.homedir(),
+            workspaceId: config.workspaceId,
+          }),
+        ]
+      : []),
   ]);
 
   const wrappedTools: Record<string, Tool> = {};
@@ -892,10 +914,11 @@ export async function getToolsForModel(
       ? {
           session_history: wrap(createSessionHistoryTool(config)),
           // Continuous compaction and PTC+RLM take precedence over token-budget rollover
-          // (AgentSession.isTokenBudgetActive), and a 100% threshold disables sealing; a
-          // request nothing could honor is not offered, so no stale receipt can be persisted.
-          ...(config.contextBudgetRolloverAvailable !== false &&
-          config.experiments.continuousCompaction !== true &&
+          // (AgentSession.isTokenBudgetActive), so the tool is not offered with them. A 100%
+          // threshold also disables sealing, but that is a settings edit during the
+          // workspace's life: the tool stays registered (stable tool block for prompt
+          // caching, #5249) and refuses at execution, so no stale receipt is persisted.
+          ...(config.experiments.continuousCompaction !== true &&
           !(config.experiments.programmaticToolCalling === true && config.experiments.rlm === true)
             ? { new_context: wrap(createNewContextTool(config)) }
             : {}),
@@ -959,14 +982,16 @@ export async function getToolsForModel(
         }
       : {}),
     ...(shouldExposeHeartbeatTool ? { heartbeat: createHeartbeatTool(config) } : {}),
-    ...(config.goalService && config.enableGoalTools?.setGoal
-      ? { set_goal: createSetGoalTool(config) }
-      : {}),
-    ...(config.goalService && config.enableGoalTools?.getGoal
-      ? { get_goal: createGetGoalTool(config) }
-      : {}),
-    ...(config.goalService && config.enableGoalTools?.completeGoal
-      ? { complete_goal: createCompleteGoalTool(config) }
+    // Always register all three goal tools when a goal service exists, whatever
+    // the goal status or turn kind: adding or removing them per turn changes the
+    // tool block and misses the provider prompt cache. The handlers enforce the
+    // gates at execution time with typed refusals (#5247).
+    ...(config.goalService
+      ? {
+          set_goal: createSetGoalTool(config),
+          get_goal: createGetGoalTool(config),
+          complete_goal: createCompleteGoalTool(config),
+        }
       : {}),
     todo_write: createTodoWriteTool(config),
     todo_read: createTodoReadTool(config),

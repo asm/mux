@@ -13,6 +13,7 @@ import { WORKTREE_ARCHIVE_BEHAVIORS } from "@/common/config/worktreeArchiveBehav
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { MAX_RENDERED_MODELS } from "@/common/constants/ui";
 import {
   MAX_STAGED_ATTACHMENT_BASE64_CHARS,
   MAX_STAGED_ATTACHMENT_SIZE_BYTES,
@@ -75,6 +76,7 @@ import {
   HeartbeatEventSchema,
   OnChatModeSchema,
   SendMessageOptionsSchema,
+  AcpPromptCorrelationSchema,
   hasExactlyOneEditFence,
   EDIT_FENCE_REQUIRED_MESSAGE,
   StreamEndEventSchema,
@@ -105,9 +107,21 @@ import {
   ReviewStateUpdateOutputSchema,
 } from "./reviewState";
 import {
+  DraftEventSchema,
+  DraftGetOutputSchema,
+  DraftImportLegacyOutputSchema,
+  DraftListEntrySchema,
+  DraftListSchema,
+  DraftRevisionOutputSchema,
+  DraftScopeSchema,
+  DraftSummarySchema,
+  DraftUpdateInputSchema,
+} from "./drafts";
+import {
   AgentMessageDispatchModeSchema,
   FrontendWorkspaceMetadataSchema,
   WorkspaceRemoveResultSchema,
+  WorkspaceRemoveWarningSchema,
   GitStatusSchema,
   ProjectRefSchema,
   WorkspaceActivitySnapshotSchema,
@@ -171,6 +185,7 @@ import {
   UpdateChannelSchema,
 } from "../../config/schemas/appConfigOnDisk";
 import {
+  AnthropicSpeedSchema,
   CacheTtlSchema,
   CodexOauthDefaultAuthSchema,
   FastModePreviousServiceTierSchema,
@@ -319,6 +334,8 @@ export const ProviderConfigInfoSchema = z.object({
   webSocketTransportEnabled: z.boolean().optional(),
   /** Anthropic-specific fields */
   cacheTtl: CacheTtlSchema.optional(),
+  /** Anthropic Fast mode preference ("fast" sends `speed: "fast"` on supported routes). */
+  speed: AnthropicSpeedSchema.optional(),
   disableBetaFeatures: z.boolean().optional(),
   /** OpenAI-only: whether Codex OAuth tokens are present in providers.jsonc */
   codexOauthSet: z.boolean().optional(),
@@ -432,10 +449,38 @@ export const ProviderModelDiscoveryResultSchema = z.discriminatedUnion("status",
   }),
 ]);
 
+export const ModelCatalogSearchInputSchema = z.object({
+  query: z.string().optional(),
+  provider: z.string().optional(),
+  offset: z.number().int().min(0).optional(),
+  // Omitted limit returns every match; paging is opt-in.
+  limit: z.number().int().min(1).max(MAX_RENDERED_MODELS).optional(),
+});
+
+export const ModelCatalogEntrySchema = z.object({
+  /** Canonical `provider:model` id. */
+  id: z.string(),
+  provider: z.string(),
+  providerModelId: z.string(),
+  contextWindowTokens: z.number().nullable(),
+  builtIn: z.boolean(),
+});
+
+export const ModelCatalogSearchResultSchema = z.object({
+  models: z.array(ModelCatalogEntrySchema),
+  /** Match count before paging. */
+  total: z.number(),
+  nextOffset: z.number().nullable(),
+});
+
 export const providers = {
   discoverModels: {
     input: z.object({ provider: z.string() }),
     output: ProviderModelDiscoveryResultSchema,
+  },
+  searchModelCatalog: {
+    input: ModelCatalogSearchInputSchema,
+    output: ModelCatalogSearchResultSchema,
   },
   addCustomProvider: {
     input: z.object({
@@ -1501,6 +1546,11 @@ export const workspace = {
     input: z.object({ workspaceId: z.string(), pinned: z.boolean() }),
     output: ResultSchema(z.void(), z.string()),
   },
+  /** Keep a delegated workspace whose setup was interrupted (#4983): clears its flag. */
+  keepInterruptedDelegatedWorkspace: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(z.void(), z.string()),
+  },
   reorderPinned: {
     /**
      * Full desired pinned order for one project bucket. The server derives the
@@ -1804,7 +1854,12 @@ export const workspace = {
    * unless the send is accepted; the error explains why it was not.
    */
   sendHeldInput: {
-    input: z.object({ workspaceId: z.string(), heldInputId: z.string() }),
+    input: z.object({
+      workspaceId: z.string(),
+      heldInputId: z.string(),
+      /** ACP /send-held only: re-send as this prompt instead of the one it was queued as. */
+      acpCorrelation: AcpPromptCorrelationSchema.optional(),
+    }),
     output: ResultSchema(z.void(), SendMessageErrorSchema),
   },
   /** Drop a held input without sending it. */
@@ -1957,6 +2012,8 @@ export const workspace = {
             beforeMessageId: z.string().nullish(),
           })
           .nullish(),
+        // The client holds a replay window (#4961): bounded pages inside the active epoch.
+        windowed: z.boolean().optional(),
       }),
       output: z.object({
         messages: z.array(WorkspaceChatMessageSchema),
@@ -1967,6 +2024,8 @@ export const workspace = {
           })
           .nullable(),
         hasOlder: z.boolean(),
+        // Windowed requests only: the rows before the cursor cannot be paged; do a full replay.
+        notPageable: z.boolean().optional(),
       }),
     },
     /** Searches full history, including prompts before the replay boundary. */
@@ -2038,6 +2097,15 @@ export const workspace = {
       // One-shot migration hint: legacy renderer localStorage opt-out value.
       // Used only when backend auto-retry preference file is missing.
       legacyAutoRetryEnabled: z.boolean().optional(),
+      // The client can unpack `message-batch` events, so the server may group replayed history
+      // rows (#4868). Servers without this field strip it (the input object is not strict) and
+      // send single rows; clients that do not send it (ACP, VS Code, tests, older renderers)
+      // always get single rows.
+      batchReplay: z.boolean().optional(),
+      // The client can hold a window of the newest rows, so a full replay may send only those
+      // (#4961); `hasOlderHistory` on caught-up then says whether older rows exist. Clients that
+      // do not send it get the whole active epoch, as before.
+      replayWindow: z.boolean().optional(),
     }),
     output: eventIterator(WorkspaceChatMessageSchema), // Stream event
   },
@@ -2357,6 +2425,29 @@ export const tasks = {
         status: z.enum(["queued", "starting", "running"]),
         desktopOwnerWorkspaceId: z.string().optional(),
       }),
+      z.string()
+    ),
+  },
+  /** #5106: what removing a sub-agent would lose (summary null = nothing), for the user's confirmation. */
+  previewRemoval: {
+    input: z.object({ taskId: z.string() }),
+    output: ResultSchema(
+      z.object({ summary: z.string().nullable(), paths: z.array(z.string()) }),
+      z.string()
+    ),
+  },
+  /**
+   * #5106: user-confirmed sub-agent removal; never exposed as a model tool. `acknowledgedWork` is
+   * the preview the user confirmed: removal refuses if the work changed since.
+   */
+  remove: {
+    input: z.object({
+      taskId: z.string(),
+      acknowledgedWork: z.object({ summary: z.string().nullable(), paths: z.array(z.string()) }),
+    }),
+    // Warnings name what the forced removal left behind (#5143), as workspace.remove does.
+    output: ResultSchema(
+      z.object({ warnings: z.array(WorkspaceRemoveWarningSchema).optional() }),
       z.string()
     ),
   },
@@ -3251,6 +3342,54 @@ export const browser = {
       url: z.string().nullable(),
       error: z.string().nullish(),
     }),
+  },
+};
+
+// Composer drafts (text + attachments) persisted by the backend DraftService.
+export const drafts = {
+  /** Every draft as metadata (no attachment payloads), for bulk hydration. */
+  list: {
+    input: z.void(),
+    output: z.array(DraftSummarySchema),
+  },
+  /** One draft including attachment payloads. */
+  get: {
+    input: z.object({ scope: DraftScopeSchema }),
+    output: DraftGetOutputSchema,
+  },
+  update: {
+    input: DraftUpdateInputSchema,
+    output: DraftRevisionOutputSchema,
+  },
+  delete: {
+    input: z.object({ scope: DraftScopeSchema }),
+    output: DraftRevisionOutputSchema,
+  },
+  importLegacy: {
+    input: DraftUpdateInputSchema,
+    output: DraftImportLegacyOutputSchema,
+  },
+  /**
+   * The creation draft list, strictly: rejects when it cannot be read (the subscription snapshot
+   * falls back to an empty list instead). For the renderer's storage GC.
+   */
+  getList: {
+    input: z.void(),
+    output: DraftListSchema,
+  },
+  /** Add a creation draft to the list, or update its sub-project. Output: the list revision. */
+  putListEntry: {
+    input: DraftListEntrySchema,
+    output: DraftRevisionOutputSchema,
+  },
+  /** One-way import of the legacy localStorage list (never clobbers). Output: the list revision. */
+  importLegacyList: {
+    input: z.object({ entries: z.array(DraftListEntrySchema) }),
+    output: DraftRevisionOutputSchema,
+  },
+  subscribe: {
+    input: z.void(),
+    output: eventIterator(DraftEventSchema),
   },
 };
 

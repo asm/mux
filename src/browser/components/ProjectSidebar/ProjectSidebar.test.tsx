@@ -12,7 +12,7 @@ import {
   SIDEBAR_FLAT_MODE_KEY,
   SIDEBAR_HIDE_SUBAGENTS_KEY,
 } from "@/common/constants/storage";
-import { getDraftScopeId, getInputKey } from "@/common/constants/storage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
@@ -171,6 +171,7 @@ interface MockAgentListItemProps {
   completedChildrenExpanded?: boolean;
   onToggleCompletedChildren?: (workspaceId: string) => void;
   onArchiveWorkspace?: (workspaceId: string, button: HTMLElement) => Promise<void>;
+  onCancelCreation?: (workspaceId: string) => Promise<void>;
 }
 
 type HexColorPickerProps = ComponentProps<typeof ReactColorfulModule.HexColorPicker>;
@@ -179,6 +180,7 @@ let renderRealAgentListItems = false;
 let latestArchiveWorkspaceHandler:
   | ((workspaceId: string, button: HTMLElement) => Promise<void>)
   | null = null;
+let latestCancelCreationHandler: ((workspaceId: string) => Promise<void>) | null = null;
 
 let ProjectSidebar!: typeof ProjectSidebarComponent;
 let preflightArchiveWorkspaceMock = mock(
@@ -328,6 +330,7 @@ function installProjectSidebarTestDoubles() {
   );
   confirmDialogMock = mock(() => Promise.resolve(true));
   latestArchiveWorkspaceHandler = null;
+  latestCancelCreationHandler = null;
   void mock.module("@/browser/assets/logos/xum-logo-dark.svg?react", () => ({
     __esModule: true,
     default: () => <svg data-testid="xum-logo-dark" />,
@@ -365,6 +368,7 @@ function installProjectSidebarTestDoubles() {
       const displayTitle = metadata.title ?? metadata.name;
 
       latestArchiveWorkspaceHandler = props.onArchiveWorkspace ?? null;
+      latestCancelCreationHandler = props.onCancelCreation ?? null;
 
       return (
         <div
@@ -1134,9 +1138,12 @@ describe("ProjectSidebar flat chat list", () => {
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
     );
     // Give both drafts persisted content so their rows would render.
-    updatePersistedState(getInputKey(getDraftScopeId("_multi", "draft-multi")), "Multi draft");
-    updatePersistedState(
-      getInputKey(getDraftScopeId("/projects/demo-project", "draft-single")),
+    getDraftStore().setText(
+      { kind: "creation", projectPath: "_multi", draftId: "draft-multi" },
+      "Multi draft"
+    );
+    getDraftStore().setText(
+      { kind: "creation", projectPath: "/projects/demo-project", draftId: "draft-single" },
       "Single draft"
     );
     updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
@@ -1184,8 +1191,8 @@ describe("ProjectSidebar flat chat list", () => {
           deleteWorkspaceDraft: () => undefined,
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
     );
-    updatePersistedState(
-      getInputKey(getDraftScopeId("_multi", "draft-multi-badge")),
+    getDraftStore().setText(
+      { kind: "creation", projectPath: "_multi", draftId: "draft-multi-badge" },
       "Multi draft"
     );
     updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
@@ -1457,8 +1464,8 @@ describe("ProjectSidebar flat chat list", () => {
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
     );
     // Non-empty drafts render as rows; empty ones stay hidden.
-    updatePersistedState(
-      getInputKey(getDraftScopeId("/projects/demo-project", "draft-order")),
+    getDraftStore().setText(
+      { kind: "creation", projectPath: "/projects/demo-project", draftId: "draft-order" },
       "Draft prompt"
     );
     updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
@@ -1515,8 +1522,8 @@ describe("ProjectSidebar flat chat list", () => {
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
     );
     // Give the draft persisted content so the draft row would render pre-substitution.
-    updatePersistedState(
-      getInputKey(getDraftScopeId("/projects/demo-project", "draft-promoted")),
+    getDraftStore().setText(
+      { kind: "creation", projectPath: "/projects/demo-project", draftId: "draft-promoted" },
       "Draft prompt"
     );
 
@@ -2850,6 +2857,54 @@ describe("ProjectSidebar archive errors", () => {
   });
 });
 
+// #5143: cancel-creation forces the removal without the Force Delete dialog, so what the removal
+// left behind (a devcontainer that may still hold the plan) must reach the user another way.
+describe("ProjectSidebar cancel-creation warnings", () => {
+  const showPopoverMock = mock(
+    (_workspaceId: string, _message: string, _anchor?: { top: number; left: number }) => undefined
+  );
+
+  beforeEach(() => {
+    setupProjectSidebarDom();
+    showPopoverMock.mockClear();
+    spyOn(PopoverErrorHookModule, "usePopoverError").mockImplementation(
+      () =>
+        ({
+          error: null,
+          showError: showPopoverMock,
+          clearError: mock(() => undefined),
+        }) as unknown as ReturnType<typeof PopoverErrorHookModule.usePopoverError>
+    );
+  });
+  afterEach(cleanupProjectSidebarDom);
+
+  test("shows what a cancelled creation's forced removal left behind", async () => {
+    const description = "The devcontainer container labeled x was left behind";
+    const removeWorkspaceMock = mock((_workspaceId: string, _options?: { force?: boolean }) =>
+      Promise.resolve({
+        success: true,
+        warnings: [{ kind: "leftover" as const, description }],
+      })
+    );
+    mockWorkspaceActions({ removeWorkspace: removeWorkspaceMock });
+    const workspace = {
+      ...createWorkspace("cancel-target"),
+      projects: [{ projectPath: "/projects/demo-project", projectName: "demo-project" }],
+    };
+    renderProjectSidebarForWorkspace(workspace);
+
+    expect(latestCancelCreationHandler).toBeTruthy();
+    await act(async () => {
+      await latestCancelCreationHandler?.(workspace.id);
+    });
+
+    expect(removeWorkspaceMock).toHaveBeenCalledWith(workspace.id, { force: true });
+    expect(showPopoverMock).toHaveBeenCalledTimes(1);
+    expect(showPopoverMock.mock.calls[0]?.[0]).toBe(workspace.id);
+    expect(showPopoverMock.mock.calls[0]?.[1]).toContain(description);
+  });
+});
+
 describe("ProjectSidebar project actions menu", () => {
   const demoProjectPath = "/projects/demo-project";
 
@@ -3327,11 +3382,11 @@ describe("ProjectSidebar project actions menu", () => {
     const view = renderSidebar();
     expect(view.getByText("Empty")).toBeTruthy();
 
-    const draftScopeId = getDraftScopeId(demoProjectPath, draftId);
-    const draftInputKey = getInputKey(draftScopeId);
-
     act(() => {
-      updatePersistedState<string>(draftInputKey, "Visible draft prompt", "");
+      getDraftStore().setText(
+        { kind: "creation", projectPath: demoProjectPath, draftId },
+        "Visible draft prompt"
+      );
     });
 
     await waitFor(() => {

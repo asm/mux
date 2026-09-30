@@ -108,6 +108,10 @@ import { trackStreamCompleted } from "@/common/telemetry";
 import { isWorkflowRunEmittingToolName } from "@/common/utils/workflowRunMessages";
 import { isProviderConfigFixableError } from "@/common/utils/messages/retryEligibility";
 import {
+  isAutoRetryStatusEvent,
+  type AutoRetryStatus,
+} from "@/browser/utils/messages/autoRetryStatus";
+import {
   markChatSwitchMilestone,
   markChatSwitchStart,
 } from "@/browser/utils/perf/chatSwitchTiming";
@@ -182,22 +186,6 @@ const EMPTY_TIMELINE_SNAPSHOT: WorkspaceTimelineSnapshot = {
   loadError: null,
   loadErrorKind: null,
 };
-
-export type AutoRetryStatus = Extract<
-  WorkspaceChatMessage,
-  | { type: "auto-retry-scheduled" }
-  | { type: "auto-retry-starting" }
-  | { type: "auto-retry-abandoned" }
->;
-
-function isAutoRetryStatusEvent(msg: WorkspaceChatMessage): msg is AutoRetryStatus {
-  const type = (msg as { type?: string }).type;
-  return (
-    type === "auto-retry-scheduled" ||
-    type === "auto-retry-starting" ||
-    type === "auto-retry-abandoned"
-  );
-}
 
 export type HistoryLoadResult = "loaded" | "exhausted" | "busy" | "unavailable" | "failed";
 
@@ -629,58 +617,16 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
   };
 }
 
-interface ValidationIssue {
-  path?: Array<string | number>;
-  message?: string;
-}
-
-type IteratorValidationFailedError = Error & {
-  code: "EVENT_ITERATOR_VALIDATION_FAILED";
-  cause?: {
-    issues?: ValidationIssue[];
-    data?: unknown;
-  };
-};
-
-function isIteratorValidationFailed(error: unknown): error is IteratorValidationFailedError {
+/**
+ * The error oRPC (and the server's own onChat validation, #4868) raises when a yielded chat
+ * event fails the output schema. The client receives only its code and message: oRPC does not
+ * serialize the error's `cause`, so the schema issues stay on the server (#5082).
+ */
+function isIteratorValidationFailed(error: unknown): error is Error {
   return (
     error instanceof Error &&
-    (error as { code?: unknown }).code === "EVENT_ITERATOR_VALIDATION_FAILED"
+    (error as { code?: unknown }).code === "ASYNC_ITERATOR_OBJECT_VALIDATION_FAILED"
   );
-}
-
-/**
- * Extract a human-readable summary from an iterator validation error.
- * ORPC wraps Zod issues in error.cause with { issues: [...], data: ... }
- */
-function formatValidationError(error: IteratorValidationFailedError): string {
-  const cause = error.cause;
-  if (!cause) {
-    return "Unknown validation error (no cause)";
-  }
-
-  const issues = cause.issues ?? [];
-  if (issues.length === 0) {
-    return `Unknown validation error (no issues). Data: ${JSON.stringify(cause.data)}`;
-  }
-
-  // Format issues like: "type: Invalid discriminator value" or "metadata.usage.inputTokens: Expected number"
-  const issuesSummary = issues
-    .slice(0, 3) // Limit to first 3 issues
-    .map((issue) => {
-      const path = issue.path?.join(".") ?? "(root)";
-      const message = issue.message ?? "Unknown issue";
-      return `${path}: ${message}`;
-    })
-    .join("; ");
-
-  const moreCount = issues.length > 3 ? ` (+${issues.length - 3} more)` : "";
-
-  // Include the event type if available
-  const data = cause.data as { type?: string } | undefined;
-  const eventType = data?.type ? ` [event: ${data.type}]` : "";
-
-  return `${issuesSummary}${moreCount}${eventType}`;
 }
 
 /**
@@ -2769,11 +2715,17 @@ export class WorkspaceStore {
   }
 
   /**
-   * A composer applied a restore naming these held inputs (#4448): hide them now and ask the
-   * backend to drop its copy. If the backend refuses, show them again: a visible duplicate of
-   * what the composer holds is recoverable, a hidden held copy is not.
+   * A composer applied a restore naming these held inputs (#4448): hide them now (the composer
+   * shows the restored draft), and once `durable` resolves true (the draft write is confirmed by
+   * the backend) ask the backend to drop its copy. If the draft is not durable or the backend
+   * refuses, show them again: a visible duplicate of what the composer holds is recoverable, a
+   * hidden held copy is not.
    */
-  acceptRestoredHeldInputs(workspaceId: string, heldInputIds: readonly string[]): void {
+  acceptRestoredHeldInputs(
+    workspaceId: string,
+    heldInputIds: readonly string[],
+    durable: Promise<boolean>
+  ): void {
     assert(workspaceId.length > 0, "acceptRestoredHeldInputs requires a workspaceId");
     assert(heldInputIds.length > 0, "acceptRestoredHeldInputs requires held input ids");
     this.acceptedRestoreHeldInputs.set(
@@ -2782,6 +2734,25 @@ export class WorkspaceStore {
     );
     this.states.bump(workspaceId);
 
+    durable.then(
+      (isDurable) => {
+        if (isDurable) {
+          this.discardRestoredHeldInputs(workspaceId, heldInputIds);
+          return;
+        }
+        for (const heldInputId of heldInputIds) {
+          this.showRestoredHeldInputAgain(workspaceId, heldInputId, "restored draft not durable");
+        }
+      },
+      (error: unknown) => {
+        for (const heldInputId of heldInputIds) {
+          this.showRestoredHeldInputAgain(workspaceId, heldInputId, error);
+        }
+      }
+    );
+  }
+
+  private discardRestoredHeldInputs(workspaceId: string, heldInputIds: readonly string[]): void {
     const client = this.client;
     for (const heldInputId of heldInputIds) {
       if (!client) {
@@ -2907,6 +2878,7 @@ export class WorkspaceStore {
     this.states.bump(workspaceId);
   }
 
+  /** Loads the page before the oldest loaded row: a bounded (windowed) page of the epoch (#4961). */
   async loadOlderHistory(workspaceId: string): Promise<HistoryLoadResult> {
     assert(
       typeof workspaceId === "string" && workspaceId.length > 0,
@@ -2956,10 +2928,20 @@ export class WorkspaceStore {
     this.states.bump(workspaceId);
 
     try {
-      const result = await client.workspace.history.loadMore({
+      let result = await client.workspace.history.loadMore({
         workspaceId,
         cursor: requestedCursor,
+        windowed: true,
       });
+      if (result.notPageable === true) {
+        // The rows before the cursor cannot be cut into bounded pages: today's unbounded page
+        // for the same cursor is contiguous with what this client holds. Accepted limitation:
+        // such sessions (rare) load the rest of the epoch at once.
+        console.debug(
+          `[WorkspaceStore] windowed loadMore not pageable for ${workspaceId}; loading an unbounded page`
+        );
+        result = await client.workspace.history.loadMore({ workspaceId, cursor: requestedCursor });
+      }
 
       const aggregator = this.aggregators.get(workspaceId);
       const latestPagination = this.historyPagination.get(workspaceId);
@@ -2993,6 +2975,9 @@ export class WorkspaceStore {
           skipDerivedState: true,
         });
         this.consumerManager.scheduleCalculation(workspaceId, aggregator);
+      }
+      if (!result.hasOlder || historicalMessages.some(isDurableCompactionBoundaryMarker)) {
+        aggregator.markEpochStartLoaded();
       }
 
       this.historyPagination.set(workspaceId, {
@@ -3638,10 +3623,7 @@ export class WorkspaceStore {
         }
         this.workspaceStats.delete(workspaceId);
 
-        // Clear MapStore caches for this workspace.
-        // MapStore.delete() is version-gated, so bump first to ensure we clear even
-        // if the key was only ever read (get()) and never bumped.
-        this.statsStore.bump(workspaceId);
+        // delete also clears snapshots that were read before the first update.
         this.statsStore.delete(workspaceId);
         return;
       }
@@ -4426,10 +4408,13 @@ export class WorkspaceStore {
         const legacyAutoRetryEnabled = typeof legacyRaw === "boolean" ? legacyRaw : undefined;
         if (legacyRaw !== undefined && legacyAutoRetryEnabled === undefined)
           updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
+        // batchReplay: this store unpacks `message-batch` replay events (#4868).
+        // replayWindow: a full replay sends only the newest rows of the active epoch; older rows
+        // load through loadOlderHistory (#4961).
         const input =
           legacyAutoRetryEnabled === undefined
-            ? { workspaceId, mode }
-            : { workspaceId, mode, legacyAutoRetryEnabled };
+            ? { workspaceId, mode, batchReplay: true, replayWindow: true }
+            : { workspaceId, mode, legacyAutoRetryEnabled, batchReplay: true, replayWindow: true };
         const iterator = await client.workspace.onChat(input, { signal: attemptSignal });
         if (legacyAutoRetryEnabled !== undefined)
           updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
@@ -4468,10 +4453,7 @@ export class WorkspaceStore {
         } else if (isIteratorValidationFailed(error)) {
           if (!this.isWorkspaceRegistered(workspaceId)) return true;
           console.error(
-            "[WorkspaceStore] Event validation failed for " +
-              workspaceId +
-              ": " +
-              formatValidationError(error)
+            "[WorkspaceStore] Event validation failed for " + workspaceId + ": " + error.message
           );
         } else if (!abortError)
           console.error(
@@ -4965,6 +4947,12 @@ export class WorkspaceStore {
     data: WorkspaceChatMessage,
     attemptContext?: OnChatAttemptContext
   ): void {
+    // Replay batch (#4868): consecutive history rows grouped to save one frame per row. Each row
+    // takes the single-row path, which old servers and non-batchable rows still use.
+    if (data.type === "message-batch") {
+      for (const row of data.messages) this.handleChatMessage(workspaceId, row, attemptContext);
+      return;
+    }
     // Aggregator must exist - workspaces are initialized in addWorkspace() before subscriptions run.
     const aggregator = this.assertGet(workspaceId);
 
@@ -5102,6 +5090,10 @@ export class WorkspaceStore {
         // Clear stale interruption suppression state so retry UI is derived solely
         // from the replayed transcript instead of a pre-disconnect abort reason.
         aggregator.clearLastAbortReason();
+
+        // Every full replay replaces the window seed (#4961), absent included: a stale seed must
+        // not survive a window that reached the epoch start.
+        aggregator.setWindowSeed(data.windowSeed ?? null);
       }
 
       if (replay === "full" || !data.cursor?.stream || streamContextMismatched) {

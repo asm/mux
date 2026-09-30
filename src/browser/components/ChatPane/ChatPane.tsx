@@ -15,7 +15,6 @@ import { ChatInstructionsChatDecoration } from "@/browser/components/Instruction
 import { MessageRenderer } from "@/browser/features/Messages/MessageRenderer";
 import { MarkdownRenderer } from "@/browser/features/Messages/MarkdownRenderer";
 import { useTranscriptContextMenu } from "@/browser/features/Messages/useTranscriptContextMenu";
-import type { UserMessageNavigation } from "@/browser/features/Messages/UserMessage";
 import { InterruptedBarrier } from "@/browser/features/Messages/ChatBarrier/InterruptedBarrier";
 import { useResumeStream } from "@/browser/hooks/useResumeStream";
 import { EditCutoffBarrier } from "@/browser/features/Messages/ChatBarrier/EditCutoffBarrier";
@@ -27,30 +26,29 @@ import { computeChatViewReveal, useChatViewDataReady } from "./useChatViewDataRe
 import { TranscriptHydrationSkeleton } from "./TranscriptHydrationSkeleton";
 import { TranscriptBundleRows, useTranscriptBundles } from "./TranscriptBundles";
 import {
+  findTranscriptMessageElement,
+  getTranscriptRowProps,
+  useTranscriptRowDerivations,
+  useUserMessageNavigation,
+} from "./transcriptRowDerivations";
+import {
   createChatInputDecorationStackItem,
   createTranscriptTailStackItem,
   selectVisibleChatInputDecorations,
   type ChatInputDecorationStackItem,
   type TranscriptTailStackItem,
 } from "./layoutStack";
+import { getRetryBarrierDerivation } from "./retryBarrierDerivation";
 import { VIM_ENABLED_KEY } from "@/common/constants/storage";
 import { ChatInput, type ChatInputAPI } from "@/browser/features/ChatInput/index";
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import {
-  shouldShowInterruptedBarrier,
   mergeConsecutiveStreamErrors,
-  computeBashOutputGroupInfos,
   shouldBypassDeferredMessages,
 } from "@/browser/utils/messages/messageUtils";
-import { computeTaskReportLinking } from "@/browser/utils/messages/taskReportLinking";
 import { BashCollapsedSummaryModeProvider } from "@/browser/features/Tools/BashCollapsedSummaryModeContext";
 import { BashOutputCollapsedIndicator } from "@/browser/features/Tools/BashOutputCollapsedIndicator";
-import {
-  getInterruptionContext,
-  getLastMainRetryCandidateMessage,
-  getLastNonDecorativeMessage,
-  isPreTokenInterruptedUserTurn,
-} from "@/common/utils/messages/retryEligibility";
+import { getLastNonDecorativeMessage } from "@/common/utils/messages/retryEligibility";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useAutoScroll } from "@/browser/hooks/useAutoScroll";
@@ -72,11 +70,13 @@ import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useAIViewKeybinds } from "@/browser/hooks/useAIViewKeybinds";
 import { QueuedMessage } from "@/browser/features/Messages/QueuedMessage";
 import { HeldInput } from "@/browser/features/Messages/HeldInput";
+import { DelegatedCreationInterruptedBanner } from "@/browser/components/DelegatedCreationInterruptedBanner/DelegatedCreationInterruptedBanner";
 import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
 import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
 import { BackgroundProcessesBanner } from "../BackgroundProcessesBanner/BackgroundProcessesBanner";
 import { checkAutoCompaction } from "@/common/utils/compaction/autoCompactionCheck";
+import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { getEffectiveThreshold } from "@/browser/features/RightSidebar/ThresholdSlider";
 import { cancelCompaction } from "@/browser/utils/compaction/handler";
 import type { ContextSwitchWarning } from "@/browser/utils/compaction/contextSwitchCheck";
@@ -188,15 +188,6 @@ const TRANSCRIPT_BOTTOM_SENTINEL_STYLE = { overflowAnchor: "auto" } as const;
 const EMPTY_TRANSCRIPT: DisplayedMessage[] = [];
 const NO_HELD_INPUTS: readonly HeldInputData[] = [];
 const COMPOSER_DOCK_STYLE = { overflowAnchor: "none" } as const;
-
-function findTranscriptMessageElement(
-  scrollContainer: HTMLElement,
-  historyId: string
-): HTMLElement | undefined {
-  return Array.from(scrollContainer.querySelectorAll<HTMLElement>("[data-message-id]")).find(
-    (element) => element.getAttribute("data-message-id") === historyId
-  );
-}
 
 const TIMELINE_REVEAL_HIGHLIGHT_CLASS = "timeline-reveal-highlight";
 
@@ -415,11 +406,19 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
         : previous
     );
   };
+  // The workspace with an unresolved edit send: no edit starts there meanwhile (#5226).
+  const [editSendPendingIn, setEditSendPendingIn] = useState<string | null>(null);
+  const editSendPending = editSendPendingIn === workspaceId;
+  const handleEditSendPendingChange = (pending: boolean) =>
+    setEditSendPendingIn((current) =>
+      pending ? workspaceId : current === workspaceId ? null : current
+    );
   /**
    * Enter edit mode with content evidence of the rows the edit deletes. A row the aggregator
    * does not hold cannot be fenced (a real state, not a bug): stay out of edit mode and say so.
    */
   const beginEditingMessage = (message: EditingMessageState): boolean => {
+    if (editSendPending) return false;
     const precondition = storeRaw.captureHistoryEditPrecondition(workspaceId, message.id);
     if (!precondition) {
       publishChatError(workspaceId, EDIT_NOT_HELD_MESSAGE);
@@ -441,9 +440,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       setEditingState({ workspaceId, message: undefined });
     }
   }, [editingMessage, transcriptOnly, workspaceId]);
-
-  // Track which bash_output groups are expanded (keyed by first message ID)
-  const [expandedBashGroups, setExpandedBashGroups] = useState<Set<string>>(new Set());
 
   // A navigation (prompt arrows, ArrowUp edit) targets a row by historyId. The tail-first
   // reveal may not have mounted it yet, so the scroll runs from an effect once it is in the
@@ -535,16 +531,11 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     [workspaceId, latestMessageId, onOpenTerminal]
   );
 
-  const taskReportLinking = useMemo(
-    () => computeTaskReportLinking(deferredMessages),
-    [deferredMessages]
-  );
-
-  // Precompute bash_output grouping once per message snapshot so row rendering stays O(n).
-  const bashOutputGroupInfos = useMemo(
-    () => computeBashOutputGroupInfos(deferredMessages),
-    [deferredMessages]
-  );
+  const transcriptRowDerivations = useTranscriptRowDerivations({
+    workspaceId,
+    messages: deferredMessages,
+  });
+  const { bashOutputGroupInfos, expandedBashGroups, expandBashGroup } = transcriptRowDerivations;
 
   const transcriptBundles = useTranscriptBundles({
     workspaceId,
@@ -630,22 +621,30 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   // Rollover mode evaluates the clamped threshold, so the chat-input bar's visibility and
   // text must use the same effective value the slider label advertises.
-  const effectiveAutoCompactionThreshold = getEffectiveThreshold({
-    threshold: autoCompactionThreshold,
+  const autoCompactionResult = useMemo(() => {
+    const effectiveAutoCompactionThreshold = getEffectiveThreshold({
+      threshold: autoCompactionThreshold,
+      rolloverEnabled,
+      modelContextLimit: pendingModel
+        ? getEffectiveContextLimit(pendingModel, use1M, providersConfig)
+        : null,
+    });
+    return checkAutoCompaction(
+      workspaceUsage,
+      pendingModel,
+      use1M,
+      effectiveAutoCompactionThreshold / 100,
+      undefined,
+      providersConfig
+    );
+  }, [
+    workspaceUsage,
+    pendingModel,
+    use1M,
+    providersConfig,
+    autoCompactionThreshold,
     rolloverEnabled,
-  });
-  const autoCompactionResult = useMemo(
-    () =>
-      checkAutoCompaction(
-        workspaceUsage,
-        pendingModel,
-        use1M,
-        effectiveAutoCompactionThreshold / 100,
-        undefined,
-        providersConfig
-      ),
-    [workspaceUsage, pendingModel, use1M, providersConfig, effectiveAutoCompactionThreshold]
-  );
+  ]);
 
   // Show warning when: shouldShowWarning flag is true AND not currently compacting.
   // Context-switch warning takes priority so we don't show competing banners.
@@ -714,7 +713,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       ? deferredMessages[bashOutputGroup.firstIndex]?.id
       : undefined;
     if (bashGroupKey && !expandedBashGroups.has(bashGroupKey)) {
-      setExpandedBashGroups((current) => new Set(current).add(bashGroupKey));
+      expandBashGroup(bashGroupKey);
       return;
     }
 
@@ -761,6 +760,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     bashOutputGroupInfos,
     contentRef,
     deferredMessages,
+    expandBashGroup,
     expandedBashGroups,
     operationalBundleExpansionOverrides,
     operationalBundleInfos,
@@ -867,39 +867,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     workspaceId,
   ]);
 
-  // Precompute per-user navigation objects so MessageRenderer rows receive stable prop
-  // references across non-message updates (usage bumps, stats updates, etc.).
-  const userMessageNavigationByHistoryId = useMemo(() => {
-    const userHistoryIds: string[] = [];
-    for (const message of deferredMessages) {
-      // Machine wakes and budget warnings should not interrupt navigation between human prompts.
-      if (
-        message.type === "user" &&
-        message.isPendingSend == null &&
-        message.bashMonitorWake == null &&
-        message.agentPeerMessageTrigger == null &&
-        message.contextBudgetWarning == null
-      ) {
-        userHistoryIds.push(message.historyId);
-      }
-    }
-
-    if (userHistoryIds.length < 2) {
-      return null;
-    }
-
-    const navigationByHistoryId = new Map<string, UserMessageNavigation>();
-    for (let index = 0; index < userHistoryIds.length; index++) {
-      navigationByHistoryId.set(userHistoryIds[index], {
-        prevUserMessageId: index > 0 ? userHistoryIds[index - 1] : undefined,
-        nextUserMessageId:
-          index < userHistoryIds.length - 1 ? userHistoryIds[index + 1] : undefined,
-        onNavigate: handleNavigateToMessage,
-      });
-    }
-
-    return navigationByHistoryId;
-  }, [deferredMessages, handleNavigateToMessage]);
+  const userMessageNavigationByHistoryId = useUserMessageNavigation({
+    messages: deferredMessages,
+    onNavigateToMessage: handleNavigateToMessage,
+  });
 
   // ChatInput API for focus management
   const chatInputAPI = useRef<ChatInputAPI | null>(null);
@@ -924,7 +895,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   useEffect(() => {
     setEditingState({ workspaceId, message: undefined });
-    setExpandedBashGroups(new Set());
     setPendingTimelineReveal(null);
   }, [workspaceId]);
 
@@ -1202,18 +1172,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     handleJumpToBottom();
   }, [hasLoadedTranscriptRows, handleJumpToBottom, workspaceId]);
 
-  // Compute showRetryBarrier once for both keybinds and UI.
-  // Track if last message was interrupted or errored (for RetryBarrier).
-  const interruption = workspaceState
-    ? getInterruptionContext(
-        workspaceState.messages,
-        workspaceState.pendingStreamStartTime,
-        workspaceState.runtimeStatus,
-        workspaceState.lastAbortReason
-      )
-    : null;
-
-  const hasInterruptedStream = interruption?.hasInterruptedStream ?? false;
   const shouldShowStreamingBarrier = isStreamStarting || canInterrupt;
   // An armed background bash monitor means the turn ended but the agent will be
   // woken on matching output. Keep the barrier mounted so StreamingBarrier can
@@ -1223,61 +1181,35 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     deferredMessages.length === 0 &&
     !showTranscriptHydrationPlaceholder &&
     !shouldMountStreamingBarrier;
-  const showRetryBarrier =
-    !isHydratingTranscript && !shouldShowStreamingBarrier && hasInterruptedStream;
-  const isAutoRetryActive =
-    workspaceState.autoRetryStatus?.type === "auto-retry-scheduled" ||
-    workspaceState.autoRetryStatus?.type === "auto-retry-starting";
-
-  const lastRetryCandidateMessage = getLastMainRetryCandidateMessage(workspaceState.messages);
-  const suppressRetryBarrier =
-    lastRetryCandidateMessage?.type === "stream-error" &&
-    lastRetryCandidateMessage.errorType === "context_exceeded";
-  const shouldMountRetryBarrier = !suppressRetryBarrier;
-  const showRetryBarrierUI = showRetryBarrier && !suppressRetryBarrier;
-
-  // Derive inline transcript chrome once so row rendering and layout pinning share the exact same
-  // visibility decision. This keeps late interrupted markers from sneaking in through a second code
-  // path after hydration or auto-retry state changes.
-  const interruptedBarrierMessageIds = new Set<string>();
-  for (const message of deferredMessages) {
-    if (
-      shouldShowInterruptedBarrier(message, {
-        isHydratingTranscript,
-        isAutoRetryActive,
-      })
-    ) {
-      interruptedBarrierMessageIds.add(message.id);
-    }
-  }
-  // A turn interrupted before its first token leaves the user message as the tail
-  // with no assistant row, so the loop above never marks it. Mark it here (subject
-  // to the same hydration/auto-retry/streaming suppression) so the divider still
-  // offers to continue. interruptedTailResumable/render both key off this set.
-  if (
-    !isHydratingTranscript &&
-    !isAutoRetryActive &&
-    !shouldShowStreamingBarrier &&
-    lastRetryCandidateMessage != null &&
-    isPreTokenInterruptedUserTurn(lastRetryCandidateMessage, workspaceState.lastAbortReason)
-  ) {
-    interruptedBarrierMessageIds.add(lastRetryCandidateMessage.id);
-  }
+  // Compute retry/interrupted chrome once for both keybinds and UI. Interruption and the retry
+  // candidate come from the latest rows; dividers are placed on the rendered (deferred) rows.
+  const {
+    showRetryBarrier,
+    lastRetryCandidateMessage,
+    shouldMountRetryBarrier,
+    showRetryBarrierUI,
+    interruptedBarrierMessageIds,
+    interruptedTailResumable,
+  } = getRetryBarrierDerivation({
+    messages: workspaceState.messages,
+    renderedMessages: deferredMessages,
+    pendingStreamStartTime: workspaceState.pendingStreamStartTime,
+    runtimeStatus: workspaceState.runtimeStatus,
+    lastAbortReason: workspaceState.lastAbortReason,
+    autoRetryStatus: workspaceState.autoRetryStatus,
+    isHydratingTranscript,
+    isTurnActive: shouldShowStreamingBarrier,
+    transcriptOnly,
+  });
 
   // Owned here so the click and keybind paths share one resume/error. resetKey is
   // the resume target, so error/spinner reset when the interrupted turn changes.
   const { resume: resumeInterruptedStreamAsync, error: resumeInterruptedError } = useResumeStream(
     workspaceId,
-    lastRetryCandidateMessage?.id
+    lastRetryCandidateMessage?.id,
+    workspaceState.messages
   );
   const resumeInterruptedStream = () => void resumeInterruptedStreamAsync();
-  // Resumable only on the writable tail and only when RetryBarrier is suppressed
-  // (user-aborted case). When RetryBarrier is visible, its button owns resume.
-  const interruptedTailResumable =
-    !transcriptOnly &&
-    !showRetryBarrierUI &&
-    lastRetryCandidateMessage != null &&
-    interruptedBarrierMessageIds.has(lastRetryCandidateMessage.id);
   // Live status belongs beside the input, below async decorations: neither history
   // reveal nor banners arriving should bump the label and Stop across the screen.
   const turnStatus = shouldMountStreamingBarrier ? (
@@ -1471,28 +1403,21 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     }
   }
 
-  const toggleBashOutputGroup = (groupKey: string) => {
-    setExpandedBashGroups((prev) => {
-      const next = new Set(prev);
-      if (next.has(groupKey)) {
-        next.delete(groupKey);
-      } else {
-        next.add(groupKey);
-      }
-      return next;
-    });
-  };
-
   const renderMessageAtIndex = (
     message: DisplayedMessage,
     index: number,
     options: { key: string; className?: string }
   ): React.ReactNode => {
-    const bashOutputGroup = bashOutputGroupInfos[index];
-    const groupKey = bashOutputGroup ? deferredMessages[bashOutputGroup.firstIndex]?.id : undefined;
-    const isGroupExpanded = groupKey ? expandedBashGroups.has(groupKey) : false;
+    const rowProps = getTranscriptRowProps({
+      derivations: transcriptRowDerivations,
+      userMessageNavigationByHistoryId,
+      messages: deferredMessages,
+      message,
+      index,
+    });
+    const { bashOutputGroup, bashGroupKey } = rowProps;
 
-    if (bashOutputGroup?.position === "middle" && !isGroupExpanded) {
+    if (rowProps.hidden) {
       return null;
     }
 
@@ -1502,11 +1427,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       message.type !== "workspace-init" &&
       message.type !== "compaction-boundary" &&
       message.historyId === editCutoffHistoryId;
-
-    const taskReportLinkingForMessage =
-      message.type === "tool" && (message.toolName === "task" || message.toolName === "task_await")
-        ? taskReportLinking
-        : undefined;
 
     const messageNode = (
       <MessageRenderer
@@ -1518,6 +1438,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
         }
         workspaceId={workspaceId}
         isCompacting={isCompacting}
+        editSendPending={editSendPending}
         onReviewNote={handleReviewNote}
         isLatestProposePlan={
           message.type === "tool" &&
@@ -1525,24 +1446,20 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
           message.id === latestProposePlanId
         }
         bashOutputGroup={bashOutputGroup}
-        taskReportLinking={taskReportLinkingForMessage}
-        userMessageNavigation={
-          message.type === "user"
-            ? userMessageNavigationByHistoryId?.get(message.historyId)
-            : undefined
-        }
+        taskReportLinking={rowProps.taskReportLinking}
+        userMessageNavigation={rowProps.userMessageNavigation}
       />
     );
 
     return (
       <React.Fragment key={options.key}>
         {options.className ? <div className={options.className}>{messageNode}</div> : messageNode}
-        {bashOutputGroup?.position === "first" && groupKey && (
+        {bashOutputGroup?.position === "first" && bashGroupKey && (
           <BashOutputCollapsedIndicator
             processId={bashOutputGroup.processId}
             collapsedCount={bashOutputGroup.collapsedCount}
-            isExpanded={isGroupExpanded}
-            onToggle={() => toggleBashOutputGroup(groupKey)}
+            isExpanded={rowProps.isBashGroupExpanded}
+            onToggle={() => transcriptRowDerivations.toggleBashOutputGroup(bashGroupKey)}
           />
         )}
         {isAtCutoff && <EditCutoffBarrier />}
@@ -1749,6 +1666,14 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                     // composer surface is replaced with a single read-only notice.
                     <>
                       {turnStatus}
+                      {/* A failed cleanup can leave a flagged row whose checkout is gone (#4983). */}
+                      {meta?.delegatedCreationInterrupted === true && (
+                        <DelegatedCreationInterruptedBanner
+                          key={workspaceId}
+                          workspaceId={workspaceId}
+                          workspaceName={workspaceName}
+                        />
+                      )}
                       <TranscriptOnlyNoticePane
                         workspaceId={workspaceId}
                         heldInputs={workspaceState?.heldInputs ?? NO_HELD_INPUTS}
@@ -1767,6 +1692,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       transcriptReplayFailed={transcriptReplayFailed}
                       runtimeConfig={runtimeConfig}
                       isPreStreamAgentTask={isPreStreamAgentTask}
+                      delegatedCreationInterrupted={meta?.delegatedCreationInterrupted === true}
                       preStreamAgentTaskStatus={
                         meta?.taskStatus === "starting" ? "starting" : "queued"
                       }
@@ -1789,6 +1715,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       onCancelEdit={handleCancelEdit}
                       onEditingMessageChange={updateEditingMessage}
                       onEditLastUserMessage={handleEditLastUserMessageClick}
+                      onEditSendPendingChange={handleEditSendPendingChange}
                       onChatInputReady={handleChatInputReady}
                       queuedMessage={workspaceState?.queuedMessage ?? null}
                       heldInputs={workspaceState?.heldInputs ?? NO_HELD_INPUTS}
@@ -1861,6 +1788,8 @@ interface ChatInputPaneProps {
   revealDecorations: boolean;
   runtimeConfig?: RuntimeConfig;
   isPreStreamAgentTask: boolean;
+  /** The delegated task that created this workspace died before its setup finished (#4983). */
+  delegatedCreationInterrupted: boolean;
   preStreamAgentTaskStatus: "queued" | "starting";
   isCompacting: boolean;
   isStreamStarting: boolean;
@@ -1885,6 +1814,7 @@ interface ChatInputPaneProps {
   onCancelEdit: () => void;
   onEditingMessageChange: (update: (current: EditingMessageState) => EditingMessageState) => void;
   onEditLastUserMessage: () => void;
+  onEditSendPendingChange: (pending: boolean) => void;
   onChatInputReady: (api: ChatInputAPI) => void;
   queuedMessage: QueuedMessageData | null;
   heldInputs: readonly HeldInputData[];
@@ -2031,6 +1961,20 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       node: <ReviewsBanner workspaceId={props.workspaceId} />,
     });
   }
+  if (props.delegatedCreationInterrupted) {
+    addDecorationEntry({
+      key: "delegated-creation-interrupted",
+      node: (
+        <DelegatedCreationInterruptedBanner
+          // Keyed by workspace: ChatPane stays mounted across switches, and one workspace's
+          // pending Remove/Keep or its error must not carry over to another's banner.
+          key={props.workspaceId}
+          workspaceId={props.workspaceId}
+          workspaceName={props.workspaceName}
+        />
+      ),
+    });
+  }
   if (props.isPreStreamAgentTask) {
     addDecorationEntry({
       key: "pre-stream-agent-task",
@@ -2080,6 +2024,7 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         onCancelEdit={props.onCancelEdit}
         onEditingMessageChange={props.onEditingMessageChange}
         onEditLastUserMessage={props.onEditLastUserMessage}
+        onEditSendPendingChange={props.onEditSendPendingChange}
         canInterrupt={props.canInterrupt}
         queuedMessage={props.queuedMessage}
         onQueuedDispatchModeChange={props.onQueuedDispatchModeChange}
@@ -2089,8 +2034,8 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         onReady={props.onChatInputReady}
         attachedReviews={reviews.attachedReviews}
         onAddReview={reviews.addReview}
-        onAcceptRestoredHeldInputs={(heldInputIds) =>
-          storeRaw.acceptRestoredHeldInputs(props.workspaceId, heldInputIds)
+        onAcceptRestoredHeldInputs={(heldInputIds, durable) =>
+          storeRaw.acceptRestoredHeldInputs(props.workspaceId, heldInputIds, durable)
         }
         onDetachReview={reviews.detachReview}
         onDetachAllReviews={reviews.detachAllAttached}

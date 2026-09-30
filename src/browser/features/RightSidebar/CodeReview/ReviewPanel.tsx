@@ -78,7 +78,9 @@ import {
   getReviewSelectedHunkKey,
   getReviewSearchStateKey,
   REVIEW_INCLUDE_UNCOMMITTED_KEY,
+  REVIEW_SEARCH_STATE_MAX_CHARS,
   REVIEW_SORT_ORDER_KEY,
+  REVIEW_SHOW_READ_KEY,
 } from "@/common/constants/storage";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { parseNumstat, buildFileTree, extractNewPath } from "@/common/utils/git/numstatParser";
@@ -818,11 +820,26 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     workspaceStore.getFileModifyingToolMs(workspaceId) !== undefined
   );
 
-  // Unified search state (per-workspace persistence)
-  const [searchState, setSearchState] = usePersistedState<ReviewSearchState>(
-    getReviewSearchStateKey(workspaceId),
+  // Unified search state (per-workspace persistence). The persisted copy is bounded by its key
+  // budget: a search too long for it stays live in memory and persists with an empty input, so the
+  // box keeps accepting input (a refused write would freeze it) but the search is not restored on
+  // reload. A truncated input would restore a different (possibly invalid) regex.
+  const searchStateKey = getReviewSearchStateKey(workspaceId);
+  const [persistedSearchState, setPersistedSearchState] = usePersistedState<ReviewSearchState>(
+    searchStateKey,
     { input: "", useRegex: false, matchCase: false }
   );
+  const [liveSearchState, setLiveSearchState] = useState<{
+    key: string;
+    value: ReviewSearchState;
+  } | null>(null);
+  const searchState =
+    liveSearchState?.key === searchStateKey ? liveSearchState.value : persistedSearchState;
+  const setSearchState = (next: ReviewSearchState) => {
+    setLiveSearchState({ key: searchStateKey, value: next });
+    const fits = JSON.stringify(next).length <= REVIEW_SEARCH_STATE_MAX_CHARS;
+    setPersistedSearchState(fits ? next : { ...next, input: "" });
+  };
   const [debouncedSearchTerm, setDebouncedSearchTerm] = useState("");
 
   // Persist file filter per workspace
@@ -867,7 +884,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   );
 
   // Persist showReadHunks flag globally
-  const [showReadHunks, setShowReadHunks] = usePersistedState("review-show-read", true);
+  const [showReadHunks, setShowReadHunks] = usePersistedState(REVIEW_SHOW_READ_KEY, true);
 
   // Persist sort order globally
   const [sortOrder, setSortOrder] = usePersistedState<ReviewSortOrder>(

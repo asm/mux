@@ -30,6 +30,10 @@ const HOT_COMPONENTS: Record<string, readonly string[]> = {
     "TranscriptBundleRows",
     "useTranscriptBundles",
   ],
+  "src/browser/components/ChatPane/transcriptRowDerivations.ts": [
+    "useTranscriptRowDerivations",
+    "useUserMessageNavigation",
+  ],
   "src/browser/features/Messages/MessageRenderer.tsx": ["MessageRenderer"],
   "src/browser/features/Messages/MessageWindow.tsx": ["MessageWindow"],
   "src/browser/features/Messages/AssistantMessage.tsx": ["AssistantMessage"],
@@ -37,6 +41,7 @@ const HOT_COMPONENTS: Record<string, readonly string[]> = {
   "src/browser/features/Messages/ToolMessage.tsx": ["ToolMessage"],
   "src/browser/features/Messages/ReasoningMessage.tsx": ["ReasoningMessage"],
   "src/browser/features/Messages/MarkdownCore.tsx": ["MarkdownCore"],
+  "src/browser/features/Messages/ChatBarrier/RetryBarrier.tsx": ["RetryBarrierContent"],
   "src/browser/components/ProjectSidebar/ProjectSidebar.tsx": ["ProjectSidebarInner"],
   "src/browser/components/AgentListItem/AgentListItem.tsx": ["AgentListItemInner"],
   "src/browser/components/AppLoader/AppLoader.tsx": [

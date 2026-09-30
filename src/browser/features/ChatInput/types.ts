@@ -59,6 +59,8 @@ export interface ChatInputWorkspaceVariant {
    */
   onEditingMessageChange?: (update: (current: EditingMessageState) => EditingMessageState) => void;
   onEditLastUserMessage?: () => void;
+  /** An edit send started (true) or settled (false); no new edit may start meanwhile. */
+  onEditSendPendingChange?: (pending: boolean) => void;
   canInterrupt?: boolean;
   disabled?: boolean;
   /** Queued follow-up currently waiting during an active workspace stream. */
@@ -75,8 +77,11 @@ export interface ChatInputWorkspaceVariant {
   attachedReviews?: Review[];
   /** Add a review to the workspace's review store, attached to chat input */
   onAddReview?: (data: ReviewNoteData) => Review;
-  /** The composer applied a restore naming these backend held inputs; release them (#4448) */
-  onAcceptRestoredHeldInputs?: (heldInputIds: string[]) => void;
+  /**
+   * The composer applied a restore naming these backend held inputs; release them once `durable`
+   * resolves true, i.e. the backend confirmed the restored draft (#4448)
+   */
+  onAcceptRestoredHeldInputs?: (heldInputIds: string[], durable: Promise<boolean>) => void;
   /** Detach a review from chat input (sets status to pending) */
   onDetachReview?: (reviewId: string) => void;
   /** Detach all attached reviews from chat input */

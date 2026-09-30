@@ -19,7 +19,7 @@ Most providers only need an API key. The UI handles validation and shows which p
 | Provider           | Models                      | Get API Key                                             |
 | ------------------ | --------------------------- | ------------------------------------------------------- |
 | **Anthropic**      | Claude Opus, Sonnet, Haiku  | [console.anthropic.com](https://console.anthropic.com/) |
-| **OpenAI**         | GPT-5, Codex                | [platform.openai.com](https://platform.openai.com/)     |
+| **OpenAI**         | GPT-6                       | [platform.openai.com](https://platform.openai.com/)     |
 | **Google**         | Gemini Pro, Flash           | [aistudio.google.com](https://aistudio.google.com/)     |
 | **xAI**            | Grok                        | [console.x.ai](https://console.x.ai/)                   |
 | **DeepSeek**       | DeepSeek Chat, Reasoner     | [platform.deepseek.com](https://platform.deepseek.com/) |
@@ -309,6 +309,12 @@ Bedrock supports multiple authentication methods (tried in order):
 3. **AWS Credential Chain** - Automatic resolution from environment, `~/.aws/credentials`, SSO, EC2/ECS roles
 
 If you're already authenticated with AWS CLI (`aws sso login`), Xum uses those credentials automatically.
+
+### Anthropic Fast mode
+
+Claude Opus 5.5, Opus 5, and Opus 4.8 support Anthropic's [Fast mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode) research preview: up to 2.5× faster output at 2× token pricing. Toggle it from the thinking selector's **Fast mode** row, the command palette (**Toggle Fast Mode**), or its keyboard shortcut. Xum stores the preference as `"speed": "fast"` under `anthropic` in `providers.jsonc`.
+
+Fast mode is only sent on the direct Anthropic API with an account that has Fast mode access. It is hidden for gateway routes (Xum Gateway, OpenRouter, Bedrock, Coder), custom Anthropic-compatible providers, a non-`api.anthropic.com` base URL, and when Anthropic beta features are disabled for ZDR. Costs are priced from the speed Anthropic reports for each response.
 
 ### OpenRouter Provider Routing
 

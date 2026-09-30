@@ -393,6 +393,7 @@ export class ProviderService {
         store?: unknown;
         webSocketTransportEnabled?: unknown;
         cacheTtl?: unknown;
+        speed?: unknown;
         disableBetaFeatures?: unknown;
         /** OpenAI-only: default auth precedence for Codex-OAuth-allowed models. */
         codexOauthDefaultAuth?: unknown;
@@ -461,7 +462,8 @@ export class ProviderService {
         (serviceTier === "auto" ||
           serviceTier === "default" ||
           serviceTier === "flex" ||
-          serviceTier === "priority");
+          serviceTier === "priority" ||
+          serviceTier === "ultrafast");
       const validXAIServiceTier =
         provider === "xai" && (serviceTier === "default" || serviceTier === "priority");
       if (validOpenAIServiceTier || validXAIServiceTier) {
@@ -474,6 +476,7 @@ export class ProviderService {
         (fastModePreviousServiceTier === "auto" ||
           fastModePreviousServiceTier === "default" ||
           fastModePreviousServiceTier === "flex" ||
+          fastModePreviousServiceTier === "ultrafast" ||
           fastModePreviousServiceTier === "unset");
       const validXAIFastModePreviousTier =
         provider === "xai" &&
@@ -505,6 +508,11 @@ export class ProviderService {
       const cacheTtl = config.cacheTtl;
       if (provider === "anthropic" && (cacheTtl === "5m" || cacheTtl === "1h")) {
         providerInfo.cacheTtl = cacheTtl;
+      }
+
+      // Anthropic-specific: Fast mode preference (only "fast" changes requests).
+      if (provider === "anthropic" && config.speed === "fast") {
+        providerInfo.speed = "fast";
       }
 
       // Anthropic-specific: disable all beta features for ZDR orgs.
@@ -1868,9 +1876,9 @@ export class ProviderService {
           const existingModels = normalizeProviderModelEntries(providerConfig.models);
           if (existingModels.length === 0) {
             providerConfig.models = [
-              "anthropic/claude-sonnet-5",
+              "anthropic/claude-sonnet-5-5",
               "anthropic/claude-opus-5-5",
-              "openai/gpt-5.5",
+              "openai/gpt-6.1-sol",
             ];
           }
         }

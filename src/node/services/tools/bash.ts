@@ -1,6 +1,7 @@
 import { tool } from "ai";
 import assert from "node:assert/strict";
 // NOTE: We avoid readline; consume Web Streams directly to prevent race conditions
+import * as fs from "fs";
 import * as path from "path";
 import {
   BASH_DEFAULT_TIMEOUT_SECS,
@@ -31,6 +32,7 @@ import {
   gitNoRepoAutomationEnv,
   gitNoRepoAutomationEnvForLocalRepo,
   gitNoRepoAutomationEnvForRuntimeRepo,
+  LOCAL_DISCOVERY_AUTOMATION_ERROR,
 } from "@/node/utils/gitNoHooksEnv";
 import { getErrorMessage } from "@/common/utils/errors";
 import { emitChatEventBestEffort } from "./toolUtils";
@@ -870,6 +872,20 @@ export function buildBashToolDescription(cwd: string, projects: ProjectRef[]): s
 }
 
 /**
+ * Local discovery treats `git -C <path>` exit 128 as "not a repository" and returns only the
+ * static env, so a missing directory would silently skip the repo's driver config. Fail
+ * instead; remote discovery already fails on a missing cwd.
+ */
+async function assertLocalRepoDirectoryExists(repoPath: string): Promise<void> {
+  const stats = await fs.promises.stat(repoPath).catch(() => null);
+  if (!stats?.isDirectory()) {
+    throw new Error(LOCAL_DISCOVERY_AUTOMATION_ERROR, {
+      cause: new Error(`Repository directory does not exist: ${repoPath}`),
+    });
+  }
+}
+
+/**
  * Bash execution tool factory for AI assistant
  * Creates a bash tool that can execute commands with a configurable timeout
  * @param config Required configuration including working directory
@@ -919,8 +935,12 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
       // selected by highest-precedence .git/info/attributes on every runtime.
       let hooksEnv: Record<string, string> = {};
       if (!gitHooksAllowed(config.trusted)) {
+        // getProjects() returns one entry even for a single-project workspace, whose cwd is
+        // the checkout itself (or a directory inside it). Only a multi-project cwd (the
+        // _workspaces/<name> container with one <projectName> symlink per checkout) is joined
+        // with project names. The threshold matches isMultiProject().
         const repoPaths =
-          config.projects != null && config.projects.length > 0
+          config.projects != null && config.projects.length > 1
             ? [
                 ...new Set(
                   config.projects.map((project) => path.join(config.cwd, project.projectName))
@@ -929,10 +949,12 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
             : [config.cwd];
         const repoEnvs: Array<Record<string, string>> = [];
         for (const repoPath of repoPaths) {
-          repoEnvs.push(
-            config.runtime instanceof LocalBaseRuntime
-              ? await gitNoRepoAutomationEnvForLocalRepo(repoPath, abortSignal, true)
-              : config.runtime != null
+          if (config.runtime instanceof LocalBaseRuntime) {
+            await assertLocalRepoDirectoryExists(repoPath);
+            repoEnvs.push(await gitNoRepoAutomationEnvForLocalRepo(repoPath, abortSignal, true));
+          } else {
+            repoEnvs.push(
+              config.runtime != null
                 ? await gitNoRepoAutomationEnvForRuntimeRepo(
                     config.runtime,
                     repoPath,
@@ -940,7 +962,8 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
                     true
                   )
                 : gitNoRepoAutomationEnv()
-          );
+            );
+          }
         }
         hooksEnv = combineGitNoRepoAutomationEnvs(repoEnvs);
       }
@@ -1396,13 +1419,22 @@ ${scriptWithEnv}`;
         // If the process already exited, drain the foreground streams for reliable output
         // instead of backgrounding based on timing.
         if (shouldBackground) {
+          // Tracked from here until the command is registered below, terminated after a failed
+          // migration, or found exited: a cleanup() in between waits for it (#4805), including
+          // the awaited name claim and exit grace (#4967). Refused (not admitted) once cleanup
+          // has started for the workspace (#4967).
+          using migration =
+            config.backgroundProcessManager && config.workspaceId
+              ? config.backgroundProcessManager.beginMigration(config.workspaceId)
+              : undefined;
           // Claim the migrated record's name across backends BEFORE the exit check below
           // (#4878): the claim may wait on another backend's spawn lock, and a command that
           // exits during that wait must take the normal completion path, not be reported as
           // backgrounded (or as a failed migration). The lock stays held until the migrated
-          // record directory exists (end of this block).
+          // record directory exists (end of this block). A refused migration claims nothing:
+          // cleanup() is waiting for it, and the lock can be held for its whole timeout.
           const claim =
-            config.backgroundProcessManager && config.workspaceId
+            config.backgroundProcessManager && config.workspaceId && migration?.admitted
               ? await config.backgroundProcessManager.claimMigrationProcessId(
                   config.workspaceId,
                   safeDisplayName
@@ -1423,15 +1455,11 @@ ${scriptWithEnv}`;
             // can outlast the exit (e.g. a grandchild holding stdout open).
             claimLock?.releaseName();
             await claimLock?.[Symbol.asyncDispose]();
+            // Nor is the command migrating any more; cleanup() must not wait for the drain.
+            migration?.[Symbol.dispose]();
             const completed = await foregroundCompletion;
             exitCode = completed[0];
           } else {
-            // Held until the command is registered below or terminated after a failed
-            // migration: a removal's cleanup() in between waits for it (#4805).
-            using _migration =
-              config.backgroundProcessManager && config.workspaceId
-                ? config.backgroundProcessManager.beginMigration(config.workspaceId)
-                : undefined;
             // Detach from abort signal as early as possible - process should continue running
             // even when the stream ends and fires abort.
             abortDetached = true;
@@ -1458,7 +1486,11 @@ ${scriptWithEnv}`;
 
             // Migrate to background tracking if manager is available
             let migrationError =
-              claim?.success === false ? claim.error : "background process manager unavailable";
+              migration?.admitted === false
+                ? "the workspace's background processes are being cleaned up"
+                : claim?.success === false
+                  ? claim.error
+                  : "background process manager unavailable";
             if (config.backgroundProcessManager && config.workspaceId && claimLock) {
               const processId = claimLock.processId;
 

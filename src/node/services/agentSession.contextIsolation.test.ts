@@ -9,6 +9,8 @@ import {
 import { Ok } from "@/common/types/result";
 import assert from "@/common/utils/assert";
 import type { ContinuousCompactor } from "./continuousCompactor";
+import type { MessageQueue } from "./messageQueue";
+import { CONTEXT_WARNING_DEDUPE_KEY } from "@/common/constants/contextBudget";
 
 const harnesses: AgentSessionHarness[] = [];
 
@@ -32,7 +34,7 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
   });
   harnesses.push(budget);
   spyOn(continuous.aiService, "isExperimentEnabled").mockImplementation(
-    (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET
+    (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
   );
   // The default single-session harness closes handles with its first session's signal.
   // Shared AI dependencies must instead retain each workspace's physical stream lifetime.
@@ -53,10 +55,11 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
   const budgetState = Reflect.get(
     Reflect.get(budget.session, "contextController") as object,
     "tokenBudget"
-  ) as {
-    contextBudgetGeneration: number;
-    pendingBudgetPrompt?: "warn" | "handoff";
-  };
+  ) as { contextBudgetGeneration: number };
+  const handoffQueued = () =>
+    (budget.session as unknown as { messageQueue: MessageQueue }).messageQueue.hasDedupeKey(
+      CONTEXT_WARNING_DEDUPE_KEY
+    );
   const model = "openai:gpt-4o";
   expect(
     (
@@ -83,30 +86,30 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
   expect(
     await settle?.({
       model,
-      usage: { inputTokens: 85_000, outputTokens: 10, totalTokens: 85_010 },
+      usage: { inputTokens: 90_000, outputTokens: 10, totalTokens: 90_010 },
       toolResultChars: 0,
       imageParts: 0,
       sessionHistoryAvailable: true,
-      memoryWritable: true,
+      newContextAvailable: true,
     })
   ).toMatchObject({ decision: "warn" });
   // Settlement queues intent; only durable publication claims an advisory. Another
   // workspace changing its compaction threshold must leave this pending intent intact.
-  expect(budgetState.pendingBudgetPrompt).toBe("warn");
+  expect(handoffQueued()).toBe(true);
 
   const budgetGeneration = budgetState.contextBudgetGeneration;
   // The threshold is a per-model user preference in the shared config, not session state:
   // this change reaches both sessions, but only the continuous compactor has anything to reset.
   await seedAutoCompactionThreshold(continuous.config, model, 80);
   expect(budgetState.contextBudgetGeneration).toBe(budgetGeneration);
-  expect(budgetState.pendingBudgetPrompt).toBe("warn");
+  expect(handoffQueued()).toBe(true);
   const continuousGeneration: unknown = Reflect.get(
     continuousState.contextController.continuous.continuousCompactor,
     "generation"
   );
   assert(typeof continuousGeneration === "number", "The compactor must have a generation fence");
   expect((await budget.session.interruptStream({ abandonPartial: true })).success).toBe(true);
-  expect(budgetState.pendingBudgetPrompt).toBeUndefined();
+  expect(handoffQueued()).toBe(false);
   expect(
     Reflect.get(continuousState.contextController.continuous.continuousCompactor, "generation")
   ).toBe(continuousGeneration);

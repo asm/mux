@@ -3,7 +3,9 @@ import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget"
 import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./contextBudgetError";
 import {
   checkAssembledRequestBudgetForModel,
-  estimateAssembledRequestTokensForModel,
+  createContextBudgetAnchor,
+  estimateAnchoredRequestTokensForModel,
+  type ContextBudgetAnchorRequest,
   estimateToolResultTokensForModel,
 } from "./contextBudgetCounting";
 import {
@@ -21,7 +23,7 @@ import {
   streamText,
   type stepCountIs,
   type ModelMessage,
-  type SystemModelMessage,
+  type Instructions,
   type LanguageModel,
   type Tool,
   type ToolSet,
@@ -61,7 +63,7 @@ import {
   findFirstReasoningPartIndexInTrailingRun,
   mergeReasoningProviderOptions,
   reasoningProviderOptionsFromMetadata,
-  stripOpenAIReasoningReplay,
+  stripReasoningReplay,
   type ReasoningProviderMetadata,
 } from "@/node/utils/messages/reasoningProviderOptions";
 import {
@@ -120,6 +122,7 @@ import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/me
 import { neutralizeAgentEnvelopeLookalikesInModelToolParts } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
 import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
+import { stripAnthropicReasoning } from "@/browser/utils/messages/modelMessageTransform";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";
 import { getModelStats, getModelStatsResolved } from "@/common/utils/tokens/modelStats";
@@ -288,7 +291,8 @@ export interface SettledStepBudget {
    */
   nextRequestTokens?: number;
   sessionHistoryAvailable: boolean;
-  memoryWritable: boolean;
+  /** The step's request advertised `new_context`, so the final prompt can be acted on. */
+  newContextAvailable: boolean;
   /** A successful `new_context` result settled in this step (its siblings included). */
   newContextRequested?: boolean;
 }
@@ -297,8 +301,8 @@ export type ContextBudgetStepDecision = "continue" | "warn" | "rollover" | "bloc
 
 /**
  * Budget verdict for a settled step. `continuationEntryId` is the exact queue entry the session
- * designated to continue the turn when it decided to stop (its enqueued "Continue"/flush, or the
- * paired rollover behind a flush turn); absent when the stop hands over to nothing in particular.
+ * designated to continue the turn when it decided to stop (its enqueued "Continue"); absent when
+ * the stop hands over to nothing in particular.
  */
 export interface SettledStepOutcome {
   decision: ContextBudgetStepDecision;
@@ -347,7 +351,7 @@ interface StreamRequestOptions {
   model: LanguageModel;
   modelString: string;
   messages: ModelMessage[];
-  system: string | SystemModelMessage | undefined;
+  system: Instructions | undefined;
   tools?: Record<string, Tool>;
   providerOptions?: Record<string, unknown>;
   maxOutputTokens?: number;
@@ -359,7 +363,6 @@ interface StreamRequestOptions {
   onChunk?: StreamTextOnChunk;
   onStepMessages?: (messages: ModelMessage[]) => void;
   onStepSettled?: OnStepSettled;
-  contextBudgetMemoryWritable?: boolean;
   contextBudgetLimit?: number;
   toolSearchState?: ToolSearchStreamState;
   thinkingOverrideState?: ActiveTurnThinkingOverride;
@@ -447,13 +450,34 @@ function transformStepMessages(messages: ModelMessage[]): Promise<ModelMessage[]
   );
 }
 
+function sendsBetweenToolsThinking(providerOptions: Record<string, unknown> | undefined): boolean {
+  const anthropic = providerOptions?.anthropic;
+  if (typeof anthropic !== "object" || anthropic === null || !("thinking" in anthropic)) {
+    return false;
+  }
+  const thinking = anthropic.thinking;
+  return (
+    typeof thinking === "object" &&
+    thinking !== null &&
+    "type" in thinking &&
+    thinking.type === "between_tools"
+  );
+}
+
 interface StepMessageTracker {
   workspaceId?: string;
+  /** The latest step's request, anchoring the next estimate on its provider usage (#4858). */
+  contextBudgetRequest?: ContextBudgetAnchorRequest;
   pendingPrefixSwap?: ContinuousPrefixSwap;
   consumedPrefixSwap?: ContinuousPrefixSwap;
   prefixSwapInvalidated?: boolean;
   prefixSwapInvalidationEmitted?: boolean;
   latestMessages?: ModelMessage[];
+  /**
+   * Set once a step of this turn prepared a provider request. Fallback and retry streams
+   * reuse the tracker, so their step 0 is not the turn's first request (#5279).
+   */
+  providerRequestPrepared?: boolean;
   /** Present only when Auto set this turn's thinking level; shared across fallback hops. */
   autoThinkingEscalation?: AutoThinkingEscalationState;
 }
@@ -467,7 +491,7 @@ interface StreamRequestConfig {
   /** Per-step consent verdict for routed project-skill turns (see TurnExecutionOptions). */
   preDispatchConsentGate?: PreDispatchConsentGate;
   /** Provider-ready system instructions from TurnContextAssembler. */
-  system?: string | SystemModelMessage;
+  system?: Instructions;
   tools?: Record<string, Tool>;
   providerOptions?: Record<string, unknown>;
   /** Per-request HTTP headers (e.g., anthropic-beta for 1M context). */
@@ -481,7 +505,6 @@ interface StreamRequestConfig {
   /** Optional hook for callers that need the live prepared step transcript. */
   onStepMessages?: (messages: ModelMessage[]) => void;
   onStepSettled?: OnStepSettled;
-  contextBudgetMemoryWritable?: boolean;
   contextBudgetLimit?: number;
   toolPolicy?: ToolPolicy;
   /**
@@ -519,7 +542,6 @@ interface StreamRequestConfig {
  * verbatim would leak provider-specific options/messages across providers).
  */
 interface PreparedModelFallback {
-  contextBudgetMemoryWritable?: boolean;
   contextBudgetLimit?: number;
   model: LanguageModel;
   /** Canonical model string of the fallback attempt (drives metadata + tokenizer). */
@@ -527,7 +549,7 @@ interface PreparedModelFallback {
   /** Messages re-prepared for the fallback model's provider. */
   messages: ModelMessage[];
   /** Provider-ready system prompt rebuilt for the fallback model. */
-  system: string | SystemModelMessage | undefined;
+  system: Instructions | undefined;
   /**
    * Tools rebuilt for the fallback model. Required (even if undefined for a
    * tool-less stream) so callers cannot silently reuse the source model's
@@ -539,12 +561,6 @@ interface PreparedModelFallback {
   headers?: Record<string, string | undefined>;
   callSettingsOverrides?: ResolvedCallSettingsOverrides;
   thinkingLevel?: string;
-  /**
-   * Output cap for the fallback attempt when it must differ from the source request's (the
-   * context-budget flush sizes its cap for each model's own thinking level). Otherwise the
-   * original cap carries over.
-   */
-  maxOutputTokens?: number;
   /** Route attribution corrections (routedThroughGateway, routeProvider, costsIncluded). */
   initialMetadataPatch?: Partial<MuxMetadata>;
   /**
@@ -657,6 +673,11 @@ const OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN = /Item with id 'rs_[A-Za-z0-9_-]+
 // "The encrypted content [for item rs_…] <blob> could not be verified. Reason: …"
 const OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN =
   /encrypted content\b[\s\S]*?\bcould not be verified/;
+// Anthropic rejecting a replayed thinking signature, e.g. Opus 5.5 binding the
+// block to a system prompt or tool list that has since changed (hot memories
+// and the memory index live there). Routes without the drop_block control
+// (Coder gateway, custom providers) otherwise fail every retry identically.
+const ANTHROPIC_THINKING_SIGNATURE_INVALID_PATTERN = /Invalid `signature` in `thinking` block/;
 
 // Use the resolved SDK model, not the requested prefix: OpenAI Responses can
 // arrive through direct, custom, Coder, or Vercel gateway routes. xAI Responses
@@ -666,6 +687,16 @@ function isOpenAIResponsesModel(model: LanguageModel): boolean {
   return (
     model.provider === "openai.responses" ||
     (model.provider === "gateway" && model.modelId.startsWith("openai/"))
+  );
+}
+
+// Same idea for the Anthropic Messages wire, whose converter replays thinking
+// from the `anthropic` providerOptions namespace on every route.
+function isAnthropicMessagesModel(model: LanguageModel): boolean {
+  if (typeof model === "string") return false;
+  return (
+    model.provider === "anthropic.messages" ||
+    (model.provider === "gateway" && model.modelId.startsWith("anthropic/"))
   );
 }
 
@@ -876,7 +907,7 @@ interface WorkspaceStreamInfo {
   // stream-end prefers cumulative usage across attempts instead of the final
   // attempt's totalUsage only.
   didRetryAfterEmptyOutput?: boolean;
-  // Same for a step-boundary retry without OpenAI reasoning replay.
+  // Same for a step-boundary retry without rejected reasoning replay.
   didRetryReasoningReplayAtStep?: boolean;
   // Refusal-fallback chain state. `original` keeps the pre-wrap request inputs
   // (as passed by TurnRequestBuilder) that prepare() does not rebuild, so the request can
@@ -2516,7 +2547,6 @@ export class StreamManager {
       onChunk,
       onStepMessages,
       onStepSettled,
-      contextBudgetMemoryWritable,
       contextBudgetLimit,
       toolSearchState,
       onToolExecutionStart,
@@ -2574,7 +2604,6 @@ export class StreamManager {
       onChunk,
       onStepMessages,
       onStepSettled,
-      contextBudgetMemoryWritable,
       contextBudgetLimit,
       toolPolicy,
       toolSearchState,
@@ -2595,7 +2624,6 @@ export class StreamManager {
       | "onStepSettled"
       | "modelString"
       | "tools"
-      | "contextBudgetMemoryWritable"
       | "budgetMetadataModel"
       | "contextBudgetLimit"
       | "system"
@@ -2676,7 +2704,7 @@ export class StreamManager {
             request.contextBudgetLimit == null
               ? undefined
               : (
-                  await estimateAssembledRequestTokensForModel(
+                  await estimateAnchoredRequestTokensForModel(
                     {
                       system: request.system,
                       messages: await transformStepMessages([
@@ -2693,7 +2721,10 @@ export class StreamManager {
                       metadataModel: request.budgetMetadataModel,
                       modelContextLimit: request.contextBudgetLimit,
                       activeTools: computeActiveToolNames(request.toolSearchState),
-                    }
+                    },
+                    // prepareStep anchors the next step on this same request and usage, so both
+                    // measures take the same anchored-or-full branch and the invariant holds.
+                    createContextBudgetAnchor(stepTracker?.contextBudgetRequest, step)
                   )
                 )?.estimate;
           const { decision, continuationEntryId } = await request.onStepSettled({
@@ -2704,7 +2735,7 @@ export class StreamManager {
             toolResultTokens,
             ...(nextRequestTokens != null ? { nextRequestTokens } : {}),
             sessionHistoryAvailable: request.tools?.session_history != null,
-            memoryWritable: request.contextBudgetMemoryWritable === true,
+            newContextAvailable: request.tools?.new_context != null,
             newContextRequested: step.toolResults.some(
               (result) => result.toolName === "new_context" && isSuccessfulOutput(result.output)
             ),
@@ -2758,7 +2789,8 @@ export class StreamManager {
    * undefined when there is nothing to apply.
    */
   private applyPendingThinkingOverride(
-    request: StreamRequestConfig
+    request: StreamRequestConfig,
+    beforeFirstStep: boolean
   ): Record<string, unknown> | undefined {
     const state = request.thinkingOverrideState;
     const pending = state?.pending;
@@ -2770,7 +2802,7 @@ export class StreamManager {
     if (rebuild == null) {
       return undefined;
     }
-    const rebuilt = rebuild(pending);
+    const rebuilt = rebuild(pending, beforeFirstStep);
     if (rebuilt == null) {
       log.debug("Mid-turn thinking override skipped (not applicable / no-op)", {
         requestedLevel: pending,
@@ -2879,6 +2911,11 @@ export class StreamManager {
     // Explicit <ToolSet> pins RUNTIME_CONTEXT to its default: mux tools use
     // Tool's `any` context, which would otherwise infect the inferred result
     // type (no-unsafe-return).
+    // #5086: see the `between_tools` replay guard in prepareStep.
+    let previousToolSetKey: string | undefined;
+    let seenPrefixSwap: ContinuousPrefixSwap | undefined;
+    // Outgoing rows before this index predate the latest in-turn prefix change.
+    let reasoningReplayBoundary = 0;
     return (this.streamTextOverride ?? streamText)<ToolSet>({
       model: request.model,
       messages: request.messages,
@@ -2888,7 +2925,7 @@ export class StreamManager {
       // Trusted: mux builds these messages server-side.
       allowSystemInMessages: true,
       abortSignal: abortController.signal,
-      prepareStep: async ({ messages: stepMessages, stepNumber }) => {
+      prepareStep: async ({ messages: stepMessages, stepNumber, steps }) => {
         // streamText runs multiple internal LLM calls (steps) when tools are enabled.
         const rewritten = await transformStepMessages(stepMessages);
         let effectiveMessages = rewritten === stepMessages ? stepMessages : rewritten;
@@ -2976,8 +3013,13 @@ export class StreamManager {
             : undefined;
         const activeTools = forceFirstStepTools ?? searchedActiveTools;
         // Mid-turn thinking-level change: consume a pending override before
-        // this step's provider request is built.
-        const thinkingOverride = this.applyPendingThinkingOverride(request);
+        // this step's provider request is built. Before the turn's first request it
+        // resolves as at turn start (#5279); without a tracker, assume a step ran.
+        const thinkingOverride = this.applyPendingThinkingOverride(
+          request,
+          stepTracker != null && stepNumber === 0 && !stepTracker.providerRequestPrepared
+        );
+        if (stepTracker) stepTracker.providerRequestPrepared = true;
         if (escalation && escalationState) {
           // The rebuild clamps to the model's ladder and reports a no-op as "not applicable";
           // only a level that actually changed is provenance, at the level it changed to (a
@@ -3059,19 +3101,60 @@ export class StreamManager {
             throw new Error(formatSendMessageError(consentError).message);
           }
         }
+        // #5086: `between_tools` cannot carry blockBinding, so a replayed in-turn
+        // thinking block stays valid only while everything before it is unchanged.
+        // A consumed prefix swap or a change to the advertised tool set edits that
+        // prefix, so rows sent up to that step never replay reasoning again. Blocks
+        // produced after it are bound to the new prefix and keep replaying (#5279).
+        const toolSetKey = activeTools === undefined ? "" : [...activeTools].sort().join("\n");
+        const consumedSwap = stepTracker?.consumedPrefixSwap;
+        const outgoing = rebuiltFirstStepMessages ?? effectiveMessages;
+        if (
+          (consumedSwap != null && consumedSwap !== seenPrefixSwap) ||
+          (previousToolSetKey !== undefined && toolSetKey !== previousToolSetKey)
+        ) {
+          // Kept at the unstripped length: if stripping drops reasoning-only rows, the
+          // boundary covers a few later rows too, which only strips more (fail safe).
+          reasoningReplayBoundary = outgoing.length;
+        }
+        seenPrefixSwap = consumedSwap;
+        previousToolSetKey = toolSetKey;
+        if (
+          sendsBetweenToolsThinking(request.providerOptions) &&
+          outgoing.some(
+            (message, index) =>
+              index < reasoningReplayBoundary &&
+              message.role === "assistant" &&
+              typeof message.content !== "string" &&
+              message.content.some((part) => part.type === "reasoning")
+          )
+        ) {
+          const stripped = [
+            ...stripAnthropicReasoning(outgoing.slice(0, reasoningReplayBoundary)),
+            ...outgoing.slice(reasoningReplayBoundary),
+          ];
+          if (rebuiltFirstStepMessages != null) {
+            rebuiltFirstStepMessages = stripped;
+          } else {
+            effectiveMessages = stripped;
+          }
+        }
+        // Taken before this step records its own request; step zero has no settled step.
+        const previousRequest = stepNumber > 0 ? stepTracker?.contextBudgetRequest : undefined;
+        const budgetRequest: ContextBudgetAnchorRequest = {
+          model: request.modelString,
+          metadataModel: request.budgetMetadataModel,
+          system: request.system,
+          tools: request.tools,
+          activeTools,
+          messages: rebuiltFirstStepMessages ?? effectiveMessages,
+        };
+        if (stepTracker) stepTracker.contextBudgetRequest = budgetRequest;
         if (request.contextBudgetLimit != null) {
           const exceeded = await checkAssembledRequestBudgetForModel(
-            {
-              system: request.system,
-              messages: rebuiltFirstStepMessages ?? effectiveMessages,
-              tools: request.tools,
-            },
-            {
-              model: request.modelString,
-              metadataModel: request.budgetMetadataModel,
-              modelContextLimit: request.contextBudgetLimit,
-              activeTools,
-            }
+            budgetRequest,
+            { ...budgetRequest, modelContextLimit: request.contextBudgetLimit },
+            createContextBudgetAnchor(previousRequest, steps.at(-1))
           );
           // Step zero can follow executed tools on a fallback. This late hard stop
           // preserves settled results; it must not reset/replay the activated catalog.
@@ -3997,7 +4080,7 @@ export class StreamManager {
       system: prepared.data.system,
       tools: prepared.data.tools,
       providerOptions: prepared.data.providerOptions,
-      maxOutputTokens: prepared.data.maxOutputTokens ?? fallbackState.original.maxOutputTokens,
+      maxOutputTokens: fallbackState.original.maxOutputTokens,
       callSettingsOverrides: prepared.data.callSettingsOverrides,
       toolPolicy: streamInfo.request.toolPolicy,
       hasQueuedMessages: streamInfo.request.hasQueuedMessages,
@@ -4006,7 +4089,6 @@ export class StreamManager {
       onChunk: streamInfo.request.onChunk,
       onStepMessages: streamInfo.request.onStepMessages,
       onStepSettled: streamInfo.request.onStepSettled,
-      contextBudgetMemoryWritable: prepared.data.contextBudgetMemoryWritable,
       contextBudgetLimit: prepared.data.contextBudgetLimit,
       // The fallback attempt ships the same routed project-skill turn: the
       // per-step consent gate must ride along or the fallback provider gets
@@ -5016,7 +5098,7 @@ export class StreamManager {
               didRetryPreviousResponseId = true;
               retried = true;
             } else if (
-              await this.retryStreamWithoutOpenAIReasoningReplay(
+              await this.retryStreamWithoutReasoningReplay(
                 workspaceId,
                 streamInfo,
                 error,
@@ -5155,11 +5237,11 @@ export class StreamManager {
     let errorType = this.categorizeError(actualError);
 
     // A matching rejection that reaches failure handling is final: the one-shot
-    // repair (retryStreamWithoutOpenAIReasoningReplay) already ran, or was
+    // repair (retryStreamWithoutReasoningReplay) already ran, or was
     // unsafe/no-op. Its generic `api` class is auto-retryable, and every outer
     // retry would resend the same rejected input, so classify it terminal.
     // Only this exact shape is reclassified; a later 503/401/429 keeps its own.
-    if (this.isOpenAIReasoningReplayRejection(error, streamInfo.request.model)) {
+    if (this.getReasoningReplayRejection(error, streamInfo.request.model) != null) {
       errorType = "reasoning_rejected";
     }
 
@@ -5539,13 +5621,29 @@ export class StreamManager {
   // These deterministic rejections survive encrypted-only replay: cross-org
   // blobs and same-turn reasoning references from a flapping route. Keep the
   // match narrow so unrelated provider errors retain their normal retry policy.
-  private isOpenAIReasoningReplayRejection(error: unknown, model: LanguageModel): boolean {
+  // Returns the providerOptions namespace whose replayed reasoning was rejected.
+  private getReasoningReplayRejection(
+    error: unknown,
+    model: LanguageModel
+  ): "openai" | "anthropic" | null {
     // The SDK can exhaust its own retries on a synthetic stream-error 500.
     // Classify only the final cause; earlier failures must not taint a later one.
     if (RetryError.isInstance(error)) {
       error = error.lastError;
     }
     const statusCode = this.extractStatusCode(error);
+    // Gateways can drop the structured code and forward only the message.
+    const texts = [
+      APICallError.isInstance(error) ? error.responseBody : undefined,
+      error instanceof Error ? error.message : undefined,
+    ];
+    const mentions = (pattern: RegExp) =>
+      texts.some((text) => typeof text === "string" && pattern.test(text));
+    if (isAnthropicMessagesModel(model)) {
+      return statusCode === 400 && mentions(ANTHROPIC_THINKING_SIGNATURE_INVALID_PATTERN)
+        ? "anthropic"
+        : null;
+    }
     // WebSocket/SSE validation errors have no HTTP failure status. The SDK
     // assigns 500 to code-less frames, including missing reasoning references.
     const isStreamError =
@@ -5557,31 +5655,22 @@ export class StreamManager {
         "type" in error.data &&
         (error.data.type === "error" || error.data.type === "response.failed"));
     if (statusCode !== 400 && statusCode !== 404 && !(statusCode === 500 && isStreamError)) {
-      return false;
+      return null;
     }
     if (!isOpenAIResponsesModel(model)) {
-      return false;
+      return null;
     }
-    if (this.extractErrorCode(error) === "invalid_encrypted_content") {
-      return true;
-    }
-    // Gateways can drop the structured code and forward only the message.
-    const texts = [
-      APICallError.isInstance(error) ? error.responseBody : undefined,
-      error instanceof Error ? error.message : undefined,
-    ];
-    return texts.some(
-      (text) =>
-        typeof text === "string" &&
-        (OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN.test(text) ||
-          OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN.test(text))
-    );
+    return this.extractErrorCode(error) === "invalid_encrypted_content" ||
+      mentions(OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN) ||
+      mentions(OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN)
+      ? "openai"
+      : null;
   }
 
   // Mirror previousResponseId recovery without repeating emitted output or
   // completed tools. The repair budget belongs to this attempt, so a manual
   // continuation may try again after the user changes route or credentials.
-  private async retryStreamWithoutOpenAIReasoningReplay(
+  private async retryStreamWithoutReasoningReplay(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
     error: unknown,
@@ -5601,7 +5690,8 @@ export class StreamManager {
       return false;
     }
 
-    if (!this.isOpenAIReasoningReplayRejection(error, streamInfo.request.model)) {
+    const rejectedNamespace = this.getReasoningReplayRejection(error, streamInfo.request.model);
+    if (rejectedNamespace == null) {
       return false;
     }
 
@@ -5612,7 +5702,9 @@ export class StreamManager {
       return false;
     }
     const sourceMessages = stepMessages ?? streamInfo.request.messages;
-    const messages = stripOpenAIReasoningReplay(sourceMessages);
+    // Strip every block of the namespace, not just the one the error names:
+    // removing one changes the prefix later blocks were bound to.
+    const messages = stripReasoningReplay(sourceMessages, rejectedNamespace);
     if (messages === sourceMessages) {
       return false;
     }
@@ -5627,9 +5719,10 @@ export class StreamManager {
       streamInfo.didRetryReasoningReplayAtStep = true;
     }
 
-    workspaceLog.info("Retrying stream without OpenAI reasoning replay", {
+    workspaceLog.info("Retrying stream without rejected reasoning replay", {
       messageId: streamInfo.messageId,
       model: streamInfo.model,
+      rejectedNamespace,
       retryScope: hasParts ? "step" : "stream",
       errorCode,
       statusCode,

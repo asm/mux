@@ -18,7 +18,7 @@ import {
 import type { Toast } from "@/browser/features/ChatInput/ChatInputToast";
 import { ConnectionStatusToast } from "@/browser/components/ConnectionStatusToast/ConnectionStatusToast";
 import { ChatInputToast } from "@/browser/features/ChatInput/ChatInputToast";
-import type { SendMessageError } from "@/common/types/errors";
+import { SendMessageErrorSchema } from "@/common/orpc/schemas/errors";
 import { createErrorToast } from "@/browser/features/ChatInput/ChatInputToasts";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
@@ -168,7 +168,6 @@ import type {
 } from "./types";
 import { CreationControls } from "./CreationControls";
 import { SEND_DISPATCH_MODES } from "./sendDispatchModes";
-import { CodexOauthWarningBanner } from "./CodexOauthWarningBanner";
 import { useCreationWorkspace } from "./useCreationWorkspace";
 import { useCoderConfigChangeHandler } from "./useCoderConfigChangeHandler";
 import { useCoderWorkspace } from "@/browser/hooks/useCoderWorkspace";
@@ -199,6 +198,7 @@ import { normalizeAgentId } from "@/common/utils/agentIds";
 import { isGoalRunning } from "@/common/types/goal";
 import { appendStagedAttachmentNotice, getStagedAttachments } from "./stagedAttachments";
 import type { ChatAttachment } from "./ChatAttachments";
+import { joinDraftText, removeSentText } from "./composerDraftText";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import {
   consumeAiSelectionIntent,
@@ -220,6 +220,7 @@ import {
   useComposerAttachments,
 } from "./useComposerAttachments";
 import { useComposerDraft } from "./useComposerDraft";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { useComposerSuggestions } from "./useComposerSuggestions";
 import { isRestoredDraftDurable } from "./restoredDraftDurability";
 import {
@@ -253,6 +254,8 @@ interface InternalSendOverrides extends SendOverrides {
 interface ReviewsForSend {
   data: ReviewNoteDataForDisplay[] | undefined;
   ids: string[];
+  /** The attached notes could not be loaded, so none are included (#5011). */
+  unavailable?: boolean;
 }
 
 /**
@@ -298,6 +301,16 @@ function pendingChatAttachments(
     id: `${attachmentKeyPrefix}-staged-${index}`,
   }));
   return [...providerAttachments, ...stagedAttachments];
+}
+
+/** One edit, from entering edit mode until it is cancelled or its send is accepted (#5226). */
+interface EditSession {
+  id: string;
+  /** The unsent draft from before the edit, restored when the edit ends. */
+  preEditDraft: { text: string; attachments: ChatAttachment[] };
+  preEditReviews: ReviewNoteDataForDisplay[] | null;
+  /** Its draft was given back (cancel, or accepted send); it restores nothing again. */
+  settled: boolean;
 }
 
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
@@ -464,14 +477,22 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // late failures (e.g., slow devcontainer startup) still surface a toast.
   const pendingErrorKey =
     variant === "workspace" && workspaceId ? getPendingWorkspaceSendErrorKey(workspaceId) : null;
-  const [pendingError, setPendingError] = usePersistedState<SendMessageError | null>(
+  // Typed as unknown: localStorage can hold anything (another build, a hand edit), and an
+  // invalid error used to crash the workspace view in createErrorToast (#5007).
+  const [pendingError, setPendingError] = usePersistedState<unknown>(
     pendingErrorKey ?? "__unused__",
     null,
     { listener: true }
   );
   useEffect(() => {
-    if (!pendingErrorKey || !pendingError) return;
-    setToast(createErrorToast(pendingError));
+    if (!pendingErrorKey || pendingError == null) return;
+    const parsed = SendMessageErrorSchema.safeParse(pendingError);
+    if (parsed.success) {
+      setToast(createErrorToast(parsed.data));
+    } else {
+      // Self-heal: drop the malformed value (cleared below) instead of throwing.
+      console.warn("Dropping malformed pending send error:", parsed.error);
+    }
     setPendingError(null);
   }, [pendingErrorKey, pendingError, setPendingError]);
 
@@ -488,9 +509,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     pushToast,
   });
   const { input, setInput, attachments, setAttachments, draftReviews, setDraftReviews } = draft;
-  const { getDraft, setDraft, preEditDraftRef, preEditReviewsRef } = draft;
+  const { getDraft, setDraft } = draft;
   const { reviewOverrideActive, reviewData, reviewIdsForCheck, reviewPanelItems } = draft;
-  const { removeDraftReview, updateDraftReviewNote, storageKeys, latestInputValueRef } = draft;
+  const { removeDraftReview, updateDraftReviewNote, draftScope, latestInputValueRef } = draft;
   const {
     processingAttachmentCount,
     handlePaste,
@@ -595,15 +616,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const composerSurfaceStyle: React.CSSProperties & { "--composer-focus-border": string } = {
     "--composer-focus-border": agentColor,
   };
-  const {
-    models,
-    hiddenModelsForSelector,
-    ensureModelInSettings,
-    defaultModel,
-    setDefaultModel,
-    codexOauthSet,
-    requiresCodexOauth,
-  } = useModelsFromSettings();
+  const { models, hiddenModelsForSelector, ensureModelInSettings, defaultModel, setDefaultModel } =
+    useModelsFromSettings();
 
   const [agentAiDefaults] = usePersistedState<AgentAiDefaults>(
     AGENT_AI_DEFAULTS_KEY,
@@ -717,7 +731,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       ? calculateTokenMeterData(lastUsage, contextDisplayModel, use1M, false, providersConfig)
       : { segments: [], totalTokens: 0, totalPercentage: 0 };
   }, [lastUsage, contextDisplayModel, use1M, providersConfig]);
-  const autoCompactionProps = useAutoCompactionSettings(workspaceIdForUsage, contextDisplayModel);
+  const autoCompactionSettings = useAutoCompactionSettings(
+    workspaceIdForUsage,
+    contextDisplayModel
+  );
+  const autoCompactionProps = {
+    ...autoCompactionSettings,
+    modelContextLimit: contextUsageData.maxTokens,
+  };
 
   // Idle compaction settings (per-project, persisted to backend for idleCompactionService)
   const { hours: idleCompactionHours, setHours: setIdleCompactionHours } = useIdleCompactionHours({
@@ -1201,10 +1222,54 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     [applyDraftFromPending, focusMessageInput, setDraftReviews]
   );
 
-  const restorePreEditDraft = useCallback(() => {
-    setDraft(preEditDraftRef.current);
-    setDraftReviews(preEditReviewsRef.current);
-  }, [preEditDraftRef, preEditReviewsRef, setDraft, setDraftReviews]);
+  // The latest edit's session. Settled explicitly: the edit target also leaves the live
+  // transcript when the accepted edit replaces it (possibly before the send returns), and that
+  // is not a cancel.
+  const editSessionRef = useRef<EditSession | null>(null);
+  // Live review override for completions that settle after the render they started in.
+  const draftReviewsRef = useRef(draftReviews);
+  useLayoutEffect(() => {
+    draftReviewsRef.current = draftReviews;
+  });
+  const restorePreEditDraft = () => {
+    const session = editSessionRef.current;
+    if (!session || session.settled || session.id !== editingMessageIdRef.current) return;
+    session.settled = true;
+    setDraft(session.preEditDraft);
+    setDraftReviews(session.preEditReviews);
+  };
+
+  // Completing an edit sends the edited message; the unsent draft from before the edit comes
+  // back as on cancel, so typed input is never lost (#5155). Functional updates keep anything
+  // typed while the send was in flight, after the restored draft; restored notes join notes
+  // attached meanwhile. Not for an edit the user cancelled meanwhile: it got its draft back. No
+  // edit starts while the send is pending (#5226). `dropEditReviews`: an editing command's send
+  // leaves the edit's own notes in the composer; they are replaced, not merged.
+  const restorePreEditDraftAfterSend = (
+    session: EditSession | null,
+    dropEditReviews = false
+  ): boolean => {
+    if (!session || session.settled) return false;
+    session.settled = true;
+    const { preEditDraft, preEditReviews } = session;
+    if (dropEditReviews) setDraftReviews(null);
+    setInput((current) => joinDraftText(preEditDraft.text, current));
+    if (preEditDraft.attachments.length > 0) {
+      setAttachments((current) => [...preEditDraft.attachments, ...current]);
+    }
+    if (preEditReviews !== null) {
+      if ((dropEditReviews || draftReviewsRef.current === null) && onAddReviewForRestore) {
+        // The notes in effect live in the review store: add the restored ones there too.
+        for (const review of preEditReviews) onAddReviewForRestore(review);
+      } else {
+        setDraftReviews((current) => [...preEditReviews, ...(current ?? [])]);
+      }
+    }
+    return true;
+  };
+  // By identity, not row id: a row reopened after a cancel is a new edit.
+  const isOpenEditOrNone = (session: EditSession | null) =>
+    editingMessageIdRef.current === undefined || editSessionRef.current === session;
 
   // Method to restore text to input (used by compaction cancel)
   const restoreText = useCallback(
@@ -1301,15 +1366,29 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // re-applying would clobber the in-progress edit text. The applied-id ref makes that
   // explicit instead of hiding the callbacks from the dependency list.
   const appliedEditIdRef = useRef<string | null>(null);
+  const draftPayloadsLoaded = draft.payloadsLoaded;
   useEffect(() => {
     if (!editingMessage) {
       appliedEditIdRef.current = null;
       return;
     }
     if (appliedEditIdRef.current === editingMessage.id) return;
+    if (!draftPayloadsLoaded) {
+      // Hydrated attachments have no payloads yet (the draft shows none). Snapshotting now would
+      // save an attachment-less draft on cancel, and the edit's full replacement would end the
+      // load. Enter edit mode once they load (re-requested here in case an earlier load failed).
+      getDraftStore()
+        .ensurePayloads(draftScope)
+        .catch((error: unknown) => console.warn("Failed to load draft attachments:", error));
+      return;
+    }
     appliedEditIdRef.current = editingMessage.id;
-    preEditDraftRef.current = getDraft();
-    preEditReviewsRef.current = draftReviews;
+    editSessionRef.current = {
+      id: editingMessage.id,
+      preEditDraft: getDraft(),
+      preEditReviews: draftReviews,
+      settled: false,
+    };
     applyDraftFromPending(editingMessage.pending, `edit-${editingMessage.id}`);
     setDraftReviews(editingMessage.pending.reviews);
     // Auto-resize textarea and focus
@@ -1323,12 +1402,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }, 0);
   }, [
     editingMessage,
+    draftPayloadsLoaded,
+    draftScope,
     getDraft,
     draftReviews,
     applyDraftFromPending,
     setDraftReviews,
-    preEditDraftRef,
-    preEditReviewsRef,
   ]);
 
   // Project live workflow run cards for foreground slash invocations after reloads.
@@ -1481,7 +1560,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         const restoredAttachments = pendingChatAttachments(restoredPending, restoredIdPrefix);
         // Merged from the stored draft, exactly as a functional setInput would, so the
         // acknowledgement below can check that this exact value landed.
-        const mergedText = [restoredPending.content, readPersistedState(storageKeys.inputKey, "")]
+        const mergedText = [restoredPending.content, getDraftStore().getText(draftScope)]
           .filter((part) => part.trim().length > 0)
           .join("\n\n");
         setInput(mergedText);
@@ -1511,30 +1590,27 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // takes nothing.
         const heldInputIds = customEvent.detail.heldInputIds ?? [];
         if (heldInputIds.length > 0 && workspaceIdForComposerClear != null) {
-          // Checked now, synchronously: the user may edit the draft while the review flush
-          // below is in flight, and that must not revoke a restore that already landed.
+          // The backend copy is released only after the backend confirmed the restored draft
+          // write; a failed write keeps (and shows) the held input.
           const draftDurable = isRestoredDraftDurable({
-            inputKey: storageKeys.inputKey,
-            expectedText: mergedText,
-            attachmentsKey: storageKeys.attachmentsKey,
+            draftStore: getDraftStore(),
+            draftScope,
             restoredAttachmentIds: restoredAttachments.map(({ id }) => id),
             restoredReviewIds,
           });
-          if (draftDurable && restoredReviewIds !== null && restoredReviewIds.length > 0) {
-            // Restored notes live in the backend review-state store: flush them and require
-            // the server-acknowledged copy before releasing the held input. A failed flush
-            // leaves the input held (fail closed; a visible duplicate beats a loss).
-            getReviewStateStore()
-              .areReviewsDurable(workspaceIdForComposerClear, restoredReviewIds)
-              .then(
-                (reviewsDurable) => {
-                  if (reviewsDurable) onAcceptRestoredHeldInputs?.(heldInputIds);
-                },
-                () => undefined
-              );
-          } else if (draftDurable) {
-            onAcceptRestoredHeldInputs?.(heldInputIds);
-          }
+          // Restored notes live in the backend review-state store: require its
+          // server-acknowledged copy too. A failed flush leaves the input held (fail closed; a
+          // visible duplicate beats a loss).
+          const durable =
+            restoredReviewIds !== null && restoredReviewIds.length > 0
+              ? Promise.all([
+                  draftDurable,
+                  getReviewStateStore()
+                    .areReviewsDurable(workspaceIdForComposerClear, restoredReviewIds)
+                    .catch(() => false),
+                ]).then(([draftOk, reviewsOk]) => draftOk && reviewsOk)
+              : draftDurable;
+          onAcceptRestoredHeldInputs?.(heldInputIds, durable);
         }
         focusMessageInput();
       } else if (mode === "replace") {
@@ -1577,8 +1653,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     setDraftReviews,
     onAddReviewForRestore,
     onAcceptRestoredHeldInputs,
-    storageKeys.inputKey,
-    storageKeys.attachmentsKey,
+    draftScope,
     focusMessageInput,
   ]);
 
@@ -1763,9 +1838,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // dependency list; the React Compiler already handles memoization.
   /**
    * The composer's review notes for a send. Attached notes live in the backend review-state
-   * store; a send racing its first hydration waits for it (normally already resolved) and reads
-   * them from the store, so neither a command (e.g. /compact's follow-up) nor a normal send is
-   * built from the empty loading view.
+   * store; a send racing its hydration waits for it (normally already done) and reads them from
+   * the store, so neither a command (e.g. /compact's follow-up) nor a normal send is built from
+   * the empty loading view. After a failed subscription the store retries it (bounded, #5011);
+   * if the notes still cannot be read, none are included and `unavailable` is set, so the send
+   * path can say so (see warnIfReviewsUnavailable).
    */
   const readReviewsForSend = async (): Promise<ReviewsForSend> => {
     const renderTime: ReviewsForSend = { data: reviewData, ids: reviewIdsForCheck };
@@ -1774,13 +1851,29 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // Without an API client (backend reconnecting) hydration cannot finish, and waiting would
     // hold this send in flight and fire it after reconnect; let the send path report
     // "Not connected to server" instead.
-    if (!api || reviewStateStore.isReady(workspaceId)) return renderTime;
-    await reviewStateStore.whenReady(workspaceId);
-    const attached = reviewStateStore.getAttachedReviews(workspaceId);
+    if (!api || reviewStateStore.isHydrated(workspaceId)) return renderTime;
+    const attached = await reviewStateStore.readAttachedReviewsForSend(workspaceId);
+    if (attached === null) {
+      // The render-time notes may be a stale cache; send none rather than a possibly wrong set.
+      return { data: undefined, ids: [], unavailable: true };
+    }
     return {
       data: attached.length > 0 ? attached.map((review) => review.data) : undefined,
       ids: attached.map((review) => review.id),
     };
+  };
+
+  /**
+   * Called only once a message that would carry the notes was accepted (a normal send, or
+   * /compact's check-reviews action), so a failed send or a command like /vim never shows it.
+   */
+  const warnIfReviewsUnavailable = (reviews: ReviewsForSend) => {
+    if (!reviews.unavailable) return;
+    pushToast({
+      type: "error",
+      message:
+        "Review notes could not be loaded, so none were attached. They are kept; send them once they load.",
+    });
   };
 
   const executeParsedCommand = async (
@@ -1874,12 +1967,23 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       },
     };
 
+    // A completed edit restored its pre-edit draft, review notes included: keep them.
+    let restoredPreEditDraft = false;
+    const commandEditSession =
+      commandEnv.editMessageId !== undefined &&
+      editSessionRef.current?.id === commandEnv.editMessageId
+        ? editSessionRef.current
+        : null;
+    // An editing command whose edit gave its draft back (the user cancelled it) or is no longer
+    // the open edit: the composer holds another draft, so the command's clears must not touch it.
+    const editCancelled = () =>
+      commandEditSession?.settled === true || !isOpenEditOrNone(commandEditSession);
     // Command actions stop at the caller's UI boundary; creation mode intentionally has its own applier.
     const applyCommandActions = (actions: CommandAction[]) => {
       for (const action of actions) {
         switch (action.type) {
           case "clear-input":
-            setInput("");
+            if (!editCancelled()) setInput("");
             break;
           case "reset-input-height":
             if (inputRef.current) inputRef.current.style.height = "";
@@ -1897,7 +2001,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             setSendingCount((count) => count + (action.sending ? 1 : -1));
             break;
           case "clear-attachments":
-            setAttachments([]);
+            if (!editCancelled()) setAttachments([]);
             break;
           case "detach-reviews":
             if (variant === "workspace") props.onDetachAllReviews?.();
@@ -1906,12 +2010,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             if (variant === "workspace" && action.reviewIds.length > 0) {
               props.onCheckReviews?.(action.reviewIds);
             }
+            // Emitted once the command's message was accepted (/compact).
+            if (options?.reviews) warnIfReviewsUnavailable(options.reviews);
             break;
           case "message-sent":
             if (variant === "workspace") props.onMessageSent?.(action.dispatchMode);
             break;
           case "cancel-edit":
-            commandOnCancelEdit?.();
+            // Emitted once an editing command (/compact) was accepted: the edit is complete.
+            restoredPreEditDraft = restorePreEditDraftAfterSend(commandEditSession, true);
+            if (isOpenEditOrNone(commandEditSession)) commandOnCancelEdit?.();
             break;
           case "edit-history-changed":
             startEditTranscriptRefresh(action.editMessageId, action.precondition);
@@ -1934,16 +2042,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       case "consume":
         // Commands clear the composer through their own clear-input actions;
         // clearing again here would wipe a draft typed while phases ran.
-        setDraftReviews(null);
+        if (!restoredPreEditDraft) setDraftReviews(null);
         break;
       case "restore":
         setInput(restoreInput);
         break;
       case "restore-if-empty":
         // Async phases can outlive the invoking render, so check the live
-        // persisted draft: the getDraft closure captured here still reports
+        // draft: the getDraft closure captured here still reports
         // this render's input and would refuse to restore over a newer draft.
-        if (readPersistedState(storageKeys.inputKey, "").trim().length === 0) {
+        if (getDraftStore().getText(draftScope).trim().length === 0) {
           setInput(restoreInput);
         } else {
           setDraftReviews(null);
@@ -2063,7 +2171,18 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       });
   };
 
+  // An edit send and a new edit never overlap (#5226): the transcript refuses to start an edit
+  // until the edit send settles, successfully or not.
   const handleSend = async (overrides?: InternalSendOverrides) => {
+    const onEditSendPendingChange =
+      variant === "workspace" && editingMessageForUi ? props.onEditSendPendingChange : undefined;
+    onEditSendPendingChange?.(true);
+    await runWithFinally(
+      () => sendComposerInput(overrides),
+      () => onEditSendPendingChange?.(false)
+    );
+  };
+  const sendComposerInput = async (overrides?: InternalSendOverrides) => {
     // Checked before `canSend` (which also carries the barrier) so a refused Enter on a real
     // draft explains itself instead of silently doing nothing. Reads the live store rather
     // than the render-time prop so a keybind racing a workspace switch sees current state.
@@ -2078,6 +2197,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return;
     }
     if (!canSend) {
+      return;
+    }
+    if (!draft.payloadsLoaded) {
+      // Hydrated drafts carry attachment metadata only; sending now would drop the attachments.
+      pushToast({ type: "info", message: "Draft attachments are still loading. Try again." });
+      getDraftStore()
+        .ensurePayloads(draftScope)
+        .catch((error: unknown) => console.warn("Failed to load draft attachments:", error));
       return;
     }
 
@@ -2465,6 +2592,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const preSendDraft = { ...getDraft(), attachments: sendAttachments };
       const preSendReviews = draftReviews;
       const editMessageForSend = editingMessageForUi;
+      const editSessionForSend =
+        editMessageForSend && editSessionRef.current?.id === editMessageForSend.id
+          ? editSessionRef.current
+          : null;
 
       const sendPreparedMessage = async () => {
         // Prepare file parts if any
@@ -2623,9 +2754,18 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // Clear input, images, and hide reviews immediately for responsive UI
         // Text/images are restored if send fails; reviews remain "attached" in state
         // so they'll reappear naturally on failure (we only call onCheckReviews on success)
-        setInput("");
-        setDraftReviews(null);
-        setAttachments([]);
+        // Clear only what this send took: a draft restored meanwhile (an edit completing while
+        // this send resolved its options) stays in the composer (#5226).
+        const sentAttachmentIds = new Set([...attachments, ...sendAttachments].map(({ id }) => id));
+        setInput((current) => removeSentText(current, input));
+        // Likewise for notes: drop the override this send captured, keeping notes an edit's
+        // completion put into it meanwhile.
+        setDraftReviews((current) => {
+          if (current === null || current === preSendReviews) return null;
+          const remaining = current.filter((review) => !preSendReviews?.includes(review));
+          return remaining.length > 0 ? remaining : null;
+        });
+        setAttachments((current) => current.filter(({ id }) => !sentAttachmentIds.has(id)));
         setHideReviewsDuringSend(true);
         // Clear inline height style - VimTextArea's useLayoutEffect will handle sizing
         if (inputRef.current) {
@@ -2709,9 +2849,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           if (sentReviewIds.length > 0) {
             props.onCheckReviews?.(sentReviewIds);
           }
+          warnIfReviewsUnavailable(reviewsForSend);
 
           // Exit editing mode if we were editing
-          if (editMessageForSend && props.onCancelEdit) {
+          restorePreEditDraftAfterSend(editSessionForSend);
+          if (editMessageForSend && props.onCancelEdit && isOpenEditOrNone(editSessionForSend)) {
             props.onCancelEdit();
           } else if (editMessageForSend) {
             setOptimisticallyDismissedEditId(null);
@@ -3052,12 +3194,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             </div>
           )}
 
-          <CodexOauthWarningBanner
-            requiresCodexOauth={requiresCodexOauth(baseModel)}
-            codexOauthSet={codexOauthSet}
-            onOpenProviders={() => open("providers", { expandProvider: "openai" })}
-          />
-
           <CommandSuggestions
             suggestions={composerSuggestions.suggestions}
             onSelectSuggestion={composerSuggestions.select}
@@ -3100,6 +3236,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     value={input}
                     ghostHint={composerSuggestions.ghostHint}
                     onChange={handleComposerInputChange}
+                    // Write the draft when focus leaves instead of after the debounce; a failure
+                    // keeps the change in the draft store, which retries it.
+                    onBlur={() => {
+                      getDraftStore()
+                        .flush(draftScope)
+                        .catch(() => undefined);
+                    }}
                     onKeyDown={handleKeyDown}
                     onPaste={handlePaste}
                     onKeyUp={composerSuggestions.handleCursorActivity}

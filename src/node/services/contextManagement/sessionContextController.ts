@@ -115,15 +115,8 @@ export class SessionContextController {
     );
   }
 
-  normalizeSend(
-    userMessage: MuxMessage,
-    options: SendMessageOptions,
-    active: boolean
-  ): SendMessageOptions {
-    return this.tokenBudget.normalizeSend(userMessage, options, active);
-  }
-  preparePublication(input: Parameters<TokenBudgetStrategy["preparePublication"]>[0]) {
-    return this.tokenBudget.preparePublication(input);
+  dropPendingRollover(): void {
+    this.tokenBudget.dropPendingRollover();
   }
   onSendAccepted(userMessage: MuxMessage, prefixRows: readonly MuxMessage[]): void {
     this.tokenBudget.onSendAccepted(userMessage, prefixRows);
@@ -180,14 +173,11 @@ export class SessionContextController {
       | { kind: "prepared" }
       | {
           kind: "starting";
-          stream: Pick<StreamContextSnapshot, "options" | "contextBudgetFlushTurn">;
+          stream: Pick<StreamContextSnapshot, "options">;
         }
   ) {
     // An already prepared rollover request owns this callback even if selection changes.
-    // The ordinary start path retains its separate active-mode/flush obligation predicate.
-    return input.kind === "prepared" ||
-      this.isTokenBudgetActive(input.stream.options) ||
-      input.stream.contextBudgetFlushTurn
+    return input.kind === "prepared" || this.isTokenBudgetActive(input.stream.options)
       ? (step: SettledStepBudget) => this.tokenBudget.onContextBudgetStepSettled(step)
       : undefined;
   }

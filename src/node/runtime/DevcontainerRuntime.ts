@@ -16,7 +16,7 @@ import type {
   ReadFileOptions,
 } from "./Runtime";
 import { RuntimeError, WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
-import { buildShellPathExport } from "./shellEnv";
+import { buildGuardedCommand, buildShellPathExport } from "./shellEnv";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
 import { isContainerUnavailableExit } from "./containerExecFailure";
 import { WorktreeManager } from "@/node/worktree/WorktreeManager";
@@ -30,7 +30,12 @@ import {
   resolveSshAgentForwarding,
   type BindMount,
 } from "./credentialForwarding";
-import { devcontainerUp, devcontainerDown, spawnDevcontainer } from "./devcontainerCli";
+import {
+  devcontainerUp,
+  devcontainerDown,
+  spawnDevcontainer,
+  type DevcontainerStopResult,
+} from "./devcontainerCli";
 import { findInitHookRelativePath, runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
 import { DisposableProcess, forceCloseStdio, killProcessTree } from "@/node/utils/disposableExec";
 import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
@@ -71,6 +76,11 @@ export interface DevcontainerRuntimeOptions {
  * - File I/O → host fs (worktree is bind-mounted into container)
  * - ensureReady → devcontainer up (starts/rebuilds container as needed)
  */
+/** Names a workspace's devcontainer by the host-path label Docker matches it with. */
+export function containerLabel(workspacePath: string): string {
+  return `devcontainer container labeled devcontainer.local_folder=${workspacePath}`;
+}
+
 export class DevcontainerRuntime extends LocalBaseRuntime {
   private readonly worktreeManager: WorktreeManager;
   private readonly configPath: string;
@@ -319,6 +329,8 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
    * Only uses options.cwd if it looks like a valid container path (POSIX absolute, no Windows drive letters).
    */
   private resolveContainerCwd(optionsCwd: string | undefined, workspaceFolder: string): string {
+    // The CLI enters the configured container workspace. Cleanup must not run `up` just to learn this path.
+    if (!this.remoteWorkspaceFolder && optionsCwd === workspaceFolder) return ".";
     if (optionsCwd && this.looksLikeContainerPath(optionsCwd)) {
       return optionsCwd;
     }
@@ -470,9 +482,11 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
         buildShellPathExport(key, value, (envValue) => shescape.quote(envValue))
       )
       .join(" && ");
-    const fullCommand = [`cd ${shescape.quote(cwd)}`, pathEnvPrelude, command]
-      .filter(Boolean)
-      .join(" && ");
+    // A failed cd/export skips every line of the command (#5192).
+    const fullCommand = buildGuardedCommand(
+      [`cd ${shescape.quote(cwd)}`, pathEnvPrelude].filter(Boolean),
+      command
+    );
     args.push("--", "bash", "-c", fullCommand);
 
     const childProcess = spawnDevcontainer(args, {
@@ -798,9 +812,25 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     | { success: true; oldPath: string; newPath: string; branchRenamed?: boolean }
     | { success: false; error: string }
   > {
-    // Stop container before rename (container labels reference old path)
+    // Remove the container before the rename: its labels reference the old path. A stopped one
+    // is removed too, and a failed removal refuses the rename before the worktree moves (#5137):
+    // the container would otherwise survive with this workspace's files, including its plan, and
+    // a later workspace at the old path would reuse it.
     const oldPath = this.getWorkspacePath(projectPath, oldName);
-    await devcontainerDown(oldPath, this.configPath);
+    const containerStop = await devcontainerDown(oldPath, this.configPath, {
+      includeStopped: true,
+    }).catch(
+      (error: unknown): DevcontainerStopResult => ({
+        kind: "error",
+        message: getErrorMessage(error),
+      })
+    );
+    if (containerStop.kind === "error") {
+      return {
+        success: false,
+        error: `Failed to remove the ${containerLabel(oldPath)}: ${containerStop.message}`,
+      };
+    }
 
     // Rename worktree on host
     const result = await this.worktreeManager.renameWorkspace(
@@ -828,24 +858,60 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     _abortSignal?: AbortSignal,
     trusted?: boolean,
     options?: { keepBranch?: boolean }
-  ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
+  ): Promise<
+    | { success: true; deletedPath: string }
+    | { success: false; error: string; leftoverPaths?: string[] }
+  > {
     const workspacePath = this.getWorkspacePath(projectPath, workspaceName);
 
-    // Stop and remove container (best-effort)
-    try {
-      await devcontainerDown(workspacePath, this.configPath);
-    } catch (error) {
-      log.debug("devcontainerDown failed (container may not exist):", { error });
+    // Stop and remove the container, which is labeled with the host path. A stopped one is
+    // removed too (#5124): it still holds the workspace's files, and a later workspace at this
+    // path would reuse it.
+    const containerStop = await devcontainerDown(workspacePath, this.configPath, {
+      includeStopped: true,
+    }).catch(
+      (error: unknown): DevcontainerStopResult => ({
+        kind: "error",
+        message: getErrorMessage(error),
+      })
+    );
+
+    const containerLeftover = containerLabel(workspacePath);
+    // A container that is still there is not a clean delete: removal and rollbacks report it, and
+    // name it so the user can remove it (#5120); a later workspace at this path would reuse it.
+    // A non-forced delete then stops before the host worktree, so the caller keeps the workspace
+    // and a retry deletes both: deleting the worktree first would drop its branch mapping, and a
+    // retry would then fall back to deleting the branch named after the workspace, which may not
+    // be this workspace's. A forced delete (rollbacks, forced removal) is not retried on the same
+    // entry, so it still removes the worktree.
+    // The message names the container and what forcing would leave (#5143): the user sees it
+    // before choosing a forced removal, which deletes the worktree and so can no longer reach the
+    // container to delete the plan inside it.
+    if (containerStop.kind === "error" && !force) {
+      return {
+        success: false,
+        error: `Failed to remove the ${containerLeftover}: ${containerStop.message}. A forced removal deletes the workspace but leaves this container, which may still hold its plan file; remove the container afterwards.`,
+        leftoverPaths: [containerLeftover],
+      };
     }
 
     // Delete worktree on host
-    return this.worktreeManager.deleteWorkspace(
+    const hostResult = await this.worktreeManager.deleteWorkspace(
       projectPath,
       workspaceName,
       force,
       trusted,
       options
     );
+    if (containerStop.kind !== "error") return hostResult;
+
+    const errors = [`Failed to remove the devcontainer: ${containerStop.message}`];
+    const leftoverPaths = [containerLeftover];
+    if (!hostResult.success) {
+      errors.push(hostResult.error);
+      leftoverPaths.push(workspacePath);
+    }
+    return { success: false, error: errors.join("; "), leftoverPaths };
   }
 
   /**

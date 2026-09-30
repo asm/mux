@@ -1,4 +1,5 @@
 import * as path from "path";
+import * as fsPromises from "fs/promises";
 import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { TaskHandleStore } from "@/node/services/taskHandleStore";
@@ -12,6 +13,7 @@ import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import assert from "node:assert";
 import * as agentDefinitionsService from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { RuntimeError } from "@/node/runtime/Runtime";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import {
   createAIServiceMocks,
   createTestConfig,
@@ -19,11 +21,13 @@ import {
   findWorkspaceInConfig,
   projectWorkspace,
   saveLocalParentWorkspace,
+  saveTestConfig,
   saveWorkspacesWithCheckouts as saveWorkspaces,
   streamEnd,
   stubStableIds,
   testTaskSettings,
   workspaceTurnManagerFor,
+  workspaceTurnManagerInternals,
   workspaceTurnMuxMetadata,
   workspaceTurnRecord,
   workspaceTurnSnapshot,
@@ -810,7 +814,7 @@ describe("TaskService", () => {
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
-  test("sendAgentTreeMessage withholds correlation from unaccepted workspace-turn registrations", async () => {
+  test("sendAgentTreeMessage never correlates a descendant with another workspace's delegated turn", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
 
@@ -832,6 +836,7 @@ describe("TaskService", () => {
     // Creation-time reservation on the ROOT: the record is persisted as running BEFORE the
     // owner's requireIdle send passes admission. Correlating a peer trigger with it would let
     // that trigger's stream-end settle the owner's unaccepted handle as the delegated result.
+    // Once accepted, the turn stays owner-only (#4997): the descendant waits for it either way.
     await registerLiveWorkspaceTurnHandle(
       taskService,
       "tree-root",
@@ -839,20 +844,9 @@ describe("TaskService", () => {
       "owner-ws",
       "reserved"
     );
-
     expect(await taskService.sendAgentTreeMessage("child-a", "tree-root", "status?")).toEqual(
-      Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: "tool-end" })
+      Ok({ delivery: "queued", relation: "target_ancestor", awaitsDelegatedTurn: true })
     );
-    const [, , options, internalArg] = sendMessage.mock.calls[0] as [
-      string,
-      string,
-      { muxMetadata?: { type?: string } },
-      { workspaceTurnContinuation?: boolean },
-    ];
-    expect(options.muxMetadata?.type).toBe("agent-peer-message");
-    expect(internalArg.workspaceTurnContinuation).toBe(false);
-
-    // Once the owner's turn is admitted, the same registration correlates again.
     await registerLiveWorkspaceTurnHandle(
       taskService,
       "tree-root",
@@ -860,17 +854,41 @@ describe("TaskService", () => {
       "owner-ws",
       "accepted"
     );
-    expect(
-      (await taskService.sendAgentTreeMessage("child-a", "tree-root", "second update")).success
-    ).toBe(true);
-    const [, , secondOptions, secondInternal] = sendMessage.mock.calls[1] as [
-      string,
-      string,
-      { muxMetadata?: { type?: string } },
-      { workspaceTurnContinuation?: boolean },
-    ];
-    expect(secondOptions.muxMetadata?.type).toBe("workspace-turn-task");
-    expect(secondInternal.workspaceTurnContinuation).toBe(true);
+    expect(await taskService.sendAgentTreeMessage("child-a", "tree-root", "second update")).toEqual(
+      Ok({ delivery: "queued", relation: "target_ancestor", awaitsDelegatedTurn: true })
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    const delivered = new Promise<void>((resolve) => {
+      sendMessage.mockImplementation(() => {
+        if (sendMessage.mock.calls.length === 2) resolve();
+        return Promise.resolve(Ok(undefined));
+      });
+    });
+    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
+      "tree-root"
+    );
+    await delivered;
+    // Both run as ordinary turns, in the order they were sent.
+    const calls = sendMessage.mock.calls as unknown as Array<
+      [
+        string,
+        string,
+        { muxMetadata?: { type?: string } },
+        { workspaceTurnContinuation?: boolean; preTurnMessages?: Array<{ parts: unknown[] }> },
+      ]
+    >;
+    expect(calls.map(([, , options]) => options.muxMetadata?.type)).toEqual([
+      "agent-peer-message",
+      "agent-peer-message",
+    ]);
+    expect(calls.map(([, , , internal]) => internal.workspaceTurnContinuation)).toEqual([
+      false,
+      false,
+    ]);
+    const payloads = calls.map(([, , , internal]) => JSON.stringify(internal.preTurnMessages));
+    expect(payloads[0]).toContain("status?");
+    expect(payloads[1]).toContain("second update");
   });
 
   test("listTaskTreeAgents strips stale execution overlays from peer rows", async () => {
@@ -986,6 +1004,67 @@ describe("TaskService", () => {
     expect(reactivated.data.executionTaskId).toMatch(/^wst_/);
     expect(unarchive.mock.calls.map((call) => call[0])).toEqual([intermediateTaskId, childTaskId]);
     expect(sendMessage).toHaveBeenCalled();
+  });
+
+  test("sendMessageToDescendantAgentTask reawakens an inactive child of a scratch parent", async () => {
+    // Scratch (project-less) chats spawn scratch children in the SCRATCH config bucket; a
+    // message to an inactive one reawakens it through a mode="existing" workspace turn.
+    const config = await createTestConfig(rootDir);
+    const parentWorkspaceId = "scratch-parent-reawaken";
+    const childTaskId = "scratch-child-reawaken";
+    const scratchPath = path.join(config.rootDir, "scratch", parentWorkspaceId);
+    await fsPromises.mkdir(scratchPath, { recursive: true });
+    const scratchWorkspace = (id: string, extra: Record<string, unknown> = {}) => ({
+      kind: "scratch" as const,
+      path: scratchPath,
+      id,
+      name: `scratch-${id}`,
+      createdAt: "2026-09-30T00:00:00.000Z",
+      runtimeConfig: { type: "local" as const },
+      ...extra,
+    });
+    await saveTestConfig(
+      config,
+      [
+        [
+          SCRATCH_PROJECT_CONFIG_KEY,
+          {
+            projectKind: "system",
+            trusted: true,
+            workspaces: [
+              scratchWorkspace(parentWorkspaceId),
+              scratchWorkspace(childTaskId, {
+                parentWorkspaceId,
+                taskIsolation: "none",
+                taskStatus: "reported",
+                title: "Testing Curator",
+              }),
+            ],
+          },
+        ],
+      ],
+      { taskSettings: testTaskSettings() }
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const reactivated = await taskService.sendMessageToDescendantAgentTask(
+      parentWorkspaceId,
+      childTaskId,
+      "Follow-up pass",
+      "tool-end"
+    );
+    expect(reactivated.success ? null : reactivated.error).toBeNull();
+    if (!reactivated.success) return;
+    expect(reactivated.data.delivery).toBe("reactivated");
+    expect(reactivated.data.executionTaskId).toMatch(/^wst_/);
+    expect(sendMessage).toHaveBeenCalledWith(
+      childTaskId,
+      expect.stringContaining("Follow-up pass"),
+      expect.any(Object),
+      expect.any(Object)
+    );
   });
 
   test("sendMessageToDescendantAgentTask rejects non-descendants and settled children", async () => {

@@ -810,6 +810,47 @@ describe("Config", () => {
     });
   });
 
+  describe("delegated creation mark (#4983)", () => {
+    it("keeps a well-formed mark and drops malformed ones while loading", () => {
+      const mark = { handleId: "wst_1", ownerWorkspaceId: "owner" };
+      const rows = [
+        ["ws-ok", mark],
+        ["ws-flagged", { ...mark, interruptedAt: "2026-09-29T00:00:00.000Z" }],
+        ["ws-str", "wst_1"],
+        ["ws-no-owner", { handleId: "wst_1" }],
+      ] as const;
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [
+              "/repo",
+              {
+                workspaces: rows.map(([id, delegatedCreation]) => ({
+                  path: `/repo/${id}`,
+                  id,
+                  name: id,
+                  delegatedCreation,
+                })),
+              },
+            ],
+          ],
+        })
+      );
+
+      const kept = (config.loadConfigOrDefault().projects.get("/repo")?.workspaces ?? []).map(
+        (workspace) => [workspace.id, Object.hasOwn(workspace, "delegatedCreation")]
+      );
+
+      expect(kept).toEqual([
+        ["ws-ok", true],
+        ["ws-flagged", true],
+        ["ws-str", false],
+        ["ws-no-owner", false],
+      ]);
+    });
+  });
+
   describe("legacy PTC exclusive taskExperiments alias", () => {
     it("aliases programmaticToolCallingExclusive onto programmaticToolCalling at load time", () => {
       // Tasks stamped by pre-merge builds may carry only the exclusive flag;
@@ -2248,6 +2289,9 @@ describe("Config", () => {
     // The shipped chain target is pinned to Opus 5, not the moving
     // KNOWN_MODELS.OPUS alias (see DEFAULT_MODEL_FALLBACKS).
     const OPUS = "anthropic:claude-opus-5";
+    // Fresh-install-only chain (#5087): both ids are pinned literals.
+    const SONNET_5_5 = "anthropic:claude-sonnet-5-5";
+    const SONNET_5 = "anthropic:claude-sonnet-5";
     const configFilePath = () => path.join(tempDir, "config.json");
 
     it("seeds the default chain once on first load and persists the migration flag", async () => {
@@ -2467,6 +2511,7 @@ describe("Config", () => {
       expect(config.loadConfigOrDefault().modelFallbacks).toEqual({
         [LEGACY_FABLE]: { models: [OPUS] },
         [FABLE]: { models: [OPUS] },
+        [SONNET_5_5]: { models: [SONNET_5] },
       });
 
       await config.editConfig((cfg) => cfg);
@@ -2478,8 +2523,42 @@ describe("Config", () => {
       expect(raw.modelFallbacks).toEqual({
         [LEGACY_FABLE]: { models: [OPUS] },
         [FABLE]: { models: [OPUS] },
+        [SONNET_5_5]: { models: [SONNET_5] },
       });
       expect(raw.migrations?.defaultModelFallbacksSeeded).toBe(true);
+
+      // A later load (e.g. after a downgrade and re-upgrade) keeps exactly
+      // the one chain per source model; nothing is re-seeded or duplicated.
+      expect(new Config(tempDir).loadConfigOrDefault().modelFallbacks).toEqual({
+        [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE]: { models: [OPUS] },
+        [SONNET_5_5]: { models: [SONNET_5] },
+      });
+    });
+
+    it.each([
+      [
+        "fully seeded",
+        { defaultModelFallbacksSeeded: true, defaultModelFallbacksSeededFable51: true },
+      ],
+      ["seeded before the Fable 5.1 promotion", { defaultModelFallbacksSeeded: true }],
+      ["never seeded", undefined],
+    ])("does not add the Sonnet 5.5 chain to an existing %s config", (_label, migrations) => {
+      // Maintainer decision on #5087: the Sonnet 5.5 chain ships to fresh
+      // installs only, with no migration and no new flag. The one-time
+      // seed passes that existing configs still run must not carry it.
+      fs.writeFileSync(
+        configFilePath(),
+        JSON.stringify({
+          projects: [],
+          ...(migrations ? { migrations } : {}),
+          modelFallbacks: { [FABLE]: { models: ["openai:gpt-5.5"] } },
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.modelFallbacks?.[SONNET_5_5]).toBeUndefined();
+      expect(loaded.modelFallbacks?.[FABLE]).toEqual({ models: ["openai:gpt-5.5"] });
     });
   });
 

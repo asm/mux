@@ -18,7 +18,11 @@ import {
 import { useResizableSidebar } from "./hooks/useResizableSidebar";
 import { isDialogOpen, matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
 import { openServerWindow } from "./utils/openServerWindow";
-import { applyFastModeServiceTierChange, getFastModeProvider } from "./utils/fastModeServiceTier";
+import {
+  applyFastModeToggle,
+  getFastModeProvider,
+  isFastModeActive,
+} from "./utils/fastModeServiceTier";
 import { handleLayoutSlotHotkeys } from "./utils/ui/layoutSlotHotkeys";
 import { buildSortedWorkspacesByProject } from "./utils/ui/workspaceFiltering";
 import {
@@ -99,6 +103,7 @@ import { ProjectPage } from "@/browser/components/ProjectPage/ProjectPage";
 import { SettingsProvider, useSettings } from "./contexts/SettingsContext";
 import { AboutDialogProvider, useAboutDialog } from "./contexts/AboutDialogContext";
 import { ConfirmDialogProvider, useConfirmDialog } from "./contexts/ConfirmDialogContext";
+import { confirmAndRemoveSubagent } from "@/browser/utils/subagentRemoval";
 import { AboutDialog } from "./features/About/AboutDialog";
 import { SettingsPage } from "@/browser/features/Settings/SettingsPage";
 import { AnalyticsDashboard } from "@/browser/features/Analytics/AnalyticsDashboard";
@@ -167,6 +172,7 @@ function AppInner() {
     loading,
     setWorkspaceMetadata,
     removeWorkspace,
+    removeSubagent,
     updateWorkspaceTitle,
     reorderPinnedWorkspaces,
     selectedWorkspace,
@@ -676,7 +682,7 @@ function AppInner() {
       providersConfig,
       resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
     });
-    return provider != null && providersConfig[provider]?.serviceTier === "priority";
+    return provider != null && isFastModeActive(provider, providersConfig[provider]);
   }, [creationScopeId, getModelForWorkspace, getRouteForModel, providersConfig, selectedWorkspace]);
 
   const fastModeToggleInFlightRef = useRef(false);
@@ -699,18 +705,9 @@ function AppInner() {
     }
 
     try {
-      const providerConfig = providersConfig[provider];
-      const change = await applyFastModeServiceTierChange(
-        api.providers,
-        provider,
-        providerConfig?.serviceTier,
-        providerConfig?.fastModePreviousServiceTier
-      );
-      if (change) {
-        updateOptimistically(provider, {
-          serviceTier: change.serviceTier,
-          fastModePreviousServiceTier: change.previousServiceTier,
-        });
+      const patch = await applyFastModeToggle(api.providers, provider, providersConfig[provider]);
+      if (patch) {
+        updateOptimistically(provider, patch);
       } else {
         await refreshProvidersConfig();
       }
@@ -916,6 +913,16 @@ function AppInner() {
     },
     [removeWorkspace, paletteRemoveError]
   );
+  const removeSubagentFromPalette = async (workspaceId: string, title: string) => {
+    const error = await confirmAndRemoveSubagent({
+      api,
+      confirm: confirmDialog,
+      removeSubagent,
+      workspaceId,
+      title,
+    });
+    if (error != null) paletteRemoveError.showError(workspaceId, error);
+  };
 
   const updateTitleFromPalette = useCallback(
     async (workspaceId: string, newTitle: string) => updateWorkspaceTitle(workspaceId, newTitle),
@@ -1006,6 +1013,7 @@ function AppInner() {
     getBranchesForProject,
     onSelectWorkspace: selectWorkspaceFromPalette,
     onRemoveWorkspace: removeWorkspaceFromPalette,
+    onRemoveSubagent: removeSubagentFromPalette,
     onUpdateTitle: updateTitleFromPalette,
     onAddProject: addProjectFromPalette,
     onRemoveProject: removeProjectFromPalette,

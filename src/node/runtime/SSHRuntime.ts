@@ -50,7 +50,7 @@ import {
   appendOpenSSHHostKeyPolicyArgs,
   sshConnectionPool,
 } from "./sshConnectionPool";
-import { getOriginUrlForBundle } from "./gitBundleSync";
+import { buildSourceRefSnapshotCommand, getOriginUrlForBundle } from "./gitBundleSync";
 import { gitNoHooksPrefix } from "@/node/utils/gitNoHooksEnv";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { syncRuntimeGitSubmodules } from "./submoduleSync";
@@ -505,6 +505,9 @@ async function fastReadGitHeadsRefs(projectPath: string): Promise<string | null>
  *
  * Extends RemoteRuntime for shared exec/file operations.
  */
+/** Trunk-like names SSH cleanups never `branch -D`, even when they look orphaned. */
+const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
+
 export class SSHRuntime extends RemoteRuntime {
   private readonly config: SSHRuntimeConfig;
   private readonly transport: SSHTransport;
@@ -3402,7 +3405,6 @@ export class SSHRuntime extends RemoteRuntime {
         // that re-forking with the same workspace name can use the fast worktree
         // path (git worktree add -b fails if the branch already exists).
         // Skip protected trunk branch names to avoid accidental deletion.
-        const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
         // keepBranch: the caller undoes a creation that reused this branch (#4819).
         if (
           branchToDelete &&
@@ -3537,6 +3539,19 @@ export class SSHRuntime extends RemoteRuntime {
         { cwd: "/tmp", timeout: 30 }
       ).catch(() => undefined);
       await removeStaging(reason);
+      // Callers run only after this fork's `worktree add -b` succeeded, and that refuses an
+      // existing branch, so the fork made `newWorkspaceName` and nothing has committed to it.
+      // Leaving it would make a retry of the name miss the fast path and the copy fallback check
+      // out the stale branch (#5125). This runs after the staging removal: `branch -D` refuses a
+      // branch any registered worktree still uses (even one whose dir is gone), so when the
+      // removal failed or another worktree took the branch, it is kept.
+      if (!PROTECTED_BRANCHES.includes(newWorkspaceName)) {
+        await execBuffered(
+          this,
+          `${nhp}git -C ${baseRepoPathArg} branch -D ${shescape.quote(newWorkspaceName)} 2>/dev/null || true`,
+          { cwd: "/tmp", timeout: 10 }
+        ).catch(() => undefined);
+      }
     };
 
     // Hoisted outside the try block so the catch handler can reach them when
@@ -3668,6 +3683,18 @@ export class SSHRuntime extends RemoteRuntime {
           await execBuffered(
             this,
             `cd ${stagingPathArg} && for branch in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -v 'origin/HEAD'); do localname=\${branch#origin/}; git show-ref --verify --quiet refs/heads/$localname || git branch $localname $branch; done`,
+            { cwd: "/tmp", timeout: 30 }
+          );
+        } catch {
+          // Ignore - best-effort.
+        }
+
+        // Best-effort: record the inherited branches and stash before origin/* can go away, so the
+        // task_remove lossy check counts only the fork's own commits (#5105).
+        try {
+          await execBuffered(
+            this,
+            `cd ${stagingPathArg} && ${buildSourceRefSnapshotCommand(nhp)}`,
             { cwd: "/tmp", timeout: 30 }
           );
         } catch {
@@ -3815,7 +3842,15 @@ export class SSHRuntime extends RemoteRuntime {
         }
       }
 
-      return { success: true, workspacePath: newWorkspacePath, sourceBranch };
+      // `worktree add -b` refuses an existing branch, so only the worktree path demonstrably made
+      // the fork's branch; the copy fallback may have checked out an existing one. Rollbacks
+      // delete the branch only when this is true (#5119).
+      return {
+        success: true,
+        workspacePath: newWorkspacePath,
+        sourceBranch,
+        createdBranch: usedWorktree,
+      };
     } catch (error) {
       // Catch-all cleanup so an aborted/thrown fork can never leave the
       // staging worktree registered in the bare repo with a dangling gitdir.

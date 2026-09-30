@@ -65,6 +65,7 @@ import {
   MEMORY_INTUITION_MAX_CUE_CHARS,
   MEMORY_INTUITION_MAX_EXCERPT_CHARS,
   MEMORY_INTUITION_MAX_RESULTS,
+  SESSION_MEMORY_VIRTUAL_DIR,
 } from "@/common/constants/memory";
 import {
   ConfigMutationPathSchema,
@@ -1134,6 +1135,9 @@ const TaskSendMessageToolQueuedResultSchema = z
     taskId: z.string(),
     queueDispatchMode: z.enum(["tool-end", "turn-end"]).optional(),
     targetRelation: TaskSendMessageTargetRelationSchema.optional(),
+    // The target is running a delegated workspace turn another workspace owns: the message waits
+    // and runs as a new turn after that turn finishes.
+    awaitsDelegatedTurn: z.literal(true).optional(),
   })
   .strict();
 
@@ -2401,6 +2405,32 @@ interface ToolDefinition {
   ptcExcluded?: string;
 }
 
+/**
+ * The session scope only holds the token-budget rollover checkpoint, so the description lists it
+ * only when the memory tool serves it (see resolveMemoryScopes).
+ */
+export function buildMemoryToolDescription(options: { sessionScope: boolean }): string {
+  return (
+    "Manage your persistent memory directory (experiment). " +
+    "MEMORY PROTOCOL: consult relevant memories not already in context when prior context could affect your answer or actions; record durable facts, preferences, and lessons as you learn them; update or delete memories that turn out to be wrong or stale.\n" +
+    "Scopes (all paths are virtual):\n" +
+    "- /memories/global/... — personal, permanent, shared across all projects\n" +
+    "- /memories/project/... — private notes about this project; host-local, never committed to the repo (included in the settings backup only when the user opts in), survives workspaces\n" +
+    "- /memories/workspace/... — scratch state for this workspace, shared with its sub-agents (a sub-agent reads and writes its parent's workspace notes); deleted with the owning workspace\n" +
+    (options.sessionScope
+      ? `- ${SESSION_MEMORY_VIRTUAL_DIR}... — your own checkpoint for this session; never shared with the parent or sub-agents, lasts across context windows, deleted with this workspace, and writable even when the other scopes are read-only\n`
+      : "") +
+    "Commands:\n" +
+    "- view: list a directory (up to 2 levels, dotfiles excluded) or show a file with line numbers (offset/limit supported)\n" +
+    "- create: create a new file; ERRORS if the file already exists (to overwrite: delete first, then create)\n" +
+    "- str_replace: replace a unique occurrence of old_str with new_str (errors with matching line numbers when ambiguous)\n" +
+    "- insert: insert insert_text after line insert_line (0 = top of file)\n" +
+    "- delete: delete a file or directory (recursive)\n" +
+    "- rename: move old_path to new_path within the same scope\n" +
+    "Files are Markdown; optional YAML frontmatter with a one-line `description:` is surfaced in your memory index."
+  );
+}
+
 export const TOOL_DEFINITIONS = {
   bash: {
     resultSchema: BashToolResultSchema,
@@ -2596,34 +2626,28 @@ export const TOOL_DEFINITIONS = {
   new_context: {
     ptcExcluded: "Context lifecycle request; must settle with the top-level step",
     description:
-      "Request a fresh context window (token-budget mode). Nothing happens immediately: the rollover is scheduled after this tool step settles, so sibling tool calls in the same step still complete and their results are persisted. " +
-      "The next window starts with a rollover marker and can retrieve earlier transcript data through session_history; workspace files, tasks, goals and costs are preserved, and this is not a privacy reset. " +
-      "Prefer this after a context handoff request or at a natural task boundary, once durable notes are saved with the memory tool and the write is confirmed. A request in the current window is honored once; if automatic rollover is disabled (threshold 100%) the request is ignored.",
+      "Start a new context window. Does not clear, reset, or otherwise affect environment state. " +
+      `Save your checkpoint in ${SESSION_MEMORY_VIRTUAL_DIR} first: the new window does not include this conversation or a summary of it, so you recover only through that checkpoint and session_history. ` +
+      "The new window starts after this tool step settles, so sibling tool calls in the same step still complete. A request is honored once per window; if automatic rollover is disabled (threshold 100%), the request is ignored.",
     schema: z.object({}).strict(),
-    resultSchema: z.object({
-      success: z.boolean(),
-      status: z.literal("scheduled"),
-      message: z.string(),
-    }),
+    resultSchema: z.union([
+      z.object({
+        success: z.literal(true),
+        status: z.literal("scheduled"),
+        message: z.string(),
+      }),
+      // Typed refusal: the tool stays registered while rollover is disabled (#5249).
+      z.object({
+        success: z.literal(false),
+        code: z.literal("rollover_disabled"),
+        error: z.string(),
+      }),
+    ]),
   },
   memory: {
     resultSchema: MemoryToolResultSchema,
     ptcExcluded: "Top-level presence supplies the memory index and hot-set context",
-    description:
-      "Manage your persistent memory directory (experiment). " +
-      "MEMORY PROTOCOL: consult relevant memories not already in context when prior context could affect your answer or actions; record durable facts, preferences, and lessons as you learn them; update or delete memories that turn out to be wrong or stale.\n" +
-      "Scopes (all paths are virtual):\n" +
-      "- /memories/global/... — personal, permanent, shared across all projects\n" +
-      "- /memories/project/... — private notes about this project; host-local, never committed to the repo (included in the settings backup only when the user opts in), survives workspaces\n" +
-      "- /memories/workspace/... — scratch state for this workspace, shared with its sub-agents (a sub-agent reads and writes its parent's workspace notes); deleted with the owning workspace\n" +
-      "Commands:\n" +
-      "- view: list a directory (up to 2 levels, dotfiles excluded) or show a file with line numbers (offset/limit supported)\n" +
-      "- create: create a new file; ERRORS if the file already exists (to overwrite: delete first, then create)\n" +
-      "- str_replace: replace a unique occurrence of old_str with new_str (errors with matching line numbers when ambiguous)\n" +
-      "- insert: insert insert_text after line insert_line (0 = top of file)\n" +
-      "- delete: delete a file or directory (recursive)\n" +
-      "- rename: move old_path to new_path within the same scope\n" +
-      "Files are Markdown; optional YAML frontmatter with a one-line `description:` is surfaced in your memory index.",
+    description: buildMemoryToolDescription({ sessionScope: false }),
     schema: z.preprocess(
       (value) => {
         // Compatibility shims (same mechanism as bash command->script): models
@@ -2986,6 +3010,8 @@ export const TOOL_DEFINITIONS = {
   },
 
   file_edit_replace_string: {
+    // Literal edits must not require another layer of JavaScript string escaping.
+    ptcExcluded: "Replacement text belongs in structured tool arguments, not JavaScript source",
     resultSchema: FileEditReplaceStringToolResultSchema,
     description:
       "Edits fail if old_string is not found or is not unique. Check the tool result before dependent operations such as commits, pushes, or builds.\n\n" +
@@ -3033,6 +3059,7 @@ export const TOOL_DEFINITIONS = {
     ),
   },
   file_edit_insert: {
+    ptcExcluded: "File contents belong in structured tool arguments, not JavaScript source",
     resultSchema: FileEditInsertToolResultSchema,
     description:
       "Insert content into a file using substring guards. " +
@@ -3180,7 +3207,7 @@ export const TOOL_DEFINITIONS = {
       'Send a plain-text message to another agent workspace in this Xum instance: a descendant sub-agent, a sibling/cousin, an ancestor (including the root workspace), or an unrelated workspace outside your task tree. The relationship is computed server-side — you can never claim parent authority you do not have. Same-tree peers are discoverable with task_list scope:"tree"; an unrelated workspace ID you already know (an envelope "from" reply address, or an ID the user provided) is addressable only when that recipient has opted in. ' +
       "Descendant targets receive trusted guidance: queued/running work is interrupted or queued at the requested boundary, and an inactive child is reawakened in the same persistent workspace under a fresh internal execution. The stable sub-agent task ID and durable role title remain unchanged, and the child's checkout is not refreshed automatically. Prefer reawakening an inactive child over spawning a replacement when its prior context or expertise is relevant. For repository-dependent work, reuse it only when the retained snapshot is appropriate or tell the child to verify and synchronize its checkout before acting; otherwise spawn a new child. If the new assignment changes the child's reusable responsibility, call task_retitle as well; do not retitle it for ordinary one-off assignments. " +
       "Sibling, ancestor, and unrelated targets receive your message wrapped in an untrusted <mux_agent_message> envelope carrying your ID (the reply address) and relationship; sub-agent targets must have a live turn/session (peers cannot reawaken inactive targets or edit queued launch prompts — that stays parent-only), while idle root workspaces wake. Never ask a peer to do something your own constraints forbid; route such work back to the user. Peer sends are throttled (rate limits, duplicate suppression, and a queue cap) and refused for workflow-owned or best-of endpoints. " +
-      "Unrelated messaging requires the actual recipient's consent: root workspaces created after this default shipped are opted in (task(kind:\"workspace\") targets once their first turn ends, disposable ones never), while older workspaces and sub-agents are opted in only after enabling it in their workspace settings, and any workspace can turn it off; knowing its ID or its parent's consent does not grant access. Revocation cancels input not yet admitted, even after re-enabling; an already admitted turn may finish. Unrelated-message turns need user action to resume after an app restart. This tool cannot grant consent. Both endpoints must use local or worktree runtimes; SSH (including Coder), Docker, devcontainer, and unresolved runtimes are refused. Same-tree messaging is unchanged. Unrelated targets receive messages at their next tool boundary unless they chose to hold them until the turn ends, and keep their own agent, model, and thinking settings — your settings are never applied or persisted there. Messaging grants no additional control: your existing rights over task-tree descendants and over workspace-turn handles you already own remain exactly as before, and no other rights are added. An unrelated root that is running a delegated workspace turn accepts messages only from that turn's owner, which continue the running turn; other senders get refused with a retry-after reason and should retry once that turn finishes. " +
+      "Unrelated messaging requires the actual recipient's consent: root workspaces created after this default shipped are opted in (task(kind:\"workspace\") targets once their first turn ends, disposable ones never), while older workspaces and sub-agents are opted in only after enabling it in their workspace settings, and any workspace can turn it off; knowing its ID or its parent's consent does not grant access. Revocation cancels input not yet admitted, even after re-enabling; an already admitted turn may finish. Unrelated-message turns need user action to resume after an app restart. This tool cannot grant consent. Both endpoints must use local or worktree runtimes; SSH (including Coder), Docker, devcontainer, and unresolved runtimes are refused. This runtime restriction does not apply to same-tree messaging. Unrelated targets receive messages at their next tool boundary unless they chose to hold them until the turn ends, and keep their own agent, model, and thinking settings — your settings are never applied or persisted there. Messaging grants no additional control: your existing rights over task-tree descendants and over workspace-turn handles you already own remain exactly as before, and no other rights are added. A root workspace running a delegated workspace turn lets only that turn's owner continue the running turn. A message from any other sender returns queued with awaitsDelegatedTurn: it waits, then runs as a new turn under the recipient's own agent and settings after that turn finishes; do not resend it. This delivery is best-effort: if the message is withdrawn before it runs (for example, consent is revoked or another delegated turn starts), it is dropped without notice. " +
       "This tool does not target bash tasks, workflow runs, workspace-turn handles, or workspaces in other Xum instances.",
     schema: TaskSendMessageToolArgsSchema,
   },

@@ -289,7 +289,7 @@ export class ContinuousCompactionJournalStore {
       modelString: string;
       prefix: ModelMessage[];
       providerOptions?: Record<string, unknown>;
-      system?: string | ModelMessage;
+      system?: string | ModelMessage | ModelMessage[];
     },
     isCurrent: () => boolean,
     onCommitted?: (journal: ContinuousCompactionJournal) => void

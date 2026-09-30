@@ -276,6 +276,48 @@ describe("TurnRequestBuilder assembled preflight", () => {
     }
   });
 
+  it("applies the claude-encoding correction only when Token Budget is on", async () => {
+    // Same request and window for both encodings: its OpenAI-encoded estimate fits the 8100-token
+    // ceiling, while the corrected claude-encoded estimate does not (#5219).
+    const window = 10_800;
+    const request = (modelString: string) => {
+      const base = options(modelString);
+      return {
+        ...base,
+        providersConfig: {
+          ...base.providersConfig,
+          openai: {
+            ...base.providersConfig.openai,
+            models: [{ id: "custom-context-model", contextWindowTokens: window }],
+          },
+          anthropic: {
+            apiKeySet: true,
+            isEnabled: true,
+            isConfigured: true,
+            models: [{ id: "custom-claude", contextWindowTokens: window }],
+          },
+        },
+      };
+    };
+    const openai = await assembleBudgetCheckedPromptPayload(
+      request("openai:custom-context-model"),
+      {
+        enabled: true,
+      }
+    );
+    expect(openai.contextBudgetLimit).toBe(window);
+    const refused = await assembleBudgetCheckedPromptPayload(request("anthropic:custom-claude"), {
+      enabled: true,
+    }).catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(ContextBudgetExceededError);
+    // Token Budget off: no estimate gates the request, so it is sent unchanged.
+    const off = await assembleBudgetCheckedPromptPayload(request("anthropic:custom-claude"), {
+      enabled: false,
+    });
+    expect(off.contextBudgetLimit).toBeUndefined();
+    expect(off.messages.length).toBeGreaterThan(0);
+  });
+
   it("rechecks the target limit when a large-window primary falls back to a smaller model", async () => {
     const primary = await assembleBudgetCheckedPromptPayload(
       options("openai:large-context-model"),
@@ -463,6 +505,76 @@ describe("TurnRequestBuilder model attempt preparation", () => {
     }
   });
 
+  it("runs a mid-turn switch to 'off' on Sonnet 5.5 as low adaptive, not between_tools", async () => {
+    // #5086: effort stays pinned for the conversation, and a mid-turn level change
+    // is a change within it.
+    const harness = await createPreparationHarness();
+    try {
+      const sonnet55 = "anthropic:claude-sonnet-5-5";
+      const snapshot: ProvidersConfigMap = {
+        anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      };
+      const prepared = harness.builder.prepareModelAttempt(
+        preparationOptions(snapshot, {
+          rawModelString: sonnet55,
+          canonicalModelString: sonnet55,
+          effectiveModelString: sonnet55,
+          optionsModelString: sonnet55,
+          routeProvider: "anthropic",
+          effectiveThinkingLevel: "medium",
+        })
+      );
+
+      const rebuilt = prepared.rebuildProviderOptionsForThinkingLevel("off");
+      expect(rebuilt?.effectiveLevel).toBe("low");
+      expect(rebuilt?.providerOptions.anthropic).toMatchObject({
+        thinking: { type: "adaptive", display: "summarized" },
+        effort: "low",
+      });
+      // Already at low: "off" resolves to the same level, so nothing is rebuilt.
+      expect(prepared.rebuildProviderOptionsForThinkingLevel("off")).toBeNull();
+      // A pre-stream override (before any provider call) looks only at the history.
+      const folded = prepared.computeRebuiltProviderOptions("off", "medium", true);
+      expect(folded?.effectiveLevel).toBe("off");
+      expect(folded?.providerOptions.anthropic).toMatchObject({
+        thinking: { type: "between_tools" },
+      });
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  it("resolves a Sonnet 5.5 'off' override consumed before the first provider request as between_tools", async () => {
+    // #5279: StreamManager can consume an override at step 0, after the pre-construction
+    // fold but before any request; it must resolve as it would at turn start.
+    const harness = await createPreparationHarness();
+    try {
+      const sonnet55 = "anthropic:claude-sonnet-5-5";
+      const prepared = harness.builder.prepareModelAttempt(
+        preparationOptions(
+          { anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true } },
+          {
+            rawModelString: sonnet55,
+            canonicalModelString: sonnet55,
+            effectiveModelString: sonnet55,
+            optionsModelString: sonnet55,
+            routeProvider: "anthropic",
+            effectiveThinkingLevel: "medium",
+          }
+        )
+      );
+
+      const rebuilt = prepared.rebuildProviderOptionsForThinkingLevel("off", true);
+      expect(rebuilt?.effectiveLevel).toBe("off");
+      expect(rebuilt?.providerOptions.anthropic).toMatchObject({
+        thinking: { type: "between_tools" },
+        effort: "low",
+      });
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
   it.each([
     { routeProvider: "openai" as const, hasCacheKey: true },
     { routeProvider: "mux-gateway" as const, hasCacheKey: false },
@@ -473,11 +585,11 @@ describe("TurnRequestBuilder model attempt preparation", () => {
         preparationOptions(
           { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } },
           {
-            rawModelString: "openai:gpt-5.6-luna",
-            canonicalModelString: "openai:gpt-5.6-luna",
+            rawModelString: "openai:gpt-6-luna",
+            canonicalModelString: "openai:gpt-6-luna",
             canonicalProviderName: "openai",
-            effectiveModelString: "openai:gpt-5.6-luna",
-            optionsModelString: "openai:gpt-5.6-luna",
+            effectiveModelString: "openai:gpt-6-luna",
+            optionsModelString: "openai:gpt-6-luna",
             wireProviderName: "openai",
             routeProvider: testCase.routeProvider,
             effectiveThinkingLevel: "off",

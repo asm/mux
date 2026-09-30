@@ -1,4 +1,13 @@
-import { useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 
 import { Pencil } from "lucide-react";
 
@@ -8,14 +17,21 @@ import { createClient } from "xum/common/orpc/client";
 
 import { ProviderOptionsProvider } from "xum/browser/contexts/ProviderOptionsContext";
 import { SettingsProvider } from "xum/browser/contexts/SettingsContext";
-import { APIProvider } from "xum/browser/contexts/API";
+import { APIProvider, type APIClient } from "xum/browser/contexts/API";
 import { ThemeProvider } from "xum/browser/contexts/ThemeContext";
 import { ChatHostContextProvider } from "xum/browser/contexts/ChatHostContext";
 import { RouterProvider } from "xum/browser/contexts/RouterContext";
 import { PolicyProvider } from "xum/browser/contexts/PolicyContext";
 import { AgentProvider } from "xum/browser/contexts/AgentContext";
 import { BashCollapsedSummaryModeProvider } from "xum/browser/features/Tools/BashCollapsedSummaryModeContext";
-import { BackgroundBashProvider } from "xum/browser/contexts/BackgroundBashContext";
+import {
+  BackgroundBashProvider,
+  useBackgroundBashError,
+} from "xum/browser/contexts/BackgroundBashContext";
+import { BackgroundProcessesBanner } from "xum/browser/components/BackgroundProcessesBanner/BackgroundProcessesBanner";
+import { PopoverError } from "xum/browser/components/PopoverError/PopoverError";
+import { useBackgroundBashStoreRaw } from "xum/browser/stores/BackgroundBashStore";
+import { mergeConsecutiveStreamErrors } from "xum/browser/utils/messages/messageUtils";
 import { seedWorkspaceLocalStorageFromBackend } from "xum/browser/contexts/WorkspaceContext";
 import { WorkspaceModeAISync } from "xum/browser/components/WorkspaceModeAISync/WorkspaceModeAISync";
 import { resolvePersistedAgentId } from "xum/common/utils/agentIds";
@@ -44,10 +60,28 @@ import {
   TranscriptBundleRows,
   useTranscriptBundles,
 } from "xum/browser/components/ChatPane/TranscriptBundles";
+import {
+  findTranscriptMessageElement,
+  getTranscriptRowProps,
+  useTranscriptRowDerivations,
+  useUserMessageNavigation,
+} from "xum/browser/components/ChatPane/transcriptRowDerivations";
+import { BashOutputCollapsedIndicator } from "xum/browser/features/Tools/BashOutputCollapsedIndicator";
 import { applyWorkspaceChatEventToAggregator } from "xum/browser/utils/messages/applyWorkspaceChatEventToAggregator";
 import { StreamingMessageAggregator } from "xum/browser/utils/messages/StreamingMessageAggregator";
 import { LiveBashOutputSourceContext } from "xum/browser/stores/liveBashOutputSource";
 import { HeldInput } from "xum/browser/features/Messages/HeldInput";
+import { RetryBarrierContent } from "xum/browser/features/Messages/ChatBarrier/RetryBarrier";
+import { InterruptedBarrier } from "xum/browser/features/Messages/ChatBarrier/InterruptedBarrier";
+import {
+  getRetryBarrierDerivation,
+  type RetryBarrierDerivation,
+} from "xum/browser/components/ChatPane/retryBarrierDerivation";
+import { useResumeStream } from "xum/browser/hooks/useResumeStream";
+import {
+  isAutoRetryStatusEvent,
+  type AutoRetryStatus,
+} from "xum/browser/utils/messages/autoRetryStatus";
 
 import type {
   ExtensionToWebviewMessage,
@@ -71,9 +105,17 @@ import type { VscodeBridge } from "./vscodeBridge";
 // (#4711). PolicyProvider falls back to "no policy" because the bridge rejects policy.* calls (the
 // backend still enforces policy on send). A single AgentProvider covers both the transcript
 // (ProposePlanToolCall) and the composer.
+/** Identifies the server connection: switching servers keeps mode "api" but changes the URL. */
+function getApiConnectionKey(status: UiConnectionStatus | null): string | null {
+  return status?.mode === "api" ? (status.baseUrl ?? "api") : null;
+}
+
 function WebviewChatProviders(props: {
   workspaceId: string | undefined;
   workspaceAi: UiWorkspaceAiState | undefined;
+  selectedWorkspaceId: string | null;
+  /** The server connection; background bash state and errors never outlive it. */
+  apiConnectionKey: string | null;
   children: ReactNode;
 }) {
   return (
@@ -96,7 +138,25 @@ function WebviewChatProviders(props: {
         {props.workspaceId ? <WorkspaceModeAISync workspaceId={props.workspaceId} /> : null}
         {/* Re-renders bash tool headers when the seeded collapsed-summary mode arrives (#4972). */}
         <BashCollapsedSummaryModeProvider>
-          <TooltipProvider>{props.children}</TooltipProvider>
+          <TooltipProvider>
+            {/* Covers the transcript's bash cards and the dock's background processes strip
+                (#5092). Without a selection nothing reads it: both render only for a selected
+                workspace. */}
+            {/* Never key this by the server connection: it wraps the whole layout, and a remount
+                replaces the transcript scrollport that useAutoScroll observes, leaving a fresh
+                open unpinned from the bottom (#5231). connectionKey, the error popover's scope,
+                and the strip's key scope late failures and rows to the connection instead. */}
+            <BackgroundBashProvider
+              workspaceId={props.selectedWorkspaceId ?? ""}
+              connectionKey={props.apiConnectionKey}
+            >
+              {props.children}
+              <BackgroundBashErrorPopover
+                workspaceId={props.selectedWorkspaceId}
+                connectionKey={props.apiConnectionKey}
+              />
+            </BackgroundBashProvider>
+          </TooltipProvider>
         </BashCollapsedSummaryModeProvider>
       </AgentProvider>
     </PolicyProvider>
@@ -120,6 +180,45 @@ const VSCODE_CHAT_HOST_CONTEXT_VALUE = {
 // When released, rows are candidates again, so the reading position survives appends.
 const TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE = { overflowAnchor: "none" } as const;
 const TRANSCRIPT_BOTTOM_SENTINEL_STYLE = { overflowAnchor: "auto" } as const;
+
+const EMPTY_DISPLAYED_ROWS: { messages: DisplayedMessage[]; rendered: DisplayedMessage[] } = {
+  messages: [],
+  rendered: [],
+};
+
+// Terminate failures of the background processes strip, shown like desktop WorkspaceShell does.
+// Cleared on a workspace or server switch, as desktop ChatPane does on a workspace switch, so it
+// never shows under another chat.
+function BackgroundBashErrorPopover(props: {
+  workspaceId: string | null;
+  connectionKey: string | null;
+}): JSX.Element {
+  const { error, clearError } = useBackgroundBashError();
+  // The error belongs to the server connection and workspace it was raised in. Hide it during the
+  // render that switches either (a post-render clear alone would paint it over the new chat for a
+  // frame), then clear it and follow the new scope.
+  const [errorScope, setErrorScope] = useState({
+    workspaceId: props.workspaceId,
+    connectionKey: props.connectionKey,
+  });
+  const switched =
+    errorScope.workspaceId !== props.workspaceId ||
+    errorScope.connectionKey !== props.connectionKey;
+  useEffect(() => {
+    if (!switched) {
+      return;
+    }
+    clearError();
+    setErrorScope({ workspaceId: props.workspaceId, connectionKey: props.connectionKey });
+  }, [clearError, props.connectionKey, props.workspaceId, switched]);
+  return (
+    <PopoverError
+      error={switched ? null : error}
+      prefix="Failed to terminate:"
+      onDismiss={clearError}
+    />
+  );
+}
 
 const MAX_BUFFERED_HISTORICAL_MESSAGES = CHAT_BUFFER_LIMITS.MAX_HISTORICAL_MESSAGES;
 const MAX_BUFFERED_STREAM_EVENTS = CHAT_BUFFER_LIMITS.MAX_STREAM_EVENTS;
@@ -148,6 +247,9 @@ function shouldBufferUntilCaughtUp(event: WorkspaceChatMessage): boolean {
     case "stream-delta":
     case "stream-end":
     case "stream-abort":
+    // The backend replays a turn's terminal error before caught-up; applied early, it would be
+    // dropped when history loads (as WorkspaceStore buffers it too).
+    case "stream-error":
     case "tool-call-start":
     case "tool-call-delta":
     case "tool-call-end":
@@ -177,6 +279,19 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     return createClient(link);
   }, [bridge]);
 
+  // The API context wraps the whole webview app: its body calls shared hooks that read it
+  // (useResumeStream for the interrupted divider and its keybind).
+  return (
+    <APIProvider client={apiClient}>
+      <WebviewApp bridge={bridge} apiClient={apiClient} />
+    </APIProvider>
+  );
+}
+
+function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.Element {
+  const bridge = props.bridge;
+  const apiClient = props.apiClient;
+
   const [connectionStatus, setConnectionStatus] = useState<UiConnectionStatus | null>(null);
   const [workspaces, setWorkspaces] = useState<UiWorkspace[]>([]);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(null);
@@ -185,6 +300,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   const [transcriptCaughtUp, setTranscriptCaughtUp] = useState(false);
 
   const activeWorkspaceIdRef = useRef<string | null>(null);
+  const connectionKeyRef = useRef<string | null>(null);
   activeWorkspaceIdRef.current = selectedWorkspaceId;
 
   const chatReplayStateRef = useRef<ChatReplayState | null>(null);
@@ -202,10 +318,33 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   // The backend's held inputs for the selected workspace (#4771): full list, replayed on each
   // subscription while non-empty.
   const [heldInputs, setHeldInputs] = useState<readonly HeldInputData[]>([]);
-  const [displayedMessages, setDisplayedMessages] = useState<DisplayedMessage[]>([]);
+  // Desktop ChatPane renders consecutive identical stream errors as one row with a count (#5092).
+  // The merged rows are derived once per new aggregator snapshot (every flush re-renders, and the
+  // snapshot keeps its identity while unchanged) and kept beside the raw rows: the retry
+  // derivation's candidates and the resume read the raw rows, as ChatPane passes
+  // workspaceState.messages.
+  const [displayedRows, setDisplayedRows] = useState(EMPTY_DISPLAYED_ROWS);
+  const setDisplayedMessages = (messages: DisplayedMessage[]) =>
+    setDisplayedRows((previous) =>
+      previous.messages === messages
+        ? previous
+        : { messages, rendered: mergeConsecutiveStreamErrors(messages) }
+    );
+  const displayedMessages = displayedRows.messages;
+  const renderedMessages = displayedRows.rendered;
   // Armed background bash monitors of the selected workspace, forwarded by the host (#4971).
   const [activeBashMonitorCount, setActiveBashMonitorCount] = useState(0);
+  // The backend's auto-retry status, read-only (the webview never toggles or stops auto-retry):
+  // tracked from the same auto-retry-* chat events WorkspaceStore uses, and cleared by
+  // stream-start/stream-end and by every reset (new selection, chatReset, new replay). While a
+  // retry is scheduled, the barrier shows the countdown instead of Retry, so a manual Retry never
+  // races the armed backoff. Stored with its workspace so it never reaches another workspace.
+  const [autoRetryState, setAutoRetryState] = useState<{
+    workspaceId: string;
+    status: AutoRetryStatus;
+  } | null>(null);
   const workspacesRef = useRef<UiWorkspace[]>([]);
+  const backgroundBashStore = useBackgroundBashStoreRaw();
 
   // Every flush re-renders, even when the displayed messages are unchanged: the turn-status barrier
   // reads aggregator state that has no transcript row (stream lifecycle, startup breadcrumbs) (#4971).
@@ -295,6 +434,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     contentRef,
     sentinelRef,
     autoScroll,
+    disableAutoScroll,
     handleScroll,
     jumpToBottom,
     markUserScrollIntent,
@@ -321,9 +461,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   pushNoticeRef.current = pushNotice;
 
   const canChat = Boolean(connectionStatus?.mode === "api" && selectedWorkspaceId);
-  // Identifies the server connection: switching servers keeps mode "api" but changes the URL.
-  const apiConnectionKey =
-    connectionStatus?.mode === "api" ? (connectionStatus.baseUrl ?? "api") : null;
+  const apiConnectionKey = getApiConnectionKey(connectionStatus);
 
   // #4766: the model list, model routing and thinking floors read the shared providers and app
   // config stores, which the desktop connects in AppLoader. Connect them while the host has a
@@ -347,12 +485,16 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     });
     providersConfigStore.setClient(apiClient);
     appConfigStore.setClient(apiClient);
+    // The background processes strip and the bash tool cards' live process status (#5092). A
+    // server switch already dropped the previous server's cached rows (connectionStatus handler).
+    backgroundBashStore.setClient(apiClient);
     return () => {
       unsubscribeSeed();
       providersConfigStore.setClient(null);
       appConfigStore.setClient(null);
+      backgroundBashStore.setClient(null);
     };
-  }, [apiClient, apiConnectionKey]);
+  }, [apiClient, apiConnectionKey, backgroundBashStore]);
 
   useEffect(() => {
     const unsubscribe = bridge.onMessage((raw) => {
@@ -368,10 +510,20 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
       const msg = raw as ExtensionToWebviewMessage;
 
       switch (msg.type) {
-        case "connectionStatus":
+        case "connectionStatus": {
           transcriptBarrier.setConnected(msg.status.mode === "api");
+          const nextConnectionKey = getApiConnectionKey(msg.status);
+          if (nextConnectionKey !== connectionKeyRef.current) {
+            connectionKeyRef.current = nextConnectionKey;
+            // Workspace IDs can repeat across servers. Drop the previous server's background bash
+            // subscriptions and cached rows now, before the render that shows the new connection,
+            // so it never paints them; the connection effect installs the new server's client.
+            backgroundBashStore.setClient(null);
+            backgroundBashStore.clearCachedState();
+          }
           setConnectionStatus(msg.status);
           return;
+        }
         case "workspaces":
           // Seed each workspace's persisted agent/AI settings into the composer's storage, with the
           // desktop's own rules (#4738): a main workspace is snapshotted once per webview load, a
@@ -404,6 +556,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           aggregatorRef.current = null;
           liveBashOutput.reset(msg.workspaceId);
           setHeldInputs([]);
+          setAutoRetryState(null);
           setActiveBashMonitorCount(0);
           chatReplayStateRef.current = msg.workspaceId
             ? createChatReplayState(msg.workspaceId)
@@ -432,6 +585,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           );
           liveBashOutput.reset(msg.workspaceId);
           setHeldInputs([]);
+          setAutoRetryState(null);
           // The monitor count is kept: a resubscribe to the same workspace posts a fresh count, but
           // if the host cannot read it, the last one is better than hiding an armed monitor.
           chatReplayStateRef.current = createChatReplayState(msg.workspaceId);
@@ -470,9 +624,20 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
               chatReplayStateRef.current = replayState;
               liveBashOutput.reset(msg.workspaceId);
               setHeldInputs([]);
+              setAutoRetryState(null);
               transcriptBarrier.reset(msg.workspaceId);
               setTranscriptCaughtUp(false);
             }
+
+            // Auto-retry status transitions, applied in stream order (replayed events from the
+            // flush loop, live ones below), so a buffered stream-start never clears a later status.
+            const applyAutoRetryTransition = (chatEvent: WorkspaceChatMessage) => {
+              if (isAutoRetryStatusEvent(chatEvent)) {
+                setAutoRetryState({ workspaceId: msg.workspaceId, status: chatEvent });
+              } else if (chatEvent.type === "stream-start" || chatEvent.type === "stream-end") {
+                setAutoRetryState(null);
+              }
+            };
 
             const flushReplayBuffer = () => {
               const hasActiveStream = replayState.pendingStreamEvents.some(
@@ -485,6 +650,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
               }
 
               for (const bufferedEvent of replayState.pendingStreamEvents) {
+                applyAutoRetryTransition(bufferedEvent);
                 applyWorkspaceChatEventToAggregator(aggregator, bufferedEvent);
               }
               replayState.pendingStreamEvents.length = 0;
@@ -549,13 +715,14 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                 return;
               }
 
-              if (shouldBufferUntilCaughtUp(event)) {
+              if (shouldBufferUntilCaughtUp(event) || isAutoRetryStatusEvent(event)) {
                 replayState.pendingStreamEvents.push(event);
                 forceCatchUp();
                 return;
               }
             }
 
+            applyAutoRetryTransition(event);
             const hint = applyWorkspaceChatEventToAggregator(aggregator, event);
 
             if (hint === "ignored") {
@@ -651,6 +818,10 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   };
   const interruptStreamRef = useRef(interruptStream);
   interruptStreamRef.current = interruptStream;
+  // The Shift+R listener reads the latest retry derivation and resumes through these refs, which
+  // are updated where both are computed below.
+  const retryBarrierRef = useRef<RetryBarrierDerivation | null>(null);
+  const resumeInterruptedStreamRef = useRef<() => void>(() => undefined);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -704,18 +875,26 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [canChat, selectedWorkspaceId]);
 
-  // Transcript-scoped Shift+G, as in desktop useAIViewKeybinds: capture phase, and never while
-  // typing (the composer still receives a capital G) or while a modal owns the keyboard.
+  // Transcript-scoped Shift+G and Shift+R, as in desktop useAIViewKeybinds: capture phase, and
+  // never while typing (the composer still receives a capital G/R) or while a modal owns the
+  // keyboard. Shift+R resumes only when the interrupted divider on the tail offers resume.
   useEffect(() => {
     if (!selectedWorkspaceId) {
       return;
     }
     const handleKeyDownCapture = (e: KeyboardEvent) => {
+      if (isDialogOpen() || isEditableElement(e.target)) {
+        return;
+      }
       if (
-        isDialogOpen() ||
-        isEditableElement(e.target) ||
-        !matchesKeybind(e, KEYBINDS.JUMP_TO_BOTTOM)
+        matchesKeybind(e, KEYBINDS.RESUME_STREAM) &&
+        retryBarrierRef.current?.interruptedTailResumable
       ) {
+        e.preventDefault();
+        resumeInterruptedStreamRef.current();
+        return;
+      }
+      if (!matchesKeybind(e, KEYBINDS.JUMP_TO_BOTTOM)) {
         return;
       }
       e.preventDefault();
@@ -764,9 +943,74 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     : undefined;
   const transcriptBundles = useTranscriptBundles({
     workspaceId: selectedWorkspaceId ?? "",
-    messages: displayedMessages,
+    messages: renderedMessages,
     transcriptDensity,
     isTurnActive: streamState ? streamState.isStreamStarting || streamState.canInterrupt : false,
+  });
+  // Retry barrier and interrupted dividers, with desktop ChatPane's shared derivation fed from this
+  // webview's aggregator. Its rows are never deferred, so renderedMessages are the merged rows on
+  // screen and messages the raw ones, as in ChatPane.
+  const aggregator = aggregatorRef.current;
+  const autoRetryStatus =
+    autoRetryState?.workspaceId === selectedWorkspaceId ? autoRetryState.status : null;
+  const retryBarrier =
+    selectedWorkspaceId && aggregator && streamState
+      ? getRetryBarrierDerivation({
+          messages: displayedMessages,
+          renderedMessages,
+          pendingStreamStartTime: aggregator.getPendingStreamStartTime(),
+          runtimeStatus: aggregator.getRuntimeStatus(),
+          lastAbortReason: aggregator.getLastAbortReason(),
+          // Read-only: an active backend retry hides the dividers' resume, as on desktop.
+          autoRetryStatus,
+          isHydratingTranscript: !transcriptCaughtUp,
+          isTurnActive: streamState.isStreamStarting || streamState.canInterrupt,
+          // Without a server connection (file mode) every bridged action is refused, so the
+          // interrupted divider offers no resume (as a read-only desktop transcript) and the
+          // retry barrier is not mounted below.
+          transcriptOnly: !canChat,
+        })
+      : null;
+  // Retry and resume send as the composer does: a sub-agent's locked agent, not a stored pick
+  // (#4738). Same resolution as WebviewChatProviders' workspaceMetaFallback.
+  const lockedAgentId =
+    selectedWorkspace?.ai?.parentWorkspaceId != null
+      ? resolvePersistedAgentId(selectedWorkspace.ai, "") || undefined
+      : undefined;
+  // Shared by the divider's resume button, Shift+R and the retry barrier's Retry: the webview
+  // retries through the same resume path instead of toggling auto-retry.
+  const { resume: resumeInterruptedStreamAsync, error: resumeInterruptedError } = useResumeStream(
+    selectedWorkspaceId ?? "",
+    retryBarrier?.lastRetryCandidateMessage?.id,
+    displayedMessages,
+    lockedAgentId
+  );
+  const resumeInterruptedStream = () => void resumeInterruptedStreamAsync();
+  retryBarrierRef.current = retryBarrier;
+  resumeInterruptedStreamRef.current = resumeInterruptedStream;
+
+  // bash_output grouping, task report linking and prompt navigation, as in ChatPane (#5002).
+  const transcriptRowDerivations = useTranscriptRowDerivations({
+    workspaceId: selectedWorkspaceId ?? "",
+    messages: renderedMessages,
+  });
+  // Stable so the per-prompt navigation objects keep their identity across flushes. Every row is
+  // mounted (no bounded reveal), so the target can be scrolled to directly; disabling auto-scroll
+  // first keeps streaming content from pulling the view back to the tail.
+  const handleNavigateToMessage = useCallback(
+    (historyId: string) => {
+      disableAutoScroll();
+      const scrollContainer = contentRef.current;
+      const target = scrollContainer
+        ? findTranscriptMessageElement(scrollContainer, historyId)
+        : undefined;
+      target?.scrollIntoView({ behavior: "smooth", block: "center" });
+    },
+    [contentRef, disableAutoScroll]
+  );
+  const userMessageNavigationByHistoryId = useUserMessageNavigation({
+    messages: renderedMessages,
+    onNavigateToMessage: handleNavigateToMessage,
   });
 
   return (
@@ -775,213 +1019,278 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     // navigations become no-ops instead of crashing the mount or rewriting the webview URL.
     <RouterProvider embedded>
       <ChatHostContextProvider value={chatHostContextValue}>
-        <APIProvider client={apiClient}>
-          <SettingsProvider>
-            <ProviderOptionsProvider>
-              <ThemeProvider forcedTheme="dark">
-                <WebviewChatProviders
-                  // Scope agent state (and its agents.list lookup) to the selected workspace only
-                  // once the extension has listed it: on a fresh extension host the restored
-                  // selection arrives before the list, and the host rejects lookups for workspaces
-                  // it has not sent (#4751). It also requires a server connection: file mode lists
-                  // workspaces but the host rejects agents.list there, and a recovery that keeps
-                  // the same selection must change this prop so the lookup runs again (#4797).
-                  workspaceId={agentScopeWorkspaceId}
-                  workspaceAi={selectedWorkspace?.ai}
-                >
-                  <div className="flex h-screen flex-col">
-                    <div className="border-b border-border bg-background-secondary p-3">
-                      <div className="flex items-center gap-2">
-                        <WorkspacePicker
-                          workspaces={workspaces}
-                          selectedWorkspaceId={selectedWorkspaceId}
-                          onSelectWorkspace={(workspaceId) => {
-                            bridge.postMessage({ type: "selectWorkspace", workspaceId });
-                          }}
-                          onRequestRefresh={requestRefreshWorkspaces}
-                        />
-
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <span
-                              className="inline-flex shrink-0 items-center rounded border border-border-light bg-background px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted"
-                              aria-label="Preview feature"
-                            >
-                              Preview
-                            </span>
-                          </TooltipTrigger>
-                          <TooltipContent align="center">
-                            Preview feature — under active development; may contain bugs.
-                          </TooltipContent>
-                        </Tooltip>
-
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon"
-                              onClick={onOpenWorkspace}
-                              disabled={!selectedWorkspaceId}
-                              aria-label="Open workspace"
-                              className="text-muted hover:text-foreground h-8 w-8 shrink-0"
-                            >
-                              <Pencil className="h-4 w-4" />
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent align="center">Open workspace</TooltipContent>
-                        </Tooltip>
-                      </div>
-                    </div>
-
-                    <div
-                      ref={contentRef}
-                      className="flex-1 overflow-y-auto p-3"
-                      onScroll={handleScroll}
-                      onWheel={handleScrollContainerWheel}
-                      onMouseDown={handleScrollContainerMouseDown}
-                      onMouseMove={handleScrollContainerMouseMove}
-                      onMouseUp={handleScrollContainerMouseUp}
-                      onKeyDown={handleScrollContainerKeyDown}
-                      onTouchMove={markUserScrollIntent}
-                    >
-                      <div style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}>
-                        {selectedWorkspaceId ? (
-                          <BackgroundBashProvider workspaceId={selectedWorkspaceId}>
-                            <LiveBashOutputSourceContext.Provider value={liveBashOutput}>
-                              <TranscriptBundleRows
-                                workspaceId={selectedWorkspaceId}
-                                messages={displayedMessages}
-                                indexOffset={0}
-                                bundles={transcriptBundles}
-                                renderMessageAtIndex={(msg, _index, options) => {
-                                  const row = (
-                                    <DisplayedMessageRenderer
-                                      key={options.key}
-                                      message={msg}
-                                      workspaceId={selectedWorkspaceId}
-                                      isLatestProposePlan={msg.id === latestProposePlanId}
-                                      isCompacting={aggregatorRef.current?.isCompacting() ?? false}
-                                      onCloseEphemeral={messageRowActions.closeEphemeral}
-                                      onShowAllHistory={messageRowActions.showAllHistory}
-                                    />
-                                  );
-                                  return options.className ? (
-                                    <div key={options.key} className={options.className}>
-                                      {row}
-                                    </div>
-                                  ) : (
-                                    row
-                                  );
-                                }}
-                              />
-                            </LiveBashOutputSourceContext.Provider>
-                          </BackgroundBashProvider>
-                        ) : null}
-
-                        {notices.map((notice) => (
-                          <div
-                            key={notice.id}
-                            className={
-                              notice.level === "error"
-                                ? "mt-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200"
-                                : "mt-3 rounded-md border border-border-medium bg-background-secondary px-3 py-2 text-sm"
-                            }
-                          >
-                            {notice.message}
-                          </div>
-                        ))}
-
-                        {!selectedWorkspaceId && notices.length === 0 ? (
-                          <div className="text-muted text-sm">
-                            Select a Xum workspace to view messages.
-                          </div>
-                        ) : null}
-                      </div>
-                      {/* Bottom anchor: last child of the scrollport, so content appends above it. */}
-                      <div
-                        ref={sentinelRef}
-                        data-testid="transcript-bottom-sentinel"
-                        aria-hidden="true"
-                        className="h-0 w-full"
-                        style={TRANSCRIPT_BOTTOM_SENTINEL_STYLE}
+        <SettingsProvider>
+          <ProviderOptionsProvider>
+            <ThemeProvider forcedTheme="dark">
+              <WebviewChatProviders
+                // Scope agent state (and its agents.list lookup) to the selected workspace only
+                // once the extension has listed it: on a fresh extension host the restored
+                // selection arrives before the list, and the host rejects lookups for workspaces
+                // it has not sent (#4751). It also requires a server connection: file mode lists
+                // workspaces but the host rejects agents.list there, and a recovery that keeps
+                // the same selection must change this prop so the lookup runs again (#4797).
+                workspaceId={agentScopeWorkspaceId}
+                workspaceAi={selectedWorkspace?.ai}
+                selectedWorkspaceId={selectedWorkspaceId}
+                apiConnectionKey={apiConnectionKey}
+              >
+                <div className="flex h-screen flex-col">
+                  <div className="border-b border-border bg-background-secondary p-3">
+                    <div className="flex items-center gap-2">
+                      <WorkspacePicker
+                        workspaces={workspaces}
+                        selectedWorkspaceId={selectedWorkspaceId}
+                        onSelectWorkspace={(workspaceId) => {
+                          bridge.postMessage({ type: "selectWorkspace", workspaceId });
+                        }}
+                        onRequestRefresh={requestRefreshWorkspaces}
                       />
-                    </div>
 
-                    {/* The dock holds the chat input, which opts into Escape-to-interrupt like the
-                        desktop ChatInput textarea; other editors keep Escape to themselves. */}
-                    <div
-                      className="relative bg-surface-primary px-[15px] pt-2 pb-2"
-                      data-escape-interrupts-stream="true"
-                    >
-                      {selectedWorkspaceId && !autoScroll ? (
-                        // Same pill as desktop ChatPane, just above the dock.
-                        <button
-                          onClick={jumpToBottom}
-                          type="button"
-                          className="assistant-chip font-primary text-foreground hover:assistant-chip-hover absolute bottom-full left-1/2 z-20 mb-2 -translate-x-1/2 cursor-pointer rounded-[20px] px-2 py-1 text-xs font-medium shadow-[0_4px_12px_rgba(0,0,0,0.3)] backdrop-blur-[1px] transition-transform duration-200 hover:scale-105 active:scale-95"
-                        >
-                          Jump to bottom{" "}
-                          <span className="mobile-hide-shortcut-hints">
-                            ({formatKeybind(KEYBINDS.JUMP_TO_BOTTOM)})
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <span
+                            className="inline-flex shrink-0 items-center rounded border border-border-light bg-background px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted"
+                            aria-label="Preview feature"
+                          >
+                            Preview
                           </span>
-                        </button>
-                      ) : null}
-                      {selectedWorkspaceId && heldInputs.length > 0 ? (
-                        // Bounded scroll lane: many or long held inputs must not push the composer
-                        // below the fixed-height layout or collapse the transcript.
-                        <div className="max-h-[40vh] overflow-y-auto">
-                          {heldInputs.map((heldInput, index) => (
-                            <HeldInput
-                              key={heldInput.id}
-                              workspaceId={selectedWorkspaceId}
-                              heldInput={heldInput}
-                              // The composer's held-input shortcuts act on the oldest one.
-                              isShortcutTarget={index === 0}
-                            />
-                          ))}
-                        </div>
-                      ) : null}
-                      {/* Live turn status sits beside the input, below held inputs, as in desktop. */}
-                      {selectedWorkspaceId ? (
-                        <VscodeStreamingBarrier
-                          workspaceId={selectedWorkspaceId}
-                          aggregator={aggregatorRef.current}
-                          activeBashMonitorCount={activeBashMonitorCount}
-                          onCancel={(phase) =>
-                            interruptStream({ abandonPartial: phase === "compacting" })
-                          }
-                        />
-                      ) : null}
-                      {selectedWorkspaceId ? (
-                        <ChatComposer
-                          key={selectedWorkspaceId}
-                          workspaceId={selectedWorkspaceId}
-                          disabled={!canChat || !transcriptCaughtUp}
-                          disabledReason={
-                            !canChat
-                              ? "Chat requires Xum server connection."
-                              : !transcriptCaughtUp
-                                ? "Loading chat history..."
-                                : undefined
-                          }
-                          aggregator={aggregatorRef.current}
-                          aiSettingsLoaded={selectedWorkspace?.ai != null}
-                          agentScoped={agentScopeWorkspaceId != null}
-                          heldInputId={heldInputs[0]?.id}
-                          onSendComplete={jumpToBottom}
-                          onNotice={pushNotice}
-                        />
-                      ) : (
-                        <div className="text-muted text-sm">Select a Xum workspace to chat.</div>
-                      )}
+                        </TooltipTrigger>
+                        <TooltipContent align="center">
+                          Preview feature — under active development; may contain bugs.
+                        </TooltipContent>
+                      </Tooltip>
+
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            onClick={onOpenWorkspace}
+                            disabled={!selectedWorkspaceId}
+                            aria-label="Open workspace"
+                            className="text-muted hover:text-foreground h-8 w-8 shrink-0"
+                          >
+                            <Pencil className="h-4 w-4" />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent align="center">Open workspace</TooltipContent>
+                      </Tooltip>
                     </div>
                   </div>
-                </WebviewChatProviders>
-              </ThemeProvider>
-            </ProviderOptionsProvider>
-          </SettingsProvider>
-        </APIProvider>
+
+                  <div
+                    ref={contentRef}
+                    className="flex-1 overflow-y-auto p-3"
+                    onScroll={handleScroll}
+                    onWheel={handleScrollContainerWheel}
+                    onMouseDown={handleScrollContainerMouseDown}
+                    onMouseMove={handleScrollContainerMouseMove}
+                    onMouseUp={handleScrollContainerMouseUp}
+                    onKeyDown={handleScrollContainerKeyDown}
+                    onTouchMove={markUserScrollIntent}
+                  >
+                    <div style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}>
+                      {selectedWorkspaceId ? (
+                        <LiveBashOutputSourceContext.Provider value={liveBashOutput}>
+                          <TranscriptBundleRows
+                            workspaceId={selectedWorkspaceId}
+                            messages={renderedMessages}
+                            indexOffset={0}
+                            bundles={transcriptBundles}
+                            renderMessageAtIndex={(msg, index, options) => {
+                              const rowProps = getTranscriptRowProps({
+                                derivations: transcriptRowDerivations,
+                                userMessageNavigationByHistoryId,
+                                messages: renderedMessages,
+                                message: msg,
+                                index,
+                              });
+                              if (rowProps.hidden) {
+                                return null;
+                              }
+                              const { bashOutputGroup, bashGroupKey } = rowProps;
+                              const row = (
+                                <DisplayedMessageRenderer
+                                  message={msg}
+                                  workspaceId={selectedWorkspaceId}
+                                  isLatestProposePlan={msg.id === latestProposePlanId}
+                                  isCompacting={aggregatorRef.current?.isCompacting() ?? false}
+                                  onCloseEphemeral={messageRowActions.closeEphemeral}
+                                  onShowAllHistory={messageRowActions.showAllHistory}
+                                  bashOutputGroup={bashOutputGroup}
+                                  taskReportLinking={rowProps.taskReportLinking}
+                                  userMessageNavigation={rowProps.userMessageNavigation}
+                                />
+                              );
+                              return (
+                                <Fragment key={options.key}>
+                                  {options.className ? (
+                                    <div className={options.className}>{row}</div>
+                                  ) : (
+                                    row
+                                  )}
+                                  {bashOutputGroup?.position === "first" && bashGroupKey ? (
+                                    <BashOutputCollapsedIndicator
+                                      processId={bashOutputGroup.processId}
+                                      collapsedCount={bashOutputGroup.collapsedCount}
+                                      isExpanded={rowProps.isBashGroupExpanded}
+                                      onToggle={() =>
+                                        transcriptRowDerivations.toggleBashOutputGroup(bashGroupKey)
+                                      }
+                                    />
+                                  ) : null}
+                                  {retryBarrier?.interruptedBarrierMessageIds.has(msg.id) ? (
+                                    <InterruptedBarrier
+                                      resumable={
+                                        retryBarrier.interruptedTailResumable &&
+                                        msg.id === retryBarrier.lastRetryCandidateMessage?.id
+                                      }
+                                      onResume={resumeInterruptedStream}
+                                      error={resumeInterruptedError}
+                                    />
+                                  ) : null}
+                                </Fragment>
+                              );
+                            }}
+                          />
+                          {/* Transcript tail, after the rows, as in desktop ChatPane. */}
+                          {canChat && retryBarrier?.shouldMountRetryBarrier && streamState ? (
+                            <RetryBarrierContent
+                              workspaceId={selectedWorkspaceId}
+                              visible={retryBarrier.showRetryBarrierUI}
+                              messages={displayedMessages}
+                              autoRetryStatus={autoRetryStatus}
+                              // The webview shows the backend's retry countdown but never
+                              // stops auto-retry, so no Stop action.
+                              showStopAutoRetry={false}
+                              isStreamStarting={streamState.isStreamStarting}
+                              canInterrupt={streamState.canInterrupt}
+                              onRetry={resumeInterruptedStreamAsync}
+                              retryError={resumeInterruptedError}
+                            />
+                          ) : null}
+                        </LiveBashOutputSourceContext.Provider>
+                      ) : null}
+
+                      {notices.map((notice) => (
+                        <div
+                          key={notice.id}
+                          className={
+                            notice.level === "error"
+                              ? "mt-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200"
+                              : "mt-3 rounded-md border border-border-medium bg-background-secondary px-3 py-2 text-sm"
+                          }
+                        >
+                          {notice.message}
+                        </div>
+                      ))}
+
+                      {!selectedWorkspaceId && notices.length === 0 ? (
+                        <div className="text-muted text-sm">
+                          Select a Xum workspace to view messages.
+                        </div>
+                      ) : null}
+                    </div>
+                    {/* Bottom anchor: last child of the scrollport, so content appends above it. */}
+                    <div
+                      ref={sentinelRef}
+                      data-testid="transcript-bottom-sentinel"
+                      aria-hidden="true"
+                      className="h-0 w-full"
+                      style={TRANSCRIPT_BOTTOM_SENTINEL_STYLE}
+                    />
+                  </div>
+
+                  {/* The dock holds the chat input, which opts into Escape-to-interrupt like the
+                      desktop ChatInput textarea; other editors keep Escape to themselves. */}
+                  <div
+                    className="relative bg-surface-primary px-[15px] pt-2 pb-2"
+                    data-escape-interrupts-stream="true"
+                  >
+                    {selectedWorkspaceId && !autoScroll ? (
+                      // Same pill as desktop ChatPane, just above the dock.
+                      <button
+                        onClick={jumpToBottom}
+                        type="button"
+                        className="assistant-chip font-primary text-foreground hover:assistant-chip-hover absolute bottom-full left-1/2 z-20 mb-2 -translate-x-1/2 cursor-pointer rounded-[20px] px-2 py-1 text-xs font-medium shadow-[0_4px_12px_rgba(0,0,0,0.3)] backdrop-blur-[1px] transition-transform duration-200 hover:scale-105 active:scale-95"
+                      >
+                        Jump to bottom{" "}
+                        <span className="mobile-hide-shortcut-hints">
+                          ({formatKeybind(KEYBINDS.JUMP_TO_BOTTOM)})
+                        </span>
+                      </button>
+                    ) : null}
+                    {selectedWorkspaceId && heldInputs.length > 0 ? (
+                      // Bounded scroll lane: many or long held inputs must not push the composer
+                      // below the fixed-height layout or collapse the transcript.
+                      <div className="max-h-[40vh] overflow-y-auto">
+                        {heldInputs.map((heldInput, index) => (
+                          <HeldInput
+                            key={heldInput.id}
+                            workspaceId={selectedWorkspaceId}
+                            heldInput={heldInput}
+                            // The composer's held-input shortcuts act on the oldest one.
+                            isShortcutTarget={index === 0}
+                          />
+                        ))}
+                      </div>
+                    ) : null}
+                    {/* Background bashes sit between held inputs and the turn status, as in the
+                        desktop dock. Keyed so the expanded list and an open output dialog never
+                        carry over to another workspace or server. Without a server connection the
+                        store has no client, so its last-known processes are not offered. */}
+                    {selectedWorkspaceId && canChat ? (
+                      // The shared banner brings its own dock gutter (desktop's composer has the
+                      // same one); cancel this dock's padding so it lines up with the composer.
+                      <div className="-mx-[15px]">
+                        <BackgroundProcessesBanner
+                          // Sibling of the composer, which is keyed by the bare workspace ID.
+                          // Includes the connection: both servers may share a workspace ID.
+                          key={`background-processes-${apiConnectionKey ?? ""}-${selectedWorkspaceId}`}
+                          workspaceId={selectedWorkspaceId}
+                        />
+                      </div>
+                    ) : null}
+                    {/* Live turn status sits beside the input, below held inputs, as in desktop. */}
+                    {selectedWorkspaceId ? (
+                      <VscodeStreamingBarrier
+                        workspaceId={selectedWorkspaceId}
+                        aggregator={aggregatorRef.current}
+                        activeBashMonitorCount={activeBashMonitorCount}
+                        onCancel={(phase) =>
+                          interruptStream({ abandonPartial: phase === "compacting" })
+                        }
+                      />
+                    ) : null}
+                    {selectedWorkspaceId ? (
+                      <ChatComposer
+                        key={selectedWorkspaceId}
+                        workspaceId={selectedWorkspaceId}
+                        disabled={!canChat || !transcriptCaughtUp}
+                        disabledReason={
+                          !canChat
+                            ? "Chat requires Xum server connection."
+                            : !transcriptCaughtUp
+                              ? "Loading chat history..."
+                              : undefined
+                        }
+                        aggregator={aggregatorRef.current}
+                        aiSettingsLoaded={selectedWorkspace?.ai != null}
+                        agentScoped={agentScopeWorkspaceId != null}
+                        heldInputId={heldInputs[0]?.id}
+                        onSendComplete={jumpToBottom}
+                        onNotice={pushNotice}
+                      />
+                    ) : (
+                      <div className="text-muted text-sm">Select a Xum workspace to chat.</div>
+                    )}
+                  </div>
+                </div>
+              </WebviewChatProviders>
+            </ThemeProvider>
+          </ProviderOptionsProvider>
+        </SettingsProvider>
       </ChatHostContextProvider>
     </RouterProvider>
   );

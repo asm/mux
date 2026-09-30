@@ -18,7 +18,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
  * uninterruptible in the service pipeline (see asAtomicMutation in
  * providerService.ts and startDesktopFlowEffect in muxGatewayOauthService.ts).
  */
-import { ORPCError, os } from "@orpc/server";
+import { ORPCError, os, type ProcedureConfig } from "@orpc/server";
 import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
 import * as schemas from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
@@ -99,6 +99,7 @@ import {
   subscribeConfigChanges,
   subscribeDevTools,
   subscribeReviewState,
+  subscribeDrafts,
   subscribeLogs,
   subscribeBackgroundBashes,
   subscribeMemoryChanges,
@@ -146,6 +147,19 @@ import {
   subscribeWorkflowRuns,
 } from "@/node/services/workflows/WorkflowService";
 import { throwWorkflowOrpcError } from "./formatOrpcError";
+import { isDraftTooLargeError } from "@/common/utils/drafts";
+import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
+
+/**
+ * Transports mask plain errors as "Internal Server Error". The draft size refusal must reach the
+ * renderer as itself: it is permanent until the draft changes, so DraftStore stops retrying it.
+ */
+function rethrowDraftTooLarge(error: unknown): never {
+  if (isDraftTooLargeError(error)) {
+    throw new ORPCError("BAD_REQUEST", { message: (error as Error).message });
+  }
+  throw error;
+}
 
 function handleWorkflowRequest<T>(request: () => Promise<T>): Promise<T> {
   return request().catch(throwWorkflowOrpcError);
@@ -180,10 +194,16 @@ async function getCurrentServerAuthSessionId(context: ORPCContext): Promise<stri
 const atomicPromise = <A>(thunk: () => Promise<A>) => Effect.uninterruptible(Effect.promise(thunk));
 
 export const router = (authToken?: string) => {
-  const t = os
-    .$context<ORPCContext>()
-    .use(createAuthMiddleware(authToken))
-    .use(inFlightProcedureMiddleware);
+  const auth = createAuthMiddleware(authToken);
+  // One factory for every builder so their middleware chains cannot diverge. `$config` exists only
+  // on the root builder and is a plain spread, so `$config({})` leaves `t` unchanged.
+  const procedure = (config: ProcedureConfig = {}) =>
+    os.$context<ORPCContext>().$config(config).use(auth).use(inFlightProcedureMiddleware);
+  const t = procedure();
+  // For subscriptions that validate their own yielded values with the declared output schema
+  // (onChat, #4868: replay rows are then parsed once, not twice). The declared `.output()` stays,
+  // so types and the generated OpenAPI are unchanged.
+  const tSelfValidatedOutput = procedure({ disableOutputValidation: true });
 
   return t.router({
     tokenizer: {
@@ -593,6 +613,48 @@ export const router = (authToken?: string) => {
           })
         ),
     },
+    drafts: {
+      list: t
+        .input(schemas.drafts.list.input)
+        .output(schemas.drafts.list.output)
+        .handler(({ context }) => context.draftService.list()),
+      get: t
+        .input(schemas.drafts.get.input)
+        .output(schemas.drafts.get.output)
+        .handler(({ context, input }) => context.draftService.get(input.scope)),
+      update: t
+        .input(schemas.drafts.update.input)
+        .output(schemas.drafts.update.output)
+        .handler(({ context, input }) =>
+          context.draftService.update(input).catch(rethrowDraftTooLarge)
+        ),
+      delete: t
+        .input(schemas.drafts.delete.input)
+        .output(schemas.drafts.delete.output)
+        .handler(({ context, input }) => context.draftService.delete(input.scope)),
+      importLegacy: t
+        .input(schemas.drafts.importLegacy.input)
+        .output(schemas.drafts.importLegacy.output)
+        .handler(({ context, input }) =>
+          context.draftService.importLegacy(input).catch(rethrowDraftTooLarge)
+        ),
+      getList: t
+        .input(schemas.drafts.getList.input)
+        .output(schemas.drafts.getList.output)
+        .handler(({ context }) => context.draftService.getList({ strict: true })),
+      putListEntry: t
+        .input(schemas.drafts.putListEntry.input)
+        .output(schemas.drafts.putListEntry.output)
+        .handler(({ context, input }) => context.draftService.putListEntry(input)),
+      importLegacyList: t
+        .input(schemas.drafts.importLegacyList.input)
+        .output(schemas.drafts.importLegacyList.output)
+        .handler(({ context, input }) => context.draftService.importLegacyList(input.entries)),
+      subscribe: t
+        .input(schemas.drafts.subscribe.input)
+        .output(schemas.drafts.subscribe.output)
+        .handler(({ context, signal }) => subscribeDrafts(context, signal)),
+    },
     uiLayouts: {
       getAll: t
         .input(schemas.uiLayouts.getAll.input)
@@ -702,6 +764,15 @@ export const router = (authToken?: string) => {
         .output(schemas.providers.discoverModels.output)
         .handler(({ context, input, signal }) =>
           context.providerService.discoverModels(input.provider, signal)
+        ),
+      searchModelCatalog: t
+        .input(schemas.providers.searchModelCatalog.input)
+        .output(schemas.providers.searchModelCatalog.output)
+        .handler(({ context, input }) =>
+          // Filter by policy before paging so totals match what the UI can add.
+          searchModelCatalog(input, (provider, modelId) =>
+            context.policyService.isModelAllowed(provider, modelId)
+          )
         ),
       list: t
         .input(schemas.providers.list.input)
@@ -1718,6 +1789,12 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) =>
           context.workspaceService.setPinned(input.workspaceId, input.pinned)
         ),
+      keepInterruptedDelegatedWorkspace: t
+        .input(schemas.workspace.keepInterruptedDelegatedWorkspace.input)
+        .output(schemas.workspace.keepInterruptedDelegatedWorkspace.output)
+        .handler(async ({ context, input }) =>
+          context.workspaceService.keepInterruptedDelegatedWorkspace(input.workspaceId)
+        ),
       reorderPinned: t
         .input(schemas.workspace.reorderPinned.input)
         .output(schemas.workspace.reorderPinned.output)
@@ -1853,7 +1930,11 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.sendHeldInput.input)
         .output(schemas.workspace.sendHeldInput.output)
         .handler(({ context, input }) =>
-          context.workspaceService.sendHeldInput(input.workspaceId, input.heldInputId)
+          context.workspaceService.sendHeldInput(
+            input.workspaceId,
+            input.heldInputId,
+            input.acpCorrelation
+          )
         ),
       discardHeldInput: t
         .input(schemas.workspace.discardHeldInput.input)
@@ -1977,10 +2058,12 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) =>
           context.workspaceService.getFileCompletions(input.workspaceId, input.query, input.limit)
         ),
-      onChat: t
+      onChat: tSelfValidatedOutput
         .input(schemas.workspace.onChat.input)
         .output(schemas.workspace.onChat.output)
-        .handler(({ context, input, signal }) => subscribeWorkspaceChat(context, input, signal)),
+        .handler(({ context, input, signal }) =>
+          subscribeWorkspaceChat(context, input, signal, { validateOutput: true })
+        ),
       onMetadata: t
         .input(schemas.workspace.onMetadata.input)
         .output(schemas.workspace.onMetadata.output)
@@ -2000,7 +2083,9 @@ export const router = (authToken?: string) => {
           .input(schemas.workspace.history.loadMore.input)
           .output(schemas.workspace.history.loadMore.output)
           .handler(async ({ context, input }) =>
-            context.workspaceService.getHistoryLoadMore(input.workspaceId, input.cursor)
+            context.workspaceService.getHistoryLoadMore(input.workspaceId, input.cursor, {
+              windowed: input.windowed === true,
+            })
           ),
         lastUserPrompt: t
           .input(schemas.workspace.history.lastUserPrompt.input)
@@ -2213,6 +2298,16 @@ export const router = (authToken?: string) => {
         .input(schemas.tasks.create.input)
         .output(schemas.tasks.create.output)
         .handler(({ context, input }) => context.taskService.createFromRpc(input)),
+      previewRemoval: t
+        .input(schemas.tasks.previewRemoval.input)
+        .output(schemas.tasks.previewRemoval.output)
+        .handler(({ context, input }) => context.taskService.previewSubagentRemoval(input.taskId)),
+      remove: t
+        .input(schemas.tasks.remove.input)
+        .output(schemas.tasks.remove.output)
+        .handler(({ context, input }) =>
+          context.taskService.removeSubagentForUser(input.taskId, input.acknowledgedWork)
+        ),
     },
     window: {
       setTitle: t

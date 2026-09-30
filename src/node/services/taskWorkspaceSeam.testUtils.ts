@@ -9,6 +9,8 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     sendMessage: () => Promise.resolve(Ok(undefined)),
     grantPendingDefaultUnrelatedWorkspaceConsent: () => Promise.resolve(),
     clearPendingDefaultUnrelatedConsent: () => Promise.resolve(),
+    clearDelegatedCreationMark: () => Promise.resolve(),
+    markDelegatedCreationInterrupted: () => Promise.resolve(false),
     resumeStream: () => Promise.resolve(Ok({ started: true })),
     clearQueue: () => Ok(undefined),
     replaceHistory: () => Promise.resolve(Ok(undefined)),
@@ -48,6 +50,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     archiveWhileTaskTreeLocked: () => Promise.resolve(Ok({ kind: "archived" })),
     unarchiveWhileTaskTreeLocked: () => Promise.resolve(Ok(undefined)),
     preflightArchive: () => Promise.resolve(Ok({ kind: "ready" })),
+    preflightArchiveCascade: () => Promise.resolve(Ok({ targetPaths: [], subagents: [] })),
     // No live activity grants the hold so task tests reach interruption behavior.
     acquirePreInterruptionArchiveHold: () => Ok({ [Symbol.dispose]: () => undefined }),
     listLiveWorkspaceActivity: () => ({
@@ -66,6 +69,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     remove: () => Promise.resolve(Ok(undefined)),
     removeWhileTaskTreeLocked: () => Promise.resolve(Ok(undefined)),
     create: () => Promise.resolve(Err("workspaceHost.create not mocked")),
+    createScratch: () => Promise.resolve(Err("workspaceHost.createScratch not mocked")),
     // Task-create tests exercise launch flow, not plugin-override sanitization.
     sanitizeMaterializedTaskWorkspace: () => Promise.resolve(undefined),
     discardExtensionMetadataEntry: () => Promise.resolve(),
@@ -96,6 +100,7 @@ export function makeAgentTaskIntegrationFake(
     removeAcknowledgedDescendantsWhileTaskTreeLocked: () => Promise.resolve(Ok(undefined)),
     hasActiveDescendantAgentTasksForWorkspace: () => false,
     hasActiveTopLevelWorkflowRunsForWorkspace: () => Promise.resolve(false),
+    hasLiveAgentTaskContinuation: () => false,
     getAgentTaskStatus: () => undefined,
     resetAutoResumeCount: () => undefined,
     noteWorkspaceRemoved: () => undefined,
