@@ -2489,6 +2489,10 @@ export class HistoryService {
     );
 
     const operation = async (): Promise<Result<{ messages: MuxMessage[]; hasOlder: boolean }>> => {
+      // Crossing into older epochs needs the rotated layout: a crash between the archive append
+      // and the chat.jsonl rewrite leaves the sealed prefix in both files, which this read would
+      // return twice. The windowed chat-open reads skip this check (#5300); paging older pays it.
+      await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
       // Scan boundaries newest→oldest and pick the first window that has rows older
       // than the cursor. Boundaries newer than the rotation point live in chat.jsonl;
       // older ones live in the sealed archive.
@@ -2669,8 +2673,12 @@ export class HistoryService {
       workspaceId,
       "Failed to read history window",
       async () => {
-        // Same layout as the full read, which seals a legacy pre-boundary prefix first.
-        await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
+        // No ensureSealedHistoryRotatedUnlocked (#5300), as in getStatusHistorySuffix: a legacy
+        // file with no boundary in its active epoch made that check scan the whole of chat.jsonl
+        // (~1 s at 524 MB) inside chat-open. The bounded read needs rotation neither for
+        // correctness (readActiveEpochTail stops at the epoch start, so a sealed prefix is never
+        // returned) nor for boundedness. The same holds for the page and since reads below. The
+        // next full read (provider request, commitPartial) still rotates lazily.
         return Ok(
           await readProviderHistoryWindow(
             {
@@ -2694,7 +2702,7 @@ export class HistoryService {
       workspaceId,
       "Failed to read history page",
       async () => {
-        await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
+        // No rotation check: see getHistoryWindowFromLatestBoundary.
         const paths = {
           chat: this.getChatHistoryPath(workspaceId),
           archive: this.getChatArchivePath(workspaceId),
@@ -2714,7 +2722,7 @@ export class HistoryService {
       workspaceId,
       "Failed to read history since range",
       async () => {
-        await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
+        // No rotation check: see getHistoryWindowFromLatestBoundary.
         const paths = {
           chat: this.getChatHistoryPath(workspaceId),
           archive: this.getChatArchivePath(workspaceId),
@@ -2851,7 +2859,9 @@ export class HistoryService {
    * One-time-per-process check that seals any pre-boundary prefix left in
    * chat.jsonl. Newly written boundaries rotate eagerly at write time; this
    * lazily migrates files produced before rotation existed (or by crashes
-   * between boundary write and rotation).
+   * between boundary write and rotation). Only full reads, older-epoch paging,
+   * control evidence and boundary writes run it; the bounded chat-open and
+   * status reads skip it because they stay correct on unrotated files (#5300).
    */
   private async ensureSealedHistoryRotatedUnlocked(workspaceId: string): Promise<void> {
     if (this.sealedRotationChecked.has(workspaceId)) {
