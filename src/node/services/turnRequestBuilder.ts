@@ -206,7 +206,8 @@ import {
   buildPlanInstructions,
   buildContextWindowSection,
   buildStreamSystemContext,
-  formatMcpWarningPrefix,
+  formatMcpWarningSection,
+  measureVolatileSystemSuffix,
   prepareProviderRequestMessages,
   removeIntuitionGuidance,
 } from "./turnContextAssembler";
@@ -2604,10 +2605,10 @@ export class TurnRequestBuilder {
       hooks: deriveToolHookConfig(toolsForModelConfig) ?? undefined,
     });
     const ptcEnabled = experiments?.programmaticToolCalling === true;
-    const mcpWarningPrefix = mcpStats
-      ? formatMcpWarningPrefix(mcpStats.failedServerCount, mcpStats.failedServerNames)
+    const mcpWarningSection = mcpStats
+      ? formatMcpWarningSection(mcpStats.failedServerCount, mcpStats.failedServerNames)
       : undefined;
-    if (mcpWarningPrefix != null) {
+    if (mcpWarningSection != null) {
       workspaceLog.warn("MCP servers failed to start", {
         failedNames: mcpStats?.failedServerNames.join(", "),
       });
@@ -2734,8 +2735,10 @@ export class TurnRequestBuilder {
         }
         let attemptSystem = systemContext.systemMessage;
         let attemptSystemTokens = systemContext.systemMessageTokens;
-        if (mcpWarningPrefix != null) {
-          attemptSystem = mcpWarningPrefix + attemptSystem;
+        // Volatile sections (hot memories, this warning, the context-window
+        // ids) go last so the stable prefix stays cacheable (#5251).
+        if (mcpWarningSection != null) {
+          attemptSystem = attemptSystem + mcpWarningSection;
           const tokenizer = await getTokenizerForModel(
             seed.rawModelString,
             seed.capabilityModelString
@@ -2789,20 +2792,28 @@ export class TurnRequestBuilder {
         // re-render it without rerunning assembly middleware or tool construction.
         const baseSystem = attemptSystem;
         const baseSystemTokens = attemptSystemTokens;
+        let attemptVolatileSystemSuffixLength = 0;
         const renderContextWindowSection = async () => {
           const ids = tokenBudgetEnabled
             ? resolveContextWindowIds(options.sourceMessages)
             : undefined;
           attemptSystem = baseSystem;
           attemptSystemTokens = baseSystemTokens;
-          if (ids == null) return;
-          const section = `\n\n${buildContextWindowSection(ids)}`;
-          attemptSystem += section;
-          const tokenizer = await getTokenizerForModel(
-            seed.rawModelString,
-            seed.capabilityModelString
-          );
-          attemptSystemTokens += await tokenizer.countTokens(section);
+          const section = ids == null ? undefined : `\n\n${buildContextWindowSection(ids)}`;
+          if (section != null) {
+            attemptSystem += section;
+            const tokenizer = await getTokenizerForModel(
+              seed.rawModelString,
+              seed.capabilityModelString
+            );
+            attemptSystemTokens += await tokenizer.countTokens(section);
+          }
+          // Re-measured on every render: the window section can change length.
+          attemptVolatileSystemSuffixLength = measureVolatileSystemSuffix(attemptSystem, [
+            systemContext.hotMemoriesSection,
+            mcpWarningSection,
+            section,
+          ]);
         };
         await renderContextWindowSection();
 
@@ -2858,6 +2869,7 @@ export class TurnRequestBuilder {
             {
               history: options.sourceMessages,
               systemMessage: attemptSystem,
+              volatileSystemSuffixLength: attemptVolatileSystemSuffixLength,
               tools: attemptTools,
               modelString: seed.rawModelString,
               routeProvider: seed.routeProvider,
@@ -2897,6 +2909,7 @@ export class TurnRequestBuilder {
             journal: this.dependencies.durableEventJournalFor(workspaceId),
             workspaceId,
             systemMessage: attemptSystem,
+            systemVolatileSuffixLength: attemptVolatileSystemSuffixLength,
             tools: Object.fromEntries(
               Object.entries(attemptTools).filter(([name]) => firstStepToolNames.has(name))
             ),
@@ -3050,12 +3063,13 @@ export class TurnRequestBuilder {
       }
       const finalMessages = primaryRequest.messages;
       // Debug sinks pair systemMessage with the message list, so when the
-      // assembler embedded the system prompt as a leading cached row
-      // (engineSystem undefined), drop that row to keep the system prompt
-      // single-sourced in captures.
+      // assembler embedded the system prompt as leading rows (engineSystem
+      // undefined; a cached stable row plus an optional volatile row), drop
+      // them to keep the system prompt single-sourced in captures.
+      const leadingSystemRows = finalMessages.findIndex((message) => message.role !== "system");
       const debugViewMessages =
-        primaryRequest.engineSystem == null && finalMessages[0]?.role === "system"
-          ? finalMessages.slice(1)
+        primaryRequest.engineSystem == null
+          ? finalMessages.slice(leadingSystemRows === -1 ? finalMessages.length : leadingSystemRows)
           : finalMessages;
       if (combinedAbortSignal.aborted)
         return {
