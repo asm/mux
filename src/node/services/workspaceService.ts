@@ -14990,10 +14990,17 @@ export class WorkspaceService
       // to start the later one. Queue behind the earlier in-preflight send instead.
       // requireIdle callers keep their skip semantics below (and are never waited on, see
       // sessionInvisiblePreflights); edits bypass the queue by design.
+      // An idle session can still hold queued work: a report-decision hold (see
+      // TurnAdmissionToken.resolveDispatch) leaves its entry queued with no turn running. A send
+      // started directly here would run before that entry, so queue behind it; the queue then
+      // dispatches both in order (formal/message-queue, invariant UserOrder).
+      const hasEarlierPreflight = sessionInvisiblePreflight.hasEarlierPreflight();
+      const queuesBehindIdleQueue = !session.isBusy() && session.hasQueuedMessages();
       const shouldQueue =
         !normalizedOptions?.editMessageId &&
         (session.isBusy() ||
-          (sessionInvisiblePreflight.hasEarlierPreflight() && !yieldsToPreflightSends));
+          queuesBehindIdleQueue ||
+          (hasEarlierPreflight && !yieldsToPreflightSends));
 
       // Codex P1 (PRRT_kwDOPxxmWM6cGSPP): a goal-continuation dispatch closure
       // captured before a manual send entered preflight would otherwise win
@@ -15051,6 +15058,13 @@ export class WorkspaceService
             internal.cancelState.canceledBeforeAcceptance = true;
           }
           return Ok(undefined);
+        }
+        // Stop-cascade barrier, re-checked at the synchronous enqueue point: the entry check ran
+        // before this send's preflight awaits, and a Stop latched during them clears the queue
+        // (Phase B) at most once. An entry queued after the latch would be cleared or would run
+        // after the Stop; refuse visibly instead, as the direct path's session admission does.
+        if (this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true) {
+          return Err({ type: "unknown", raw: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE });
         }
         // Everything from here to queueMessage is synchronous, so a probe pass here cannot go
         // stale before the entry is enqueued. The task-attempt token is bound first so its
@@ -15211,6 +15225,13 @@ export class WorkspaceService
 
         if (effectiveQueueDispatchMode === "tool-end") {
           this.agentTaskIntegration?.backgroundForegroundWaitsForWorkspace(workspaceId);
+        }
+
+        // No stream end will drain an idle session's queue. A held head keeps holding (its
+        // decision re-runs the drain); otherwise this starts the oldest entry. An earlier
+        // in-preflight send drains on its own disposal instead, so it is not overtaken.
+        if (queuesBehindIdleQueue && !hasEarlierPreflight) {
+          session.drainQueuedMessagesIfIdle();
         }
 
         return Ok(undefined);
@@ -16228,9 +16249,16 @@ export class WorkspaceService
     }
   }
 
-  clearQueue(workspaceId: string, options?: { cancelReason?: string }): Result<void> {
+  clearQueue(
+    workspaceId: string,
+    options?: { cancelReason?: string; preserveUserInput?: boolean }
+  ): Result<void> {
     try {
-      this.sessions.get(workspaceId.trim())?.clearQueue(options?.cancelReason);
+      const session = this.sessions.get(workspaceId.trim());
+      // Stop cascades revoke execution, not the user's input: queued manual sends are handed back
+      // (held input + composer restore, as the workspace's own Stop does) instead of discarded.
+      if (options?.preserveUserInput === true) session?.restoreQueueToInput();
+      else session?.clearQueue(options?.cancelReason);
       return Ok(undefined);
     } catch (error) {
       const errorMessage = getErrorMessage(error);
