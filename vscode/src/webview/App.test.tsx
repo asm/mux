@@ -2432,6 +2432,37 @@ describe("vscode webview retry barrier (#5092)", () => {
     expect(view.getByRole("button", { name: "Retry" })).toBeTruthy();
   });
 
+  test("a replayed abandoned status shows why auto-retry stopped next to Retry until a later status replaces it", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    // A subscriber that opens after the failure learns the stop reason only from the replay.
+    await selectWorkspace(bridge, [
+      ...failedTurn("authentication"),
+      { type: "auto-retry-abandoned", reason: "authentication" },
+    ]);
+
+    expect(view.container.textContent).toContain("Stream interrupted");
+    expect(view.container.textContent).toContain("Auto-retry stopped: authentication");
+    expect(view.getByRole("button", { name: "Retry" })).toBeTruthy();
+    // Read-only: the webview never offers Stop or toggles auto-retry.
+    expect(view.queryByRole("button", { name: /^Stop/ })).toBeNull();
+    expect(bridge.orpcCalls("workspace.setAutoRetryEnabled")).toHaveLength(0);
+
+    await chatEvent(bridge, scheduledRetry());
+    expect(view.container.textContent).toContain("Retrying in");
+    expect(view.container.textContent).not.toContain("Auto-retry stopped");
+
+    // The same failure without a replayed status has no stop reason to show.
+    const other: UiWorkspace = { ...WORKSPACE, id: "ws-2", workspaceName: "other" };
+    await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE, other] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: other.id });
+    for (const event of [...failedTurn("authentication"), { type: "caught-up" }]) {
+      await chatEvent(bridge, event, other.id);
+    }
+    expect(view.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(view.container.textContent).not.toContain("Auto-retry stopped");
+  });
+
   test("repeated identical stream errors render as one card with a count, as on desktop", async () => {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
