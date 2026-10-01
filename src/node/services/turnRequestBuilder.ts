@@ -38,6 +38,7 @@ import {
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 
 import type { SendMessageError } from "@/common/types/errors";
+import type { GoalSyntheticMessageKind } from "@/constants/goals";
 import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
@@ -337,8 +338,9 @@ export interface StreamMessageOptions {
     options?: { includeHotMemories?: boolean }
   ) => Promise<MemorySessionContext | undefined>;
   experiments?: SendMessageOptions["experiments"];
-  allowAgentSetGoal?: boolean;
   workspaceGoalService?: WorkspaceGoalService;
+  /** Backend-owned kind of an automatic goal turn; gates set_goal (see GoalToolContext). */
+  goalTurnKind?: GoalSyntheticMessageKind;
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
@@ -1003,8 +1005,8 @@ export class TurnRequestBuilder {
       postCompactionAttachments,
       resolveMemoryContext,
       experiments: experimentsFromOptions,
-      allowAgentSetGoal,
       workspaceGoalService,
+      goalTurnKind,
       disableWorkspaceAgents,
       hasQueuedMessages,
       getQueuedInputStopCause,
@@ -1670,7 +1672,7 @@ export class TurnRequestBuilder {
     // tool block does not change when the goal does (prompt caching, #5247).
     const goalToolContext: GoalToolContext = {
       parentWorkspaceId: metadata.parentWorkspaceId,
-      allowAgentSetGoal,
+      goalTurnKind,
       agentInheritanceChain,
     };
 
