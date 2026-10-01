@@ -59,7 +59,10 @@ import {
   type RuntimeEnablementId,
 } from "@/common/types/runtime";
 import { SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
-import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
+import {
+  DEFAULT_RUNTIME_CONFIG,
+  WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS,
+} from "@/common/constants/workspace";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
 import { LEGACY_MUX_PRODUCT_NAME, LEGACY_MUX_PRODUCT_SLUG } from "@/common/compat/legacyMux";
 import { XUM_PRODUCT_NAME, XUM_PRODUCT_SLUG } from "@/common/constants/product";
@@ -98,6 +101,7 @@ import {
   normalizeToCanonical,
 } from "@/common/utils/ai/models";
 import { ensurePrivateDirSync } from "@/node/utils/fs";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { isProviderAutoRouteEligible } from "@/node/utils/providerRequirements";
 import { getContainerName as getDockerContainerName } from "@/node/runtime/DockerRuntime";
@@ -1112,7 +1116,7 @@ export interface WorkspaceMetadataOptions {
    * Probe each worktree checkout's existence (fs.access) to classify
    * transcript-only workspaces. Default true. Callers that only need the
    * registry (ids, paths, runtime, parent links) pass false: one stalled
-   * mount would otherwise block the whole enumeration, and per-request
+   * mount would otherwise delay the whole enumeration (by up to the probe bound), and per-request
    * callers (workspace MCP override resolution) would pay one probe per
    * registered workspace on every request.
    *
@@ -1181,6 +1185,10 @@ export class Config {
    */
   private readonly legacyTaskVariantGroups = new Map<string, LegacyTaskVariantWorkspace>();
   private readonly legacyTaskVariantMetadataOnlyIds = new Set<string>();
+  /** Checkout paths whose latest answered probe found nothing: the fallback while a probe stalls. */
+  private readonly missingCheckoutPaths = new Set<string>();
+  /** Bounded checkout probes (undefined past the bound), kept until their access answers. */
+  private readonly checkoutProbes = new Map<string, Promise<boolean | undefined>>();
   /**
    * Serializes editConfig calls; see editConfig for why. An Effect Semaphore (FIFO
    * permits) replaces the old promise-chain queue 1:1: each edit holds the single
@@ -3315,19 +3323,20 @@ export class Config {
   }
 
   private async probeWorkspaceCheckout(
-    metadata: FrontendWorkspaceMetadata
+    metadata: FrontendWorkspaceMetadata,
+    passDeadline: Promise<undefined>
   ): Promise<FrontendWorkspaceMetadata> {
     // Mark worktree workspaces with missing checkout directories as transcript-only.
     // Queued/starting agent tasks can briefly exist without a provisioned checkout, so keep
     // those workspaces interactive until the checkout is created.
-    // The probe is filesystem I/O per registered workspace (a stalled mount
-    // blocks it indefinitely); callers that only need registry data skip it
+    // The probe is filesystem I/O per registered workspace (bounded by
+    // checkoutExists); callers that only need registry data skip it
     // (see getAllWorkspaceMetadata's probeCheckouts) and get no
     // transcriptOnly classification.
-    const workspacePathExists = await fs.promises
-      .access(metadata.namedWorkspacePath)
-      .then(() => true)
-      .catch(() => false);
+    const workspacePathExists = await this.checkoutExists(
+      metadata.namedWorkspacePath,
+      passDeadline
+    );
     if (
       isWorktreeRuntime(metadata.runtimeConfig) &&
       metadata.taskStatus !== "queued" &&
@@ -3338,6 +3347,48 @@ export class Config {
     }
 
     return metadata;
+  }
+
+  /**
+   * Past WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS or the pass deadline, whichever comes first, this
+   * answers with the path's last answered result, or "present" when none is known, so a stall
+   * never makes a healthy workspace transcript-only.
+   */
+  private async checkoutExists(
+    checkoutPath: string,
+    passDeadline: Promise<undefined>
+  ): Promise<boolean> {
+    // A timed-out access keeps occupying a libuv threadpool thread, so each path has at most one
+    // access in flight: overlapping publications join it, and later ones get the fallback at once.
+    let probe = this.checkoutProbes.get(checkoutPath);
+    if (probe == null) {
+      const access = fs.promises
+        .access(checkoutPath)
+        .then(
+          () => true,
+          () => false
+        )
+        .then((exists) => {
+          this.checkoutProbes.delete(checkoutPath);
+          if (exists) this.missingCheckoutPaths.delete(checkoutPath);
+          else this.missingCheckoutPaths.add(checkoutPath);
+          return exists;
+        });
+      probe = raceWithAbortAndTimeout(access, {
+        timeoutMs: WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS,
+      }).then((result) => {
+        if (result.kind === "ok") return result.value;
+        log.warn("Workspace checkout probe timed out; using the last known checkout state", {
+          checkoutPath,
+          timeoutMs: WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS,
+        });
+        return undefined;
+      });
+      this.checkoutProbes.set(checkoutPath, probe);
+    }
+    return (
+      (await Promise.race([probe, passDeadline])) ?? !this.missingCheckoutPaths.has(checkoutPath)
+    );
   }
 
   private ensureWorkspaceIndex(config: ProjectsConfig): void {
@@ -4225,13 +4276,23 @@ export class Config {
       );
     });
     if (!probeCheckouts) return filtered;
-    return Effect.runPromise(
-      Effect.forEach(
-        filtered,
-        (metadata) => Effect.promise(() => this.probeWorkspaceCheckout(metadata)),
-        { concurrency: 32 }
-      )
-    );
+    // One deadline for the whole pass: per-probe bounds alone would stack across the concurrency
+    // cap, one more bound for every batch of stalled checkouts.
+    let passTimer: ReturnType<typeof setTimeout> | undefined;
+    const passDeadline = new Promise<undefined>((resolve) => {
+      passTimer = setTimeout(() => resolve(undefined), WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS);
+    });
+    try {
+      return await Effect.runPromise(
+        Effect.forEach(
+          filtered,
+          (metadata) => Effect.promise(() => this.probeWorkspaceCheckout(metadata, passDeadline)),
+          { concurrency: 32 }
+        )
+      );
+    } finally {
+      clearTimeout(passTimer);
+    }
   }
 
   /**
