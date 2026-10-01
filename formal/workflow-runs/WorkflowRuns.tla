@@ -32,7 +32,9 @@
 (*                                                                         *)
 (* Fix flags (all off = the code at ea52e87b33):                           *)
 (*   FixRecoverPending  crash recovery also resumes a pending run whose    *)
-(*                      lease is absent or stale                           *)
+(*                      lease is absent or stale once the process that     *)
+(*                      created it is provably dead                        *)
+(*                      (WorkflowService getCrashRecoverableRun)           *)
 (*   NoRecordMode       a STARTED checkpoint whose child has no task row:  *)
 (*     "unresolved" (code: WorkflowPriorAttemptUnresolvedError),           *)
 (*     "naive"      (replace it, as the old taskService.ts:6451 comment    *)
@@ -201,12 +203,19 @@ StartBackground(r) ==
 -----------------------------------------------------------------------------
 (* Entry points that start a runner on an existing run.                    *)
 
+\* The process that created the run is alive. The code judges the creator's process (starter.json,
+\* judgeHolder); here the slot Create gave mode "start" stands in for it: a crash resets the slot
+\* to idle, and while the process lives the slot stays active until the run has left pending.
+StarterLive == \E r \in Runners : rs[r].mode = "start" /\ Active(r) /\ Alive(r)
+
 \* resumeCrashedRuns -> resumeCrashRecoveredRun: running/backgrounded only (Service:243, 678),
-\* and only once the lease is absent or stale (getLeaseRetryDelayMs).
+\* and only once the lease is absent or stale (getLeaseRetryDelayMs). The fix also takes a
+\* pending run whose starter is provably gone, never one a live starter may still start. A scan
+\* that finds the starter live schedules another check, which keeps this action fair.
 RecoverList(r) ==
   /\ Alive(r) /\ ~Active(r)
   /\ \/ status = "running"
-     \/ FixRecoverPending /\ status = "pending"
+     \/ FixRecoverPending /\ status = "pending" /\ ~StarterLive
   /\ lease = None \/ ~fresh
   /\ rs' = [rs EXCEPT ![r] = [IdleRunner EXCEPT !.pc = "acquire", !.mode = "crash"]]
   /\ Unchanged_except_runner
