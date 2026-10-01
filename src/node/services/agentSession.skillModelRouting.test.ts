@@ -2088,6 +2088,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       {},
       false,
       undefined,
+      undefined,
       gate
     );
     expect(prepared).toHaveLength(1);

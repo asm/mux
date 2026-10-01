@@ -45,7 +45,7 @@ function failConfigPublish(options: { corruptConfig?: boolean } = {}) {
   ) => {
     if (path.basename(String(to)) === "config.json") {
       if (options.corruptConfig) cjsFs.writeFileSync(String(to), "{ not json");
-      callback(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }));
+      callback(Object.assign(new Error("EROFS: read-only file system"), { code: "EROFS" }));
       return;
     }
     realRename(from, to, callback);
@@ -57,7 +57,7 @@ async function expectFailsWithSaveError(fn: () => Promise<Result<unknown>>): Pro
   const publish = failConfigPublish();
   const result = await fn().finally(() => publish.mockRestore());
   expect(result.success).toBe(false);
-  expect(result.success ? "" : result.error).toContain("EACCES");
+  expect(result.success ? "" : result.error).toContain("EROFS");
 }
 
 function git(cwd: string, ...args: string[]): string {
@@ -124,7 +124,9 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     });
     // The init hook is not under test and would keep running against the checkout.
     spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined);
-  });
+    // Two real repos are created with git subprocesses; on a CPU-saturated host this took up to
+    // about 2.6 s, so the 5 s hook default leaves too little margin (#5401).
+  }, 30_000);
 
   /**
    * The retained settlements of this service's background inits. Each settles after its init use
@@ -277,6 +279,9 @@ describe("WorkspaceService registration rollback (#4745)", () => {
   });
 
   // A legacy `{ type: "local", srcBaseDir }` config is a worktree runtime, not a project-dir one.
+  // The timeout is raised, not replaced by a signal: there is no wait or poll here, only real git
+  // subprocesses (create, fork, rollback and the checks). Alone they take well under 1 s; on a
+  // CPU-saturated host they took up to about 3.7 s against the 5 s default (#5401).
   test("fork of a legacy local-with-srcBaseDir workspace removes its worktree", async () => {
     const source = await service.create(
       projectPath,
@@ -294,7 +299,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     await expectFailsWithSaveError(() => service.fork(source.data.metadata.id, "legacy-fork"));
     expect(worktreePaths(projectPath).map((p) => path.basename(p))).not.toContain("legacy-fork");
     expect(git(projectPath, "branch", "--list", "legacy-fork")).toBe("");
-  });
+  }, 30_000);
 
   test("rename moves the checkout back and keeps the save error", async () => {
     const created = await createWorktree("before");
@@ -395,7 +400,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       .rename(created.data.metadata.id, "keep-after")
       .finally(() => publish.mockRestore());
 
-    expect(result.success ? "" : result.error).toContain("EACCES");
+    expect(result.success ? "" : result.error).toContain("EROFS");
     // Unreadable config is not proof the rename did not land, so the move stays.
     expect(worktreePaths(projectPath).map((p) => path.basename(p))).toContain("keep-after");
   });
@@ -415,7 +420,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     const publish = failConfigPublish({ corruptConfig: true });
     const result = await createWorktree("feature-c").finally(() => publish.mockRestore());
 
-    expect(result.success ? "" : result.error).toContain("EACCES");
+    expect(result.success ? "" : result.error).toContain("EROFS");
     // Unreadable is not proof the entry is gone, so nothing is deleted.
     expect(worktreePaths(projectPath).map((p) => path.basename(p))).toContain("feature-c");
   });
@@ -520,7 +525,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     expect((await service.fork(sourceId, "fork-after-reg")).success).toBe(true);
   });
 
-  // #4842: the #4818 rule for createMultiProject; its row even carries consent from the start.
+  // #4842: the #4818 rule for createMultiProject.
   test("createMultiProject failing after registration rolls it back and keeps the error", async () => {
     git(projectPath, "branch", "multi-after");
     const tip = git(projectPath, "rev-parse", "multi-after");
@@ -583,7 +588,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       const publish = failConfigPublish();
       const result = await createWorktree("leftover-b").finally(() => publish.mockRestore());
       const error = result.success ? "" : result.error;
-      expect(error).toContain("EACCES");
+      expect(error).toContain("EROFS");
       expect(error).toContain(`could not be fully cleaned up: ${leftoverCheckout("leftover-b")!}`);
     });
 
@@ -1141,7 +1146,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
           .fork(source.data.metadata.id, "dce")
           .finally(() => publish.mockRestore());
         const error = result.success ? "" : result.error;
-        expect(error).toContain("EACCES");
+        expect(error).toContain("EROFS");
         // The label names the fork's host checkout, which the rollback removed.
         expect(error).toMatch(
           /could not be fully cleaned up: devcontainer container labeled devcontainer\.local_folder=\S+\/dce; delete it before retrying\.$/
@@ -1408,7 +1413,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
         const { error, deleteWorkspace } = await dockerFork({
           deleteResult: { success: true, deletedPath: "/src" },
         });
-        expect(error).toContain("EACCES");
+        expect(error).toContain("EROFS");
         expect(error).not.toContain("could not be fully cleaned up");
         expect(deleteWorkspace).toHaveBeenCalledTimes(1);
         expect(deleteWorkspace.mock.calls[0].slice(0, 3)).toEqual([

@@ -45,6 +45,11 @@ interface MetadataEvent {
   metadata: FrontendWorkspaceMetadataSchemaType | null;
 }
 
+interface MetadataSnapshotEvent {
+  type: "snapshot";
+  workspaces: FrontendWorkspaceMetadataSchemaType[];
+}
+
 interface WorkspaceChatSubscriptionInput {
   workspaceId: string;
   mode?: OnChatMode;
@@ -188,17 +193,6 @@ export function subscribeDesignExperiment(
       await design.getStatus();
       emit.push(design.experimentSnapshot());
     },
-  });
-}
-
-export function subscribePolicyChanges(
-  context: ORPCContext,
-  signal?: AbortSignal
-): AsyncGenerator<undefined> {
-  return runtimeSubscription<undefined>(context, {
-    signal,
-    buffer: "latest",
-    subscribe: (emit) => context.policyService.onPolicyChanged(() => emit.push(undefined)),
   });
 }
 
@@ -433,14 +427,19 @@ export function subscribeWorkspaceChat(
 
 export function subscribeMetadata(
   context: ORPCContext,
+  archived: boolean,
   signal?: AbortSignal
-): AsyncGenerator<MetadataEvent> {
-  return runtimeSubscription(context, {
+): AsyncGenerator<MetadataEvent | MetadataSnapshotEvent> {
+  return runtimeSubscription<MetadataEvent | MetadataSnapshotEvent>(context, {
     signal,
     subscribe: (emit) => {
       context.workspaceService.on("metadata", emit.push);
       return () => context.workspaceService.off("metadata", emit.push);
     },
+    initial: async () => ({
+      type: "snapshot",
+      workspaces: await context.workspaceService.listByArchivedStatus(archived),
+    }),
   });
 }
 

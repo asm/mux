@@ -116,6 +116,7 @@ import {
   DraftScopeSchema,
   DraftSummarySchema,
   DraftUpdateInputSchema,
+  RemovedCreationDraftSchema,
 } from "./drafts";
 import {
   AgentMessageDispatchModeSchema,
@@ -177,7 +178,6 @@ import {
   AgentPluginUpdateConsentSchema,
   AgentPluginUpdateReviewSchema,
 } from "./agentPlugins";
-import { PolicyGetResponseSchema } from "./policy";
 import {
   AgentAiDefaultsSchema,
   EvaluationDefaultsSchema,
@@ -293,7 +293,7 @@ export const tokenizer = {
       workspaceId: z.string(),
       model: z.string(),
     }),
-    output: ChatStatsSchema,
+    output: ChatStatsSchema.omit({ usageHistory: true }),
   },
 };
 
@@ -332,6 +332,8 @@ export const ProviderConfigInfoSchema = z.object({
   /** OpenAI/xAI Responses storage. Set false for ZDR orgs. */
   store: z.boolean().optional(),
   webSocketTransportEnabled: z.boolean().optional(),
+  /** OpenAI-only: offer Cyber (Daybreak access program) on supported models. */
+  cyberModelEnabled: z.boolean().optional(),
   /** Anthropic-specific fields */
   cacheTtl: CacheTtlSchema.optional(),
   /** Anthropic Fast mode preference ("fast" sends `speed: "fast"` on supported routes). */
@@ -412,11 +414,6 @@ export const CustomProviderMutationErrorSchema = z.discriminatedUnion("code", [
   }),
   z.object({
     code: z.literal("not_custom_provider"),
-    message: z.string(),
-    reason: z.string().optional(),
-  }),
-  z.object({
-    code: z.literal("policy_denied"),
     message: z.string(),
     reason: z.string().optional(),
   }),
@@ -536,24 +533,6 @@ export const providers = {
   },
 };
 
-// Policy (admin-enforced config)
-export const policy = {
-  get: {
-    input: z.void(),
-    output: PolicyGetResponseSchema,
-  },
-  // Subscription: emits when the effective policy changes (file refresh)
-  onChanged: {
-    input: z.void(),
-    output: eventIterator(z.void()),
-  },
-  // Force a refresh of the effective policy (re-reads MUX_POLICY_FILE or Governor policy)
-  refreshNow: {
-    input: z.void(),
-    output: ResultSchema(PolicyGetResponseSchema, z.string()),
-  },
-};
-
 // Xum Gateway OAuth (desktop login flow)
 export const muxGatewayOauth = {
   startDesktopFlow: {
@@ -605,34 +584,6 @@ export const copilotOauth = {
     output: ResultSchema(z.void(), z.string()),
   },
   cancelDeviceFlow: {
-    input: z.object({ flowId: z.string() }).strict(),
-    output: z.void(),
-  },
-};
-
-// Xum Governor OAuth (enrollment for enterprise policy service)
-export const muxGovernorOauth = {
-  startDesktopFlow: {
-    input: z.object({ governorOrigin: z.string() }).strict(),
-    output: ResultSchema(
-      z.object({
-        flowId: z.string(),
-        authorizeUrl: z.string(),
-        redirectUri: z.string(),
-      }),
-      z.string()
-    ),
-  },
-  waitForDesktopFlow: {
-    input: z
-      .object({
-        flowId: z.string(),
-        timeoutMs: z.number().int().positive().optional(),
-      })
-      .strict(),
-    output: ResultSchema(z.void(), z.string()),
-  },
-  cancelDesktopFlow: {
     input: z.object({ flowId: z.string() }).strict(),
     output: z.void(),
   },
@@ -878,7 +829,10 @@ export const projects = {
   },
   remove: {
     input: z.object({ projectPath: z.string(), force: z.boolean().nullish() }).passthrough(),
-    output: ResultSchema(z.void(), ProjectRemoveErrorSchema),
+    output: ResultSchema(
+      z.object({ removedCreationDrafts: z.array(RemovedCreationDraftSchema) }),
+      ProjectRemoveErrorSchema
+    ),
   },
   // Read-only preflight for the delete confirmation dialog: projects.list no
   // longer embeds archived workspaces, so blocker counts come from the backend.
@@ -1158,7 +1112,7 @@ export const mcp = {
 };
 
 /**
- * Managed Agent Plugin installs (agent-plugins experiment; global scope only).
+ * Managed Agent Plugin installs (global scope only).
  *
  * Human-driven surfaces only (Settings + palette) — there is deliberately no
  * agent-facing installer tool in v1. All endpoints return Result values; the
@@ -2110,12 +2064,21 @@ export const workspace = {
     output: eventIterator(WorkspaceChatMessageSchema), // Stream event
   },
   onMetadata: {
-    input: z.void(),
+    // `archived` selects the snapshot list exactly like `workspace.list`.
+    input: z.object({ archived: z.boolean().optional() }).optional(),
+    // The first event is a snapshot built after the listener attached, so changes made before or
+    // while it is built are either in it or follow it as updates (#5189).
     output: eventIterator(
-      z.object({
-        workspaceId: z.string(),
-        metadata: FrontendWorkspaceMetadataSchema.nullable(),
-      })
+      z.union([
+        z.object({
+          type: z.literal("snapshot"),
+          workspaces: z.array(FrontendWorkspaceMetadataSchema),
+        }),
+        z.object({
+          workspaceId: z.string(),
+          metadata: FrontendWorkspaceMetadataSchema.nullable(),
+        }),
+      ])
     ),
   },
   activity: {
@@ -2895,12 +2858,11 @@ export const config = {
       runtimeEnablement: z.record(z.string(), z.boolean()),
       defaultRuntime: z.string().nullable(),
       agentAiDefaults: AgentAiDefaultsSchema,
-      // Xum Governor enrollment status (safe fields only - token never exposed)
-      muxGovernorUrl: z.string().nullable(),
-      muxGovernorEnrolled: z.boolean(),
       chatTranscriptFullWidth: z.boolean(),
       llmDebugLogs: z.boolean(),
       keepScreenAwake: z.boolean(),
+      toolSearchEnabled: z.boolean(),
+      agentHeartbeatsEnabled: z.boolean(),
       heartbeatDefaultPrompt: z.string().optional(),
       heartbeatDefaultIntervalMs: z.number().optional(),
       goalDefaults: GoalDefaultsConfigSchema,
@@ -2994,7 +2956,7 @@ export const config = {
   getAutoModelRoutingEvaluationStatus: {
     // Omit to check the saved evaluation model; pass one to check an unsaved edit.
     input: z.object({ evaluationModel: z.string().optional() }).optional(),
-    // Whether the evaluator can be built (credentials, policy) and why not; never a key.
+    // Whether the evaluator can be built (credentials) and why not; never a key.
     output: z.object({
       evaluationModel: z.string(),
       available: z.boolean(),
@@ -3052,6 +3014,8 @@ export const config = {
   updateChatTranscriptFullWidth: booleanToggleRoute,
   updateLlmDebugLogs: booleanToggleRoute,
   updateKeepScreenAwake: booleanToggleRoute,
+  updateToolSearchEnabled: booleanToggleRoute,
+  updateAgentHeartbeatsEnabled: booleanToggleRoute,
   updateHeartbeatDefaultPrompt: {
     input: z
       .object({
@@ -3088,10 +3052,6 @@ export const config = {
         model: z.string().nullish(),
       })
       .strict(),
-    output: z.void(),
-  },
-  unenrollMuxGovernor: {
-    input: z.void(),
     output: z.void(),
   },
 };

@@ -157,11 +157,11 @@ export function createTestConfig(overrides: Partial<TestClientConfig> = {}): Tes
     runtimeEnablement: { ...DEFAULT_RUNTIME_ENABLEMENT },
     defaultRuntime: null,
     agentAiDefaults: {},
-    muxGovernorUrl: null,
-    muxGovernorEnrolled: false,
     chatTranscriptFullWidth: false,
     llmDebugLogs: false,
     keepScreenAwake: false,
+    toolSearchEnabled: true,
+    agentHeartbeatsEnabled: false,
     goalDefaults: DEFAULT_GOAL_DEFAULTS,
     ...overrides,
   };

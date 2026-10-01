@@ -97,7 +97,6 @@ export async function summarizeContinuousCompaction(args: {
     workspaceId: args.workspaceId,
     sessionDir,
     journal: sharedDurableEventJournal(sessionDir),
-    enabled: args.aiService.isAgentPluginsEnabled?.() === true,
     xumHome: args.config.rootDir,
     projectRoot: pluginContext?.projectRoot,
     projectTrusted: isWorkspaceProjectTrusted(args.config, metadata.data),
@@ -113,7 +112,6 @@ export async function summarizeContinuousCompaction(args: {
     callerToolPolicy: [{ regex_match: ".*", action: "disable" }],
     cfg: args.config.loadConfigOrDefault(),
     emitError: () => undefined,
-    includeAgentPlugins: args.aiService.isAgentPluginsEnabled?.(),
   });
   if (!agent.success) throw new Error(`Cannot resolve compact agent: ${agent.error.type}`);
   const system = await resolveAgentBody(
@@ -121,7 +119,6 @@ export async function summarizeContinuousCompaction(args: {
     agent.data.agentDiscoveryPath,
     agent.data.agentDefinition.id,
     {
-      includeAgentPlugins: args.aiService.isAgentPluginsEnabled?.(),
       skipScopesAbove: getSkipScopesAboveForKnownScope(agent.data.agentDefinition.scope),
     }
   );

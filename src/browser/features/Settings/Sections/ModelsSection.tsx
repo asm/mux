@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useId, useRef, useState } from "react";
-import { ArrowRight, ChevronDown, Info, Loader2, Plus, Search, ShieldCheck } from "lucide-react";
+import { ArrowRight, ChevronDown, Info, Loader2, Plus, Search } from "lucide-react";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
 import { Button } from "@/browser/components/Button/Button";
 import { ModelClassesEditor } from "./ModelClassesEditor";
@@ -21,12 +21,9 @@ import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { listModelCatalogIds } from "@/common/utils/tokens/modelCatalog";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { getExplicitGatewayPrefix, supports1MContext } from "@/common/utils/ai/models";
-import { getAllowedProvidersForUi } from "@/browser/utils/policyUi";
 import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
 import type {
-  EffectivePolicy,
   ModelCatalogEntry,
   ModelCatalogSearchResult,
   ProviderModelDiscoveryResult,
@@ -38,7 +35,10 @@ import {
   getProviderModelEntryId,
   getProviderModelEntryMappedTo,
 } from "@/common/utils/providers/modelEntries";
-import { formatProviderDisplayName } from "@/common/utils/providers/customProviders";
+import {
+  formatProviderDisplayName,
+  getProviderIdsForUi,
+} from "@/common/utils/providers/customProviders";
 import {
   CUSTOM_MODELS_PAGE_SIZE,
   MAX_RENDERED_MODELS,
@@ -50,6 +50,7 @@ import {
   tokenizeModelQuery,
 } from "@/common/utils/tokens/modelCatalogSearch";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { getModelIdLengthError } from "@/browser/utils/boundedPersistedValue";
 import { ModelRow } from "./ModelRow";
 
 // Shared header cell styles
@@ -126,10 +127,6 @@ export function shouldAllowRouteOverrideInSettings(modelId: string): boolean {
 }
 
 export function ModelsSection() {
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
-
   const { api } = useAPI();
   const { open: openSettings, close: closeSettings } = useSettings();
   const { config, loading, updateModelsOptimistically } = useProvidersConfig();
@@ -142,15 +139,13 @@ export function ModelsSection() {
     api: object;
     provider: string;
     config: ProvidersConfigMap;
-    policy: EffectivePolicy | null;
     result: ProviderModelDiscoveryResult;
   } | null>(null);
-  // Catalogue matches across providers, fenced by session, client, and policy.
+  // Catalogue matches across providers, fenced by session and client.
   const [catalog, setCatalog] = useState<{
     session: object;
     api: object;
     query: string;
-    policy: EffectivePolicy | null;
     result: ModelCatalogSearchResult;
   } | null>(null);
   const [highlightedModel, setHighlightedModel] = useState<{
@@ -158,7 +153,6 @@ export function ModelsSection() {
     api: object | null;
     provider: string;
     config: ProvidersConfigMap | null;
-    policy: EffectivePolicy | null;
   } | null>(null);
   const modelInputRef = useRef<HTMLInputElement>(null);
   const suggestionsId = useId();
@@ -170,10 +164,10 @@ export function ModelsSection() {
 
   const allowedProviders = useMemo(
     () =>
-      getAllowedProvidersForUi(effectivePolicy, config).filter(
+      getProviderIdsForUi(config).filter(
         (provider) => !CUSTOM_MODEL_HIDDEN_PROVIDERS.has(provider)
       ),
-    [effectivePolicy, config]
+    [config]
   );
 
   useEffect(() => {
@@ -185,14 +179,8 @@ export function ModelsSection() {
     setLastProvider(allowedProviders[0] ?? "");
   }, [config, allowedProviders, lastProvider, setLastProvider]);
 
-  const {
-    defaultModel,
-    setDefaultModel,
-    hiddenModels,
-    hideModel,
-    unhideModel,
-    isAllowedByPolicyOnActiveRoute,
-  } = useModelsFromSettings();
+  const { defaultModel, setDefaultModel, hiddenModels, hideModel, unhideModel } =
+    useModelsFromSettings();
   const routing = useRouting();
   const minThinking = useMinThinkingLevels();
   const { has1MContext, toggle1MContext } = useProviderOptions();
@@ -230,6 +218,12 @@ export function ModelsSection() {
     // Check for duplicates
     if (modelExists(provider, modelId)) {
       setError(`Model "${modelId}" already exists for this provider`);
+      return false;
+    }
+
+    const lengthError = getModelIdLengthError(provider, modelId);
+    if (lengthError) {
+      setError(lengthError);
       return false;
     }
 
@@ -294,7 +288,6 @@ export function ModelsSection() {
               session: suggestionsSession,
               api,
               query: catalogQuery,
-              policy: effectivePolicy,
               result,
             });
           }
@@ -308,15 +301,12 @@ export function ModelsSection() {
         }
       );
     return () => controller.abort();
-  }, [api, suggestionsSession, catalogQuery, effectivePolicy]);
+  }, [api, suggestionsSession, catalogQuery]);
 
   // Previous-query matches stay visible until the new search settles to avoid
-  // flicker while typing; a new session, client, or policy revokes them.
+  // flicker while typing; a new session or client revokes them.
   const activeCatalog =
-    catalogQueryActive &&
-    catalog?.session === suggestionsSession &&
-    catalog?.api === api &&
-    catalog?.policy === effectivePolicy
+    catalogQueryActive && catalog?.session === suggestionsSession && catalog?.api === api
       ? catalog
       : null;
 
@@ -333,7 +323,6 @@ export function ModelsSection() {
           api,
           provider: lastProvider,
           config,
-          policy: effectivePolicy,
           result,
         });
       }
@@ -342,18 +331,16 @@ export function ModelsSection() {
       .discoverModels({ provider: lastProvider }, { signal: controller.signal })
       .then(publish, () => publish({ status: "error", reason: "request-failed" }));
     return () => controller.abort();
-  }, [api, suggestionsSession, lastProvider, config, effectivePolicy]);
+  }, [api, suggestionsSession, lastProvider, config]);
 
   // Key rotation can leave every sanitized field equal. Fence rendered suggestions as
   // well as replies by the config object itself, before effect cleanup gets to run.
-  // Policy events are independent of config refreshes and also revoke completed catalogs.
   // A disconnect or reconnect replaces the API client, which revokes them too.
   const discoveryResult =
     discovery?.session === suggestionsSession &&
     discovery?.api === api &&
     discovery?.provider === lastProvider &&
-    discovery?.config === config &&
-    discovery?.policy === effectivePolicy
+    discovery?.config === config
       ? discovery.result
       : null;
   const discoveredModels =
@@ -362,7 +349,7 @@ export function ModelsSection() {
       : discoveryResult?.status === "ok"
         ? discoveryResult.modelIds
         : [];
-  // One editable field handles both manual IDs and policy-filtered discovery.
+  // One editable field handles both manual IDs and discovery.
   // Suggestions never replace a typed ID unless the user explicitly chooses one.
   const discoveredUnconfigured = discoveredModels.filter(
     (modelId) => !modelExists(lastProvider, modelId)
@@ -421,8 +408,7 @@ export function ModelsSection() {
     showSuggestions &&
     highlightedModel?.api === api &&
     highlightedModel?.config === config &&
-    highlightedModel?.provider === lastProvider &&
-    highlightedModel?.policy === effectivePolicy
+    highlightedModel?.provider === lastProvider
       ? options.findIndex((option) => option.key === highlightedModel.key)
       : -1;
 
@@ -437,7 +423,6 @@ export function ModelsSection() {
       api,
       provider: lastProvider,
       config,
-      policy: effectivePolicy,
     });
     api.providers
       .searchModelCatalog({
@@ -601,6 +586,11 @@ export function ModelsSection() {
         setError(`Model "${trimmedModelId}" already exists for this provider`);
         return;
       }
+      const lengthError = getModelIdLengthError(editing.provider, trimmedModelId);
+      if (lengthError) {
+        setError(lengthError);
+        return;
+      }
     }
 
     setError(null);
@@ -686,17 +676,12 @@ export function ModelsSection() {
   };
 
   // Get built-in models from KNOWN_MODELS.
-  // Filter by policy so the settings table doesn't list models users can't ever select.
-  // The policy applies to the active route's identity (like the backend), so a
-  // gateway-only policy keeps rows whose route is that gateway.
-  const builtInModels = Object.values(KNOWN_MODELS)
-    .map((model) => ({
-      provider: model.provider,
-      modelId: model.providerModelId,
-      fullId: model.id,
-      aliases: model.aliases,
-    }))
-    .filter((model) => isAllowedByPolicyOnActiveRoute(model.fullId));
+  const builtInModels = Object.values(KNOWN_MODELS).map((model) => ({
+    provider: model.provider,
+    modelId: model.providerModelId,
+    fullId: model.id,
+    aliases: model.aliases,
+  }));
 
   const customModels = getCustomModels();
 
@@ -736,13 +721,6 @@ export function ModelsSection() {
 
   return (
     <div className="space-y-4">
-      {policyState.status.state === "enforced" && (
-        <div className="border-border-medium bg-background-secondary/50 text-muted flex items-center gap-2 rounded-md border px-3 py-2 text-xs">
-          <ShieldCheck className="h-4 w-4" aria-hidden />
-          <span>Your settings are controlled by a policy.</span>
-        </div>
-      )}
-
       <div className="relative">
         <Search
           aria-hidden
@@ -863,7 +841,6 @@ export function ModelsSection() {
                               api,
                               provider: lastProvider,
                               config,
-                              policy: effectivePolicy,
                             }
                           : null
                       );

@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useRouting } from "@/browser/hooks/useRouting";
@@ -20,6 +19,7 @@ import { parseCommand } from "@/browser/utils/slashCommands/parser";
 import { resolveThinkingInput } from "@/common/utils/thinking/policy";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { AGENT_AI_DEFAULTS_KEY } from "@/common/constants/storage";
+import { isProviderConfigFixableError } from "@/common/utils/messages/retryEligibility";
 import type { FilePart, ProvidersConfigMap } from "@/common/orpc/types";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import {
@@ -53,6 +53,22 @@ function findTriggerUserMessage(
   }
 
   return null;
+}
+
+/**
+ * A failed /compact offers compaction recovery, except for errors compaction
+ * cannot fix (credentials, quota, OpenAI Daybreak access-program rejections):
+ * the recovery card would misreport them as a context overflow.
+ */
+export function isCompactionRecoveryError(
+  lastMessage: DisplayedMessage | undefined,
+  triggerUserMessage: Extract<DisplayedMessage, { type: "user" }> | null
+): boolean {
+  return (
+    lastMessage?.type === "stream-error" &&
+    !!triggerUserMessage?.compactionRequest &&
+    !isProviderConfigFixableError(lastMessage.errorType)
+  );
 }
 
 /**
@@ -175,9 +191,6 @@ export function buildFollowUpFromSource(
 export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRetryState {
   const workspaceState = useWorkspaceState(props.workspaceId);
   const { api } = useAPI();
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
   const [providersConfig, setProvidersConfig] = useState<ProvidersConfigMap | null>(null);
   const { routePriority, routeOverrides } = useRouting();
   const [isRetryingWithCompaction, setIsRetryingWithCompaction] = useState(false);
@@ -199,8 +212,7 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
     return findTriggerUserMessage(workspaceState.messages);
   }, [workspaceState]);
 
-  const isCompactionRecoveryFlow =
-    lastMessage?.type === "stream-error" && !!triggerUserMessage?.compactionRequest;
+  const isCompactionRecoveryFlow = isCompactionRecoveryError(lastMessage, triggerUserMessage);
 
   const isContextExceeded =
     lastMessage?.type === "stream-error" && lastMessage.errorType === "context_exceeded";
@@ -260,7 +272,6 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
       return getHigherContextCompactionSuggestion({
         currentModel: compactionTargetModel,
         providersConfig,
-        policy: effectivePolicy,
         routePriority,
         routeOverrides,
       });
@@ -271,7 +282,6 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
       const explicit = getExplicitCompactionSuggestion({
         modelId: preferred,
         providersConfig,
-        policy: effectivePolicy,
         routePriority,
         routeOverrides,
       });
@@ -283,7 +293,6 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
     return getHigherContextCompactionSuggestion({
       currentModel: compactionTargetModel,
       providersConfig,
-      policy: effectivePolicy,
       routePriority,
       routeOverrides,
     });
@@ -292,7 +301,6 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
     showCompactionUI,
     isCompactionRecoveryFlow,
     providersConfig,
-    effectivePolicy,
     configuredCompactionModel,
     routePriority,
     routeOverrides,

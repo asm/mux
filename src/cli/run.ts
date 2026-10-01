@@ -16,13 +16,12 @@ import { z } from "zod";
 import * as path from "path";
 import * as fs from "fs/promises";
 import { createConfigStores } from "../node/config";
-import { materializeResolvedTrust, replaceRunTrustProjects } from "./trust";
+import { materializeResolvedTrust, replaceRunConfig } from "./trust";
 import { runBestEffortCleanup } from "./runCleanup";
 import { DisposableTempDir } from "../node/services/tempDir";
 import { AgentSession, type AgentSessionChatEvent } from "../node/services/agentSession";
 import { CodexOauthService } from "../node/services/codexOauthService";
 import { CoderOauthService } from "../node/services/coderOauthService";
-import { PolicyService } from "../node/services/policyService";
 import { ProviderService } from "../node/services/providerService";
 import { createCoreServices } from "../node/services/coreServicesRoot";
 import { closeScopeBounded, disposeAppRuntime } from "../node/services/di/appRuntime";
@@ -86,6 +85,7 @@ import { getParseOptions } from "./argv";
 import {
   EXPERIMENT_IDS,
   LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
+  PROMOTED_EXPERIMENT_IDS,
   type ExperimentId,
 } from "../common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -287,20 +287,9 @@ function renderUnknown(value: unknown): string {
 const SEND_MESSAGE_EXPERIMENT_FIELDS = {
   [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: "programmaticToolCalling",
   [EXPERIMENT_IDS.RLM]: "rlm",
-  [EXPERIMENT_IDS.DYNAMIC_WORKFLOWS]: "dynamicWorkflows",
-  // Deliberately absent (accepting them would be a silent no-op or worse,
-  // which is exactly what this table exists to prevent):
-  // - TIMELINE: AIService resolves the timeline experiment exclusively from
-  //   the backend ExperimentsService (the schema's `timeline` request field is
-  //   never read), and `xum run` wires no timeline service.
-  // - MEMORY: MemoryService derives its storage from the CLI's ephemeral
-  //   tempDir config root, so persistent memories under the user's Xum home
-  //   would be invisible and new writes deleted on process exit.
-  // - ADVISOR_TOOL: AIService only exposes the advisor tool when the config
-  //   has a non-empty advisorModelString, which the CLI's ephemeral config
-  //   never carries over.
-  [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: "workspaceHeartbeats",
-  [EXPERIMENT_IDS.TOOL_SEARCH]: "toolSearch",
+  // Deliberately absent: MEMORY. MemoryService derives its storage from the
+  // CLI's ephemeral tempDir config root, so persistent memories under the
+  // user's Xum home would be invisible and new writes deleted on process exit.
 } as const satisfies Partial<
   Record<ExperimentId, keyof NonNullable<SendMessageOptions["experiments"]>>
 >;
@@ -316,6 +305,9 @@ function isSendMessageExperimentId(
 
 function collectExperiments(value: string, previous: string[]): string[] {
   let experimentId = value.trim().toLowerCase();
+  if (PROMOTED_EXPERIMENT_IDS.has(experimentId)) {
+    return previous;
+  }
   // Hidden compat alias: "PTC Exclusive Mode" merged into PTC, and the merged
   // flag activates exactly the old exclusive posture — keep existing
   // automation that passes the removed ID working instead of erroring.
@@ -544,11 +536,11 @@ async function main(): Promise<number> {
     Object.keys(existingSecrets).length > 0 ? JSON.stringify(existingSecrets, null, 2) : undefined
   );
 
-  // Copy only project trust metadata so AIService can read trust flags.
+  // Copy only project trust metadata and the tool-search opt-out so AIService can read them.
   // Avoid importing workspace/task metadata into ephemeral CLI config because
   // stale queued/running records can incorrectly throttle sub-agent tasks.
   // Replace the full map so a reused run root cannot retain trust removed from real config.
-  await replaceRunTrustProjects(realConfig, config);
+  await replaceRunConfig(realConfig, config);
 
   const workspaceId = generateWorkspaceId();
   const projectDir = path.resolve(opts.dir);
@@ -637,14 +629,6 @@ async function main(): Promise<number> {
     }
   }
 
-  // Enforce managed policy (MUX_POLICY_FILE / Xum Governor) in headless runs
-  // too, matching the desktop wiring: without this, `xum run` would keep using
-  // providers/models/credentials that providerAccess now denies. Bind to the
-  // REAL config so governor enrollment settings (muxGovernorUrl/Token) are
-  // honored — the ephemeral tempDir config only receives project trust flags.
-  const policyService = new PolicyService(realConfig);
-  await policyService.initialize();
-
   // Initialize the core service graph (shared with ServiceContainer).
   // CLI overrides: ephemeral extension metadata, persistent MCP config via
   // realConfig, and CLI-specific MCPServerManager options for inline servers.
@@ -669,7 +653,6 @@ async function main(): Promise<number> {
     appFiberScope,
   } = createCoreServices({
     ...runStores,
-    policyService,
     extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
     // Session config lives in tempDir (deleted on exit) — disable workspace.*
     // host actions so workflows can't create worktrees whose tags evaporate.
@@ -684,7 +667,9 @@ async function main(): Promise<number> {
           allowUserOriginBudgetWrapup: true,
           suppressKickoffContinuation: true,
         }
-      : undefined,
+      : // The agent may still call set_goal, but only --goal authorizes the run
+        // to keep spending on turns it starts itself.
+        { disableAutomaticGoalTurns: true },
   });
 
   // `xum run` uses createCoreServices directly (without ServiceContainer), so wire
@@ -700,18 +685,13 @@ async function main(): Promise<number> {
   const realFileLeaseManager = realStores.fileLeaseManager;
   const realProviderService = new ProviderService(
     realConfig,
-    policyService,
     realProvidersStore,
     realFileLeaseManager
   );
   const coderOauthService = new CoderOauthService(
     realProvidersStore,
     realFileLeaseManager,
-    realProviderService,
-    undefined,
-    // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL for
-    // token refreshes/issuer checks, and denied providers fail closed.
-    policyService
+    realProviderService
   );
   turnRequestBuilderBindings.coderOauthService = coderOauthService;
 
@@ -1519,6 +1499,22 @@ async function main(): Promise<number> {
     }
 
     finalGoalRecord = await getGoal();
+    if (!hasGoal) {
+      // A goal the agent created here is never continued (disableAutomaticGoalTurns);
+      // say so rather than let a successful set_goal imply follow-through.
+      const createdGoal = await workspaceGoalService.getGoal(workspaceId);
+      if (createdGoal != null && createdGoal.status !== "complete") {
+        writeHumanLineClosed(
+          "[goal] not continued: plain xum run is one-shot; pass --goal to drive a goal"
+        );
+        emitJsonLine({
+          type: "goal-not-continued",
+          workspaceId,
+          goalId: createdGoal.goalId,
+          status: createdGoal.status,
+        });
+      }
+    }
 
     if (
       budgetExceeded &&
@@ -1620,7 +1616,6 @@ async function main(): Promise<number> {
         { name: "codexOauthService.dispose", run: () => codexOauthService.dispose() },
         { name: "coderOauthService.dispose", run: () => coderOauthService.dispose() },
         { name: "realProviderService.dispose", run: () => realProviderService.dispose() },
-        { name: "policyService.dispose", run: () => policyService.dispose() },
         ...(keepBackgroundProcesses
           ? []
           : [

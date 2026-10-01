@@ -10,7 +10,6 @@ import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig
 import * as ActualModelPreferenceRepairModule from "@/browser/utils/modelPreferenceRepair";
 import * as ActualRoutingModule from "@/browser/hooks/useRouting";
 import * as SettingsContextModule from "@/browser/contexts/SettingsContext";
-import * as ActualPolicyContextModule from "@/browser/contexts/PolicyContext";
 import * as ActualWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import type * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
@@ -86,18 +85,11 @@ void mock.module("@/browser/hooks/useRouting", () => ({
   }),
 }));
 
-// Restore the real contexts after this suite; the stubs below would otherwise leak into later
-// suites that render the real PolicyProvider/WorkspaceProvider (PolicyContext/AgentContext tests).
+// Restore the real context after this suite; the stubs below would otherwise leak into later
+// suites that render the real WorkspaceProvider (AgentContext tests).
 restoreModulesAfterSuite([
-  ["@/browser/contexts/PolicyContext", { ...ActualPolicyContextModule }],
   ["@/browser/contexts/WorkspaceContext", { ...ActualWorkspaceContextModule }],
 ]);
-void mock.module("@/browser/contexts/PolicyContext", () => ({
-  usePolicy: () => ({
-    status: { state: "disabled" as const },
-    policy: null,
-  }),
-}));
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const actualWorkspaceContext =
@@ -310,7 +302,7 @@ describe("ProvidersSection", () => {
   test("resyncs from the backend when API format persistence fails", async () => {
     const view = renderProvidersSection();
     view.setProviderConfig.mockImplementationOnce(() =>
-      Promise.resolve({ success: false as const, error: "policy denied" })
+      Promise.resolve({ success: false as const, error: "write failed" })
     );
 
     const customButton = await view.findByRole("button", { name: /Acme OpenAI/ });
@@ -490,6 +482,53 @@ describe("ProvidersSection", () => {
         keyPath: ["webSocketTransportEnabled"],
         value: "",
       });
+    });
+  });
+
+  test.each([
+    { name: "on", initial: false, persisted: true },
+    { name: "off (removes the key)", initial: true, persisted: "" },
+  ])("persists the cyber model setting when toggled $name", async (testCase) => {
+    const view = renderProvidersSection();
+    if (testCase.initial) view.providersConfig.openai.cyberModelEnabled = true;
+    const openAiButton = await view.findByRole("button", { name: /^OpenAI\b/ });
+
+    fireEvent.click(openAiButton);
+
+    const cyberToggle = within(getProviderCard(openAiButton)).getByRole("switch", {
+      name: /Enable cyber model/i,
+    });
+    expect(cyberToggle.getAttribute("aria-checked")).toBe(String(testCase.initial));
+
+    fireEvent.click(cyberToggle);
+
+    await waitFor(() => {
+      expect(view.setProviderConfig).toHaveBeenCalledWith({
+        provider: "openai",
+        keyPath: ["cyberModelEnabled"],
+        value: testCase.persisted,
+      });
+    });
+  });
+
+  test("keeps the cyber model setting on and resyncs when turning it off fails to persist", async () => {
+    const view = renderProvidersSection();
+    view.providersConfig.openai.cyberModelEnabled = true;
+    view.setProviderConfig.mockImplementationOnce(() =>
+      Promise.resolve({ success: false as const, error: "write failed" })
+    );
+    const openAiButton = await view.findByRole("button", { name: /^OpenAI\b/ });
+    fireEvent.click(openAiButton);
+
+    fireEvent.click(
+      within(getProviderCard(openAiButton)).getByRole("switch", { name: /Enable cyber model/i })
+    );
+
+    await waitFor(() => {
+      expect(providersRefreshMock).toHaveBeenCalled();
+    });
+    expect(updateOptimisticallyMock).not.toHaveBeenCalledWith("openai", {
+      cyberModelEnabled: undefined,
     });
   });
 

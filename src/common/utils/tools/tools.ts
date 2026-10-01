@@ -340,7 +340,7 @@ export interface ToolConfiguration {
    */
   goalKickoffModel?: string;
   /**
-   * Per-turn inputs to the goal tool gates (workspace kind, allowAgentSetGoal,
+   * Per-turn inputs to the goal tool gates (workspace kind,
    * agent chain). The goal tools are registered whenever goalService exists and
    * check these plus the live goal status at execution time (#5247).
    */
@@ -362,19 +362,12 @@ export interface ToolConfiguration {
     programmaticToolCalling?: boolean;
     /** RLM mode: inherited to subagent spawns so children are stamped at spawn time. */
     rlm?: boolean;
-    advisorTool?: boolean;
-    dynamicWorkflows?: boolean;
     tokenBudget?: boolean;
     /** Continuous compaction takes precedence over token-budget rollover (new_context). */
     continuousCompaction?: boolean;
     memory?: boolean;
-    timeline?: boolean;
-    workspaceHeartbeats?: boolean;
-    toolSearch?: boolean;
     /** claude-skills-compat: discover skills from .claude/skills and ~/.claude/skills (read-only). */
     claudeSkillsCompat?: boolean;
-    /** agent-plugins: discover Agent Plugins skills from .xum/plugins, .agents/plugins and their global counterparts (read-only). */
-    agentPlugins?: boolean;
   };
   /**
    * Stream-time knowledge of whether a token-budget rollover can be sealed (mode active,
@@ -453,8 +446,8 @@ export interface ToolConfiguration {
     abortSignal: AbortSignal;
   };
   /**
-   * Runtime holder for the tool_catalog_search tool (tool-search experiment; present
-   * only when the experiment is enabled and MCP tools exist for this stream).
+   * Runtime holder for the tool_catalog_search tool (present only when tool
+   * search is enabled and MCP tools exist for this stream).
    * `state` is assigned by aiService after policy filtering builds the catalog.
    */
   toolSearchRuntime?: ToolSearchRuntime;
@@ -659,11 +652,11 @@ async function getDesktopTools(config: ToolConfiguration): Promise<Record<string
  * @returns Promise resolving to record of tools available for the model
  */
 /**
- * Returns true when an Anthropic model supports webFetch_20250910 (Claude 4.6+).
+ * Whether a Claude model id is at least version `major.minor`.
  *
  * Two-segment IDs:    claude-{variant}-{major}-{minor} (e.g. claude-sonnet-4-6, claude-opus-4-8)
  * Pinned two-segment: claude-{variant}-{major}-{minor}-{date} (e.g. claude-opus-4-6-20260201)
- * Date-based pre-4.6: claude-{variant}-{major}-{date} (e.g. claude-sonnet-4-20250514)
+ * Date-based:        claude-{variant}-{major}-{date} (e.g. claude-sonnet-4-20250514)
  * Major-only IDs:     claude-{variant}-{major} (e.g. claude-sonnet-5, claude-fable-5,
  *                     claude-mythos-5) — the dateless naming adopted for the 5 generation.
  *
@@ -671,15 +664,27 @@ async function getDesktopTools(config: ToolConfiguration): Promise<Record<string
  * are recognized; those are all > 4 and qualify. The variant segment must be alphabetic so older
  * third-generation IDs like claude-3-5-sonnet-20241022 do not get misread as major=5. The \d{1,2}
  * constraint accepts 1-2 digit version numbers (1–99) while rejecting 8-digit date suffixes, so
- * date-based pre-4.6 IDs like claude-sonnet-4-20250514 parse as major=4 / no minor and correctly
- * stay unsupported. The (?:-|$) lookahead allows an optional pinned date to follow.
+ * date-based IDs like claude-sonnet-4-20250514 parse as major=4 / no minor and never meet a 4.x
+ * minimum. The (?:-|$) lookahead allows an optional pinned date to follow.
  */
-export function supportsAnthropicNativeWebFetch(modelId: string): boolean {
+function isClaudeAtLeast(modelId: string, major: number, minor: number): boolean {
   const match = /^claude-[a-z]+-(\d+)(?:-(\d{1,2}))?(?:-|$)/.exec(modelId);
   if (!match) return false;
-  const major = parseInt(match[1], 10);
-  const minor = match[2] != null ? parseInt(match[2], 10) : undefined;
-  return major > 4 || (major === 4 && minor !== undefined && minor >= 6);
+  const modelMajor = parseInt(match[1], 10);
+  const modelMinor = match[2] != null ? parseInt(match[2], 10) : undefined;
+  return (
+    modelMajor > major || (modelMajor === major && modelMinor !== undefined && modelMinor >= minor)
+  );
+}
+
+/** Returns true when an Anthropic model supports webFetch_20250910 (Claude 4.6+). */
+export function supportsAnthropicNativeWebFetch(modelId: string): boolean {
+  return isClaudeAtLeast(modelId, 4, 6);
+}
+
+/** Returns true when an Anthropic model accepts `defer_loading` and `tool_reference` (Claude 4.5+). */
+export function supportsAnthropicToolSearch(modelId: string): boolean {
+  return isClaudeAtLeast(modelId, 4, 5);
 }
 
 interface XaiWebSearchOptions {
@@ -931,12 +936,9 @@ export async function getToolsForModel(
       : {}),
   };
 
-  // HeartbeatService intentionally skips child task workspaces, and the
-  // workspace-heartbeats experiment gates every user-facing way to create schedules.
+  // HeartbeatService intentionally skips child task workspaces.
   const shouldExposeHeartbeatTool =
-    config.workspaceHeartbeatService != null &&
-    config.experiments?.workspaceHeartbeats === true &&
-    !config.enableAgentReport;
+    config.workspaceHeartbeatService != null && !config.enableAgentReport;
 
   // Non-runtime tools execute immediately (no init wait needed)
   // Note: Tool availability is controlled by agent tool policy (allowlist), not mode checks here.
@@ -955,9 +957,7 @@ export async function getToolsForModel(
     ...(config.intuitionRuntime ? { intuition: createIntuitionTool(config) } : {}),
     ...(config.toolSearchRuntime ? { tool_catalog_search: createToolSearchTool(config) } : {}),
     ...(config.mcpPromptRuntime ? { mcp_prompt_get: createMcpPromptGetTool(config) } : {}),
-    ...(config.timelineService && config.experiments?.timeline
-      ? { timeline_event: createTimelineEventTool(config) }
-      : {}),
+    ...(config.timelineService ? { timeline_event: createTimelineEventTool(config) } : {}),
     ask_user_question: createAskUserQuestionTool(config),
     propose_plan: createProposePlanTool(config),
     // propose_name and propose_status are intentionally NOT registered here —
@@ -966,7 +966,7 @@ export async function getToolsForModel(
     // (workspaceStatusGenerator.ts), which create the tool inline. Exposing
     // them in the default toolset would let exec-derived agents see their
     // "call me immediately" descriptions.
-    ...(config.workflowService && config.experiments?.dynamicWorkflows
+    ...(config.workflowService
       ? {
           workflow_run: createWorkflowRunTool(config),
           workflow_resume: createWorkflowResumeTool(config),
@@ -1126,14 +1126,12 @@ export async function getToolsForModel(
       enableAgentReport: config.enableAgentReport,
       enableFamilyMessaging: config.enableFamilyMessaging,
       enableAnalyticsQuery: Boolean(config.analyticsService),
-      enableDynamicWorkflows: Boolean(
-        config.workflowService && config.experiments?.dynamicWorkflows
-      ),
+      enableDynamicWorkflows: Boolean(config.workflowService),
       enableAdvisor: Boolean(config.advisorRuntime),
       enableIntuition: Boolean(config.intuitionRuntime),
       enableSessionHistory: config.experiments?.tokenBudget === true,
       enableMemory: Boolean(config.memoryService && config.experiments?.memory),
-      enableTimelineEvent: Boolean(config.timelineService && config.experiments?.timeline),
+      enableTimelineEvent: Boolean(config.timelineService),
       enableToolSearch: Boolean(config.toolSearchRuntime),
       enableMcpPromptGet: Boolean(config.mcpPromptRuntime),
       // The Review pane belongs to the user-facing parent workspace. config

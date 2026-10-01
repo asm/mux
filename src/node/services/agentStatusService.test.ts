@@ -27,11 +27,18 @@ import type { TokenizerService } from "./tokenizerService";
 import { AgentStatusService } from "./agentStatusService";
 import * as workspaceStatusGenerator from "./workspaceStatusGenerator";
 import { createTestHistoryService } from "./testHistoryService";
-import { PAYLOAD_ROW_SHAPES, payloadRow } from "./historyScanner.generator.testHarness";
+import {
+  PAYLOAD_ROW_SHAPES,
+  payloadPartial,
+  payloadRow,
+} from "./historyScanner.generator.testHarness";
 import { createContextResetBoundaryMessageId } from "./utils/messageIds";
 
 interface AgentStatusServiceInternals {
   runTick(): Promise<void>;
+  buildTrailingTranscript(
+    workspaceId: string
+  ): Promise<{ transcript: string; rowIds: string[]; trustedProjectContent: boolean } | null>;
   runForWorkspace(
     workspaceId: string,
     observedRecency?: number | null,
@@ -651,30 +658,35 @@ describe("AgentStatusService", () => {
       workspaceId,
       createMuxMessage("a1", "assistant", "Running tests now")
     );
-    const readPartial = history.readPartial.bind(history);
-    const partialSpy = spyOn(history, "readPartial").mockImplementation(async (id: string) => {
-      // The new routed turn lands (rows, then its partial) around this read.
-      await history.appendToHistory(
-        id,
-        createMuxMessage("snap-late", "user", "LATE ROUTED SKILL BODY", {
-          synthetic: true,
-          agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "l" },
-        })
-      );
-      await history.appendToHistory(
-        id,
-        createMuxMessage("u-late", "user", "LATE ROUTED PROMPT", {
-          retrySendOptions: {
-            model: "anthropic:claude-haiku-4-5",
-            agentId: "exec",
-            routedProjectConsent: true,
-          },
-        })
-      );
-      await history.writePartial(id, createMuxMessage("a-late", "assistant", "LATE ROUTED OUTPUT"));
-      partialSpy.mockRestore();
-      return readPartial(id);
-    });
+    const readStatusPartial = history.readStatusPartial.bind(history);
+    const partialSpy = spyOn(history, "readStatusPartial").mockImplementation(
+      async (id: string) => {
+        // The new routed turn lands (rows, then its partial) around this read.
+        await history.appendToHistory(
+          id,
+          createMuxMessage("snap-late", "user", "LATE ROUTED SKILL BODY", {
+            synthetic: true,
+            agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "l" },
+          })
+        );
+        await history.appendToHistory(
+          id,
+          createMuxMessage("u-late", "user", "LATE ROUTED PROMPT", {
+            retrySendOptions: {
+              model: "anthropic:claude-haiku-4-5",
+              agentId: "exec",
+              routedProjectConsent: true,
+            },
+          })
+        );
+        await history.writePartial(
+          id,
+          createMuxMessage("a-late", "assistant", "LATE ROUTED OUTPUT")
+        );
+        partialSpy.mockRestore();
+        return readStatusPartial(id);
+      }
+    );
 
     const service = createService();
     await getInternals(service).runForWorkspace(workspaceId);
@@ -1079,6 +1091,28 @@ describe("AgentStatusService", () => {
     }
     expect(transcripts[0]).toContain("payload row p3");
     expect(transcripts[0]).toEqual(transcripts[1]);
+  });
+
+  test("a giant in-flight partial is read status-grade without changing the transcript (#5213)", async () => {
+    const { historyService } = historyHandle;
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please look at the logs")
+    );
+    await historyService.writePartial(
+      workspaceId,
+      payloadPartial("a-partial", "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES + 1))
+    );
+    const statusRead = spyOn(historyService, "readStatusPartial");
+    const internals = getInternals(createService());
+
+    const transcript = (await internals.buildTrailingTranscript(workspaceId))?.transcript ?? "";
+    expect(statusRead).toHaveBeenCalledWith(workspaceId);
+    expect(transcript).toContain("Assistant (in progress): payload partial a-partial");
+    expect(transcript).toContain("[tool bash done]");
+
+    statusRead.mockImplementation((id) => historyService.readPartial(id));
+    expect((await internals.buildTrailingTranscript(workspaceId))?.transcript).toEqual(transcript);
   });
 
   test("transcript tags in-flight tool calls 'running' and completed ones 'done'", async () => {

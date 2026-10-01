@@ -1,11 +1,17 @@
 /**
- * Tool search catalog (tool-search experiment, Phase 1).
+ * Tool search catalog (Phase 1).
  *
  * Client-side deferred MCP tool loading: MCP tool schemas stay out of the
  * model-visible tool list until the model discovers them via the `tool_catalog_search`
  * tool. All tools remain in the `tools:` record passed to streamText; the AI
  * SDK's `prepareStep` → `activeTools` mechanism only scopes what is advertised
  * to the model on each step, so this works with every provider.
+ *
+ * Anthropic prompt-cache models use native deferred loading instead (#5262):
+ * every tool is sent on every request, deferred tools carry
+ * `providerOptions.anthropic.deferLoading`, and search results reach the model
+ * as `tool_reference` blocks. Rescoping `activeTools` would rewrite the cached
+ * tools block after each search (#5250).
  *
  * Everything in this module is pure and deterministic (no I/O) so the gating
  * matrix, scoring, and activation semantics are unit-testable without mocking
@@ -20,6 +26,7 @@ import type {
   ToolResultPart,
 } from "ai";
 import type { ModelMessage, MuxMessage } from "@/common/types/message";
+import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 
 export const TOOL_SEARCH_TOOL_NAME = "tool_catalog_search";
@@ -28,6 +35,33 @@ export const LEGACY_TOOL_SEARCH_TOOL_NAME = "tool_search";
 /** Default / max number of matches returned by a tool_catalog_search call. */
 export const TOOL_SEARCH_DEFAULT_LIMIT = 10;
 export const TOOL_SEARCH_MAX_LIMIT = 25;
+
+/**
+ * Native deferral (#5262) applies only when the deferred definitions
+ * (description + JSON input schema) total at least this many characters
+ * (#5405). Each search costs one extra request that re-reads the whole cached
+ * transcript, while deferral saves the definitions' cached-read cost on every
+ * request, so small catalogs cost more with deferral than without.
+ *
+ * Measured on Sonnet 5.5 (eval on #5405), ~2.7 chars per wire token:
+ * - Short 4-turn sessions with 2-3 searches break even at ~25k deferred tokens.
+ * - A model of 154 real local sessions (median 45 requests, ~1 extra search
+ *   round trip at ~150k context) breaks even at ~3-5k tokens; deferral is
+ *   cheaper in 99% of them at ~8k tokens.
+ * Real sessions are mostly long, so the cutoff sits near ~8k tokens: short
+ * sessions on catalogs between ~8k and ~25k tokens can still cost a few
+ * percent more. The decision depends only on the deferred tool set, so it is
+ * stable across turns.
+ */
+export const NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS = 24_000;
+
+/** Size proxy for a tool definition on the wire: description plus JSON input schema. */
+function toolDefinitionChars(tool: Tool): number {
+  const description = typeof tool.description === "string" ? tool.description.length : 0;
+  const schema: unknown = tool.inputSchema;
+  const jsonSchema = isPlainRecord(schema) ? schema.jsonSchema : undefined;
+  return description + (jsonSchema === undefined ? 0 : (JSON.stringify(jsonSchema) ?? "").length);
+}
 
 export interface ToolCatalogEntry {
   name: string;
@@ -53,6 +87,12 @@ export interface ToolSearchStreamState {
   allToolNames: string[];
   /** Deferred tools discovered via tool_catalog_search (or prior-turn history). */
   activatedToolNames: Set<string>;
+  /**
+   * Native Anthropic deferred loading: deferred tools stay in the request
+   * marked `deferLoading`, activeTools is never scoped, and search results
+   * are `tool_reference` blocks.
+   */
+  native: boolean;
 }
 
 /**
@@ -122,8 +162,8 @@ interface ToolCatalogInputs {
   /**
    * Whether the attempt's model gets Anthropic prompt-cache breakpoints
    * (`supportsAnthropicCache`). Such providers read `tools` as the first part
-   * of the cached prefix, so each activation's larger tool list rewrites the
-   * whole cached prefix (#5250).
+   * of the cached prefix, so each activation's larger tool list would rewrite
+   * the whole cached prefix (#5250); these models use native deferred loading.
    */
   promptCacheActive?: boolean;
 }
@@ -350,17 +390,35 @@ export function buildToolCatalogOverview(catalog: readonly ToolCatalogEntry[]): 
  *   without deferral. (Exclusive mode removes MCP tools from the record, so
  *   the empty-catalog branch deactivates it anyway.)
  * - `tool_catalog_search` absent (policy-disabled) ⇒ safe fallback: no state, tools
- *   unchanged — MCP tools stay advertised exactly as without the experiment.
- * - Anthropic prompt caching active (`promptCacheActive`) ⇒ drop `tool_catalog_search`,
- *   inactive state: the experiment-off tool list keeps the cached prefix stable (#5250).
+ *   unchanged: MCP tools stay advertised exactly as with tool search off.
  * - Nothing deferred (all MCP tools policy-disabled / PTC-removed) ⇒ drop
  *   `tool_catalog_search` from the record (a search tool with an empty catalog is
  *   noise) and return no state.
+ * - Anthropic prompt caching with deferred definitions smaller than
+ *   `NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS` ⇒ same as nothing deferred: every
+ *   tool is advertised, because searching would cost more than it saves (#5405).
  * - Otherwise ⇒ tools unchanged plus a fresh state with an empty activation
  *   set (callers seed prior-turn activations via
- *   `seedToolSearchActivationsFromMessages`).
+ *   `seedToolSearchActivationsFromMessages`). With Anthropic prompt caching
+ *   (`promptCacheActive`) the state is native and deferred tools are marked
+ *   `deferLoading` (#5262).
+ *
+ * The `deferLoading` marker is present exactly on the native deferred set in
+ * every returned record, so a rebuild that switches modes (model fallback,
+ * assembly hooks) also removes stale markers: a deferred tool without a
+ * working search tool would be unreachable.
  */
 export function prepareToolSearch(inputs: ToolCatalogInputs): {
+  tools: Record<string, Tool>;
+  state?: ToolSearchStreamState;
+} {
+  const prepared = prepareToolSearchRecord(inputs);
+  const nativeDeferred =
+    prepared.state?.native === true ? prepared.state.deferredToolNames : new Set<string>();
+  return { ...prepared, tools: applyDeferLoadingMarkers(prepared.tools, nativeDeferred) };
+}
+
+function prepareToolSearchRecord(inputs: ToolCatalogInputs): {
   tools: Record<string, Tool>;
   state?: ToolSearchStreamState;
 } {
@@ -377,40 +435,28 @@ export function prepareToolSearch(inputs: ToolCatalogInputs): {
   // bridged MCP tool in its description and exposes them as callable `mux.*`
   // functions, so activeTools scoping could neither reduce context nor gate
   // access. Deferral would be ineffective and silently bypassable ⇒ drop
-  // tool_catalog_search and run without deferral when both experiments are enabled.
+  // tool_catalog_search and run without deferral when PTC is enabled.
   // Gated on the actual PTC flag, not record presence: a `code_execution`
   // record entry may be a same-named MCP tool (classified as normal deferred).
   if (inputs.ptcEnabled === true) {
     const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = inputs.tools;
     return { tools: rest };
   }
-  // Anthropic prompt caching (#5250): each activation changes the scoped tool
-  // list mid-turn, and the next step then reads 0 cached tokens and rewrites
-  // the whole prefix (tools, system, transcript). Measured on Opus 5.5 with 42
-  // deferred MCP tools, that cost 1.6-3.2x more than advertising every tool.
-  // So these models get the experiment-off tool list, which keeps the prefix
-  // stable. Native `defer_loading` + `tool_reference` could keep deferral
-  // without cache misses (#5262).
-  if (inputs.promptCacheActive === true) {
-    const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = inputs.tools;
-    // Inactive state (empty deferred set ⇒ computeActiveToolNames returns
-    // undefined) instead of none: StreamManager keeps this object, so a model
-    // fallback to a model without prompt caching can still turn deferral on
-    // in place via rebuildToolSearchState.
-    return {
-      tools: rest,
-      state: {
-        catalog: [],
-        deferredToolNames: new Set<string>(),
-        allToolNames: Object.keys(rest),
-        activatedToolNames: new Set<string>(),
-      },
-    };
-  }
   const classification = buildToolCatalog(inputs);
   if (classification.deferredToolNames.size === 0) {
     const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = inputs.tools;
     return { tools: rest };
+  }
+  // Native only: scoped deferral on other routes has different costs (#5405).
+  if (inputs.promptCacheActive === true) {
+    let deferredChars = 0;
+    for (const name of classification.deferredToolNames) {
+      deferredChars += toolDefinitionChars(inputs.tools[name]);
+    }
+    if (deferredChars < NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS) {
+      const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = inputs.tools;
+      return { tools: rest };
+    }
   }
   // Advertise the deferred surface area up front: append a compact per-server
   // index of deferred tool names to tool_catalog_search's description so the
@@ -431,8 +477,76 @@ export function prepareToolSearch(inputs: ToolCatalogInputs): {
   });
   return {
     tools: { ...inputs.tools, [TOOL_SEARCH_TOOL_NAME]: augmentedSearchTool },
-    state: { ...classification, activatedToolNames: new Set<string>() },
+    state: {
+      ...classification,
+      activatedToolNames: new Set<string>(),
+      // Scoped activeTools would rewrite the cached prefix after every search
+      // (#5250): 1.6-3.2x the cost of advertising every tool on Opus 5.5 with
+      // 42 MCP tools.
+      native: inputs.promptCacheActive === true,
+    },
   };
+}
+
+/** Also accepts serialized request tools, whose shape is unchecked. */
+export function isDeferLoadingTool(tool: { providerOptions?: unknown }): boolean {
+  return (
+    isPlainRecord(tool.providerOptions) &&
+    isPlainRecord(tool.providerOptions.anthropic) &&
+    tool.providerOptions.anthropic.deferLoading === true
+  );
+}
+
+export function collectDeferLoadingToolNames(tools: Record<string, Tool>): Set<string> {
+  return new Set(Object.keys(tools).filter((name) => isDeferLoadingTool(tools[name])));
+}
+
+function withDeferLoading(tool: Tool, deferLoading: boolean): Tool {
+  const providerOptions = tool.providerOptions ?? {};
+  const { deferLoading: _previous, ...anthropic } = providerOptions.anthropic ?? {};
+  const { anthropic: _anthropic, ...otherProviders } = providerOptions;
+  const nextAnthropic = deferLoading ? { ...anthropic, deferLoading: true } : anthropic;
+  const nextProviderOptions =
+    Object.keys(nextAnthropic).length > 0
+      ? { ...otherProviders, anthropic: nextAnthropic }
+      : otherProviders;
+  // Descriptor-preserving clone keeps execute, toModelOutput, and wrapper
+  // symbol markers; the record's tools are shared and must not be mutated.
+  const clone = cloneToolPreservingDescriptors(tool);
+  if (Object.keys(nextProviderOptions).length === 0) {
+    Reflect.deleteProperty(clone, "providerOptions");
+    return clone;
+  }
+  Object.defineProperty(clone, "providerOptions", {
+    value: nextProviderOptions,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+  return clone;
+}
+
+/**
+ * Returns a record where exactly `deferredToolNames` carry the deferLoading
+ * marker, preserving the key order (#5252) and returning the input record
+ * itself when nothing changes.
+ */
+function applyDeferLoadingMarkers(
+  tools: Record<string, Tool>,
+  deferredToolNames: ReadonlySet<string>
+): Record<string, Tool> {
+  let changed = false;
+  const next: Record<string, Tool> = {};
+  for (const [name, tool] of Object.entries(tools)) {
+    const shouldDefer = deferredToolNames.has(name);
+    if (isDeferLoadingTool(tool) === shouldDefer) {
+      next[name] = tool;
+      continue;
+    }
+    changed = true;
+    next[name] = withDeferLoading(tool, shouldDefer);
+  }
+  return changed ? next : tools;
 }
 
 /**
@@ -454,11 +568,13 @@ export function rebuildToolSearchState(
     state.deferredToolNames = new Set();
     state.allToolNames = Object.keys(prepared.tools);
     state.activatedToolNames = new Set();
+    state.native = false;
     return { tools: prepared.tools };
   }
   state.catalog = prepared.state.catalog;
   state.deferredToolNames = prepared.state.deferredToolNames;
   state.allToolNames = prepared.state.allToolNames;
+  state.native = prepared.state.native;
   state.activatedToolNames = new Set(
     [...state.activatedToolNames].filter((name) => prepared.state!.deferredToolNames.has(name))
   );
@@ -718,6 +834,69 @@ export function normalizeLegacyToolSearchMessages(messages: ModelMessage[]): Mod
   });
 }
 
+type ToolResultOutput = ToolResultPart["output"];
+
+/**
+ * Model-facing form of a tool_catalog_search result in native mode, shared by
+ * `toModelOutput` and the history replay so both send identical bytes.
+ * Anthropic 400s on a `tool_reference` to a tool absent from `tools` and on a
+ * tool_result mixing references with text, so references are filtered to the
+ * deferred set and a result without any is plain text instead.
+ */
+export function buildToolSearchModelOutput(
+  value: unknown,
+  deferredToolNames: ReadonlySet<string>
+): ToolResultOutput {
+  const matched = new Set<string>();
+  collectMatchNames(value, matched);
+  const referenced = [...matched].filter((name) => deferredToolNames.has(name));
+  if (referenced.length === 0) {
+    return { type: "text", value: JSON.stringify(value) };
+  }
+  return {
+    type: "content",
+    value: referenced.map((toolName) => ({
+      type: "custom" as const,
+      providerOptions: { anthropic: { type: "tool-reference", toolName } },
+    })),
+  };
+}
+
+/**
+ * Native mode: rewrite replayed tool_catalog_search results (persisted as the
+ * raw result, so they arrive JSON-encoded) into the `toModelOutput` form the
+ * same turn sent, keeping the cached transcript prefix byte-identical.
+ */
+export function applyNativeToolSearchReplay(
+  messages: ModelMessage[],
+  deferredToolNames: ReadonlySet<string>
+): ModelMessage[] {
+  if (deferredToolNames.size === 0) {
+    return messages;
+  }
+  return messages.map((message) => {
+    if (message.role !== "tool") {
+      return message;
+    }
+    let changed = false;
+    const content: ToolModelMessage["content"] = message.content.map((part) => {
+      if (
+        part.type !== "tool-result" ||
+        part.toolName !== TOOL_SEARCH_TOOL_NAME ||
+        !isMuxToolSearchOutput(part.output)
+      ) {
+        return part;
+      }
+      changed = true;
+      return {
+        ...part,
+        output: buildToolSearchModelOutput(decodeToolSearchOutput(part.output), deferredToolNames),
+      };
+    });
+    return changed ? { ...message, content } : message;
+  });
+}
+
 /**
  * Seed the activation set from prior tool_catalog_search results found in the
  * stream's input messages, intersected with the current deferred set.
@@ -736,9 +915,22 @@ export function seedToolSearchActivationsFromMessages(
 /**
  * Compute the per-step `activeTools` list for streamText's prepareStep.
  * Returns undefined when the feature is inactive (no state, or deactivated by
- * a fallback rebuild) so the caller returns exactly what it returns today.
+ * a fallback rebuild) so the caller returns exactly what it returns today, and
+ * in native mode, where every tool stays in the request (#5262).
  */
 export function computeActiveToolNames(
+  state: ToolSearchStreamState | undefined
+): string[] | undefined {
+  return state?.native === true ? undefined : computeLoadedToolNames(state);
+}
+
+/**
+ * Tools whose definitions occupy model context: core tools plus activated
+ * deferred tools, in both modes. For context-budget accounting and the
+ * agent-transition tool list; native deferred tools are sent but not loaded
+ * until referenced.
+ */
+export function computeLoadedToolNames(
   state: ToolSearchStreamState | undefined
 ): string[] | undefined {
   if (state === undefined || state.deferredToolNames.size === 0) {
@@ -747,4 +939,57 @@ export function computeActiveToolNames(
   return state.allToolNames.filter(
     (name) => !state.deferredToolNames.has(name) || state.activatedToolNames.has(name)
   );
+}
+
+/**
+ * Context-budget variant of computeLoadedToolNames. A native deferred tool is
+ * loaded only by a tool_reference in the transcript, and a compacted prefix can
+ * drop the result that loaded an activated tool, so count the references the
+ * request's messages actually carry.
+ */
+export function computeContextLoadedToolNames(
+  state: ToolSearchStreamState | undefined,
+  messages: readonly ModelMessage[]
+): string[] | undefined {
+  if (state?.native !== true || state.deferredToolNames.size === 0) {
+    return computeLoadedToolNames(state);
+  }
+  const referenced = countToolReferences(messages);
+  return state.allToolNames.filter(
+    (name) => !state.deferredToolNames.has(name) || referenced.has(name)
+  );
+}
+
+/**
+ * Occurrences of each native `tool_reference` block in `messages`, by tool name.
+ * Anthropic expands every reference into the full tool definition, repeats
+ * included (#5413), so context-budget accounting charges per occurrence.
+ * Accepts unknown messages because the budget estimator sees the wire payload.
+ */
+export function countToolReferences(messages: readonly unknown[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const message of messages) {
+    if (!isPlainRecord(message) || message.role !== "tool" || !Array.isArray(message.content)) {
+      continue;
+    }
+    for (const part of message.content as unknown[]) {
+      const output = isPlainRecord(part) && part.type === "tool-result" ? part.output : undefined;
+      if (!isPlainRecord(output) || output.type !== "content" || !Array.isArray(output.value)) {
+        continue;
+      }
+      for (const item of output.value as unknown[]) {
+        const providerOptions =
+          isPlainRecord(item) && item.type === "custom" ? item.providerOptions : undefined;
+        const anthropic = isPlainRecord(providerOptions) ? providerOptions.anthropic : undefined;
+        if (
+          isPlainRecord(anthropic) &&
+          anthropic.type === "tool-reference" &&
+          typeof anthropic.toolName === "string"
+        ) {
+          counts.set(anthropic.toolName, (counts.get(anthropic.toolName) ?? 0) + 1);
+        }
+      }
+    }
+  }
+  return counts;
 }

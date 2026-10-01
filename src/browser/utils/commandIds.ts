@@ -77,6 +77,7 @@ export const CommandIds = {
   modelChange: () => "model:change" as const,
   thinkingSetLevel: () => "thinking:set-level" as const,
   toggleProReasoning: () => "thinking:toggle-pro-reasoning" as const,
+  toggleCyberReasoning: () => "thinking:toggle-cyber-reasoning" as const,
   toggleFastMode: () => "thinking:toggle-fast-mode" as const,
   toggleAutoRouting: (dimension: "model" | "thinkingLevel") =>
     `auto-routing:toggle:${dimension}` as const,
@@ -104,7 +105,7 @@ export const CommandIds = {
   coderDisconnect: () => "providers:coder:disconnect" as const,
   coderRefreshModels: () => "providers:coder:refresh-models" as const,
 
-  // Agent Plugin commands (agent-plugins experiment)
+  // Agent Plugin commands
   pluginsInstall: () => "plugins:install" as const,
   pluginsManageComponents: () => "plugins:manage-components" as const,
   pluginsUninstall: () => "plugins:uninstall" as const,

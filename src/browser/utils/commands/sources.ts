@@ -15,6 +15,7 @@ import {
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { getFastModeProvider } from "@/browser/utils/fastModeServiceTier";
+import { openaiCyberModeAvailable } from "@/common/utils/ai/cyberMode";
 import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import {
   enforceThinkingPolicy,
@@ -114,7 +115,11 @@ export interface BuildSourcesParams {
   getThinkingLevel: (workspaceId: string) => ThinkingLevel;
   onSetThinkingLevel: (workspaceId: string, level: ThinkingLevel) => void;
   getReasoningMode: (workspaceId: string) => OpenAIReasoningMode;
-  onToggleReasoningMode: (workspaceId: string) => void;
+  /** Toggles between `mode` and "standard"; Pro and Cyber share one mode value. */
+  onToggleReasoningMode: (
+    workspaceId: string,
+    mode: Exclude<OpenAIReasoningMode, "standard">
+  ) => void;
   getFastMode: () => boolean;
   onToggleFastMode: () => void | Promise<void>;
   /** auto-model-routing experiment: gates the composer's Auto toggles in the palette. */
@@ -139,8 +144,6 @@ export interface BuildSourcesParams {
   onStartWorkspaceCreation: (projectPath: string) => void;
   onStartMultiProjectWorkspaceCreation: () => void;
   multiProjectWorkspacesEnabled: boolean;
-  /** agent-plugins experiment: gates the Settings → Plugins palette entry. */
-  agentPluginsEnabled: boolean;
   onArchiveMergedWorkspacesInProject: (projectPath: string) => Promise<void>;
   getBranchesForProject: (projectPath: string) => Promise<BranchListResult>;
   onSelectWorkspace: (sel: {
@@ -1534,9 +1537,9 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         list.push(fastModeAction);
       }
 
-      // Pro reasoning mode is only meaningful for models that support it
-      // on routes that deliver the native provider option (direct OpenAI or
-      // Coder OpenAI instances) with the Responses wire format; hide the action
+      // Pro and Cyber reasoning modes are only meaningful for models that support them
+      // on routes that deliver the native provider option (direct OpenAI, plus
+      // Coder OpenAI instances for Pro) with the Responses wire format; hide the actions
       // elsewhere to avoid inert toggles. Gate on the chat input's persisted selection —
       // that is the model the NEXT send will use — and only fall back to the
       // activity snapshot's currentModel (last streamed model, stale after a
@@ -1544,24 +1547,45 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       // Pro row and relies on this palette action being reachable before the
       // first send with the newly selected model.
       const proGateModelString = providerOptionGateModel;
-      const currentModelRoute = providerOptionRoute;
-      if (
-        openaiProModeAvailable(proGateModelString ?? "", {
-          providersConfig: p.providersConfig,
-          resolvedRouteProvider: currentModelRoute,
-          effectiveRouteProvider: proGateModelString
-            ? p.getEffectiveRouteForModel?.(proGateModelString)
-            : undefined,
-        })
-      ) {
-        const proActive = p.getReasoningMode(workspaceId) === "pro";
+      const reasoningModeGate = {
+        providersConfig: p.providersConfig,
+        resolvedRouteProvider: providerOptionRoute,
+        effectiveRouteProvider: proGateModelString
+          ? p.getEffectiveRouteForModel?.(proGateModelString)
+          : undefined,
+      };
+      const proModeAvailable = openaiProModeAvailable(proGateModelString ?? "", reasoningModeGate);
+      const cyberModeAvailable = openaiCyberModeAvailable(
+        proGateModelString ?? "",
+        reasoningModeGate
+      );
+      const currentReasoningMode = p.getReasoningMode(workspaceId);
+      // Pro and Cyber share one mode value, so each command reports whichever is in effect.
+      const currentReasoningLabel =
+        currentReasoningMode === "pro"
+          ? "Pro — slower, more thorough"
+          : currentReasoningMode === "cyber" && cyberModeAvailable
+            ? "Cyber (OpenAI Daybreak access program)"
+            : "Standard";
+      if (proModeAvailable) {
         list.push({
           id: CommandIds.toggleProReasoning(),
           title: "Toggle Pro Reasoning Mode",
-          subtitle: `Current: ${proActive ? "Pro — slower, more thorough" : "Standard"}`,
+          subtitle: `Current: ${currentReasoningLabel}`,
           section: section.mode,
           run: () => {
-            p.onToggleReasoningMode(workspaceId);
+            p.onToggleReasoningMode(workspaceId, "pro");
+          },
+        });
+      }
+      if (cyberModeAvailable) {
+        list.push({
+          id: CommandIds.toggleCyberReasoning(),
+          title: "Toggle Cyber Mode",
+          subtitle: `Current: ${currentReasoningLabel}`,
+          section: section.mode,
+          run: () => {
+            p.onToggleReasoningMode(workspaceId, "cyber");
           },
         });
       }
@@ -1881,327 +1905,305 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             },
           ]
         : []),
-      ...(p.agentPluginsEnabled
-        ? ([
+      {
+        id: CommandIds.settingsOpenSection("plugins"),
+        title: "Settings: Plugins",
+        subtitle: "Install and manage Agent Plugins",
+        section: section.settings,
+        keywords: ["plugin", "install", "agent", "skill", "mcp", "update"],
+        run: () => openSettings("plugins"),
+      },
+      {
+        id: CommandIds.pluginsInstall(),
+        title: "Install Agent Plugin…",
+        subtitle: "Paste a git URL or owner/repo",
+        section: section.settings,
+        keywords: ["plugin", "install", "add", "git", "clone"],
+        run: () => {
+          // Open the section with the add-plugin form already expanded.
+          publishPluginsSectionIntent({ type: "open-add-panel" });
+          openSettings("plugins");
+        },
+      },
+      {
+        id: CommandIds.pluginsManageComponents(),
+        title: "Manage Plugin Components…",
+        subtitle: "Choose which installed skills and MCP servers are imported",
+        section: section.settings,
+        keywords: ["plugin", "manage", "add", "remove", "import", "skill", "mcp", "components"],
+        run: () => undefined,
+        prompt: {
+          title: "Manage Plugin Components",
+          fields: [
             {
-              id: CommandIds.settingsOpenSection("plugins"),
-              title: "Settings: Plugins",
-              subtitle: "Install and manage Agent Plugins",
-              section: section.settings,
-              keywords: ["plugin", "install", "agent", "skill", "mcp", "update"],
-              run: () => openSettings("plugins"),
-            },
-            {
-              id: CommandIds.pluginsInstall(),
-              title: "Install Agent Plugin…",
-              subtitle: "Paste a git URL or owner/repo",
-              section: section.settings,
-              keywords: ["plugin", "install", "add", "git", "clone"],
-              run: () => {
-                // Open the section with the add-plugin form already expanded.
-                publishPluginsSectionIntent({ type: "open-add-panel" });
-                openSettings("plugins");
+              type: "select",
+              name: "pluginName",
+              label: "Installed managed plugin",
+              placeholder: "Search installed plugins…",
+              getOptions: async () => {
+                const result = await p.api?.agentPlugins.list();
+                return result?.success
+                  ? result.data
+                      .filter((item) => item.managed && item.present)
+                      .map((item) => ({
+                        id: item.name,
+                        label: item.name,
+                        keywords: [item.name, item.location],
+                      }))
+                  : [];
               },
             },
+          ],
+          onSubmit: (values) => {
+            publishPluginsSectionIntent({
+              type: "manage-components",
+              name: values.pluginName,
+            });
+            openSettings("plugins");
+          },
+        },
+      },
+      {
+        id: CommandIds.pluginsUninstall(),
+        title: "Uninstall Agent Plugin…",
+        section: section.settings,
+        keywords: ["plugin", "uninstall", "remove", "delete"],
+        run: () => undefined,
+        prompt: {
+          title: "Uninstall Agent Plugin",
+          fields: [
             {
-              id: CommandIds.pluginsManageComponents(),
-              title: "Manage Plugin Components…",
-              subtitle: "Choose which installed skills and MCP servers are imported",
-              section: section.settings,
-              keywords: [
-                "plugin",
-                "manage",
-                "add",
-                "remove",
-                "import",
-                "skill",
-                "mcp",
-                "components",
-              ],
-              run: () => undefined,
-              prompt: {
-                title: "Manage Plugin Components",
-                fields: [
-                  {
-                    type: "select",
-                    name: "pluginName",
-                    label: "Installed managed plugin",
-                    placeholder: "Search installed plugins…",
-                    getOptions: async () => {
-                      const result = await p.api?.agentPlugins.list();
-                      return result?.success
-                        ? result.data
-                            .filter((item) => item.managed && item.present)
-                            .map((item) => ({
-                              id: item.name,
-                              label: item.name,
-                              keywords: [item.name, item.location],
-                            }))
-                        : [];
-                    },
-                  },
-                ],
-                onSubmit: (values) => {
-                  publishPluginsSectionIntent({
-                    type: "manage-components",
-                    name: values.pluginName,
-                  });
-                  openSettings("plugins");
-                },
+              type: "select",
+              name: "pluginName",
+              label: "Managed plugin",
+              placeholder: "Search installed plugins…",
+              getOptions: async () => {
+                const result = await p.api?.agentPlugins.list();
+                if (!result?.success) {
+                  return [];
+                }
+                return result.data
+                  .filter((item) => item.managed)
+                  .map((item) => ({
+                    id: item.name,
+                    label: item.version ? `${item.name} (v${item.version})` : item.name,
+                    keywords: [item.name, item.location],
+                  }));
               },
             },
-            {
-              id: CommandIds.pluginsUninstall(),
-              title: "Uninstall Agent Plugin…",
-              section: section.settings,
-              keywords: ["plugin", "uninstall", "remove", "delete"],
-              run: () => undefined,
-              prompt: {
-                title: "Uninstall Agent Plugin",
-                fields: [
-                  {
-                    type: "select",
-                    name: "pluginName",
-                    label: "Managed plugin",
-                    placeholder: "Search installed plugins…",
-                    getOptions: async () => {
-                      const result = await p.api?.agentPlugins.list();
-                      if (!result?.success) {
-                        return [];
-                      }
-                      return result.data
-                        .filter((item) => item.managed)
-                        .map((item) => ({
-                          id: item.name,
-                          label: item.version ? `${item.name} (v${item.version})` : item.name,
-                          keywords: [item.name, item.location],
-                        }));
-                    },
-                  },
-                ],
-                onSubmit: (values) => {
-                  // Route through the section's confirmation flow (plugin-data
-                  // checkbox, explicit destructive button) — the palette never
-                  // uninstalls directly.
-                  publishPluginsSectionIntent({
-                    type: "confirm-uninstall",
-                    name: values.pluginName,
-                  });
-                  openSettings("plugins");
-                },
-              },
-            },
-            {
-              id: CommandIds.pluginsCheckUpdates(),
-              title: "Check for Plugin Updates",
-              section: section.settings,
-              keywords: ["plugin", "update", "check", "outdated"],
-              run: async () => {
-                const result = await p.api?.agentPlugins.checkUpdates();
-                if (!result) return;
-                if (!result.success) {
-                  showCommandFeedbackToast({ type: "error", message: result.error });
-                  return;
-                }
-                const updatable = result.data.filter(
-                  (check) => check.status === "update-available" || check.status === "tag-moved"
-                );
-                // Per-plugin failures ride inside a successful result; an
-                // unreachable remote is an unknown state, not "up to date" —
-                // and it stays in the summary even when updates were found.
-                const failed = result.data.filter((check) => check.status === "error");
-                const summary: string[] = [];
-                if (updatable.length > 0) {
-                  summary.push(
-                    `Updates available: ${updatable.map((check) => check.name).join(", ")}`
-                  );
-                }
-                if (failed.length > 0) {
-                  summary.push(
-                    `Update check failed for ${failed.map((check) => check.name).join(", ")}`
-                  );
-                }
-                // A mounted section keeps its own stale updateChecks map;
-                // tell it to re-query so badges match the toast.
-                publishPluginsSectionIntent({ type: "refresh" });
-                if (summary.length === 0) {
-                  showCommandFeedbackToast({
-                    type: "success",
-                    message: "All plugins are up to date.",
-                  });
-                  return;
-                }
-                showCommandFeedbackToast({
-                  type: failed.length > 0 ? "error" : "success",
-                  message: summary.join(". "),
-                });
-                openSettings("plugins");
-              },
-            },
-            {
-              id: CommandIds.pluginsUpdateAll(),
-              title: "Update All Plugins",
-              subtitle: "Apply pending plugin updates",
-              section: section.settings,
-              keywords: ["plugin", "update", "upgrade", "all"],
-              run: async () => {
-                const api = p.api;
-                if (!api) return;
-                const checks = await api.agentPlugins.checkUpdates();
-                if (!checks.success) {
-                  showCommandFeedbackToast({ type: "error", message: checks.error });
-                  return;
-                }
-                // Moved tags are excluded from the bulk apply: tags are
-                // supposed to be immutable, so a moved tag warrants the
-                // section's per-plugin review — but it must never read as
-                // "up to date", so it stays in the summary below.
-                const updatable = checks.data.filter(
-                  (check) => check.status === "update-available"
-                );
-                const tagMoved = checks.data
-                  .filter((check) => check.status === "tag-moved")
-                  .map((check) => check.name);
-                // Unreachable remotes are an unknown state, never "up to date" —
-                // and they must stay visible even when other updates succeed.
-                const checkFailures = checks.data
-                  .filter((check) => check.status === "error")
-                  .map((check) => check.name);
+          ],
+          onSubmit: (values) => {
+            // Route through the section's confirmation flow (plugin-data
+            // checkbox, explicit destructive button) — the palette never
+            // uninstalls directly.
+            publishPluginsSectionIntent({
+              type: "confirm-uninstall",
+              name: values.pluginName,
+            });
+            openSettings("plugins");
+          },
+        },
+      },
+      {
+        id: CommandIds.pluginsCheckUpdates(),
+        title: "Check for Plugin Updates",
+        section: section.settings,
+        keywords: ["plugin", "update", "check", "outdated"],
+        run: async () => {
+          const result = await p.api?.agentPlugins.checkUpdates();
+          if (!result) return;
+          if (!result.success) {
+            showCommandFeedbackToast({ type: "error", message: result.error });
+            return;
+          }
+          const updatable = result.data.filter(
+            (check) => check.status === "update-available" || check.status === "tag-moved"
+          );
+          // Per-plugin failures ride inside a successful result; an
+          // unreachable remote is an unknown state, not "up to date" —
+          // and it stays in the summary even when updates were found.
+          const failed = result.data.filter((check) => check.status === "error");
+          const summary: string[] = [];
+          if (updatable.length > 0) {
+            summary.push(`Updates available: ${updatable.map((check) => check.name).join(", ")}`);
+          }
+          if (failed.length > 0) {
+            summary.push(`Update check failed for ${failed.map((check) => check.name).join(", ")}`);
+          }
+          // A mounted section keeps its own stale updateChecks map;
+          // tell it to re-query so badges match the toast.
+          publishPluginsSectionIntent({ type: "refresh" });
+          if (summary.length === 0) {
+            showCommandFeedbackToast({
+              type: "success",
+              message: "All plugins are up to date.",
+            });
+            return;
+          }
+          showCommandFeedbackToast({
+            type: failed.length > 0 ? "error" : "success",
+            message: summary.join(". "),
+          });
+          openSettings("plugins");
+        },
+      },
+      {
+        id: CommandIds.pluginsUpdateAll(),
+        title: "Update All Plugins",
+        subtitle: "Apply pending plugin updates",
+        section: section.settings,
+        keywords: ["plugin", "update", "upgrade", "all"],
+        run: async () => {
+          const api = p.api;
+          if (!api) return;
+          const checks = await api.agentPlugins.checkUpdates();
+          if (!checks.success) {
+            showCommandFeedbackToast({ type: "error", message: checks.error });
+            return;
+          }
+          // Moved tags are excluded from the bulk apply: tags are
+          // supposed to be immutable, so a moved tag warrants the
+          // section's per-plugin review — but it must never read as
+          // "up to date", so it stays in the summary below.
+          const updatable = checks.data.filter((check) => check.status === "update-available");
+          const tagMoved = checks.data
+            .filter((check) => check.status === "tag-moved")
+            .map((check) => check.name);
+          // Unreachable remotes are an unknown state, never "up to date" —
+          // and they must stay visible even when other updates succeed.
+          const checkFailures = checks.data
+            .filter((check) => check.status === "error")
+            .map((check) => check.name);
 
-                const updateFailures: string[] = [];
-                const updatedNames: string[] = [];
-                for (const check of updatable) {
-                  const result = await api.agentPlugins.update({ name: check.name });
-                  if (result.success) {
-                    updatedNames.push(check.name);
-                  } else {
-                    updateFailures.push(`${check.name}: ${result.error}`);
-                  }
-                }
-                // A mounted section only re-queries from its own handlers, so
-                // tell it the state changed under it. This runs even when no
-                // branch update applied: the fresh check may have discovered
-                // moved tags or per-plugin errors the section should show.
-                publishPluginsSectionIntent({ type: "refresh" });
-                if (updatedNames.length > 0) {
-                  // Mounted composers cache contributed slash-command/skill
-                  // descriptors; an update can change them without a remount.
-                  publishAgentPluginsMutated();
-                }
+          const updateFailures: string[] = [];
+          const updatedNames: string[] = [];
+          for (const check of updatable) {
+            const result = await api.agentPlugins.update({ name: check.name });
+            if (result.success) {
+              updatedNames.push(check.name);
+            } else {
+              updateFailures.push(`${check.name}: ${result.error}`);
+            }
+          }
+          // A mounted section only re-queries from its own handlers, so
+          // tell it the state changed under it. This runs even when no
+          // branch update applied: the fresh check may have discovered
+          // moved tags or per-plugin errors the section should show.
+          publishPluginsSectionIntent({ type: "refresh" });
+          if (updatedNames.length > 0) {
+            // Mounted composers cache contributed slash-command/skill
+            // descriptors; an update can change them without a remount.
+            publishAgentPluginsMutated();
+          }
 
-                const summary: string[] = [];
-                if (updatedNames.length > 0) {
-                  summary.push(`Updated ${updatedNames.join(", ")}`);
-                }
-                if (updateFailures.length > 0) {
-                  summary.push(`Update failed — ${updateFailures.join("; ")}`);
-                }
-                if (tagMoved.length > 0) {
-                  summary.push(
-                    `Tag moved for ${tagMoved.join(", ")} — review in Settings → Plugins`
-                  );
-                }
-                if (checkFailures.length > 0) {
-                  summary.push(`Update check failed for ${checkFailures.join(", ")}`);
-                }
-                if (summary.length === 0) {
-                  showCommandFeedbackToast({
-                    type: "success",
-                    message: "All plugins are up to date.",
-                  });
-                  return;
-                }
-                showCommandFeedbackToast({
-                  // Anything unexpected taints the toast: a partial success or
-                  // a moved tag must not read as a verified all-clear.
-                  type:
-                    updateFailures.length > 0 || checkFailures.length > 0 || tagMoved.length > 0
-                      ? "error"
-                      : "success",
-                  message: summary.join(". "),
-                });
-                if (tagMoved.length > 0 || checkFailures.length > 0) {
-                  openSettings("plugins");
-                }
-              },
-            },
+          const summary: string[] = [];
+          if (updatedNames.length > 0) {
+            summary.push(`Updated ${updatedNames.join(", ")}`);
+          }
+          if (updateFailures.length > 0) {
+            summary.push(`Update failed — ${updateFailures.join("; ")}`);
+          }
+          if (tagMoved.length > 0) {
+            summary.push(`Tag moved for ${tagMoved.join(", ")} — review in Settings → Plugins`);
+          }
+          if (checkFailures.length > 0) {
+            summary.push(`Update check failed for ${checkFailures.join(", ")}`);
+          }
+          if (summary.length === 0) {
+            showCommandFeedbackToast({
+              type: "success",
+              message: "All plugins are up to date.",
+            });
+            return;
+          }
+          showCommandFeedbackToast({
+            // Anything unexpected taints the toast: a partial success or
+            // a moved tag must not read as a verified all-clear.
+            type:
+              updateFailures.length > 0 || checkFailures.length > 0 || tagMoved.length > 0
+                ? "error"
+                : "success",
+            message: summary.join(". "),
+          });
+          if (tagMoved.length > 0 || checkFailures.length > 0) {
+            openSettings("plugins");
+          }
+        },
+      },
+      {
+        id: CommandIds.pluginsUpdateOne(),
+        title: "Update Agent Plugin…",
+        subtitle: "Apply one plugin's pending update",
+        section: section.settings,
+        keywords: ["plugin", "update", "upgrade", "single", "one"],
+        run: () => undefined,
+        prompt: {
+          title: "Update Agent Plugin",
+          fields: [
             {
-              id: CommandIds.pluginsUpdateOne(),
-              title: "Update Agent Plugin…",
-              subtitle: "Apply one plugin's pending update",
-              section: section.settings,
-              keywords: ["plugin", "update", "upgrade", "single", "one"],
-              run: () => undefined,
-              prompt: {
-                title: "Update Agent Plugin",
-                fields: [
-                  {
-                    type: "select",
-                    name: "pluginName",
-                    label: "Plugin with a pending update",
-                    placeholder: "Search updatable plugins…",
-                    getOptions: async () => {
-                      const checks = await p.api?.agentPlugins.checkUpdates();
-                      if (!checks?.success) {
-                        return [];
-                      }
-                      // Moved tags are updatable here BY DESIGN: bulk update
-                      // excludes them so they get per-plugin review, and this
-                      // selector (with its warning label) is that reviewed,
-                      // keyboard-accessible path.
-                      return checks.data
-                        .filter(
-                          (check) =>
-                            check.status === "update-available" || check.status === "tag-moved"
-                        )
-                        .map((check) => ({
-                          id: check.name,
-                          label:
-                            check.status === "tag-moved"
-                              ? `${check.name} — tag moved (review: tags should be immutable)`
-                              : `${check.name} — update available`,
-                          keywords: [check.name, check.status],
-                        }));
-                    },
-                  },
-                ],
-                onSubmit: async (values) => {
-                  const api = p.api;
-                  if (!api) return;
-                  // Review before applying: an update that changes the
-                  // plugin's capability surface needs the user's consent,
-                  // which only the section's inline review can collect.
-                  const preview = await api.agentPlugins.previewUpdate({
-                    name: values.pluginName,
-                  });
-                  if (!preview.success) {
-                    showCommandFeedbackToast({ type: "error", message: preview.error });
-                    return;
-                  }
-                  if (preview.data.changes.length > 0) {
-                    publishPluginsSectionIntent({ type: "review-update", review: preview.data });
-                    openSettings("plugins");
-                    return;
-                  }
-                  const result = await api.agentPlugins.update({ name: values.pluginName });
-                  // A mounted section keeps its own stale updateChecks map;
-                  // tell it to re-query so badges match the toast.
-                  publishPluginsSectionIntent({ type: "refresh" });
-                  if (result.success) {
-                    // Mounted composers cache contributed slash-command/skill
-                    // descriptors; an update can change them without a remount.
-                    publishAgentPluginsMutated();
-                  }
-                  showCommandFeedbackToast(
-                    result.success
-                      ? { type: "success", message: `Updated ${values.pluginName}.` }
-                      : { type: "error", message: result.error }
-                  );
-                },
+              type: "select",
+              name: "pluginName",
+              label: "Plugin with a pending update",
+              placeholder: "Search updatable plugins…",
+              getOptions: async () => {
+                const checks = await p.api?.agentPlugins.checkUpdates();
+                if (!checks?.success) {
+                  return [];
+                }
+                // Moved tags are updatable here BY DESIGN: bulk update
+                // excludes them so they get per-plugin review, and this
+                // selector (with its warning label) is that reviewed,
+                // keyboard-accessible path.
+                return checks.data
+                  .filter(
+                    (check) => check.status === "update-available" || check.status === "tag-moved"
+                  )
+                  .map((check) => ({
+                    id: check.name,
+                    label:
+                      check.status === "tag-moved"
+                        ? `${check.name} — tag moved (review: tags should be immutable)`
+                        : `${check.name} — update available`,
+                    keywords: [check.name, check.status],
+                  }));
               },
             },
-          ] satisfies CommandAction[])
-        : []),
+          ],
+          onSubmit: async (values) => {
+            const api = p.api;
+            if (!api) return;
+            // Review before applying: an update that changes the
+            // plugin's capability surface needs the user's consent,
+            // which only the section's inline review can collect.
+            const preview = await api.agentPlugins.previewUpdate({
+              name: values.pluginName,
+            });
+            if (!preview.success) {
+              showCommandFeedbackToast({ type: "error", message: preview.error });
+              return;
+            }
+            if (preview.data.changes.length > 0) {
+              publishPluginsSectionIntent({ type: "review-update", review: preview.data });
+              openSettings("plugins");
+              return;
+            }
+            const result = await api.agentPlugins.update({ name: values.pluginName });
+            // A mounted section keeps its own stale updateChecks map;
+            // tell it to re-query so badges match the toast.
+            publishPluginsSectionIntent({ type: "refresh" });
+            if (result.success) {
+              // Mounted composers cache contributed slash-command/skill
+              // descriptors; an update can change them without a remount.
+              publishAgentPluginsMutated();
+            }
+            showCommandFeedbackToast(
+              result.success
+                ? { type: "success", message: `Updated ${values.pluginName}.` }
+                : { type: "error", message: result.error }
+            );
+          },
+        },
+      },
     ]);
   }
 

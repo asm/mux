@@ -6,7 +6,6 @@ import { createTestApiClient, createTestConfig } from "@/browser/testUtils";
 import * as RealAPIModule from "@/browser/contexts/API";
 import * as RealProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import * as RealModelsFromSettingsModule from "@/browser/hooks/useModelsFromSettings";
-import * as RealPolicyContextModule from "@/browser/contexts/PolicyContext";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 
 let apiMock: {
@@ -27,7 +26,6 @@ restoreModulesAfterSuite([
   ["@/browser/contexts/API", { ...RealAPIModule }],
   ["@/browser/hooks/useProvidersConfig", { ...RealProvidersConfigModule }],
   ["@/browser/hooks/useModelsFromSettings", { ...RealModelsFromSettingsModule }],
-  ["@/browser/contexts/PolicyContext", { ...RealPolicyContextModule }],
 ]);
 
 void mock.module("@/browser/contexts/API", () => ({
@@ -44,17 +42,6 @@ void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
   useModelsFromSettings: () => ({
     models: ["anthropic:claude-haiku-4-5", "anthropic:claude-sonnet-5", "anthropic:claude-fable-5"],
     hiddenModelsForSelector: [],
-  }),
-}));
-
-// The editor's real useRouting reads the policy context; render it policy-free
-// like ProvidersSection.test does. Mocked here, not inherited: bun module mocks
-// are process-global and file order differs per runner, so this file must not
-// rely on an earlier suite having registered the same stub.
-void mock.module("@/browser/contexts/PolicyContext", () => ({
-  usePolicy: () => ({
-    status: { state: "disabled" as const },
-    policy: null,
   }),
 }));
 

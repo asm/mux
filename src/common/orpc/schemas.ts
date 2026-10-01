@@ -97,14 +97,6 @@ export {
 // Secrets schemas
 export { SecretSchema } from "./schemas/secrets";
 
-// Policy schemas
-export {
-  PolicySourceSchema,
-  PolicyStatusSchema,
-  EffectivePolicySchema,
-  PolicyGetResponseSchema,
-  PolicyRuntimeIdSchema,
-} from "./schemas/policy";
 // Provider options schemas
 export { MuxProviderOptionsSchema } from "./schemas/providerOptions";
 
@@ -203,10 +195,8 @@ export {
   muxGateway,
   muxGatewayOauth,
   copilotOauth,
-  muxGovernorOauth,
   codexOauth,
   coderOauth,
-  policy,
   providers,
   ProvidersConfigMapSchema,
   server,

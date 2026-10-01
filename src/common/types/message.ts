@@ -92,7 +92,6 @@ type PreservedSendOptions = Pick<
   | "disableWorkspaceAgents"
   | "toolPolicy"
   | "strictAgentResolution"
-  | "allowAgentSetGoal"
   | "skipAiSettingsPersistence"
   | "skipSkillModelRouting"
   | "oneShotThinkingIndex"
@@ -130,9 +129,6 @@ export function pickPreservedSendOptions(options: SendMessageOptions): Preserved
     ...(options.strictAgentResolution !== undefined
       ? { strictAgentResolution: options.strictAgentResolution }
       : {}),
-    ...(options.allowAgentSetGoal !== undefined
-      ? { allowAgentSetGoal: options.allowAgentSetGoal }
-      : {}),
     ...(options.skipAiSettingsPersistence !== undefined
       ? { skipAiSettingsPersistence: options.skipAiSettingsPersistence }
       : {}),
@@ -162,7 +158,6 @@ export type StartupRetrySendOptions = Pick<
   | "experiments"
   | "disableWorkspaceAgents"
   | "strictAgentResolution"
-  | "allowAgentSetGoal"
 > & {
   /**
    * Correlation metadata that must survive restart recovery: delegated
@@ -222,7 +217,6 @@ export const STARTUP_RETRY_DURABLE_SEND_OPTION_KEYS = [
   "experiments",
   "disableWorkspaceAgents",
   "strictAgentResolution",
-  "allowAgentSetGoal",
   "muxMetadata",
 ] as const satisfies ReadonlyArray<keyof SendMessageOptions>;
 
@@ -255,7 +249,6 @@ export function pickStartupRetrySendOptions(
     disableWorkspaceAgents: options.disableWorkspaceAgents,
     // Keep explicit-agent turns loud across restart recovery (see pickPreservedSendOptions).
     strictAgentResolution: options.strictAgentResolution,
-    allowAgentSetGoal: options.allowAgentSetGoal,
     ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     ...(agentInitiated === true ? { agentInitiated: true } : {}),
     ...(goalKind != null ? { goalKind } : {}),
@@ -1286,6 +1279,12 @@ export interface MuxMetadata {
   contextProviderMetadata?: Record<string, unknown>;
   systemMessageTokens?: number; // Token count for system message sent with this request (calculated by AIService)
   partial?: boolean; // Whether this message was interrupted and is incomplete
+  /**
+   * partial.json only, never a chat.jsonl row: the provider finished this turn but its final
+   * history write failed, so the kept partial is a completed reply, not an interrupted one
+   * (#5322). Read it through isStreamFinalizedPartial.
+   */
+  streamFinalized?: boolean;
   synthetic?: boolean; // Whether this message was synthetically generated (e.g., [CONTINUE] sentinel)
   /**
    * For queue-dispatched user turns: when the user last added to the queued

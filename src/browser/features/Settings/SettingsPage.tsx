@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import {
   Blocks,
   Brain,
@@ -8,6 +8,7 @@ import {
   X,
   FlaskConical,
   Bot,
+  HeartPulse,
   Keyboard,
   Layout,
   Container,
@@ -23,12 +24,13 @@ import { Dialog, DialogContent, DialogTitle } from "@/browser/components/Dialog/
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useOnboardingPause } from "@/browser/features/SplashScreens/SplashScreenProvider";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { GeneralSection } from "./Sections/GeneralSection";
 import { TasksSection } from "./Sections/TasksSection";
+import { HeartbeatSection } from "./Sections/HeartbeatSection";
 import { ProvidersSection } from "./Sections/ProvidersSection";
 import { ModelsSection } from "./Sections/ModelsSection";
-import { GovernorSection } from "./Sections/GovernorSection";
 import { MemorySection } from "./Sections/MemorySection";
 import { Button } from "@/browser/components/Button/Button";
 import { MCPSettingsSection } from "./Sections/MCPSettingsSection";
@@ -45,8 +47,7 @@ import { SecuritySection } from "./Sections/SecuritySection";
 import { BackupSection } from "./Sections/BackupSection";
 import type { SettingsSection } from "./types";
 
-const LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS = new Set(["goals", "heartbeat"]);
-const FOCUS_HISTORY_LIMIT = 3;
+const LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS = new Set(["goals"]);
 
 const BASE_SECTIONS: SettingsSection[] = [
   {
@@ -60,6 +61,12 @@ const BASE_SECTIONS: SettingsSection[] = [
     label: "Agents",
     icon: <Bot className="h-4 w-4" />,
     component: TasksSection,
+  },
+  {
+    id: "heartbeat",
+    label: "Heartbeats",
+    icon: <HeartPulse className="h-4 w-4" />,
+    component: HeartbeatSection,
   },
   {
     id: "instructions",
@@ -84,6 +91,12 @@ const BASE_SECTIONS: SettingsSection[] = [
     label: "MCP",
     icon: <Server className="h-4 w-4" />,
     component: MCPSettingsSection,
+  },
+  {
+    id: "plugins",
+    label: "Plugins",
+    icon: <Blocks className="h-4 w-4" />,
+    component: PluginsSettingsSection,
   },
   {
     id: "secrets",
@@ -135,9 +148,7 @@ interface SettingsSectionRedirect {
 }
 
 export function getSettingsSections(
-  governorEnabled: boolean,
   memoryEnabled: boolean,
-  agentPluginsEnabled: boolean,
   remoteConnectionAvailable = false
 ): SettingsSection[] {
   const sections = [...BASE_SECTIONS];
@@ -148,17 +159,6 @@ export function getSettingsSections(
       label: "Remote Connection",
       icon: <Monitor className="h-4 w-4 shrink-0" />,
       component: RemoteConnectionSection,
-    });
-  }
-  if (agentPluginsEnabled) {
-    // Next to MCP: plugins contribute skills + MCP servers.
-    const mcpIndex = sections.findIndex((section) => section.id === "mcp");
-    sections.splice(mcpIndex + 1, 0, {
-      id: "plugins",
-      label: "Plugins",
-      icon: <Blocks className="h-4 w-4" />,
-      component: PluginsSettingsSection,
-      experimental: true,
     });
   }
   if (memoryEnabled) {
@@ -176,37 +176,24 @@ export function getSettingsSections(
     component: BackupSection,
     experimental: true,
   });
-  if (governorEnabled) {
-    sections.push({
-      id: "governor",
-      label: "Governor",
-      icon: <ShieldCheck className="h-4 w-4" />,
-      component: GovernorSection,
-    });
-  }
   return sections;
 }
 
 export function getSettingsSectionRedirect(
   activeSection: string,
-  governorEnabled: boolean,
   memoryEnabled: boolean,
-  agentPluginsEnabled: boolean,
   remoteConnectionAvailable = false
 ): SettingsSectionRedirect | null {
   if (LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS.has(activeSection)) {
     return { section: "experiments", replace: true };
   }
 
-  if (!governorEnabled && activeSection === "governor") {
-    return { section: BASE_SECTIONS[0]?.id ?? "general" };
+  // Removed section: replace so the restored URL and back stack drop the dead route.
+  if (activeSection === "governor") {
+    return { section: BASE_SECTIONS[0]?.id ?? "general", replace: true };
   }
 
   if (!memoryEnabled && activeSection === "memory") {
-    return { section: BASE_SECTIONS[0]?.id ?? "general" };
-  }
-
-  if (!agentPluginsEnabled && activeSection === "plugins") {
     return { section: BASE_SECTIONS[0]?.id ?? "general" };
   }
 
@@ -220,33 +207,9 @@ export function getSettingsSectionRedirect(
 export function SettingsPage() {
   const { isOpen, close, activeSection, setActiveSection } = useSettings();
   const onboardingPause = useOnboardingPause();
-  const governorEnabled = useExperimentValue(EXPERIMENT_IDS.MUX_GOVERNOR);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
-  const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
   const remoteConnectionAvailable = window.api?.remoteConnection != null;
-  // Radix only returns focus to a DialogTrigger, and settings opens from shortcuts, menus, and the
-  // command palette, whose focused item often unmounts as settings opens. Recent focus is tracked
-  // while closed so closing can fall back to the latest element still on the page.
-  const focusHistoryRef = useRef<HTMLElement[]>([]);
-  const returnFocusRef = useRef<HTMLElement[]>([]);
-
-  useEffect(() => {
-    if (isOpen) {
-      return;
-    }
-    const recordFocus = (event: FocusEvent) => {
-      const target = event.target;
-      if (!(target instanceof HTMLElement)) {
-        return;
-      }
-      focusHistoryRef.current = [
-        target,
-        ...focusHistoryRef.current.filter((element) => element !== target),
-      ].slice(0, FOCUS_HISTORY_LIMIT);
-    };
-    document.addEventListener("focusin", recordFocus);
-    return () => document.removeEventListener("focusin", recordFocus);
-  }, [isOpen]);
+  const focusReturn = useModalFocusReturn(isOpen);
 
   // Redirect restored links when an experiment or desktop bridge is unavailable.
   useEffect(() => {
@@ -255,9 +218,7 @@ export function SettingsPage() {
     }
     const redirect = getSettingsSectionRedirect(
       activeSection,
-      governorEnabled,
       memoryEnabled,
-      agentPluginsEnabled,
       remoteConnectionAvailable
     );
     if (!redirect) {
@@ -270,22 +231,9 @@ export function SettingsPage() {
     }
 
     setActiveSection(redirect.section);
-  }, [
-    isOpen,
-    activeSection,
-    setActiveSection,
-    governorEnabled,
-    memoryEnabled,
-    agentPluginsEnabled,
-    remoteConnectionAvailable,
-  ]);
+  }, [isOpen, activeSection, setActiveSection, memoryEnabled, remoteConnectionAvailable]);
 
-  const sections = getSettingsSections(
-    governorEnabled,
-    memoryEnabled,
-    agentPluginsEnabled,
-    remoteConnectionAvailable
-  );
+  const sections = getSettingsSections(memoryEnabled, remoteConnectionAvailable);
   const currentSection = sections.find((section) => section.id === activeSection) ?? sections[0];
   const SectionComponent = currentSection.component;
 
@@ -296,29 +244,8 @@ export function SettingsPage() {
         showCloseButton={false}
         allowEditableEscape
         aria-describedby={undefined}
-        onOpenAutoFocus={() => {
-          returnFocusRef.current = focusHistoryRef.current;
-        }}
-        onCloseAutoFocus={(e) => {
-          e.preventDefault();
-          const candidates = returnFocusRef.current;
-          returnFocusRef.current = [];
-          // Closing by navigating elsewhere can hand focus to the destination (a newly shown chat
-          // input autofocuses); only recover focus that fell back to the body.
-          const active = document.activeElement;
-          if (active instanceof HTMLElement && active !== document.body && active.isConnected) {
-            return;
-          }
-          for (const candidate of candidates) {
-            if (!candidate.isConnected) {
-              continue;
-            }
-            candidate.focus();
-            if (document.activeElement === candidate) {
-              return;
-            }
-          }
-        }}
+        onOpenAutoFocus={focusReturn.onOpenAutoFocus}
+        onCloseAutoFocus={focusReturn.onCloseAutoFocus}
         className="top-0 left-0 flex h-full w-full max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] md:top-[50%] md:left-[50%] md:h-[min(880px,88vh)] md:w-[min(1100px,92vw)] md:translate-x-[-50%] md:translate-y-[-50%] md:flex-row md:rounded-lg md:border"
       >
         <div className="border-border-medium flex min-w-0 shrink-0 flex-col border-b md:w-48 md:border-r md:border-b-0">

@@ -2,7 +2,7 @@
 import { installDom } from "../../../../../tests/ui/dom";
 import type React from "react";
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as tooltipModule from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
@@ -14,14 +14,14 @@ import * as SelectPrimitiveModule from "@/browser/components/SelectPrimitive/Sel
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
-import { PolicyProvider } from "@/browser/contexts/PolicyContext";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getModelKey } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { FALLBACK_AGENTS } from "./TasksSection.agents";
 
-let advisorExperimentEnabled = false;
+let experimentsEnabledByDefault = false;
 let experimentValues: Record<string, boolean> = {};
 
 let apiMock: {
@@ -51,7 +51,7 @@ void mock.module("@/browser/contexts/WorkspaceContext", () => ({
 }));
 
 void mock.module("@/browser/hooks/useExperiments", () => ({
-  useExperimentValue: (id: string) => experimentValues[id] ?? advisorExperimentEnabled,
+  useExperimentValue: (id: string) => experimentValues[id] ?? experimentsEnabledByDefault,
 }));
 
 void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
@@ -169,9 +169,7 @@ function renderTasksSection(options: RenderTasksSectionOptions = {}) {
   // later files.
   const view = render(
     <APIProvider client={createTestApiClient(apiMock)}>
-      <PolicyProvider>
-        <TasksSection />
-      </PolicyProvider>
+      <TasksSection />
     </APIProvider>
   );
   return { ...view, getConfig, saveConfig };
@@ -191,6 +189,20 @@ function getAgentCardByName(
     throw new Error(`Could not find ${name} agent card`);
   }
   return card;
+}
+
+const CYBER_CAPABLE_MODEL = "openai:gpt-6.1-sol";
+const REASONING_MODE_TOGGLES: Array<{ mode: "pro" | "cyber"; component: string }> = [
+  { mode: "pro", component: "ProModeToggle" },
+  { mode: "cyber", component: "CyberModeToggle" },
+];
+
+let providersConfigSpy: { mockRestore: () => void } | null = null;
+
+function enableCyberModel() {
+  providersConfigSpy = spyOn(getProvidersConfigStore(), "getConfig").mockReturnValue({
+    openai: { apiKeySet: true, isEnabled: true, isConfigured: true, cyberModelEnabled: true },
+  });
 }
 
 function getLatestSavePayload(saveConfig: ReturnType<typeof mock>) {
@@ -215,7 +227,7 @@ describe("TasksSection Exec subagent defaults", () => {
   beforeEach(() => {
     restoreDom = installDom();
     getAppConfigStore().updateOptimistically({ minThinkingLevelByModel: {} });
-    advisorExperimentEnabled = false;
+    experimentsEnabledByDefault = false;
     experimentValues = {};
     apiMock = null;
     selectedWorkspaceMock = null;
@@ -223,6 +235,8 @@ describe("TasksSection Exec subagent defaults", () => {
 
   afterEach(() => {
     cleanup();
+    providersConfigSpy?.mockRestore();
+    providersConfigSpy = null;
     getAppConfigStore().updateOptimistically({ minThinkingLevelByModel: {} });
     apiMock = null;
     restoreDom?.();
@@ -235,7 +249,7 @@ describe("TasksSection Exec subagent defaults", () => {
     [true, false],
     [true, true],
   ])("gates the Intuition card on parent=%s and intuition=%s", async (memory, intuition) => {
-    advisorExperimentEnabled = true;
+    experimentsEnabledByDefault = true;
     experimentValues = {
       [EXPERIMENT_IDS.MEMORY]: memory,
       [EXPERIMENT_IDS.MEMORY_INTUITION]: intuition,
@@ -288,7 +302,7 @@ describe("TasksSection Exec subagent defaults", () => {
   });
 
   test("Intuition can display and save Off and Low below the chat minimum", async () => {
-    advisorExperimentEnabled = true;
+    experimentsEnabledByDefault = true;
     getAppConfigStore().updateOptimistically({
       minThinkingLevelByModel: { "openai:gpt-6-luna": "high" },
     });
@@ -329,7 +343,7 @@ describe("TasksSection Exec subagent defaults", () => {
   test.each([undefined, "openai:gpt-6-luna"])(
     "Intuition inherits workspace/default capabilities instead of global Exec (workspace=%s)",
     async (workspaceModel) => {
-      advisorExperimentEnabled = true;
+      experimentsEnabledByDefault = true;
       const view = renderTasksSection({
         workspaceModel,
         agentAiDefaults: { exec: { modelString: "xai:grok-4-1-fast" } },
@@ -351,7 +365,7 @@ describe("TasksSection Exec subagent defaults", () => {
   test.each([undefined, "xai:grok-4-1-fast"])(
     "Intuition prefers its own model override to its definition, then the parent (override=%s)",
     async (modelString) => {
-      advisorExperimentEnabled = true;
+      experimentsEnabledByDefault = true;
       const view = renderTasksSection({
         agents: FALLBACK_AGENTS.map((agent) =>
           agent.id === "intuition"
@@ -379,7 +393,7 @@ describe("TasksSection Exec subagent defaults", () => {
   );
 
   test("Intuition exposes only Off and High for the binary Grok Fast model", async () => {
-    advisorExperimentEnabled = true;
+    experimentsEnabledByDefault = true;
     const view = renderTasksSection({
       agentAiDefaults: { intuition: { modelString: "xai:grok-4-1-fast", thinkingLevel: "low" } },
     });
@@ -415,8 +429,7 @@ describe("TasksSection Exec subagent defaults", () => {
     expect(view.getByText("Sub-agents")).toBeTruthy();
   });
 
-  test("defaults advisor on for Exec and Plan when the experiment is enabled", async () => {
-    advisorExperimentEnabled = true;
+  test("defaults advisor on for Exec and Plan", async () => {
     const view = renderTasksSection();
 
     const planAdvisorSwitch = await view.findByRole("switch", { name: "Toggle plan advisor" });
@@ -628,25 +641,29 @@ describe("TasksSection Exec subagent defaults", () => {
     expect(payload.agentAiDefaults.exec).toBeUndefined();
   });
 
-  test("toggling Pro mode persists the agent default", async () => {
-    const view = renderTasksSection({
-      agentAiDefaults: {
-        explore: { modelString: "openai:gpt-6-luna" },
-      },
-    });
+  test.each(REASONING_MODE_TOGGLES)(
+    "toggling $mode mode persists the agent default",
+    async ({ mode, component }) => {
+      enableCyberModel();
+      const view = renderTasksSection({
+        agentAiDefaults: {
+          explore: { modelString: CYBER_CAPABLE_MODEL },
+        },
+      });
 
-    await view.findByText("Explore");
-    const card = getAgentCardByName(view, "Explore");
-    fireEvent.click(within(card).getByRole("button", { name: "Reasoning" }));
-    const proToggle = card.querySelector('[data-component="ProModeToggle"]');
-    if (!(proToggle instanceof HTMLElement)) throw new Error("Pro mode toggle not rendered");
-    fireEvent.click(proToggle);
+      await view.findByText("Explore");
+      const card = getAgentCardByName(view, "Explore");
+      fireEvent.click(within(card).getByRole("button", { name: "Reasoning" }));
+      const modeToggle = card.querySelector(`[data-component="${component}"]`);
+      if (!(modeToggle instanceof HTMLElement)) throw new Error(`${component} not rendered`);
+      fireEvent.click(modeToggle);
 
-    await waitFor(() => expect(view.saveConfig).toHaveBeenCalled());
-    const payload = getLatestSavePayload(view.saveConfig);
+      await waitFor(() => expect(view.saveConfig).toHaveBeenCalled());
+      const payload = getLatestSavePayload(view.saveConfig);
 
-    expect(payload.agentAiDefaults.explore?.reasoningMode).toBe("pro");
-  });
+      expect(payload.agentAiDefaults.explore?.reasoningMode).toBe(mode);
+    }
+  );
 
   test("toggling Pro mode off removes the persisted reasoning mode", async () => {
     const view = renderTasksSection({
@@ -703,29 +720,33 @@ describe("TasksSection Exec subagent defaults", () => {
     }
   );
 
-  test("disabling Pro mode inherited from a base agent persists an explicit standard override", async () => {
-    // Explore's base is exec (FALLBACK_AGENTS), so ACP resolution inherits
-    // exec's pro; deleting explore's override would silently fall back to pro.
-    const view = renderTasksSection({
-      agentAiDefaults: {
-        exec: { reasoningMode: "pro" },
-        explore: { modelString: "openai:gpt-6-luna", reasoningMode: "pro" },
-      },
-    });
+  test.each(REASONING_MODE_TOGGLES)(
+    "disabling $mode mode inherited from a base agent persists an explicit standard override",
+    async ({ mode, component }) => {
+      enableCyberModel();
+      // Explore's base is exec (FALLBACK_AGENTS), so ACP resolution inherits
+      // exec's mode; deleting explore's override would silently fall back to it.
+      const view = renderTasksSection({
+        agentAiDefaults: {
+          exec: { reasoningMode: mode },
+          explore: { modelString: CYBER_CAPABLE_MODEL, reasoningMode: mode },
+        },
+      });
 
-    await view.findByText("Explore");
-    const card = getAgentCardByName(view, "Explore");
-    fireEvent.click(within(card).getByRole("button", { name: "Reasoning" }));
-    const proToggle = card.querySelector('[data-component="ProModeToggle"]');
-    if (!(proToggle instanceof HTMLElement)) throw new Error("Pro mode toggle not rendered");
-    fireEvent.click(proToggle);
+      await view.findByText("Explore");
+      const card = getAgentCardByName(view, "Explore");
+      fireEvent.click(within(card).getByRole("button", { name: "Reasoning" }));
+      const modeToggle = card.querySelector(`[data-component="${component}"]`);
+      if (!(modeToggle instanceof HTMLElement)) throw new Error(`${component} not rendered`);
+      fireEvent.click(modeToggle);
 
-    await waitFor(() => expect(view.saveConfig).toHaveBeenCalled());
-    const payload = getLatestSavePayload(view.saveConfig);
+      await waitFor(() => expect(view.saveConfig).toHaveBeenCalled());
+      const payload = getLatestSavePayload(view.saveConfig);
 
-    expect(payload.agentAiDefaults.explore?.reasoningMode).toBe("standard");
-    expect(payload.agentAiDefaults.exec?.reasoningMode).toBe("pro");
-  });
+      expect(payload.agentAiDefaults.explore?.reasoningMode).toBe("standard");
+      expect(payload.agentAiDefaults.exec?.reasoningMode).toBe(mode);
+    }
+  );
 
   test("selecting Inherit clears the reasoning override along with the thinking level", async () => {
     const view = renderTasksSection({
@@ -834,7 +855,7 @@ describe("TasksSection Exec subagent defaults", () => {
   test("hides the Pro mode toggle on the Dream card even for pro-capable models", async () => {
     // Dream's headless requests (raw streamText) never apply reasoningMode,
     // so the card must not offer a toggle that cannot affect them.
-    advisorExperimentEnabled = true; // shared experiment mock also enables memory consolidation
+    experimentsEnabledByDefault = true; // enables memory consolidation
     const view = renderTasksSection({
       agentAiDefaults: {
         dream: { modelString: "openai:gpt-6-luna" },
@@ -870,7 +891,7 @@ describe("TasksSection Auto routing defaults", () => {
 
   beforeEach(() => {
     restoreDom = installDom();
-    advisorExperimentEnabled = false;
+    experimentsEnabledByDefault = false;
     experimentValues = { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true };
     apiMock = null;
     selectedWorkspaceMock = null;

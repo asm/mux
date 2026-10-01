@@ -21,7 +21,6 @@ import { APIProvider, type APIClient } from "xum/browser/contexts/API";
 import { ThemeProvider } from "xum/browser/contexts/ThemeContext";
 import { ChatHostContextProvider } from "xum/browser/contexts/ChatHostContext";
 import { RouterProvider } from "xum/browser/contexts/RouterContext";
-import { PolicyProvider } from "xum/browser/contexts/PolicyContext";
 import { AgentProvider } from "xum/browser/contexts/AgentContext";
 import { BashCollapsedSummaryModeProvider } from "xum/browser/features/Tools/BashCollapsedSummaryModeContext";
 import {
@@ -30,7 +29,11 @@ import {
 } from "xum/browser/contexts/BackgroundBashContext";
 import { BackgroundProcessesBanner } from "xum/browser/components/BackgroundProcessesBanner/BackgroundProcessesBanner";
 import { PopoverError } from "xum/browser/components/PopoverError/PopoverError";
-import { useBackgroundBashStoreRaw } from "xum/browser/stores/BackgroundBashStore";
+import {
+  useBackgroundBashStateKnown,
+  useBackgroundBashStoreRaw,
+} from "xum/browser/stores/BackgroundBashStore";
+import { useChatViewDataReadyDeadline } from "xum/browser/components/ChatPane/useChatViewDataReady";
 import { mergeConsecutiveStreamErrors } from "xum/browser/utils/messages/messageUtils";
 import { seedWorkspaceLocalStorageFromBackend } from "xum/browser/contexts/WorkspaceContext";
 import { WorkspaceModeAISync } from "xum/browser/components/WorkspaceModeAISync/WorkspaceModeAISync";
@@ -102,9 +105,8 @@ import { seedWebviewPreferences } from "./seedPreferences";
 import type { VscodeBridge } from "./vscodeBridge";
 
 // Shared chat components need these providers; the webview has no desktop shell to supply them
-// (#4711). PolicyProvider falls back to "no policy" because the bridge rejects policy.* calls (the
-// backend still enforces policy on send). A single AgentProvider covers both the transcript
-// (ProposePlanToolCall) and the composer.
+// (#4711). A single AgentProvider covers both the transcript (ProposePlanToolCall) and the
+// composer.
 /** Identifies the server connection: switching servers keeps mode "api" but changes the URL. */
 function getApiConnectionKey(status: UiConnectionStatus | null): string | null {
   return status?.mode === "api" ? (status.baseUrl ?? "api") : null;
@@ -119,47 +121,45 @@ function WebviewChatProviders(props: {
   children: ReactNode;
 }) {
   return (
-    <PolicyProvider>
-      <AgentProvider
-        workspaceId={props.workspaceId}
-        workspaceMetaFallback={
-          props.workspaceAi
-            ? {
-                parentWorkspaceId: props.workspaceAi.parentWorkspaceId,
-                // Same identity resolution as the seeding: a child task's creation-time agentType
-                // wins over an agentId restamped by a recovery send.
-                agentId: resolvePersistedAgentId(props.workspaceAi, "") || undefined,
-              }
-            : undefined
-        }
-      >
-        {/* Desktop's per-agent settings sync: switching agents restores that agent's cached
-            model/thinking/reasoning (seeded from the workspace), exactly as in AIView. */}
-        {props.workspaceId ? <WorkspaceModeAISync workspaceId={props.workspaceId} /> : null}
-        {/* Re-renders bash tool headers when the seeded collapsed-summary mode arrives (#4972). */}
-        <BashCollapsedSummaryModeProvider>
-          <TooltipProvider>
-            {/* Covers the transcript's bash cards and the dock's background processes strip
-                (#5092). Without a selection nothing reads it: both render only for a selected
-                workspace. */}
-            {/* Never key this by the server connection: it wraps the whole layout, and a remount
-                replaces the transcript scrollport that useAutoScroll observes, leaving a fresh
-                open unpinned from the bottom (#5231). connectionKey, the error popover's scope,
-                and the strip's key scope late failures and rows to the connection instead. */}
-            <BackgroundBashProvider
-              workspaceId={props.selectedWorkspaceId ?? ""}
+    <AgentProvider
+      workspaceId={props.workspaceId}
+      workspaceMetaFallback={
+        props.workspaceAi
+          ? {
+              parentWorkspaceId: props.workspaceAi.parentWorkspaceId,
+              // Same identity resolution as the seeding: a child task's creation-time agentType
+              // wins over an agentId restamped by a recovery send.
+              agentId: resolvePersistedAgentId(props.workspaceAi, "") || undefined,
+            }
+          : undefined
+      }
+    >
+      {/* Desktop's per-agent settings sync: switching agents restores that agent's cached
+          model/thinking/reasoning (seeded from the workspace), exactly as in AIView. */}
+      {props.workspaceId ? <WorkspaceModeAISync workspaceId={props.workspaceId} /> : null}
+      {/* Re-renders bash tool headers when the seeded collapsed-summary mode arrives (#4972). */}
+      <BashCollapsedSummaryModeProvider>
+        <TooltipProvider>
+          {/* Covers the transcript's bash cards and the dock's background processes strip
+              (#5092). Without a selection nothing reads it: both render only for a selected
+              workspace. */}
+          {/* Never key this by the server connection: it wraps the whole layout, and a remount
+              replaces the transcript scrollport that useAutoScroll observes, leaving a fresh
+              open unpinned from the bottom (#5231). connectionKey, the error popover's scope,
+              and the strip's key scope late failures and rows to the connection instead. */}
+          <BackgroundBashProvider
+            workspaceId={props.selectedWorkspaceId ?? ""}
+            connectionKey={props.apiConnectionKey}
+          >
+            {props.children}
+            <BackgroundBashErrorPopover
+              workspaceId={props.selectedWorkspaceId}
               connectionKey={props.apiConnectionKey}
-            >
-              {props.children}
-              <BackgroundBashErrorPopover
-                workspaceId={props.selectedWorkspaceId}
-                connectionKey={props.apiConnectionKey}
-              />
-            </BackgroundBashProvider>
-          </TooltipProvider>
-        </BashCollapsedSummaryModeProvider>
-      </AgentProvider>
-    </PolicyProvider>
+            />
+          </BackgroundBashProvider>
+        </TooltipProvider>
+      </BashCollapsedSummaryModeProvider>
+    </AgentProvider>
   );
 }
 
@@ -295,8 +295,8 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   const [connectionStatus, setConnectionStatus] = useState<UiConnectionStatus | null>(null);
   const [workspaces, setWorkspaces] = useState<UiWorkspace[]>([]);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(null);
-  // Mirrors the replay's caught-up flag for rendering: the composer stays disabled until the
-  // history replay completes, so a send never acts on a partial transcript.
+  // Mirrors the replay's caught-up flag for rendering: the transcript and the composer wait for
+  // the history replay to complete, so a send never acts on a partial transcript.
   const [transcriptCaughtUp, setTranscriptCaughtUp] = useState(false);
 
   const activeWorkspaceIdRef = useRef<string | null>(null);
@@ -462,6 +462,19 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
 
   const canChat = Boolean(connectionStatus?.mode === "api" && selectedWorkspaceId);
   const apiConnectionKey = getApiConnectionKey(connectionStatus);
+
+  // #5202: like desktop ChatPane's first-paint barrier, hold the transcript and the dock
+  // decorations until the replay caught up and the workspace's background bash state is known
+  // (or the shared deadline passed), so the processes strip, held inputs and turn status reveal
+  // with the transcript instead of growing the dock under it.
+  const backgroundBashStateKnown = useBackgroundBashStateKnown(
+    canChat && selectedWorkspaceId ? selectedWorkspaceId : undefined
+  );
+  const chatViewDataReady = useChatViewDataReadyDeadline(
+    selectedWorkspaceId ?? "",
+    !canChat || backgroundBashStateKnown
+  );
+  const chatRevealed = transcriptCaughtUp && chatViewDataReady;
 
   // #4766: the model list, model routing and thinking floors read the shared providers and app
   // config stores, which the desktop connects in AppLoader. Connect them while the host has a
@@ -825,7 +838,9 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (!canChat || !selectedWorkspaceId) {
+      // Until the first reveal the turn status is hidden, so Esc must not stop a turn the user
+      // cannot see.
+      if (!canChat || !selectedWorkspaceId || !chatRevealed) {
         return;
       }
 
@@ -873,7 +888,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [canChat, selectedWorkspaceId]);
+  }, [canChat, selectedWorkspaceId, chatRevealed]);
 
   // Transcript-scoped Shift+G and Shift+R, as in desktop useAIViewKeybinds: capture phase, and
   // never while typing (the composer still receives a capital G/R) or while a modal owns the
@@ -888,6 +903,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
       }
       if (
         matchesKeybind(e, KEYBINDS.RESUME_STREAM) &&
+        chatRevealed &&
         retryBarrierRef.current?.interruptedTailResumable
       ) {
         e.preventDefault();
@@ -902,7 +918,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
     };
     window.addEventListener("keydown", handleKeyDownCapture, { capture: true });
     return () => window.removeEventListener("keydown", handleKeyDownCapture, { capture: true });
-  }, [selectedWorkspaceId]);
+  }, [selectedWorkspaceId, chatRevealed]);
 
   const requestRefreshWorkspaces = () => {
     bridge.postMessage({ type: "refreshWorkspaces" });
@@ -1091,7 +1107,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                     onTouchMove={markUserScrollIntent}
                   >
                     <div style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}>
-                      {selectedWorkspaceId ? (
+                      {selectedWorkspaceId && chatRevealed ? (
                         <LiveBashOutputSourceContext.Provider value={liveBashOutput}>
                           <TranscriptBundleRows
                             workspaceId={selectedWorkspaceId}
@@ -1221,7 +1237,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                         </span>
                       </button>
                     ) : null}
-                    {selectedWorkspaceId && heldInputs.length > 0 ? (
+                    {selectedWorkspaceId && chatRevealed && heldInputs.length > 0 ? (
                       // Bounded scroll lane: many or long held inputs must not push the composer
                       // below the fixed-height layout or collapse the transcript.
                       <div className="max-h-[40vh] overflow-y-auto">
@@ -1240,7 +1256,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                         desktop dock. Keyed so the expanded list and an open output dialog never
                         carry over to another workspace or server. Without a server connection the
                         store has no client, so its last-known processes are not offered. */}
-                    {selectedWorkspaceId && canChat ? (
+                    {selectedWorkspaceId && canChat && chatRevealed ? (
                       // The shared banner brings its own dock gutter (desktop's composer has the
                       // same one); cancel this dock's padding so it lines up with the composer.
                       <div className="-mx-[15px]">
@@ -1253,7 +1269,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                       </div>
                     ) : null}
                     {/* Live turn status sits beside the input, below held inputs, as in desktop. */}
-                    {selectedWorkspaceId ? (
+                    {selectedWorkspaceId && chatRevealed ? (
                       <VscodeStreamingBarrier
                         workspaceId={selectedWorkspaceId}
                         aggregator={aggregatorRef.current}
@@ -1267,11 +1283,11 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                       <ChatComposer
                         key={selectedWorkspaceId}
                         workspaceId={selectedWorkspaceId}
-                        disabled={!canChat || !transcriptCaughtUp}
+                        disabled={!canChat || !chatRevealed}
                         disabledReason={
                           !canChat
                             ? "Chat requires Xum server connection."
-                            : !transcriptCaughtUp
+                            : !chatRevealed
                               ? "Loading chat history..."
                               : undefined
                         }

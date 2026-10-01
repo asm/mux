@@ -8,7 +8,6 @@ import {
   EyeOff,
   GripVertical,
   Loader2,
-  ShieldCheck,
   X,
 } from "lucide-react";
 import {
@@ -30,9 +29,7 @@ import { CSS } from "@dnd-kit/utilities";
 import { createEditKeyHandler } from "@/browser/utils/ui/keybinds";
 import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
-import { getAllowedProvidersForUi } from "@/browser/utils/policyUi";
 import { ProviderIcon, ProviderWithIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
 import { getStoredAuthToken } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 import { useAPI } from "@/browser/contexts/API";
@@ -73,6 +70,7 @@ import { repairLocalModelPreferencesForRemovedProvider } from "@/browser/utils/m
 import {
   CUSTOM_PROVIDER_TYPES,
   formatProviderDisplayName,
+  getProviderIdsForUi,
   isBuiltInProvider,
   isCustomProviderConfig,
   isCustomProviderType,
@@ -461,10 +459,6 @@ function GatewayRoutePriorityList({
 }
 
 export function ProvidersSection() {
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
-
   const {
     providersExpandedProvider,
     setProvidersExpandedProvider,
@@ -475,10 +469,7 @@ export function ProvidersSection() {
   const { api } = useAPI();
   const { config, loading: configLoading, refresh, updateOptimistically } = useProvidersConfig();
   const { workspaceMetadata, selectedWorkspace, refreshWorkspaceMetadata } = useWorkspaceContext();
-  const visibleProviders = useMemo(
-    () => getAllowedProvidersForUi(effectivePolicy, config),
-    [effectivePolicy, config]
-  );
+  const visibleProviders = useMemo(() => getProviderIdsForUi(config), [config]);
   const {
     data: muxGatewayAccountStatus,
     error: muxGatewayAccountError,
@@ -493,17 +484,15 @@ export function ProvidersSection() {
   // cannot leave the dropdown claiming disabled while requests still send store=true.
   // xAI frontier Grok always uses store=false in the request path (no settings surface).
   const [openaiStoreSaving, setOpenAIStoreSaving] = useState(false);
+  const [openaiCyberSaving, setOpenAICyberSaving] = useState(false);
 
   const routing = useRouting();
 
   // The TypeSafe evaluation key is only useful to the auto-model-routing experiment. A legacy
   // custom chat provider under the same id is listed with the custom providers instead.
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
-  const typesafeAccess = effectivePolicy?.providerAccess;
   const showTypeSafeProvider =
-    autoModelRoutingEnabled &&
-    (typesafeAccess == null || typesafeAccess.some((p) => p.id === TYPESAFE_PROVIDER_KEY)) &&
-    !isCustomProviderInfo(config?.[TYPESAFE_PROVIDER_KEY]);
+    autoModelRoutingEnabled && !isCustomProviderInfo(config?.[TYPESAFE_PROVIDER_KEY]);
 
   const providerGroups = useMemo(() => {
     const groups: Record<"direct" | "gateway" | "local" | "custom", string[]> = {
@@ -512,8 +501,6 @@ export function ProvidersSection() {
       local: [],
       custom: [],
     };
-    const policyAllowedSet = new Set(visibleProviders);
-
     for (const provider of visibleProviders) {
       if (!isBuiltInProvider(provider) || isCustomProviderInfo(config?.[provider])) {
         continue;
@@ -523,7 +510,7 @@ export function ProvidersSection() {
     }
 
     for (const [provider, providerInfo] of Object.entries(config ?? {})) {
-      if (!policyAllowedSet.has(provider) || !isCustomProviderInfo(providerInfo)) {
+      if (!isCustomProviderInfo(providerInfo)) {
         continue;
       }
 
@@ -1561,7 +1548,7 @@ export function ProvidersSection() {
           return; // Stale: a newer selection owns the shared state.
         }
         // The format decides the request wire protocol, so an optimistic
-        // value that failed to persist (policy denial, lock/write failure)
+        // value that failed to persist (lock/write failure)
         // must not keep advertising an adapter the backend never adopted.
         // Restore the previous value first: refresh() is best-effort and
         // keeps the optimistic state when the refetch itself fails.
@@ -1923,13 +1910,6 @@ export function ProvidersSection() {
         Configure API keys and endpoints for AI providers. Keys are stored in{" "}
         <code className="text-accent">~/.xum/providers.jsonc</code>
       </p>
-
-      {policyState.status.state === "enforced" && (
-        <div className="border-border-medium bg-background-secondary/50 text-muted flex items-center gap-2 rounded-md border px-3 py-2 text-xs">
-          <ShieldCheck className="h-4 w-4" aria-hidden />
-          <span>Your settings are controlled by a policy.</span>
-        </div>
-      )}
 
       {customProviderNotice && (
         <div className="border-warning/40 bg-warning/10 text-warning rounded-md border px-3 py-2 text-xs">
@@ -3019,6 +2999,52 @@ export function ProvidersSection() {
                                   </div>
                                 </div>
                               )}
+
+                              <div className="border-border-light border-t pt-3">
+                                <div className="flex items-center justify-between gap-3">
+                                  <div>
+                                    <label className="text-foreground block text-xs font-medium">
+                                      Enable cyber model
+                                    </label>
+                                    <span className="text-muted text-xs">
+                                      Shows a Cyber option in the thinking menu for supported
+                                      models. Requires OpenAI Daybreak approval for this API
+                                      key&apos;s project.
+                                    </span>
+                                  </div>
+                                  <Switch
+                                    checked={config?.openai?.cyberModelEnabled === true}
+                                    disabled={!api || openaiCyberSaving}
+                                    onCheckedChange={(nextChecked) => {
+                                      if (!api || openaiCyberSaving) return;
+
+                                      // Persist before publishing: a rejected write must not show
+                                      // Cyber off while the backend still sends access_programs.
+                                      setOpenAICyberSaving(true);
+                                      void api.providers
+                                        .setProviderConfig({
+                                          provider: "openai",
+                                          keyPath: ["cyberModelEnabled"],
+                                          value: nextChecked ? true : "",
+                                        })
+                                        .then(
+                                          (result) => {
+                                            if (result.success) {
+                                              updateOptimistically("openai", {
+                                                cyberModelEnabled: nextChecked ? true : undefined,
+                                              });
+                                              return undefined;
+                                            }
+                                            return refresh();
+                                          },
+                                          () => refresh()
+                                        )
+                                        .finally(() => setOpenAICyberSaving(false));
+                                    }}
+                                    aria-label="Enable cyber model"
+                                  />
+                                </div>
+                              </div>
 
                               <div className="border-border-light border-t pt-3">
                                 <div className="mb-1 flex items-center gap-1">

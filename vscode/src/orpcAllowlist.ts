@@ -49,20 +49,16 @@ const ALLOWED_PROCEDURES = {
   // the agent picker and agent-cycle shortcut (#4751). agents.get (full prompt bodies) stays
   // blocked, and sanitizeWebviewOrpcInput limits the input to workspaces the webview is shown.
   agents: new Set(["list"]),
-  // Read-only admin policy (provider/model allowlists, runtime and MCP flags) so the model list
-  // matches what the backend enforces (#4739); onChanged only emits empty change signals.
-  // redactWebviewOrpcResult strips provider forcedBaseUrl before policy.get reaches the webview.
-  policy: new Set(["get", "onChanged"]),
 } as const;
 
 // The only nested procedures the webview may call: the background processes strip lists
-// (subscribe) and terminates a workspace's background bashes (#5092). sendToBackground stays
-// blocked (bashForegroundControls is unsupported), and so does getOutput: the output dialog is not
-// offered in the webview (backgroundBashOutput is unsupported, #5196).
-// sanitizeWebviewOrpcInput limits each to workspaces the extension sent.
+// (subscribe) and terminates a workspace's background bashes (#5092), and the output dialog reads
+// a process's output (getOutput, #5196). sendToBackground stays blocked (bashForegroundControls is
+// unsupported). sanitizeWebviewOrpcInput limits each to workspaces the extension sent.
 const ALLOWED_NESTED_PROCEDURES = new Set([
   "workspace.backgroundBashes.subscribe",
   "workspace.backgroundBashes.terminate",
+  "workspace.backgroundBashes.getOutput",
 ]);
 
 export function isAllowedOrpcPath(path: string[]): boolean {
@@ -92,8 +88,6 @@ export function isAllowedOrpcPath(path: string[]): boolean {
       return ALLOWED_PROCEDURES.providers.has(procedure);
     case "agents":
       return ALLOWED_PROCEDURES.agents.has(procedure);
-    case "policy":
-      return ALLOWED_PROCEDURES.policy.has(procedure);
     case "config":
       return ALLOWED_PROCEDURES.config.has(procedure);
     default:
@@ -104,11 +98,7 @@ export function isAllowedOrpcPath(path: string[]): boolean {
 /**
  * Removes fields the webview does not need from results before they cross the bridge.
  *
- * policy.get: a provider's forcedBaseUrl is an internal gateway URL that could embed credentials,
- * and no webview code reads it; only the allowlists and flags are forwarded. The input is not
- * mutated. Every other result passes through unchanged.
- *
- * config.getConfig (#4766): the app config also holds prompts, the governor URL, preferences and
+ * config.getConfig (#4766): the app config also holds prompts, preferences and
  * task settings. Only the fields AppConfigStore reads are forwarded (an allow-list, so fields added
  * later stay in the host).
  * Of the task settings, only proposePlanImplementReplacesChatHistory (a boolean) is forwarded (#4942).
@@ -131,30 +121,7 @@ export function redactWebviewOrpcResult(path: string[], value: unknown): unknown
   if (procedure === "workspace.backgroundBashes.subscribe") {
     return redactBackgroundBashState(value);
   }
-  if (procedure !== "policy.get") {
-    return value;
-  }
-  if (typeof value !== "object" || value === null) {
-    return value;
-  }
-  const response = value as { policy?: unknown };
-  const policy = response.policy as { providerAccess?: unknown } | null | undefined;
-  if (typeof policy !== "object" || policy === null || !Array.isArray(policy.providerAccess)) {
-    return value;
-  }
-  return {
-    ...response,
-    policy: {
-      ...policy,
-      providerAccess: policy.providerAccess.map((entry: unknown) => {
-        if (typeof entry !== "object" || entry === null) {
-          return entry;
-        }
-        const { forcedBaseUrl: _forcedBaseUrl, ...rest } = entry as Record<string, unknown>;
-        return rest;
-      }),
-    },
-  };
+  return value;
 }
 
 const WEBVIEW_APP_CONFIG_FIELDS = ["routePriority", "routeOverrides", "minThinkingLevelByModel"];
@@ -253,9 +220,10 @@ export type SanitizedOrpcInput = { ok: true; input: unknown } | { ok: false; err
  * workspace.resumeStream (#5092): only for a workspace the extension sent, and only
  * {workspaceId, options} is forwarded.
  *
- * workspace.backgroundBashes.subscribe / terminate (#5092): only for a workspace the extension sent.
- * subscribe forwards {workspaceId} and terminate {workspaceId, processId}. The backend refuses a
- * processId of another workspace.
+ * workspace.backgroundBashes.subscribe / terminate (#5092) / getOutput (#5196): only for a
+ * workspace the extension sent. subscribe forwards {workspaceId}, terminate {workspaceId, processId},
+ * and getOutput {workspaceId, processId} plus numeric fromOffset/tailBytes (the backend schema
+ * bounds them). The backend refuses a processId of another workspace.
  */
 export function sanitizeWebviewOrpcInput(
   path: string[],
@@ -349,15 +317,26 @@ function sanitizeBackgroundBashAction(
   if (typeof record.processId !== "string") {
     return { ok: false, error: `${procedure} requires a processId` };
   }
+  if (procedure === "workspace.backgroundBashes.getOutput") {
+    return {
+      ok: true,
+      input: {
+        workspaceId,
+        processId: record.processId,
+        ...(typeof record.fromOffset === "number" ? { fromOffset: record.fromOffset } : {}),
+        ...(typeof record.tailBytes === "number" ? { tailBytes: record.tailBytes } : {}),
+      },
+    };
+  }
   assert(procedure === "workspace.backgroundBashes.terminate", `unexpected procedure ${procedure}`);
   return { ok: true, input: { workspaceId, processId: record.processId } };
 }
 
 /**
  * workspace.backgroundBashes.subscribe (#5092): a process's monitor carries up to 20 matched
- * stdout/stderr lines (monitor.lastLines). The strip never shows them, and the webview cannot read
- * process output otherwise (getOutput is not bridged), so they are emptied before the state crosses
- * the bridge. Everything else in each state passes through; the input is not mutated.
+ * stdout/stderr lines (monitor.lastLines). Neither the strip nor the output dialog reads them (the
+ * dialog reads output through getOutput), so they are emptied before the state crosses the bridge.
+ * Everything else in each state passes through; the input is not mutated.
  */
 function redactBackgroundBashState(value: unknown): unknown {
   if (typeof value !== "object" || value === null) {

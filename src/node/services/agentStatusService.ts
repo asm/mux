@@ -593,7 +593,7 @@ export class AgentStatusService {
   /**
    * Build the trailing chat transcript, capped by message count and
    * AGENT_STATUS_MAX_TRANSCRIPT_TOKENS. Includes the in-flight partial
-   * assistant message (HistoryService.readPartial) so the hash refreshes
+   * assistant message (HistoryService.readStatusPartial) so the hash refreshes
    * mid-stream — exactly when "what is the agent doing now" matters most.
    *
    * SECURITY: the status model may live on another provider, and this loop
@@ -625,7 +625,7 @@ export class AgentStatusService {
     // turn, and correlating the partial with the LATEST user row of that read
     // cannot attach a newer turn's in-flight text to an older turn whose rows
     // are the only ones verified.
-    const partial = await this.historyService.readPartial(workspaceId);
+    const partial = await this.historyService.readStatusPartial(workspaceId);
     // Sidebar status is a provider request too, so it reads the same context the agent's model
     // sees: getHistoryFromLatestBoundary starts at the latest compaction boundary (the summary
     // row is kept, the conversation it replaced is not; #4421) or manual reset. It honors RAW
@@ -634,7 +634,7 @@ export class AgentStatusService {
     // AGENT_STATUS_MAX_TRAILING_MESSAGES status rows of that read, so the filtered window below
     // is unchanged without parsing the whole epoch under the history lock (#4720). Rows over
     // 1 MiB come back status-grade (null tool payloads, empty file URLs), which the formatter
-    // never reads (#4790).
+    // never reads (#4790); so does a partial over 1 MiB (#5213).
     //
     // UI-only rows (plan-review snapshot/resolve/reopen records, workflow display-only rows)
     // must not leak into the request, and a readable reset marker is structure, not

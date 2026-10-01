@@ -52,7 +52,6 @@ import {
   type WorkspaceRuntimeContext,
 } from "@/node/runtime/runtimeHelpers";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
 import {
@@ -116,7 +115,6 @@ export class AIService extends EventEmitter {
   private readonly historyService: HistoryService;
   private readonly config: Config;
   private readonly workspaceMcpOverridesService: WorkspaceMcpOverridesService;
-  private readonly policyService?: PolicyService;
   private readonly telemetryService?: TelemetryService;
   private readonly initStateManager: InitStateManager;
   private mockModeEnabled: boolean;
@@ -149,7 +147,6 @@ export class AIService extends EventEmitter {
     backgroundProcessManager?: BackgroundProcessManager,
     sessionUsageService?: SessionUsageService,
     workspaceMcpOverridesService?: WorkspaceMcpOverridesService,
-    policyService?: PolicyService,
     telemetryService?: TelemetryService,
     devToolsService?: DevToolsService,
     experimentsService?: ExperimentsService,
@@ -172,7 +169,6 @@ export class AIService extends EventEmitter {
     this.initStateManager = initStateManager;
     this.backgroundProcessManager = backgroundProcessManager;
     this.sessionUsageService = sessionUsageService;
-    this.policyService = policyService;
     this.telemetryService = telemetryService;
     this.experimentsService = experimentsService;
     this.providerService = providerService;
@@ -187,7 +183,6 @@ export class AIService extends EventEmitter {
     this.providerModelFactory = new ProviderModelFactory(
       config,
       providerService,
-      policyService,
       turnRequestBuilderBindings,
       devToolsService,
       this.providersConfigStore
@@ -202,7 +197,6 @@ export class AIService extends EventEmitter {
       providerModelFactory: this.providerModelFactory,
       streamManager: this.streamManager,
       workspaceMcpOverridesService: this.workspaceMcpOverridesService,
-      policyService: this.policyService,
       telemetryService: this.telemetryService,
       backgroundProcessManager: this.backgroundProcessManager,
       sessionUsageService: this.sessionUsageService,
@@ -219,7 +213,6 @@ export class AIService extends EventEmitter {
       createWorkspaceRuntimeContext: (workspaceId, metadata) =>
         this.createWorkspaceRuntimeContext(workspaceId, metadata),
       isClaudeSkillsCompatEnabled: () => this.isClaudeSkillsCompatEnabled(),
-      isAgentPluginsEnabled: () => this.isAgentPluginsEnabled(),
       wrapToolsForDelegation: (workspaceId, tools, delegatedToolNames) =>
         this.wrapToolsForDelegation(workspaceId, tools, delegatedToolNames),
       durableEventJournalFor: (workspaceId) => this.durableEventJournalFor(workspaceId),
@@ -522,7 +515,6 @@ export class AIService extends EventEmitter {
       config: this.config,
       metadata: metadata.data,
       hostCheckoutRoot: runtimeContext.data.hostCheckoutRoot,
-      enabled: this.isAgentPluginsEnabled(),
       journal: this.durableEventJournalFor(workspaceId),
     });
     return Ok(eventSpine.captureRequestAssembly(workspaceId));
@@ -848,16 +840,6 @@ export class AIService extends EventEmitter {
     return (
       this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT) === true
     );
-  }
-
-  /**
-   * Host-evaluated gate for the agent-plugins experiment: when enabled, skill
-   * discovery/read paths also scan Agent Plugins containers (.xum/plugins,
-   * .agents/plugins, ~/.xum/plugins, ~/.agents/plugins; read-only, lowest
-   * precedence). Public for the same reason as isClaudeSkillsCompatEnabled.
-   */
-  isAgentPluginsEnabled(): boolean {
-    return this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS) === true;
   }
 
   /**

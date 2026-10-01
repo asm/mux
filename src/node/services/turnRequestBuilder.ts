@@ -39,6 +39,7 @@ import {
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 
 import type { SendMessageError } from "@/common/types/errors";
+import type { GoalSyntheticMessageKind } from "@/constants/goals";
 import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import type { PreDispatchConsentGate } from "@/node/services/streamManager";
@@ -52,6 +53,7 @@ import {
   deriveToolHookConfig,
   getForcedXaiSearchToolNames,
   getToolsForModel,
+  supportsAnthropicToolSearch,
   type AdvisorStepCaptureRef,
   type MCPPromptRuntime,
   type ToolConfiguration,
@@ -67,7 +69,6 @@ import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { isRlmModeEnabled } from "@/node/services/branchSummary";
-import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { type DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
@@ -86,7 +87,6 @@ import { emitTurnEnvelope } from "./turnEnvelope";
 
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { listAvailableModels } from "@/common/utils/ai/selectableModels";
-import { DEFAULT_HIDDEN_MODELS } from "@/common/constants/knownModels";
 import { DEFAULT_ROUTE_PRIORITY } from "@/common/routing";
 import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
@@ -181,6 +181,7 @@ import {
 } from "@/common/utils/providers/modelEntries";
 import {
   computeActiveToolNames,
+  computeLoadedToolNames,
   prepareToolSearch,
   rebuildToolSearchState,
   seedToolSearchActivationsFromMessages,
@@ -365,8 +366,9 @@ export interface StreamMessageOptions {
   /** Routed turn under trust: trust re-read at tool calls (ToolConfiguration.projectSkillContentStillReadable). */
   projectSkillContentStillReadable?: () => Promise<boolean>;
   experiments?: SendMessageOptions["experiments"];
-  allowAgentSetGoal?: boolean;
   workspaceGoalService?: WorkspaceGoalService;
+  /** Backend-owned kind of an automatic goal turn; gates set_goal (see GoalToolContext). */
+  goalTurnKind?: GoalSyntheticMessageKind;
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
@@ -659,7 +661,6 @@ interface TurnRequestBuilderDependencies {
   providerModelFactory: ProviderModelFactory;
   streamManager: StreamManager;
   workspaceMcpOverridesService: WorkspaceMcpOverridesService;
-  policyService?: PolicyService;
   telemetryService?: TelemetryService;
   backgroundProcessManager?: BackgroundProcessManager;
   sessionUsageService?: SessionUsageService;
@@ -682,7 +683,6 @@ interface TurnRequestBuilderDependencies {
     SendMessageError
   >;
   isClaudeSkillsCompatEnabled: () => boolean;
-  isAgentPluginsEnabled: () => boolean;
   wrapToolsForDelegation: (
     workspaceId: string,
     tools: Record<string, Tool>,
@@ -1036,8 +1036,8 @@ export class TurnRequestBuilder {
       excludeProjectSkillContent,
       projectSkillContentStillReadable,
       experiments: experimentsFromOptions,
-      allowAgentSetGoal,
       workspaceGoalService,
+      goalTurnKind,
       disableWorkspaceAgents,
       hasQueuedMessages,
       getQueuedInputStopCause,
@@ -1301,8 +1301,8 @@ export class TurnRequestBuilder {
     });
     // Auto routing promises the composer's model whenever the tier model cannot run. The
     // factory owns every reason it cannot be built (missing credentials, disabled or removed
-    // provider, policy on the route-resolved identity, catalog), so the fallback keys on its
-    // verdict here instead of pre-checking copies of those rules at classification time.
+    // provider, catalog), so the fallback keys on its verdict here instead of pre-checking
+    // copies of those rules at classification time.
     // Only the model reverts: the tier's thinking level (when Auto set it) is re-clamped for
     // the fallback model here and recorded with the assembled request, like a refusal hop.
     if (
@@ -1393,18 +1393,6 @@ export class TurnRequestBuilder {
     }
 
     const metadata = metadataResult.data;
-
-    if (this.dependencies.policyService?.isEnforced()) {
-      if (!this.dependencies.policyService.isRuntimeAllowed(metadata.runtimeConfig)) {
-        return {
-          type: "finished",
-          result: Err({
-            type: "policy_denied",
-            message: "Workspace runtime is not allowed by policy",
-          }),
-        };
-      }
-    }
     const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
     const logSlowStreamStartup = (details: Record<string, unknown>): void => {
       const totalMs = Date.now() - startTime;
@@ -1561,32 +1549,15 @@ export class TurnRequestBuilder {
       : undefined;
 
     const cfg = this.dependencies.config.loadConfigOrDefault();
-    const advisorExperimentEnabled =
-      experiments?.advisorTool ??
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL) ===
-        true;
-    const dynamicWorkflowsExperimentEnabled =
-      experiments?.dynamicWorkflows ??
-      this.dependencies.experimentsService?.isExperimentEnabled(
-        EXPERIMENT_IDS.DYNAMIC_WORKFLOWS
-      ) === true;
     const memoryExperimentEnabled =
       experiments?.memory ??
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) === true;
     const isExperimentEnabled = (id: Parameters<ExperimentsService["isExperimentEnabled"]>[0]) =>
       this.dependencies.experimentsService?.isExperimentEnabled(id) === true;
     const sessionHistoryEnabled = isTokenBudgetActive(experiments, isExperimentEnabled);
-    const timelineExperimentEnabled =
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE) === true;
-    const workspaceHeartbeatsExperimentEnabled =
-      experiments?.workspaceHeartbeats ??
-      this.dependencies.experimentsService?.isExperimentEnabled(
-        EXPERIMENT_IDS.WORKSPACE_HEARTBEATS
-      ) === true;
-    const toolSearchExperimentEnabled =
-      experiments?.toolSearch ??
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH) ===
-        true;
+    // Tool search is a host-level user setting (default on); sub-agents and CLI
+    // runs follow the same config.
+    const toolSearchEnabled = cfg.toolSearchEnabled !== false;
     const memoryIntuitionExperimentEnabled =
       experiments?.memoryIntuition ??
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_INTUITION) ===
@@ -1597,7 +1568,6 @@ export class TurnRequestBuilder {
     // claude-skills-compat is host-evaluated (like memory-hot-set): sub-agents share the
     // host ExperimentsService, so it is not inherited through SendMessageOptions.experiments.
     const claudeSkillsCompatExperimentEnabled = this.dependencies.isClaudeSkillsCompatEnabled();
-    const agentPluginsExperimentEnabled = this.dependencies.isAgentPluginsEnabled();
     // Once final tool policy keeps the memory tool, upgrade the index-only
     // memory context (resolved pre-policy with includeHotMemories: false) to
     // the token-budgeted hot block for the model that will actually stream.
@@ -1632,8 +1602,6 @@ export class TurnRequestBuilder {
         if (!context.admissionOnly) this.dependencies.emit("error", event);
         onPreStartError?.(event);
       },
-      isAdvisorExperimentEnabled: advisorExperimentEnabled,
-      includeAgentPlugins: agentPluginsExperimentEnabled,
       agentDefinitionCache,
     });
     recordStartupPhaseTiming("resolveAgentForStreamMs", resolveAgentForStreamStartedAt);
@@ -1691,8 +1659,7 @@ export class TurnRequestBuilder {
       resolveAdvisorEnabledForAgent(agentId, cfg.agentAiDefaults?.[agentId]?.advisorEnabled)
     );
     const advisorModelString = cfg.advisorModelString?.trim() ?? "";
-    const advisorToolEligible =
-      advisorExperimentEnabled && agentAdvisorEnabled && advisorModelString.length > 0;
+    const advisorToolEligible = agentAdvisorEnabled && advisorModelString.length > 0;
 
     const effectiveGoalDefaults = mergeGoalDefaults(
       normalizeGoalDefaults(cfg.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
@@ -1703,7 +1670,7 @@ export class TurnRequestBuilder {
     // tool block does not change when the goal does (prompt caching, #5247).
     const goalToolContext: GoalToolContext = {
       parentWorkspaceId: metadata.parentWorkspaceId,
-      allowAgentSetGoal,
+      goalTurnKind,
       agentInheritanceChain,
     };
 
@@ -1754,17 +1721,16 @@ export class TurnRequestBuilder {
       ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
       : null;
 
-    // Tier-1 plugin hooks (agent-plugins experiment): reconcile discovered
-    // hooks.js modules with the event spine BEFORE request assembly so both
-    // request.assemble and tool.execute middleware are in place for this
-    // turn. Failure posture: a broken plugin never blocks a send.
+    // Tier-1 plugin hooks: reconcile discovered hooks.js modules with the
+    // event spine BEFORE request assembly so both request.assemble and
+    // tool.execute middleware are in place for this turn. Failure posture: a
+    // broken plugin never blocks a send.
     if (!requestAssemblySnapshot) {
       await prepareWorkspaceRequestHooks({
         config: this.dependencies.config,
         metadata,
         hostCheckoutRoot,
         journal: this.dependencies.durableEventJournalFor(workspaceId),
-        enabled: this.dependencies.isAgentPluginsEnabled(),
       });
     }
 
@@ -1846,7 +1812,6 @@ export class TurnRequestBuilder {
       runtime,
       workspacePath,
       xumScope,
-      includeAgentPlugins: this.dependencies.isAgentPluginsEnabled(),
     });
 
     const desktopSessionManager = this.dependencies.bindings.desktopSessionManager;
@@ -1931,7 +1896,6 @@ export class TurnRequestBuilder {
         intuitionToolAvailable: toolset.intuitionToolAvailable,
         hotMemoriesBlock: contextForModel?.hotMemoriesBlock ?? undefined,
         claudeSkillsCompatEnabled: claudeSkillsCompatExperimentEnabled,
-        agentPluginsEnabled: agentPluginsExperimentEnabled,
         instructionSources: turnInstructionSources.current,
         agentDefinitionCache,
       });
@@ -2055,13 +2019,13 @@ export class TurnRequestBuilder {
       }
     }
 
-    // Tool search (tool-search experiment): assembly-time gate. The runtime
+    // Tool search (user setting, default on): assembly-time gate. The runtime
     // holder makes getToolsForModel create the tool_catalog_search tool; its `state`
     // is assigned only after policy filtering builds the deferred catalog
     // (see prepareToolSearch below). Without MCP tools there is nothing to
     // defer, so the feature stays fully inactive.
     const toolSearchRuntime: ToolSearchRuntime | undefined =
-      toolSearchExperimentEnabled && Object.keys(mcpTools ?? {}).length > 0 ? {} : undefined;
+      toolSearchEnabled && Object.keys(mcpTools ?? {}).length > 0 ? {} : undefined;
 
     const createTempDirForStreamStartedAt = Date.now();
     const runtimeTempDir = await this.dependencies.streamManager.createTempDirForStream(
@@ -2110,11 +2074,6 @@ export class TurnRequestBuilder {
 
     emitStartupBreadcrumb("loading_tools");
     assert(workspaceId.trim().length > 0, "streamMessage requires a non-empty workspaceId");
-    if (advisorExperimentEnabled && agentAdvisorEnabled && advisorModelString.length === 0) {
-      workspaceLog.warn("Advisor tool enabled for agent without advisorModelString; suppressing", {
-        effectiveAgentId,
-      });
-    }
     if (advisorToolEligible) {
       assert(
         advisorModelString.length > 0,
@@ -2222,7 +2181,7 @@ export class TurnRequestBuilder {
       isWorkspaceProjectTrusted(this.dependencies.config, metadata);
 
     const workflowService =
-      dynamicWorkflowsExperimentEnabled && this.dependencies.bindings.taskService != null
+      this.dependencies.bindings.taskService != null
         ? new WorkflowService({
             archiveAdmission: requireWorkflowArchiveAdmission(this.dependencies.bindings),
             runStore: new WorkflowRunStore({
@@ -2269,11 +2228,7 @@ export class TurnRequestBuilder {
                   trusted: getWorkflowProjectTrusted(),
                 },
                 getProjectTrusted: getWorkflowProjectTrusted,
-                experiments: {
-                  ...experiments,
-                  dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
-                  workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
-                },
+                experiments,
               }),
             resolveWorkflowScript: (scriptPath) =>
               resolveWorkflowScript({
@@ -2282,7 +2237,6 @@ export class TurnRequestBuilder {
                 workspacePath,
                 projectSearchRoot: projectCheckoutRoot ?? workspacePath,
                 projectTrusted: getWorkflowProjectTrusted(),
-                includeAgentPlugins: this.dependencies.isAgentPluginsEnabled(),
                 skillStorageContext: workflowSkillStorageContext,
               }),
             // Background workflow tools outlive the model turn that started them. Feed the
@@ -2349,11 +2303,7 @@ export class TurnRequestBuilder {
                     additionalSystemInstructions: scratchpadAdditionalSystemInstructions,
                     maxOutputTokens,
                     providerOptions: effectiveMuxProviderOptions,
-                    experiments: {
-                      ...experiments,
-                      dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
-                      workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
-                    },
+                    experiments,
                     skipAiSettingsPersistence: true,
                     muxMetadata: {
                       type: WORKFLOW_RESULT_METADATA_TYPE,
@@ -2518,10 +2468,12 @@ export class TurnRequestBuilder {
       agentId: effectiveAgentId,
       strictAgentResolution,
       xumScope,
-      timelineService: timelineExperimentEnabled
-        ? this.dependencies.bindings.timelineService
-        : undefined,
-      workspaceHeartbeatService: this.dependencies.bindings.workspaceHeartbeatService,
+      timelineService: this.dependencies.bindings.timelineService,
+      // Agent-scheduled heartbeats start paid turns unattended, so they are user opt-in.
+      workspaceHeartbeatService:
+        this.dependencies.config.loadConfigOrDefault().agentHeartbeatsEnabled === true
+          ? this.dependencies.bindings.workspaceHeartbeatService
+          : undefined,
       workflowService,
       goalService: workspaceGoalService,
       goalDefaults: effectiveGoalDefaults,
@@ -2635,22 +2587,12 @@ export class TurnRequestBuilder {
       // resolved on the Xum host, so this is the source even for SSH workspaces.
       listAvailableModels: () => {
         const appConfig = this.dependencies.config.loadConfigOrDefault();
-        const policy = this.dependencies.policyService;
-        const enforced = policy?.isEnforced() === true;
-        const effectivePolicy = enforced ? (policy?.getEffectivePolicy() ?? null) : null;
-        // Enforcement without an effective policy is the "blocked" state, where
-        // PolicyService denies every model. Shared filtering reads a null policy as
-        // "unenforced", so advertise nothing rather than every configured model.
-        if (enforced && effectivePolicy == null) {
-          return [];
-        }
         return listAvailableModels(
           {
             providersConfig: this.dependencies.providerService.getConfig(),
-            hiddenModels: appConfig.hiddenModels ?? [...DEFAULT_HIDDEN_MODELS],
+            hiddenModels: appConfig.hiddenModels ?? [],
             routePriority: appConfig.routePriority ?? [...DEFAULT_ROUTE_PRIORITY],
             routeOverrides: appConfig.routeOverrides ?? {},
-            effectivePolicy,
           },
           (raw, reason) => log.debug(`[models_list] skipped ${raw}: ${reason}`)
         );
@@ -2675,13 +2617,8 @@ export class TurnRequestBuilder {
       // Experiments for inheritance to subagents and workflow tool gating.
       experiments: {
         ...experiments,
-        dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
         memory: memoryExperimentEnabled,
-        timeline: timelineExperimentEnabled,
-        workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
-        toolSearch: toolSearchExperimentEnabled,
         claudeSkillsCompat: claudeSkillsCompatExperimentEnabled,
-        agentPlugins: agentPluginsExperimentEnabled,
       },
       // Dynamic context for tool descriptions (moved from system prompt for better model attention)
       availableSubagents: agentDefinitions,
@@ -2804,15 +2741,22 @@ export class TurnRequestBuilder {
 
         // Same predicate and model as the tools cache breakpoint
         // (applyCacheControlToTools), so "caches the tools block" and "keeps the
-        // tool list stable" cannot disagree (#5250).
+        // tool list stable" cannot disagree (#5250): these attempts use native
+        // Anthropic deferred loading instead of activeTools scoping (#5262).
+        // A request-level beta opt-out also makes the provider strip cache
+        // markers, and must keep defer_loading/tool_reference off the wire too.
+        // Claude models before 4.5 reject both, so they keep scoped search, as do
+        // transforming gateways, which ignore the anthropic providerOptions namespace.
         // #5253: classify by every switchable agent's require rules, like PTC
         // promotion, so a tool required in one mode is not deferred in another.
         const toolSearchPolicy =
           switchableAgents?.flatMap((agent) => agent.toolPolicy) ?? effectiveToolPolicy;
-        const toolSearchPromptCacheActive = supportsAnthropicCache(
-          seed.rawModelString,
-          seed.providersConfig
-        );
+        const toolSearchPromptCacheActive =
+          supportsAnthropicCache(seed.rawModelString, seed.providersConfig) &&
+          effectiveMuxProviderOptions.anthropic?.disableBetaFeatures !== true &&
+          supportsAnthropicToolSearch(seed.capabilityModelString.split(":")[1] ?? "") &&
+          resolveProviderOptionsNamespaceKey(seed.wireProviderName, seed.routeProvider) ===
+            "anthropic";
         if (toolSearchRuntime) {
           if (options.initializeToolSearch) {
             const preparedSearch = prepareToolSearch({
@@ -2953,10 +2897,9 @@ export class TurnRequestBuilder {
         };
         await renderContextWindowSection();
 
-        // Also on fallbacks: a primary with prompt caching seeds nothing into
-        // its inactive state, so a fallback that turns deferral on must seed
-        // prior-turn activations itself. Seeding only adds names, so repeating
-        // it is harmless.
+        // Also on fallbacks: the rebuild drops activations the fallback cannot
+        // defer, so a fallback that defers them again must reseed prior-turn
+        // activations. Seeding only adds names, so repeating it is harmless.
         if (toolSearchRuntime?.state) {
           seedToolSearchActivationsFromMessages(
             toolSearchRuntime.state,
@@ -2966,6 +2909,10 @@ export class TurnRequestBuilder {
         const toolNamesForSentinel = (
           computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(attemptTools)
         ).sort();
+        // Native mode sends deferred tools unloaded, so an agent transition must
+        // not list them as callable before a search loads them.
+        const loadedToolNames =
+          computeLoadedToolNames(toolSearchRuntime?.state)?.sort() ?? toolNamesForSentinel;
         const preparedAttempt = this.prepareModelAttempt({
           rawModelString: seed.rawModelString,
           canonicalModelString: seed.canonicalModelString,
@@ -3017,7 +2964,7 @@ export class TurnRequestBuilder {
               providerForMessages: seed.wireProviderName,
               effectiveThinkingLevel: level,
               effectiveAgentId,
-              toolNamesForSentinel,
+              toolNamesForSentinel: loadedToolNames,
               planContentForTransition,
               planFilePath,
               postCompactionAttachments,
@@ -3029,7 +2976,10 @@ export class TurnRequestBuilder {
             {
               enabled: tokenBudgetEnabled,
               providerOptions: effectiveMuxProviderOptions,
-              activeTools: [...firstStepToolNames],
+              // Native tool search sends deferred tools without loading them into context.
+              activeTools: forcedFirstStepToolNames?.length
+                ? forcedFirstStepToolNames
+                : (computeLoadedToolNames(toolSearchRuntime?.state) ?? [...firstStepToolNames]),
             }
           );
         const prepareMessagesForProviderStartedAt = Date.now();
@@ -3057,7 +3007,7 @@ export class TurnRequestBuilder {
             thinkingLevel: level,
             providerOptions: providerOptionsForEnvelope,
             requestHistorySequence: options.requestHistorySequence(),
-            sentinelToolNames: toolNamesForSentinel,
+            sentinelToolNames: loadedToolNames,
             wireProviderName: seed.wireProviderName,
             anthropicCacheTtl: effectiveAnthropicCacheTtl,
             planContentForTransition,

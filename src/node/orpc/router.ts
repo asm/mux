@@ -105,7 +105,6 @@ import {
   subscribeMemoryChanges,
   subscribeMetadata,
   subscribeOpenSettings,
-  subscribePolicyChanges,
   subscribeDesignExperiment,
   subscribeProviderConfig,
   subscribeSshPrompts,
@@ -510,6 +509,24 @@ export const router = (authToken?: string) => {
             yield* atomicPromise(async () => context.config.updateKeepScreenAwake(input.enabled));
           })
         ),
+      updateToolSearchEnabled: t
+        .input(schemas.config.updateToolSearchEnabled.input)
+        .output(schemas.config.updateToolSearchEnabled.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* atomicPromise(async () => context.config.updateToolSearchEnabled(input.enabled));
+          })
+        ),
+      updateAgentHeartbeatsEnabled: t
+        .input(schemas.config.updateAgentHeartbeatsEnabled.input)
+        .output(schemas.config.updateAgentHeartbeatsEnabled.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* atomicPromise(async () =>
+              context.config.updateAgentHeartbeatsEnabled(input.enabled)
+            );
+          })
+        ),
       updateHeartbeatDefaultPrompt: t
         .input(schemas.config.updateHeartbeatDefaultPrompt.input)
         .output(schemas.config.updateHeartbeatDefaultPrompt.output)
@@ -544,17 +561,6 @@ export const router = (authToken?: string) => {
         .handler(
           handlerGen(function* ({ context }, input) {
             yield* atomicPromise(async () => context.config.updateEvaluationDefaults(input));
-          })
-        ),
-      unenrollMuxGovernor: t
-        .input(schemas.config.unenrollMuxGovernor.input)
-        .output(schemas.config.unenrollMuxGovernor.output)
-        .handler(
-          handlerGen(function* ({ context }) {
-            yield* atomicPromise(async () => {
-              await context.config.unenrollMuxGovernor();
-              await context.policyService.refreshNow();
-            });
           })
         ),
     },
@@ -768,12 +774,7 @@ export const router = (authToken?: string) => {
       searchModelCatalog: t
         .input(schemas.providers.searchModelCatalog.input)
         .output(schemas.providers.searchModelCatalog.output)
-        .handler(({ context, input }) =>
-          // Filter by policy before paging so totals match what the UI can add.
-          searchModelCatalog(input, (provider, modelId) =>
-            context.policyService.isModelAllowed(provider, modelId)
-          )
-        ),
+        .handler(({ input }) => searchModelCatalog(input)),
       list: t
         .input(schemas.providers.list.input)
         .output(schemas.providers.list.output)
@@ -828,20 +829,6 @@ export const router = (authToken?: string) => {
         .output(schemas.providers.onConfigChanged.output)
         .handler(({ context, signal }) => subscribeProviderConfig(context, signal)),
     },
-    policy: {
-      get: t
-        .input(schemas.policy.get.input)
-        .output(schemas.policy.get.output)
-        .handler(({ context }) => context.policyService.getPolicyGetResponse()),
-      onChanged: t
-        .input(schemas.policy.onChanged.input)
-        .output(schemas.policy.onChanged.output)
-        .handler(({ context, signal }) => subscribePolicyChanges(context, signal)),
-      refreshNow: t
-        .input(schemas.policy.refreshNow.input)
-        .output(schemas.policy.refreshNow.output)
-        .handler(({ context }) => context.policyService.refreshNowForApi()),
-    },
     muxGateway: {
       getAccountStatus: t
         .input(schemas.muxGateway.getAccountStatus.input)
@@ -853,7 +840,7 @@ export const router = (authToken?: string) => {
         ),
     },
 
-    // OAuth procedures (gateway/copilot/governor/codex) run Effect generators
+    // OAuth procedures (gateway/copilot/codex) run Effect generators
     // via handlerGen; the wire contracts are unchanged. Flow-starting
     // mutations are uninterruptible in the services (see the respective
     // startDesktopFlowEffect/startDeviceFlowEffect), so a client abort cannot
@@ -913,36 +900,6 @@ export const router = (authToken?: string) => {
         .handler(
           handlerGen(function* ({ context }, input) {
             yield* context.copilotOauthService.cancelDeviceFlowEffect(input.flowId);
-          })
-        ),
-    },
-    muxGovernorOauth: {
-      startDesktopFlow: t
-        .input(schemas.muxGovernorOauth.startDesktopFlow.input)
-        .output(schemas.muxGovernorOauth.startDesktopFlow.output)
-        .handler(
-          handlerGen(function* ({ context }, input) {
-            return yield* context.muxGovernorOauthService.startDesktopFlowEffect({
-              governorOrigin: input.governorOrigin,
-            });
-          })
-        ),
-      waitForDesktopFlow: t
-        .input(schemas.muxGovernorOauth.waitForDesktopFlow.input)
-        .output(schemas.muxGovernorOauth.waitForDesktopFlow.output)
-        .handler(
-          handlerGen(function* ({ context }, input) {
-            return yield* context.muxGovernorOauthService.waitForDesktopFlowEffect(input.flowId, {
-              timeoutMs: input.timeoutMs,
-            });
-          })
-        ),
-      cancelDesktopFlow: t
-        .input(schemas.muxGovernorOauth.cancelDesktopFlow.input)
-        .output(schemas.muxGovernorOauth.cancelDesktopFlow.output)
-        .handler(
-          handlerGen(function* ({ context }, input) {
-            yield* context.muxGovernorOauthService.cancelDesktopFlowEffect(input.flowId);
           })
         ),
     },
@@ -1211,9 +1168,8 @@ export const router = (authToken?: string) => {
           context.mcpConfigService.setToolAllowlistForApi(input.name, input.toolAllowlist)
         ),
     },
-    // Managed Agent Plugin installs (agent-plugins experiment). The service
-    // gates every method on the experiment flag and throws user-facing
-    // errors; handlers translate them into Result values.
+    // Managed Agent Plugin installs. The service throws user-facing errors;
+    // handlers translate them into Result values.
     agentPlugins: {
       preview: t
         .input(schemas.agentPlugins.preview.input)
@@ -2067,7 +2023,9 @@ export const router = (authToken?: string) => {
       onMetadata: t
         .input(schemas.workspace.onMetadata.input)
         .output(schemas.workspace.onMetadata.output)
-        .handler(({ context, signal }) => subscribeMetadata(context, signal)),
+        .handler(({ context, input, signal }) =>
+          subscribeMetadata(context, input?.archived === true, signal)
+        ),
       activity: {
         list: t
           .input(schemas.workspace.activity.list.input)

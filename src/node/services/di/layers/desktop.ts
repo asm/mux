@@ -2,7 +2,6 @@ import * as path from "path";
 import { Context, Effect, Layer } from "effect";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type {
   ErrorEvent,
   ReasoningDeltaEvent,
@@ -91,8 +90,6 @@ import {
   MemoryMeta,
   MenuEvent,
   MuxGatewayOauth,
-  MuxGovernorOauth,
-  Policy,
   Project,
   Provider,
   ProvidersConfigStoreTag,
@@ -138,8 +135,6 @@ import { InstructionsService } from "@/node/services/instructionsService";
 import { McpOauthService } from "@/node/services/mcpOauthService";
 import { MenuEventService } from "@/node/services/menuEventService";
 import { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
-import { MuxGovernorOauthService } from "@/node/services/muxGovernorOauthService";
-import { PolicyService } from "@/node/services/policyService";
 import { ProjectService } from "@/node/services/projectService";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { PTYService } from "@/node/services/ptyService";
@@ -189,7 +184,6 @@ import { CoreOptionsTag } from "./core";
 export const CrossCuttingLive: Layer.Layer<CrossCuttingTags, never, ConfigTag> =
   Layer.effectContext(
     Effect.map(ConfigTag, (config) => {
-      const policyService = new PolicyService(config);
       const telemetryService = new TelemetryService(config.rootDir);
       const experimentsService = new ExperimentsService({
         telemetryService,
@@ -204,7 +198,6 @@ export const CrossCuttingLive: Layer.Layer<CrossCuttingTags, never, ConfigTag> =
       // the persistent config rather than creating a default with an ephemeral one.
       const workspaceMcpOverridesService = new WorkspaceMcpOverridesService(config);
       return Context.empty().pipe(
-        Context.add(Policy, policyService),
         Context.add(Telemetry, telemetryService),
         Context.add(Experiments, experimentsService),
         Context.add(SessionTiming, sessionTimingService),
@@ -232,7 +225,6 @@ export const CoreOptionsFromDesktopLive: Layer.Layer<
     const config = yield* ConfigTag;
     return {
       extensionMetadataPath: path.join(config.rootDir, "extensionMetadata.json"),
-      policyService: yield* Policy,
       telemetryService: yield* Telemetry,
       analyticsService: yield* Analytics,
       experimentsService: yield* Experiments,
@@ -359,8 +351,6 @@ export const MiscDesktopLive: Layer.Layer<
   | ConfigTag
   | SecretsStoreTag
   | ProvidersConfigStoreTag
-  | Experiments
-  | Policy
   | Provider
   | MCPConfig
   | MCPServerManagerTag
@@ -368,8 +358,6 @@ export const MiscDesktopLive: Layer.Layer<
 > = Layer.effectContext(
   Effect.gen(function* () {
     const config = yield* ConfigTag;
-    const experimentsService = yield* Experiments;
-    const policyService = yield* Policy;
     const providerService = yield* Provider;
     const providersConfigStore = yield* ProvidersConfigStoreTag;
     const workflowRuntimeFactory = new QuickJSRuntimeFactory();
@@ -381,12 +369,10 @@ export const MiscDesktopLive: Layer.Layer<
       }),
       payload: createBackupPayloadStore({ config }),
     });
-    // Managed Agent Plugin installer (agent-plugins experiment). Gated on the
-    // backend ExperimentsService exactly like the plugin MCP provider; the
-    // MCP manager dependency lets update/uninstall recycle running plugin
-    // servers whose content changed behind an unchanged command line.
+    // Managed Agent Plugin installer. The MCP manager dependency lets
+    // update/uninstall recycle running plugin servers whose content changed
+    // behind an unchanged command line.
     const agentPluginInstallService = new AgentPluginInstallService(config, {
-      isEnabled: () => experimentsService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS),
       mcpServerManager: yield* MCPServerManagerTag,
       mcpConfigService: yield* MCPConfig,
       workspaceMcpOverridesService: yield* WorkspaceMcpOverrides,
@@ -395,12 +381,7 @@ export const MiscDesktopLive: Layer.Layer<
     const updateService = new UpdateService(config);
     const serverService = new ServerService();
     const menuEventService = new MenuEventService();
-    const voiceService = new VoiceService(
-      config,
-      providerService,
-      policyService,
-      providersConfigStore
-    );
+    const voiceService = new VoiceService(config, providerService, providersConfigStore);
     const serverAuthService = new ServerAuthService(config);
     const workspaceLifecycleHooks = new WorkspaceLifecycleHooks();
     const worktreeArchiveSnapshotService = new WorktreeArchiveSnapshotService(config);
@@ -432,7 +413,6 @@ export const OauthLive: Layer.Layer<
   | FileLeaseManagerTag
   | MCPConfig
   | Provider
-  | Policy
   | Telemetry
   | WindowTag
 > = Layer.effectContext(
@@ -441,7 +421,6 @@ export const OauthLive: Layer.Layer<
     const windowService = yield* WindowTag;
     const providersConfigStore = yield* ProvidersConfigStoreTag;
     const providerService = yield* Provider;
-    const policyService = yield* Policy;
     const mcpOauthService = new McpOauthService(
       config,
       yield* MCPConfig,
@@ -453,11 +432,6 @@ export const OauthLive: Layer.Layer<
       providerService,
       windowService
     );
-    const muxGovernorOauthService = new MuxGovernorOauthService(
-      config,
-      windowService,
-      policyService
-    );
     const codexOauthService = new CodexOauthService(
       providersConfigStore,
       providerService,
@@ -467,16 +441,12 @@ export const OauthLive: Layer.Layer<
       providersConfigStore,
       yield* FileLeaseManagerTag,
       providerService,
-      windowService,
-      // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL
-      // for logins, refreshes, and issuer checks.
-      policyService
+      windowService
     );
     const copilotOauthService = new CopilotOauthService(providerService, windowService);
     return Context.empty().pipe(
       Context.add(McpOauth, mcpOauthService),
       Context.add(MuxGatewayOauth, muxGatewayOauthService),
-      Context.add(MuxGovernorOauth, muxGovernorOauthService),
       Context.add(CodexOauth, codexOauthService),
       Context.add(CoderOauth, coderOauthService),
       Context.add(CopilotOauth, copilotOauthService)
@@ -538,7 +508,7 @@ export const WorkersLive: Layer.Layer<
       yield* IdleDispatcherTag,
       effectRunner
     );
-    const timelineService = new TimelineService(config, historyService, experimentsService);
+    const timelineService = new TimelineService(config, historyService);
     // /refine trajectory distillation (RLM r11). Chat emission routes through
     // WorkspaceService so a live session renders the appended summary row
     // immediately (the row itself is already durable in chat.jsonl).

@@ -33,11 +33,6 @@ import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { ThinkingSelector } from "@/browser/components/ThinkingSelector/ThinkingSelector";
-import {
-  getAllowedRuntimeModesForUi,
-  isParsedRuntimeAllowedByPolicy,
-} from "@/browser/utils/policyUi";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { useUserPreferencePersistence } from "@/browser/contexts/UserPreferencesContext";
 import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
@@ -316,13 +311,6 @@ interface EditSession {
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { api } = useAPI();
   const { waitForPreferencePersisted } = useUserPreferencePersistence();
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
-  const runtimePolicy = useMemo(
-    () => getAllowedRuntimeModesForUi(effectivePolicy),
-    [effectivePolicy]
-  );
   const { variant } = props;
   const { userProjects } = useProjectContext();
   const creationScope =
@@ -335,7 +323,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     variant === "creation" ? userProjects.get(creationParentProjectPath) : undefined;
   const [thinkingLevel] = useThinkingLevel();
   const [reasoningMode] = useReasoningMode();
-  const dynamicWorkflowsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
   const atMentionProjectPath =
     variant === "creation" && props.kind !== "scratch" ? props.projectPath : null;
   const asyncCommandScopeRef = useRef<{ variant: typeof variant; workspaceId: string | null }>({
@@ -874,7 +861,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           subProjectPath: creationSubProjectPath,
           onWorkspaceCreated: props.onWorkspaceCreated,
           message: creationNameMessage,
-          dynamicWorkflowsEnabled: dynamicWorkflowsExperimentEnabled,
           draftId: props.pendingDraftId,
           userModel: preferredModel,
           agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
@@ -915,19 +901,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       ? validateCreationRuntime(creationState.selectedRuntime, coderState.presets.length)
       : null;
 
-  const creationRuntimePolicyError =
-    variant === "creation" &&
-    props.kind !== "scratch" &&
-    effectivePolicy?.runtimes != null &&
-    !isParsedRuntimeAllowedByPolicy(effectivePolicy, creationState.selectedRuntime)
-      ? creationState.selectedRuntime.mode === "ssh" &&
-        !creationState.selectedRuntime.coder &&
-        runtimePolicy.allowSshHost === false &&
-        runtimePolicy.allowSshCoder
-        ? "Host SSH runtimes are disabled by policy. Select the Coder runtime instead."
-        : "Selected runtime is disabled by policy."
-      : null;
-
   const runtimeFieldError =
     variant === "creation" && hasAttemptedCreateSend ? (creationRuntimeError?.mode ?? null) : null;
 
@@ -960,10 +933,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           nameState: creationState.nameState,
           runtimeAvailabilityState: creationState.runtimeAvailabilityState,
           runtimeEnablement: creationRuntimeEnablement,
-          allowedRuntimeModes: runtimePolicy.allowedModes,
-          allowSshHost: runtimePolicy.allowSshHost,
-          allowSshCoder: runtimePolicy.allowSshCoder,
-          runtimePolicyError: creationRuntimePolicyError,
           coderInfo: coderState.coderInfo,
           runtimeFieldError,
           // Pass coderProps when CLI is available/outdated, Coder is enabled, or still checking (so "Checking…" UI renders)
@@ -994,7 +963,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const hasImages = attachments.length > 0;
   const hasReviews = reviewData !== undefined;
   // Disable send while Coder presets are loading (user could bypass preset validation)
-  const policyBlocksCreateSend = variant === "creation" && creationRuntimePolicyError != null;
   const coderPresetsLoading =
     coderState.enabled && !coderState.coderConfig?.existingWorkspace && coderState.loadingPresets;
   const isProcessingAttachments = processingAttachmentCount > 0;
@@ -1019,7 +987,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     !sendInFlightBlocksInput &&
     !isProcessingAttachments &&
     !coderPresetsLoading &&
-    !policyBlocksCreateSend &&
     !transcriptBlocksSend &&
     !editPreconditionInvalidated;
   const runningGoalActive =
@@ -1416,7 +1383,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const requestId = ++workflowsRequestIdRef.current;
 
     const loadWorkflows = async () => {
-      if (!api || !dynamicWorkflowsExperimentEnabled) {
+      if (!api) {
         return;
       }
 
@@ -1460,15 +1427,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     return () => {
       isMounted = false;
     };
-  }, [
-    api,
-    variant,
-    workspaceId,
-    atMentionProjectPath,
-    dynamicWorkflowsExperimentEnabled,
-    isTranscriptCaughtUp,
-    store,
-  ]);
+  }, [api, variant, workspaceId, atMentionProjectPath, isTranscriptCaughtUp, store]);
 
   // Voice input: track transcription provider availability (subscribe to provider config changes)
   useEffect(() => {
@@ -1944,7 +1903,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       workspaceId: commandWorkspaceId,
       projectPath: commandProjectPath,
       rawInput: restoreInput,
-      dynamicWorkflowsEnabled: dynamicWorkflowsExperimentEnabled,
       currentModel: workspaceSidebarState?.currentModel ?? null,
       sendMessageOptions: commandSendMessageOptions,
       resetContext: variant === "workspace" ? props.onResetContext : undefined,
@@ -3117,7 +3075,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     if (isMobileTouch || props.kind === "scratch") {
       return "Type a message...";
     }
-    return getPlaceholderTip({ dynamicWorkflows: dynamicWorkflowsExperimentEnabled });
+    return getPlaceholderTip();
   })();
 
   const activeToast = toast ?? (variant === "creation" ? creationState.toast : null);

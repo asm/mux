@@ -68,12 +68,6 @@ export function isRouteGatewayModelAccessible(
  * (providerOptions.openai.wireFormat): with no stored format the factory
  * honors it, and Codex-OAuth-only credentials cannot serve a Chat Completions
  * request — send-path callers pass it so the verdict matches model creation.
- *
- * Known one-directional gap: enforced-policy model gating (policyService
- * isModelAllowed, applied inside the node-side gateway checker) is not
- * consulted here, so this can over-report availability for policy-blocked
- * gateway models — the send then fails with the provider's own error rather
- * than the actionable class message. It can never spuriously block.
  */
 export function isModelServableWithProvidersConfig(args: {
   canonicalModel: string;

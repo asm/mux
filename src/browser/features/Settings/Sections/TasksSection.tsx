@@ -51,13 +51,14 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { AdvisorConfig } from "./AdvisorConfig";
 import { FALLBACK_AGENTS, deriveTasksSectionAgentGroups } from "./TasksSection.agents";
 
 const INHERIT = "__inherit__";
 
 // Agents whose requests run outside the send path (raw streamText: Dream in
 // memoryConsolidation, Name Workspace in workspaceTitleGenerator) and never
-// apply reasoningMode. Never offer a Pro toggle that cannot affect requests.
+// apply reasoningMode. Never offer a Pro/Cyber toggle that cannot affect requests.
 // Compact stays eligible: compaction goes through the send path, which
 // threads reasoningMode.
 const HEADLESS_REASONING_AGENT_IDS = new Set(["dream", "name_workspace", "intuition"]);
@@ -316,8 +317,8 @@ interface AiDefaultsControlsProps {
   reasoningModeInherited?: boolean;
   modelCapabilitiesDeferred?: boolean;
   applyMinimumThinkingLevel?: boolean;
-  /** Forwarded to the picker; false hides the Pro toggle (e.g. Dream, whose requests never apply reasoningMode). */
-  allowProMode?: boolean;
+  /** Forwarded to the picker; false hides the Pro and Cyber toggles (e.g. Dream, whose requests never apply reasoningMode). */
+  allowReasoningModes?: boolean;
   effectiveModel: string | undefined;
   models: string[];
   hiddenModelsForSelector: string[];
@@ -377,7 +378,7 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
             reasoningMode={props.reasoningModeValue}
             reasoningModeInherited={props.reasoningModeInherited}
             onReasoningModeChange={props.onReasoningModeChange}
-            allowProMode={props.allowProMode}
+            allowReasoningModes={props.allowReasoningModes}
             variant="box"
             inheritOption={{
               label: inheritLabel,
@@ -440,7 +441,6 @@ export function TasksSection() {
   );
   const newWorkspaceDefaultAgentId = coerceAgentId(globalDefaultAgentIdRaw);
   const portableDesktopEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
-  const advisorToolEnabled = useExperimentValue(EXPERIMENT_IDS.ADVISOR_TOOL);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   // Dream only runs when both flags are on (see memoryConsolidationService);
   // mirror that gate for its Settings card.
@@ -777,8 +777,10 @@ export function TasksSection() {
     return { modelString, reasoningMode };
   };
 
-  const baseChainInheritsPro = (agentId: string): boolean =>
-    resolveBaseChainDefaults(agentId).reasoningMode === "pro";
+  const baseChainSuppliesNonStandardMode = (agentId: string): boolean => {
+    const inherited = resolveBaseChainDefaults(agentId).reasoningMode;
+    return inherited !== undefined && inherited !== "standard";
+  };
 
   // Definitions may pin ai.model (possibly an alias like "sonnet"); ACP/task
   // resolution slots it below Settings overrides and above the ambient
@@ -788,14 +790,14 @@ export function TasksSection() {
 
   const setAgentReasoningMode = (agentId: string, mode: OpenAIReasoningMode) => {
     // "standard" is the wire default; keep entries sparse by only persisting
-    // "pro", unless a base agent supplies pro, where deleting the override
-    // would silently fall back to pro (see baseChainInheritsPro).
-    const inheritsPro = baseChainInheritsPro(agentId);
+    // non-standard modes, unless a base agent supplies one, where deleting the
+    // override would silently fall back to it.
+    const inheritsNonStandard = baseChainSuppliesNonStandardMode(agentId);
     setAgentAiDefaults((prev) =>
       updateAgentDefaultEntry(prev, agentId, (updated) => {
-        if (mode === "pro") {
-          updated.reasoningMode = "pro";
-        } else if (inheritsPro) {
+        if (mode !== "standard") {
+          updated.reasoningMode = mode;
+        } else if (inheritsNonStandard) {
           updated.reasoningMode = "standard";
         } else {
           delete updated.reasoningMode;
@@ -1049,7 +1051,7 @@ export function TasksSection() {
                 </Button>
               ) : null}
             </div>
-            {advisorToolEnabled && agent.id !== "intuition" ? (
+            {agent.id !== "intuition" ? (
               <div className="flex items-center gap-3">
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -1084,7 +1086,7 @@ export function TasksSection() {
           modelValue={modelValue}
           thinkingValue={thinkingValue}
           reasoningModeValue={entry?.reasoningMode ?? inheritedDefaults.reasoningMode ?? "standard"}
-          allowProMode={!HEADLESS_REASONING_AGENT_IDS.has(agent.id)}
+          allowReasoningModes={!HEADLESS_REASONING_AGENT_IDS.has(agent.id)}
           // Intuition clamps to model capabilities, not the chat's minimum effort.
           applyMinimumThinkingLevel={agent.id !== "intuition"}
           effectiveModel={effectiveModel}
@@ -1165,34 +1167,32 @@ export function TasksSection() {
             <div className="text-foreground text-sm font-medium">{agentId}</div>
             <div className="text-muted text-xs">Not discovered in the current workspace</div>
           </div>
-          {advisorToolEnabled ? (
-            <div className="flex shrink-0 items-center gap-3">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <div className="flex items-center gap-2">
-                    <div className="text-muted text-xs">Advisor</div>
-                    <Switch
-                      checked={advisorSwitchState.checked}
-                      onCheckedChange={(checked) => setAgentAdvisorEnabled(agentId, checked)}
-                      aria-label={`Toggle ${agentId} advisor`}
-                    />
-                  </div>
-                </TooltipTrigger>
-                <TooltipContent>{advisorSwitchState.title}</TooltipContent>
-              </Tooltip>
-              {advisorEnabledOverride !== undefined ? (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className="px-2"
-                  onClick={() => resetAgentAdvisorEnabled(agentId)}
-                >
-                  Reset
-                </Button>
-              ) : null}
-            </div>
-          ) : null}
+          <div className="flex shrink-0 items-center gap-3">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <div className="flex items-center gap-2">
+                  <div className="text-muted text-xs">Advisor</div>
+                  <Switch
+                    checked={advisorSwitchState.checked}
+                    onCheckedChange={(checked) => setAgentAdvisorEnabled(agentId, checked)}
+                    aria-label={`Toggle ${agentId} advisor`}
+                  />
+                </div>
+              </TooltipTrigger>
+              <TooltipContent>{advisorSwitchState.title}</TooltipContent>
+            </Tooltip>
+            {advisorEnabledOverride !== undefined ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="px-2"
+                onClick={() => resetAgentAdvisorEnabled(agentId)}
+              >
+                Reset
+              </Button>
+            ) : null}
+          </div>
         </div>
 
         <AiDefaultsControls
@@ -1301,6 +1301,15 @@ export function TasksSection() {
         </div>
 
         {saveError ? <div className="text-danger-light mt-4 text-xs">{saveError}</div> : null}
+      </div>
+
+      <div>
+        <h3 className="text-foreground mb-1 text-sm font-medium">Advisor</h3>
+        <div className="text-muted mb-3 text-xs">
+          Agents can consult a stronger model for strategic guidance. Choose an advisor model to
+          enable the advisor tool.
+        </div>
+        <AdvisorConfig />
       </div>
 
       <div>

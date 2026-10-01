@@ -158,22 +158,6 @@ describe("router drafts.update", () => {
   });
 });
 
-describe("router providers.searchModelCatalog", () => {
-  test("filters by the effective policy before counting and paging", async () => {
-    const context = {
-      policyService: {
-        isModelAllowed: (provider: string, modelId: string) =>
-          provider === "anthropic" && modelId === "claude-fable-5",
-      },
-    } as unknown as ORPCContext;
-    const client = createRouterClient(router(), { context });
-
-    const result = await client.providers.searchModelCatalog({ query: "fable", limit: 1 });
-    expect(result.models.map((model) => model.id)).toEqual(["anthropic:claude-fable-5"]);
-    expect([result.total, result.nextOffset]).toEqual([1, null]);
-  });
-});
-
 describe("router terminal.create", () => {
   test("a structural mutation's refusal reaches the client with its message (#4476)", async () => {
     const message = "Workspace ws-1 is being renamed, removed or archived by pid 42";
@@ -444,6 +428,19 @@ describe("router config transcript mutation", () => {
     expect((await client.config.getConfig()).keepScreenAwake).toBe(false);
     expect(config.loadConfigOrDefault().keepScreenAwake).toBeUndefined();
     expect(config.getKeepScreenAwakeEnabled()).toBe(false);
+  });
+
+  test("persists the tool-search opt-out and treats an absent key as enabled", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+
+    expect((await client.config.getConfig()).toolSearchEnabled).toBe(true);
+    await client.config.updateToolSearchEnabled({ enabled: false });
+    expect((await client.config.getConfig()).toolSearchEnabled).toBe(false);
+    expect(new Config(config.rootDir).loadConfigOrDefault().toolSearchEnabled).toBe(false);
+
+    await client.config.updateToolSearchEnabled({ enabled: true });
+    expect((await client.config.getConfig()).toolSearchEnabled).toBe(true);
+    expect(new Config(config.rootDir).loadConfigOrDefault().toolSearchEnabled).toBeUndefined();
   });
 
   test("refuses procedure calls once the server has begun shutting down", async () => {
