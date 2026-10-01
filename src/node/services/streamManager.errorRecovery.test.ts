@@ -11,6 +11,8 @@ import {
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
+import { OPENAI_RESPONSES_BASE_URL_HINT } from "./utils/openAIResponsesBaseUrlHint";
+import type { MuxMetadata } from "@/common/types/message";
 import {
   installStreamManagerTestHistory,
   historyService,
@@ -127,6 +129,7 @@ function createRecoveryHarness() {
     modelString?: string;
     messages?: ModelMessage[];
     providerOptions?: Record<string, unknown>;
+    initialMetadata?: Partial<MuxMetadata>;
     /** SDK-reported total usage for every attempt of this turn. */
     streamUsage?: unknown;
   }) {
@@ -147,6 +150,7 @@ function createRecoveryHarness() {
         ...(input.modelString != null ? { modelString: input.modelString } : {}),
         ...(input.messages != null ? { messages: input.messages } : {}),
         providerOptions: input.providerOptions,
+        ...(input.initialMetadata != null ? { initialMetadata: input.initialMetadata } : {}),
         providedRuntimeTempDir: "",
       })
     );
@@ -983,6 +987,66 @@ describe("StreamManager - stream error classification", () => {
     });
 
     expect(await errorTypeForStreamFailure(apiError)).toBe("model_not_found");
+  });
+
+  describe("OpenAI Daybreak access program rejections", () => {
+    // Built-in OpenAI provider with a custom base URL, the route that gets the
+    // Responses base-URL hint on generic 400s.
+    const accessProgramError = (code: string, statusCode: number, message: string) =>
+      createApiCallErrorForTests({
+        message: "Bad Request",
+        url: "https://proxy.example.com/v1/responses",
+        statusCode,
+        responseBody: JSON.stringify({ error: { code, message } }),
+        isRetryable: false,
+        data: { error: { code, message } },
+      });
+
+    let runs = 0;
+    async function surfacedError(error: unknown): Promise<{ type: unknown; message: unknown }> {
+      const harness = createRecoveryHarness();
+      await harness.run({
+        workspaceId: `access-program-${++runs}`,
+        attempts: [failingAttempt(error)],
+        initialMetadata: { routeProvider: "openai" },
+      });
+      const [event] = harness.errors();
+      return { type: event?.errorType, message: event?.error };
+    }
+
+    for (const [code, statusCode] of [
+      ["invalid_access_program", 400],
+      ["unsupported_access_program", 400],
+      ["access_program_not_enabled", 403],
+    ] as const) {
+      test(`stops auto-retry and keeps OpenAI's explanation for ${code}`, async () => {
+        const openaiMessage = `Program rejected (${code}).`;
+        const apiError = accessProgramError(code, statusCode, openaiMessage);
+        const retryError = new RetryError({
+          message: "AI SDK retry exhausted",
+          reason: "maxRetriesExceeded",
+          errors: [apiError],
+        });
+        for (const error of [apiError, retryError]) {
+          const surfaced = await surfacedError(error);
+          expect(surfaced.type).toBe("authentication");
+          expect(surfaced.message).toEndWith(` OpenAI: ${openaiMessage}`);
+          expect(surfaced.message).not.toBe(` OpenAI: ${openaiMessage}`);
+        }
+      });
+    }
+
+    test("leaves other 400 and 403 rejections unchanged", async () => {
+      for (const [code, statusCode] of [
+        ["invalid_value", 400],
+        ["unsupported_country_region_territory", 403],
+      ] as const) {
+        const surfaced = await surfacedError(accessProgramError(code, statusCode, "Nope."));
+        expect(surfaced.type).not.toBe("authentication");
+        expect(surfaced.message).not.toContain("OpenAI: ");
+        if (statusCode === 400) expect(surfaced.message).toContain(OPENAI_RESPONSES_BASE_URL_HINT);
+      }
+    });
   });
 
   const categorizeCases: Array<{ name: string; error: unknown; expected: string }> = [

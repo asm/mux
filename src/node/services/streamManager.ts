@@ -628,6 +628,32 @@ function isStreamTruncatedMessage(message: string): boolean {
   );
 }
 
+// OpenAI rejections of Cyber mode's access_programs.cyber value
+// (https://developers.openai.com/api/docs/guides/daybreak). OpenAI's own
+// message names the required program or approval level, so it is kept.
+const OPENAI_ACCESS_PROGRAM_ERROR_HINTS: Record<string, string> = {
+  invalid_access_program: "This model needs a different OpenAI Daybreak access program.",
+  // OpenAI also returns this for Daybreak models whose reduced refusals need
+  // approval the project lacks, so do not claim the model has no Daybreak.
+  unsupported_access_program:
+    "OpenAI did not accept Cyber mode for this model. Turn off Cyber in the thinking menu to use standard safeguards.",
+  access_program_not_enabled:
+    "The OpenAI API key's project does not have this Daybreak program enabled. Ask your OpenAI organization admin, or turn off Cyber in the thinking menu to use standard safeguards.",
+};
+
+function getOpenAIAccessProgramError(error: unknown): { code: string; message: string } | null {
+  const apiError =
+    RetryError.isInstance(error) && error.lastError != null ? error.lastError : error;
+  if (!APICallError.isInstance(apiError)) return null;
+  const data = apiError.data as { error?: { code?: unknown; message?: unknown } } | undefined;
+  const code = data?.error?.code;
+  if (typeof code !== "string" || !Object.hasOwn(OPENAI_ACCESS_PROGRAM_ERROR_HINTS, code)) {
+    return null;
+  }
+  const message = data?.error?.message;
+  return { code, message: typeof message === "string" ? message : apiError.message };
+}
+
 // OpenAI Responses rejecting replayed reasoning. Exact item type on purpose:
 // `rs_` is a reasoning item; message/tool items use other prefixes.
 const OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN = /Item with id 'rs_[A-Za-z0-9_-]+' not found/;
@@ -5225,6 +5251,10 @@ export class StreamManager {
       const [, modelName] = streamInfo.model.split(":");
       errorMessage = `Model '${modelName || streamInfo.model}' does not exist or is not available. Please check your model selection.`;
     }
+    const accessProgramError = getOpenAIAccessProgramError(actualError);
+    if (accessProgramError != null) {
+      errorMessage = `${OPENAI_ACCESS_PROGRAM_ERROR_HINTS[accessProgramError.code]} OpenAI: ${accessProgramError.message}`;
+    }
 
     // Normalize Anthropic overload errors (HTTP 529 / overloaded_error) into a stable,
     // user-friendly message. Keep errorType = server_error so the frontend's auto-retry
@@ -5282,7 +5312,8 @@ export class StreamManager {
       providerId: streamInfo.initialMetadata?.routeProvider ?? "",
       error: actualError,
     });
-    if (openAIResponsesBaseUrlHint) {
+    // An access-program rejection proves the endpoint speaks Responses.
+    if (openAIResponsesBaseUrlHint && accessProgramError == null) {
       errorMessage = `${errorMessage}\n\n${openAIResponsesBaseUrlHint}`;
     }
 
@@ -5744,6 +5775,10 @@ export class StreamManager {
     }
     if (APICallError.isInstance(error)) {
       if (error.statusCode === 401) return "authentication";
+      // Daybreak access-program rejections are deterministic: a retry resends
+      // the same program. Like a bad key, the user must change provider config
+      // or turn Cyber off, so reuse the non-retryable authentication class.
+      if (getOpenAIAccessProgramError(error) != null) return "authentication";
       // 402 (Payment Required) is used by mux gateway for billing/credits issues
       // (e.g. "Insufficient balance. Please add credits to continue.").
       // Treat as non-retryable quota. Some providers also encode quota failures as

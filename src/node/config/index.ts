@@ -63,7 +63,6 @@ import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
 import { LEGACY_MUX_PRODUCT_NAME, LEGACY_MUX_PRODUCT_SLUG } from "@/common/compat/legacyMux";
 import { XUM_PRODUCT_NAME, XUM_PRODUCT_SLUG } from "@/common/constants/product";
-import { DEFAULT_HIDDEN_MODELS } from "@/common/constants/knownModels";
 import { GATEWAY_PROVIDERS } from "@/common/constants/providers";
 import {
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
@@ -104,6 +103,10 @@ import { isProviderAutoRouteEligible } from "@/node/utils/providerRequirements";
 import { getContainerName as getDockerContainerName } from "@/node/runtime/DockerRuntime";
 import { deriveProjectHierarchy } from "@/common/utils/subProjects";
 import { deriveSharedTaskCheckouts } from "./sharedTaskCheckouts";
+import {
+  decodeCyberReasoningModesFromDisk,
+  encodeCyberReasoningModesForDisk,
+} from "./cyberReasoningModeDisk";
 import {
   type ProjectRegistrationLockHandle,
   tryProjectRegistrationFileLock,
@@ -1665,9 +1668,7 @@ export class Config {
       // migration flag rides along so the first save locks in seed-once
       // semantics (later loads never re-apply the defaults).
       modelFallbacks: { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...DEFAULT_MODEL_FALLBACKS },
-      hiddenModels: [...DEFAULT_HIDDEN_MODELS],
       migrations: {
-        daybreakModelsHidden: true,
         defaultModelFallbacksSeeded: true,
         defaultModelFallbacksSeededFable51: true,
         persistentSubagentsDefaulted: true,
@@ -1796,6 +1797,7 @@ export class Config {
   private normalizeParsedConfig(
     parsed: Partial<AppConfigOnDisk> & Record<string, unknown>
   ): ProjectsConfig {
+    decodeCyberReasoningModesFromDisk(parsed);
     let configModified = false;
     let shouldInvalidateSessionUsageCaches = false;
 
@@ -2076,19 +2078,6 @@ export class Config {
     if (existingHiddenModels === undefined && hiddenMigrations.hiddenModelsInitialized === true) {
       hiddenMigrations.hiddenModelsInitialized = false;
       parsed.migrations = hiddenMigrations;
-      configModified = true;
-    }
-    if (hiddenMigrations.daybreakModelsHidden !== true) {
-      // Seed once, without losing unrelated hides or re-hiding models users later enable.
-      parsed.migrations = {
-        ...hiddenMigrations,
-        daybreakModelsHidden: true,
-        hiddenModelsInitialized:
-          hiddenMigrations.hiddenModelsInitialized === true || existingHiddenModels !== undefined,
-      };
-      parsed.hiddenModels = [
-        ...new Set([...(existingHiddenModels ?? []), ...DEFAULT_HIDDEN_MODELS]),
-      ];
       configModified = true;
     }
     const hiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
@@ -2556,12 +2545,16 @@ export class Config {
           }
         }
       }
+      // Encode a copy: `data` still shares settings objects with runtime state.
+      const diskData = structuredClone(data);
+      encodeCyberReasoningModesForDisk(diskData);
       // writeFileAtomic writes the whole payload and verifies the temp file's size before
       // the rename: a filling disk makes write(2) accept a short count without an error,
       // and the npm write-file-atomic package renamed that truncated file over
       // config.json, which then loaded as an empty registry (coder/xum#4197).
       yield* Effect.tryPromise({
-        try: async () => writeFileAtomic(self.configFile, JSON.stringify(data, null, 2), "utf-8"),
+        try: async () =>
+          writeFileAtomic(self.configFile, JSON.stringify(diskData, null, 2), "utf-8"),
         catch: (error) => error,
       });
       // A competing rename may already have replaced our write; only a fresh read can publish it.
