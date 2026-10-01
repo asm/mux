@@ -3909,7 +3909,7 @@ export class AgentSession {
     using _execution = this.coordinator.enterExecution();
     this.activePreparations++;
     // Start (not await) the turn's use lease: preparation keeps its synchronous startup, and
-    // streamWithHistory confirms the lease before the provider can touch the checkout.
+    // prepareMessage / streamWithHistory confirm it before they touch the checkout (L1).
     this.beginTurnUseLease();
     try {
       const result = await run();
@@ -4256,9 +4256,18 @@ export class AgentSession {
     if (!frontier.success) return Err(createUnknownSendMessageError(frontier.error));
     attempt.admissionCapture = frontier.data;
 
+    // L1 (formal/workspace-leases, MC_lease_turn_fixed): confirm the turn's use lease before
+    // anything below can touch the checkout (@file reads, skill dynamic-context commands,
+    // rollover's runtime readiness and workspace path). completePreparation only starts the
+    // hold so that its synchronous startup is kept; this await follows the frontier read. A send
+    // refused by another backend's rename, removal or archive fails here, before the edit
+    // truncation or any publication, like WorkspaceService.sendMessage's in-process refusal.
+    // A send the caller already canceled keeps its canceled outcome instead of the refusal.
+    const leaseRefusal = await this.confirmTurnUseLease();
     if (await cancelBeforeAcceptance()) {
       return Ok(undefined);
     }
+    if (leaseRefusal != null) return Err(createUnknownSendMessageError(leaseRefusal));
 
     // Capture before the first automatic gate: a foreign Stop discovered during preparation
     // belongs to a later admission and cannot grant this attempt replacement authority.
@@ -7823,9 +7832,18 @@ export class AgentSession {
       // abort or append failure therefore re-detects the same change (nothing is
       // dropped), while a successful append cannot produce a duplicate row.
       // Fresh candidates already fix the admitted rows; detect later edits on the next request.
-      const fileChangeDetection = preparedRequest
-        ? { attachments: [], commit: () => undefined }
-        : await this.fileChangeTracker.getChangedAttachments();
+      // #4476/L1: file-change detection and post-compaction attachments read the checkout, so the
+      // turn use lease is confirmed first (resumes and retries reach here without prepareMessage).
+      // A refused lease skips those reads and fails below, where the request's user row and
+      // compaction request are known, so the refusal keeps its retry correlation.
+      const leaseRefusal = await this.confirmTurnUseLease();
+      if (isStreamStartAborted()) {
+        return Ok(undefined);
+      }
+      const fileChangeDetection =
+        preparedRequest || leaseRefusal != null
+          ? { attachments: [], commit: () => undefined }
+          : await this.fileChangeTracker.getChangedAttachments();
       if (isStreamStartAborted()) {
         return Ok(undefined);
       }
@@ -7924,7 +7942,7 @@ export class AgentSession {
 
       // Check if post-compaction attachments should be injected.
       const postCompactionAttachments =
-        disablePostCompactionAttachments === true || preparedRequest != null
+        disablePostCompactionAttachments === true || preparedRequest != null || leaseRefusal != null
           ? null
           : await this.getPostCompactionAttachmentsIfNeeded(this.isRlmCompactionEnabled(options));
       if (isStreamStartAborted()) {
@@ -7932,12 +7950,8 @@ export class AgentSession {
       }
 
       // #4476: from here the provider can run tools in the checkout, so another backend's rename
-      // or removal must see this turn first (and a running one refuses it).
-      const leaseRefusal = await this.confirmTurnUseLease();
+      // or removal must have seen this turn's lease (confirmed above; a running one refused it).
       if (leaseRefusal != null) return fail(createUnknownSendMessageError(leaseRefusal));
-      if (isStreamStartAborted()) {
-        return Ok(undefined);
-      }
 
       this.activeStreamHadPostCompactionInjection =
         postCompactionAttachments !== null && postCompactionAttachments.length > 0;
