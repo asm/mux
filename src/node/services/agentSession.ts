@@ -3721,17 +3721,7 @@ export class AgentSession {
       // rebuild queue UI state even when history replay errored mid-flight.
       listener({
         workspaceId: this.workspaceId,
-        message: {
-          type: "queued-message-changed",
-          workspaceId: this.workspaceId,
-          hasQueuedMessages: !this.messageQueue.isEmpty(),
-          queuedMessages: this.messageQueue.getVisibleMessages(),
-          displayText: this.messageQueue.getVisibleDisplayText(),
-          fileParts: this.messageQueue.getVisibleFileParts(),
-          reviews: this.messageQueue.getVisibleReviews(),
-          queueDispatchMode: this.messageQueue.getVisibleQueueDispatchMode(),
-          hasCompactionRequest: this.messageQueue.hasVisibleCompactionRequest(),
-        },
+        message: this.queuedMessageChangedEvent(),
       });
 
       // Held input snapshot (see heldInputs): this subscription may be the first one since the
@@ -10612,7 +10602,14 @@ export class AgentSession {
     // Every queue mutation publishes here, so successor withdrawal is recorded before observers
     // (TaskService deferral reconciliation) read the receipt for this notification.
     this.settleWithdrawnQueueCutReceipts();
-    this.emitChatEvent({
+    this.emitChatEvent(this.queuedMessageChangedEvent());
+  }
+
+  private queuedMessageChangedEvent(): Extract<
+    WorkspaceChatMessage,
+    { type: "queued-message-changed" }
+  > {
+    return {
       type: "queued-message-changed",
       workspaceId: this.workspaceId,
       hasQueuedMessages: !this.messageQueue.isEmpty(),
@@ -10622,7 +10619,8 @@ export class AgentSession {
       reviews: this.messageQueue.getVisibleReviews(),
       queueDispatchMode: this.messageQueue.getVisibleQueueDispatchMode(),
       hasCompactionRequest: this.messageQueue.hasVisibleCompactionRequest(),
-    });
+      acpPromptIds: this.messageQueue.getAcpPromptIds(),
+    };
   }
 
   /**
