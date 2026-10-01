@@ -81,8 +81,6 @@ import {
   normalizeUserPreferences,
   type UserPreferences,
 } from "@/common/config/schemas/userPreferences";
-import type { z } from "zod";
-import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 import {
@@ -139,8 +137,6 @@ type MockBackupData<Route extends Exclude<MockBackupRoute, "getSettings">> = Ext
   { success: true }
 >["data"];
 type MockBackupSettings = NonNullable<MockBackupRouteOutput<"getSettings">>;
-
-type ProjectRemoveError = z.infer<typeof ProjectRemoveErrorSchema>;
 
 export interface MockORPCClientOptions {
   /** Layout presets config for Settings → Layouts stories */
@@ -229,9 +225,7 @@ export interface MockORPCClientOptions {
   /** Server auth sessions for Settings → Server Access stories */
   serverAuthSessions?: ServerAuthSession[];
   /** Mock for projects.remove - return typed error to simulate failure */
-  onProjectRemove?: (
-    projectPath: string
-  ) => { success: true; data: undefined } | { success: false; error: ProjectRemoveError };
+  onProjectRemove?: (projectPath: string) => Awaited<ReturnType<APIClient["projects"]["remove"]>>;
   /** Override for nameGeneration.generate result (default: success) */
   nameGenerationResult?: { success: false; error: NameGenerationError };
   /** Background processes per workspace */
@@ -1529,7 +1523,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             error: { type: "workspace_blockers", ...counts },
           });
         }
-        return Promise.resolve({ success: true, data: undefined });
+        return Promise.resolve({ success: true, data: { removedCreationDrafts: [] } });
       },
       setTrust: (input: { projectPath: string; trusted: boolean }) => {
         const project = projects.get(input.projectPath);
