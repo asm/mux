@@ -83,7 +83,10 @@ import { makeEvaluationService } from "@/node/services/evaluation/evaluationServ
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { MemoryService, projectMemoryDirName } from "@/node/services/memoryService";
 import * as toolAssembly from "./toolAssembly";
-import type { ToolModelUsageEvent } from "@/common/utils/tools/tools";
+import type {
+  ToolModelUsageEvent,
+  WorkspaceHeartbeatToolService,
+} from "@/common/utils/tools/tools";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
@@ -1038,7 +1041,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
-      experiments: { advisorTool: true },
     });
     expect(result.success).toBe(true);
     return result;
@@ -1773,7 +1775,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
-      experiments: { advisorTool: true },
     });
 
     expect(result.success).toBe(true);
@@ -1813,7 +1814,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId,
         modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
-        experiments: { advisorTool: true },
       });
       expect(result.success).toBe(true);
     }
@@ -2243,6 +2243,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
     const mcpTools: Record<string, Tool> = { tracker_list_issues: stubTool };
     const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    if (!toolSearch) await harness.config.updateToolSearchEnabled(false);
     // Mirror getToolsForModel: the search tool exists only with a tool-search runtime.
     harness.getToolsForModelSpy.mockImplementation((_model, config) =>
       Promise.resolve({
@@ -2270,7 +2271,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId: metadata.id,
       modelString,
       thinkingLevel: "off",
-      experiments: { toolSearch },
     });
     expect(result.success).toBe(true);
     const started = harness.startStreamCalls[0];
@@ -2278,7 +2278,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     return { toolNames: Object.keys(started.tools ?? {}).sort(), state: started.toolSearchState };
   }
 
-  it("advertises the experiment-off tool list on Anthropic prompt-cache models", async () => {
+  it("advertises the tool-search-off tool list on Anthropic prompt-cache models", async () => {
     const on = await startToolSearchStream("anthropic:claude-sonnet-4-5", true);
     const off = await startToolSearchStream("anthropic:claude-sonnet-4-5", false);
     expect(computeActiveToolNames(on.state)).toBeUndefined();
@@ -2292,6 +2292,38 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(on.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
     expect(on.toolNames).toContain("tool_catalog_search");
   });
+
+  it("disables tool-search deferral when the user setting is off", async () => {
+    const off = await startToolSearchStream("openai:gpt-5.2", false);
+    expect(off.state).toBeUndefined();
+    expect(off.toolNames).toContain("tracker_list_issues");
+    expect(off.toolNames).not.toContain("tool_catalog_search");
+  });
+
+  it.each([true, false])(
+    "passes the heartbeat service to tools only when agent heartbeats are enabled (%s)",
+    async (enabled) => {
+      using xumHome = new DisposableTempDir("ai-agent-heartbeats");
+      const metadata = createLocalWorkspaceMetadata("agent-heartbeats", xumHome.path);
+      const harness = createHarness(xumHome.path, metadata);
+      const heartbeatService: WorkspaceHeartbeatToolService = {
+        getHeartbeatSettings: () => null,
+        setHeartbeatSettings: () => Promise.reject(new Error("unused")),
+        unsetHeartbeatSettings: () => Promise.reject(new Error("unused")),
+      };
+      harness.service.turnRequestBuilderBindings.workspaceHeartbeatService = heartbeatService;
+      await harness.config.updateAgentHeartbeatsEnabled(enabled);
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "hello")],
+        workspaceId: metadata.id,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+      });
+      expect(result.success).toBe(true);
+      const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
+      expect(toolConfig?.workspaceHeartbeatService).toBe(enabled ? heartbeatService : undefined);
+    }
+  );
 
   it.each(["memory", "intuition", "restore-denied"])(
     "keeps recall policy enforced after request middleware: %s",
@@ -2585,6 +2617,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         createLocalWorkspaceMetadata(workspaceId, projectPath, metadataOverrides),
         { experimentsService }
       );
+      if (!options?.toolSearch) await harness.config.updateToolSearchEnabled(false);
       if (options?.toolSearch) {
         // A selectable agent that requires an MCP tool the other modes only allow.
         await fs.writeFile(
@@ -2631,7 +2664,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           modelString: "openai:gpt-5.2",
           thinkingLevel: "off",
           agentId,
-          experiments: { memory: options?.memory, toolSearch: options?.toolSearch },
+          experiments: { memory: options?.memory },
         });
         expect(result.success).toBe(true);
         toolsByAgent[agentId] = harness.startStreamCalls.at(-1)?.tools ?? {};
@@ -2857,13 +2890,14 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const observations: string[] = [];
       for (const next of states) {
         state = next;
+        await harness.config.updateToolSearchEnabled(state.toolSearch === true);
         const result = await harness.service.streamMessage({
           messages: [createMuxMessage("latest-user", "user", "hello")],
           workspaceId,
           modelString: KNOWN_MODELS.SONNET.id,
           thinkingLevel: "off",
           agentId: state.agentId ?? "exec",
-          experiments: { tokenBudget: true, memory: true, toolSearch: state.toolSearch === true },
+          experiments: { tokenBudget: true, memory: true },
           contextBudgetRolloverAvailable: state.rolloverAvailable === true,
           workspaceGoalService: goalService,
         });
@@ -2934,7 +2968,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       },
       // Deferral stays off under Anthropic caching (#5250), so nothing activates mid-session.
       {
-        label: "tool-search experiment",
+        label: "tool-search setting",
         states: [{ toolSearch: false }, { toolSearch: true }],
         observe: (_request, toolConfig) => toolConfig?.toolSearchRuntime != null,
       },
@@ -3170,7 +3204,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       modelString: "openai:gpt-5.6",
       thinkingLevel: "max",
       reasoningMode: testCase.parentMode,
-      experiments: { advisorTool: true },
     });
     expect(result.success).toBe(true);
     expect(getToolConfigFromHarness(harness).advisorRuntime).toMatchObject({
@@ -3831,7 +3864,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId: metadata.id,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
-      experiments: { advisorTool: true, memory: true },
+      experiments: { memory: true },
     });
     expect(result.success).toBe(true);
     const tools = harness.getToolsForModelSpy.mock.calls[0]?.[1];
@@ -3920,7 +3953,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId,
         modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
-        experiments: { advisorTool: true, memory: true },
+        experiments: { memory: true },
       });
 
       expect(result.success).toBe(true);

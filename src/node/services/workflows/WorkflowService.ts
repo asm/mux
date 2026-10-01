@@ -10,7 +10,6 @@ import {
   type WorkflowRunStreamEvent,
 } from "@/common/types/workflow";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import {
   appendSubProjectRelativePath,
@@ -22,7 +21,6 @@ import type { AIService } from "@/node/services/aiService";
 import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { InitStateManager } from "@/node/services/initStateManager";
-import type { ExperimentsService } from "@/node/services/experimentsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import type { TaskService } from "@/node/services/taskService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
@@ -44,7 +42,6 @@ import {
 } from "./WorkflowRunStore";
 import { workflowRunStreamHub } from "./workflowRunStreamHub";
 import { asyncIterableFromSubscription } from "@/common/utils/asyncEventIterator";
-import { ORPCError } from "@orpc/server";
 import {
   WorkflowRunBackgroundedError,
   WorkflowRunner,
@@ -1105,8 +1102,6 @@ export class WorkflowService {
   }
 }
 
-export const DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE = "Dynamic workflows are disabled";
-
 export interface WorkflowServiceContext {
   config: Config;
   aiService: AIService;
@@ -1115,7 +1110,6 @@ export interface WorkflowServiceContext {
   initStateManager: InitStateManager;
   workspaceService: WorkspaceService;
   taskService: TaskService;
-  experimentsService: ExperimentsService;
   workflowRuntimeFactory: IJSRuntimeFactory;
 }
 
@@ -1138,9 +1132,6 @@ export async function resolveWorkflowContext(
   } = {}
 ) {
   assert(workspaceId.length > 0, "resolveWorkflowContext: workspaceId is required");
-  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
-    throw new Error(DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE);
-  }
   await context.initStateManager.waitForInit(workspaceId);
   const metadataResult = await context.aiService.getWorkspaceMetadata(workspaceId);
   if (!metadataResult.success) {
@@ -1168,14 +1159,10 @@ export async function resolveWorkflowContext(
       )
     : appendSubProjectRelativePath(metadata, runtime, workspaceRootPath);
   const workspacePath = workflowExecutionProjectPath;
-  const includeAgentPlugins = context.experimentsService.isExperimentEnabled(
-    EXPERIMENT_IDS.AGENT_PLUGINS
-  );
   const skillStorageContext = resolveSkillStorageContext({
     runtime,
     workspacePath,
     xumScope: context.aiService.resolveXumToolScopeForWorkspace(metadata, runtime, workspacePath),
-    includeAgentPlugins,
   });
   const workflowRuntimeTempDir = runtime.normalizePath(".xum/tmp", workspacePath);
 
@@ -1220,7 +1207,6 @@ export async function resolveWorkflowContext(
             trusted: projectTrusted,
           },
           getProjectTrusted: resolveWorkflowProjectTrusted,
-          experiments: { dynamicWorkflows: true },
         }),
       resolveWorkflowScript: (scriptPath) =>
         resolveWorkflowScript({
@@ -1229,7 +1215,6 @@ export async function resolveWorkflowContext(
           workspacePath,
           projectSearchRoot: workspaceRootPath,
           projectTrusted: resolveWorkflowProjectTrusted(),
-          includeAgentPlugins,
           skillStorageContext,
         }),
       // Settled markers are keyed by the run's terminal generation, so a resumed run's next
@@ -1297,7 +1282,6 @@ export async function getWorkflowRunStatuses(
   context: WorkflowServiceContext,
   runs: Array<{ workspaceId: string; runId: string }>
 ) {
-  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) return [];
   return getWorkflowRunStatusesForOwners(context.config, runs);
 }
 
@@ -1305,7 +1289,6 @@ export async function listActiveWorkflowRuns(
   context: WorkflowServiceContext,
   workspaceIds: string[]
 ) {
-  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) return [];
   return listActiveWorkflowRunsForOwners(context.config, workspaceIds);
 }
 
@@ -1316,11 +1299,6 @@ export function subscribeWorkflowRuns(
 ): AsyncGenerator<WorkflowRunStreamEvent> {
   return asyncIterableFromSubscription<WorkflowRunStreamEvent>({
     signal,
-    validate: () => {
-      if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
-        throw new ORPCError("BAD_REQUEST", { message: DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE });
-      }
-    },
     subscribe: (push) =>
       workflowRunStreamHub.subscribe(workspaceId, (run) => {
         if (run.parentWorkflow == null)
@@ -1420,9 +1398,6 @@ export async function startWorkflowRun(
     workspacePath: resolved.workspacePath,
     projectSearchRoot: resolved.projectSearchRoot,
     projectTrusted: resolved.projectTrusted,
-    includeAgentPlugins: context.experimentsService.isExperimentEnabled(
-      EXPERIMENT_IDS.AGENT_PLUGINS
-    ),
     skillStorageContext: resolved.skillStorageContext,
   });
   if (input.rawCommand != null) {
@@ -1491,9 +1466,6 @@ export async function listWorkflowScripts(
     workspacePath: resolved.workspacePath,
     projectSearchRoot: resolved.projectSearchRoot,
     projectTrusted: resolved.projectTrusted,
-    includeAgentPlugins: context.experimentsService.isExperimentEnabled(
-      EXPERIMENT_IDS.AGENT_PLUGINS
-    ),
     skillStorageContext: resolved.skillStorageContext,
   });
 }
