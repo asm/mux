@@ -1157,6 +1157,7 @@ export class AgentSession {
     [];
   private readonly initListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
+  private readonly stopEmptyErroredReplyDeletes: () => void;
   private readonly coordinator = new TurnCoordinator({
     streamStarted: (payload) => {
       // The admitted successor now owns completion through its own stream end.
@@ -1752,6 +1753,15 @@ export class AgentSession {
     const existingStream = this.streamManager.getStreamInfo(this.workspaceId);
     if (existingStream) this.coordinator.observeStreamReplay(existingStream.messageId);
     eventSpine.emit("session.start", { workspaceId: this.workspaceId });
+    // #6116: the client still holds an empty failed reply that commitPartial deleted. Its next
+    // edit would send that row as evidence and be refused; drop it as a truncation does.
+    // Last statement: no later constructor step can throw and leak this process-wide listener.
+    this.stopEmptyErroredReplyDeletes = this.historyService.onEmptyErroredReplyDeleted(
+      (workspaceId, historySequences) => {
+        if (workspaceId === this.workspaceId)
+          this.emitChatEvent({ type: "delete", historySequences });
+      }
+    );
   }
 
   /**
@@ -1800,6 +1810,9 @@ export class AgentSession {
 
   dispose(): Promise<void> {
     if (this.disposePromise) return this.disposePromise;
+    // First, before any step that can throw: the listener lives in the process-wide
+    // HistoryService. A delete during disposal is not published anyway (emitChatEvent).
+    this.stopEmptyErroredReplyDeletes();
     const disposed = Promise.withResolvers<void>();
     this.disposePromise = disposed.promise;
     // Register before closing the guardian so app teardown also joins stop/background cleanup.
