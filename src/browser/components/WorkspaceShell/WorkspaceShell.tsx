@@ -1,5 +1,5 @@
 import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
-import React, { useCallback, useRef } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "@/common/lib/utils";
 import { LazyFeature } from "../LazyFeature/LazyFeature";
 import {
@@ -13,6 +13,8 @@ import { useOpenTerminal } from "@/browser/hooks/useOpenTerminal";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { RightSidebar } from "@/browser/features/RightSidebar/RightSidebar";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
+import type { SidebarMenuItem } from "@/browser/features/RightSidebar/Tabs/tabConfig";
+import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
 import { PopoverError } from "../PopoverError/PopoverError";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { useBackgroundBashError } from "@/browser/contexts/BackgroundBashContext";
@@ -198,6 +200,69 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   const [isReviewImmersive] = usePersistedState(getReviewImmersiveKey(props.workspaceId), false, {
     listener: true,
   });
+
+  // Phones: the narrow layout hides the right sidebar, so the workspace menu lists its tools and
+  // opens them in the sidebar itself, shown full-screen. The real sidebar (not a copy in a
+  // dialog) keeps its tabs and panel state. Keyed by workspace: a switch closes it for good
+  // (render-time reset, so it does not reopen on the way back). Immersive review covers the
+  // workspace on its own, so it wins and closes it.
+  const [fullscreenSidebarWorkspaceId, setFullscreenSidebarWorkspaceId] = useState<string | null>(
+    null
+  );
+  // Immersive review closes it for good too: it is not reopened once immersive review ends.
+  if (
+    fullscreenSidebarWorkspaceId !== null &&
+    (fullscreenSidebarWorkspaceId !== props.workspaceId || isReviewImmersive)
+  ) {
+    setFullscreenSidebarWorkspaceId(null);
+  }
+  const sidebarFullscreen = fullscreenSidebarWorkspaceId === props.workspaceId;
+  const openSidebarToolRef = useRef<((tool: SidebarMenuItem) => void) | null>(null);
+  // Focus returns here when the full-screen sidebar closes (the menu button, or wherever the
+  // shortcut was pressed).
+  const fullscreenReturnFocusRef = useRef<HTMLElement | null>(null);
+  const openSidebarFullscreen = (returnFocusTo: HTMLElement | null) => {
+    fullscreenReturnFocusRef.current = returnFocusTo;
+    setFullscreenSidebarWorkspaceId(props.workspaceId);
+  };
+  const handleOpenSidebarTool = (tool: SidebarMenuItem, returnFocusTo: HTMLElement | null) => {
+    openSidebarToolRef.current?.(tool);
+    openSidebarFullscreen(returnFocusTo);
+  };
+  const handleRequestSidebarFullscreen = () => {
+    openSidebarFullscreen(
+      document.activeElement instanceof HTMLElement ? document.activeElement : null
+    );
+  };
+  const closeSidebarFullscreen = () => setFullscreenSidebarWorkspaceId(null);
+  // Layer 1: the full-screen sidebar is drawn above the narrow-screen drawer (layer 0), so it
+  // answers Escape first when both are open.
+  useEscapeToDismiss(sidebarFullscreen, closeSidebarFullscreen, 1);
+  // After RightSidebar lifts `inert` from the rest of the page (effect cleanups run before
+  // effects), so the element can take focus again.
+  useEffect(() => {
+    if (sidebarFullscreen) return;
+    const target = fullscreenReturnFocusRef.current;
+    fullscreenReturnFocusRef.current = null;
+    if (target?.isConnected) target.focus();
+  }, [sidebarFullscreen]);
+  // The tools the sidebar's New tab launcher offers (RightSidebar loads their availability),
+  // relayed to the workspace menu. An unchanged list keeps the old state, so the chat pane does
+  // not re-render.
+  const [sidebarTools, setSidebarTools] = useState<{
+    workspaceId: string;
+    tools: readonly SidebarMenuItem[];
+  } | null>(null);
+  const handleLauncherToolsChange = (tools: readonly SidebarMenuItem[]) => {
+    const workspaceId = props.workspaceId;
+    setSidebarTools((prev) =>
+      prev?.workspaceId === workspaceId &&
+      prev.tools.length === tools.length &&
+      prev.tools.every((tool, index) => tool === tools[index])
+        ? prev
+        : { workspaceId, tools }
+    );
+  };
   const backgroundBashError = useBackgroundBashError();
 
   const shouldKeepChatPaneMountedDuringHydration =
@@ -259,6 +324,11 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
         runtimeConfig={props.runtimeConfig}
         onOpenTerminal={handleOpenTerminal}
         immersiveHidden={isReviewImmersive}
+        sidebarTools={
+          sidebarTools?.workspaceId === props.workspaceId ? sidebarTools.tools : undefined
+        }
+        onOpenSidebarTool={handleOpenSidebarTool}
+        sidebarFullscreen={sidebarFullscreen}
       />
 
       <RightSidebar
@@ -273,6 +343,11 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
         isCreating={props.isInitializing === true}
         immersiveHidden={isReviewImmersive}
         addTerminalRef={addTerminalRef}
+        fullscreen={sidebarFullscreen}
+        onCloseFullscreen={closeSidebarFullscreen}
+        onRequestFullscreen={handleRequestSidebarFullscreen}
+        openToolRef={openSidebarToolRef}
+        onLauncherToolsChange={handleLauncherToolsChange}
       />
 
       {/* Portal target for immersive review mode overlay */}

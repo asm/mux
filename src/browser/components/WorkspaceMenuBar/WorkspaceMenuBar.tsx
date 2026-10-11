@@ -74,6 +74,7 @@ import { StatsDialog } from "@/browser/features/RightSidebar/StatsDialog";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { focusRightSidebarTab } from "@/browser/utils/rightSidebarTabFocus";
 import type { TabType } from "@/browser/types/rightSidebar";
+import type { SidebarMenuItem } from "@/browser/features/RightSidebar/Tabs/tabConfig";
 import { useAgentSkills } from "@/browser/stores/AgentSkillsStore";
 
 interface WorkspaceMenuBarProps {
@@ -88,7 +89,25 @@ interface WorkspaceMenuBarProps {
   onToggleLeftSidebarCollapsed: () => void;
   /** Callback to open integrated terminal in sidebar (optional, falls back to popout) */
   onOpenTerminal?: (options?: TerminalSessionCreateOptions) => void;
+  /**
+   * Phones: the hidden right sidebar's tools (its New tab launcher's list). While the sidebar is
+   * hidden, the More menu lists them and opens them in the sidebar shown full-screen.
+   */
+  sidebarTools?: readonly SidebarMenuItem[];
+  onOpenSidebarTool?: (item: SidebarMenuItem, returnFocusTo: HTMLElement | null) => void;
+  /** The full-screen sidebar is open: its visibility changed without a resize. */
+  sidebarFullscreen?: boolean;
 }
+
+/**
+ * Tools that keep their own dialog or header button while the sidebar is hidden (Stats,
+ * Timeline, Artifacts), so the menu's sidebar-tool rows leave them out.
+ */
+const TOOLS_WITH_HIDDEN_SIDEBAR_DIALOGS: ReadonlySet<SidebarMenuItem> = new Set([
+  "costs",
+  "timeline",
+  "artifacts",
+]);
 
 import { useArchiveWorkspaceConfirmation } from "@/browser/hooks/useArchiveWorkspaceConfirmation";
 
@@ -171,6 +190,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   leftSidebarCollapsed,
   onToggleLeftSidebarCollapsed,
   onOpenTerminal,
+  sidebarTools,
+  onOpenSidebarTool,
+  sidebarFullscreen = false,
 }) => {
   const { api } = useAPI();
   const { preflightArchiveWorkspace, archiveWorkspace, archivingWorkspaceIds, setWorkspacePinned } =
@@ -326,7 +348,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       mql.removeEventListener("change", compute);
       resizeObserver?.disconnect();
     };
-  }, [isTimelineSidebarHidden]);
+    // sidebarFullscreen: opening or closing the full-screen sidebar changes its visibility
+    // without resizing the shell, so re-read it then too.
+  }, [isTimelineSidebarHidden, sidebarFullscreen]);
 
   // The dialog is the only timeline entry point while the sidebar is hidden, and every
   // operation needs a keyboard shortcut. Evaluated at keydown time so the gate tracks
@@ -687,8 +711,10 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         align="end"
         sideOffset={6}
         // Size to the widest row ("Messages from other workspaces" + shortcut
-        // overflowed a fixed 240px), but never wider than the viewport.
-        className="w-max max-w-[calc(100vw-1rem)] !min-w-[240px] p-1"
+        // overflowed a fixed 240px), but never wider than the viewport. On phones the sidebar
+        // tool rows make it taller than a short screen, so it scrolls within the room below
+        // the button instead of hiding its last actions.
+        className="max-h-(--radix-popover-content-available-height) w-max max-w-[calc(100vw-1rem)] !min-w-[240px] overflow-y-auto p-1"
         onClick={(event: React.MouseEvent<HTMLDivElement>) => {
           event.stopPropagation();
         }}
@@ -706,6 +732,16 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           }
           onOpenTimeline={
             timelineSidebarHidden ? () => setTimelineDialogWorkspaceId(workspaceId) : null
+          }
+          sidebarTools={
+            timelineSidebarHidden && onOpenSidebarTool != null
+              ? (sidebarTools ?? []).filter((tool) => !TOOLS_WITH_HIDDEN_SIDEBAR_DIALOGS.has(tool))
+              : null
+          }
+          onOpenSidebarTool={
+            onOpenSidebarTool != null
+              ? (tool) => onOpenSidebarTool(tool, moreActionsButtonRef.current)
+              : null
           }
           // Touch phones show Stats and Artifacts in the header row instead (see below).
           onOpenStats={
