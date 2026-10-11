@@ -139,6 +139,19 @@ const usd = (nanoUsd: number) => `$${(nanoUsd / 1e9).toFixed(4)}`;
 /** The text of an unreachable upstream. The host only: the base URL's path can hold a token. */
 export const cannotReach = (job: ModelJob) =>
   `cannot reach ANTHROPIC_BASE_URL (${new URL(job.upstream.baseUrl).host})`;
+/**
+ * The text of a probe that the upstream answered 401 or 403: the key is rejected. No explorer
+ * can work with it, and every later call would keep its full reservation, so both callers refuse.
+ */
+export function keyRejected(job: ModelJob, status: number, records: object[]) {
+  // The upstream's own status from the call record too: a 401 with an HTML or empty body (a
+  // gateway's) makes the probe's response unreadable, and probeApp then reports 502.
+  const upstream = records.map((r) => (r as { status?: unknown }).status);
+  const rejected = [status, ...upstream].find((s) => s === 401 || s === 403);
+  return rejected == null
+    ? undefined
+    : `ANTHROPIC_API_KEY rejected by ${new URL(job.upstream.baseUrl).host} (HTTP ${rejected}): check the key`;
+}
 /** Whether the proxy released a probe call because it could not connect (proxy.ts). */
 export const probeUnreachable = (records: object[]) =>
   records.some((r) => (r as { reason?: unknown }).reason === UNREACHABLE);
@@ -557,7 +570,8 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
         throw new Refusal(
           probeUnreachable(probe.records)
             ? `${cannotReach(driven)}: check the URL and the network`
-            : `the ${driven.model} probe failed (HTTP ${probe.status}): check ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL and BUGBASH_BUDGET_USD`
+            : (keyRejected(driven, probe.status, probe.records) ??
+                `the ${driven.model} probe failed (HTTP ${probe.status}): check ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL and BUGBASH_BUDGET_USD`)
         );
       log(`${name} probe: ${driven.model} answered`);
     }
