@@ -139,7 +139,7 @@ function lock(inputsKey: string, digest = DIGEST) {
 function fake(over: Record<string, string> = {}) {
   const vars = {
     HOST: "unix:///var/run/docker.sock",
-    INFO: '{"OSType":"linux","OperatingSystem":"Ubuntu 22.04","SecurityOptions":["name=seccomp"]}',
+    INFO: '{"OSType":"linux","OperatingSystem":"Ubuntu 22.04","Architecture":"x86_64","SecurityOptions":["name=seccomp"]}',
     IMAGES_RC: "0",
     IMAGES: "",
     PULL: "ok",
@@ -236,6 +236,23 @@ test.each([
   expect(await failure(session().ensureImage())).toThrow(message);
   await Bun.sleep(50);
   expect(calls()).not.toContain("pull");
+});
+
+// U6: the published image is linux/amd64 only (build.sh), so another daemon architecture
+// refuses before any image command; amd64 (x86_64 in `docker info`, the fake's default) pulls.
+test("U6: an arm64 daemon refuses before the pull, naming the fix", async () => {
+  fake({ INFO: '{"OSType":"linux","OperatingSystem":"Ubuntu 22.04","Architecture":"aarch64"}' });
+  const error = await failure(session().ensureImage());
+  expect(error).toThrow(/linux\/amd64/);
+  expect(error).toThrow(/aarch64/);
+  expect(error).toThrow(/use an amd64 host/);
+  expect(calls()).not.toMatch(/^(images|pull)/m);
+});
+
+test("U6: an amd64 daemon pulls the image", async () => {
+  fake();
+  expect(await session().ensureImage()).toBe(REF);
+  expect(calls()).toContain("pull");
 });
 
 const JOB = { name: "xbb-1", owner: "boot:pid", checkout: "abc" };
