@@ -427,6 +427,24 @@ type ResolvedSendMessageOptions = SendMessageOptions & {
   autoModelRoutingRecord?: AutoModelRoutingRecord;
 };
 
+/** Auto-retry abandon reason when the retried turn's goal no longer runs. */
+const GOAL_INACTIVE_RETRY_REASON = "goal_inactive";
+
+/**
+ * Whether a scheduled retry of a goal turn may still resend it: its goal is the current one and
+ * is in the status that turn kind runs in (a continuation needs an active goal, a budget wrap-up
+ * a budget-limited one). A retry without a goal id fails closed: it cannot prove which goal it
+ * belongs to, so a replacement goal could run the old goal's prompt.
+ */
+function isRetriedGoalStillRunning(
+  goal: Pick<GoalRecordV1, "goalId" | "status"> | null,
+  goalKind: GoalSyntheticMessageKind,
+  goalId: string | undefined
+): boolean {
+  if (goal == null || goalId == null || goal.goalId !== goalId) return false;
+  return goal.status === (goalKind === GOAL_BUDGET_LIMIT_KIND ? "budget_limited" : "active");
+}
+
 /** A heartbeat's own row: its turn, or the compaction that a compact heartbeat runs first. */
 function isHeartbeatTriggerMetadata(muxMetadata: MuxMessageMetadata | undefined): boolean {
   return (
@@ -2136,6 +2154,19 @@ export class AgentSession {
     return undefined;
   }
 
+  /**
+   * Cancel a scheduled auto-retry of this goal's automatic turn, so pausing or completing the
+   * goal clears the retry countdown at once instead of at the next backoff fire. A retry whose
+   * resend already started is left to finish, like any live goal turn.
+   */
+  abandonGoalAutoRetry(goalId: string): void {
+    assert(goalId.length > 0, "abandonGoalAutoRetry requires goalId");
+    if (!this.retryManager.isRetryPending) return;
+    const request = this.lastAutoRetryResumeRequest;
+    if (request?.goalKind == null || request.goalId !== goalId) return;
+    this.retryManager.abandon(GOAL_INACTIVE_RETRY_REASON);
+  }
+
   private async retryActiveStream(
     isCurrent = this.retryManager.captureGeneration(),
     signal?: AbortSignal
@@ -2152,6 +2183,33 @@ export class AgentSession {
     if (this.isWorkspaceArchivedOnDisk()) {
       this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "workspace_archived" });
       return;
+    }
+
+    // A retried goal turn resends that goal's prompt. Drop it once the goal stopped running
+    // (paused, completed, cleared or replaced during the backoff): the retry would otherwise
+    // keep the goal's loop going after the user ended it.
+    // Without a goal service the goal's state is unknown: keep retrying as before.
+    const goalService = this.workspaceGoalService;
+    if (request.goalKind != null && goalService != null) {
+      let goal: GoalRecordV1 | null;
+      try {
+        goal = await goalService.getGoal(this.workspaceId);
+      } catch (error) {
+        // A local read failure says nothing about the goal: keep the retry, checked again next time.
+        if (this.coordinator.closing || !isCurrent()) return;
+        await this.handleStreamFailureForAutoRetry(
+          { type: "unknown", message: `goal_read_failed: ${getErrorMessage(error)}` },
+          isCurrent
+        );
+        return;
+      }
+      if (this.coordinator.closing || !isCurrent()) return;
+      if (!isRetriedGoalStillRunning(goal, request.goalKind, request.goalId)) {
+        // Retire through the manager: it also resets the attempt count, so the next goal's
+        // first failure does not inherit this goal's backoff.
+        this.retryManager.abandon(GOAL_INACTIVE_RETRY_REASON);
+        return;
+      }
     }
 
     const result = await this.resumeStream(request.options, {
