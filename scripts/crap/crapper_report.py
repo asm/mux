@@ -47,6 +47,9 @@ from crapper.crap import make_entry
 from crapper.discover import is_test_file, language_of
 from crapper.languages import functions_in_file
 
+# Crapper's own module-name rule (src/a/b.ts -> a.b), private at the pinned SHA.
+from crapper.languages.typescript import _module_namespace as module_namespace
+
 # Code under src/ that never ships. Mirrors isProductionSource() in
 # scripts/check-test-seam-comments.ts (keep the two in step), plus bench files.
 # Crapper's is_test_file() also skips test/, tests/, spec/ and *.test.* files.
@@ -150,23 +153,32 @@ def load_coverage(lcov: list[Path], root: Path, files: list[str]) -> CoverageBun
     return bundle
 
 
-def score(root: Path, files: list[str], bundle: CoverageBundle | None) -> list[dict]:
+def score(
+    root: Path, files: list[str], bundle: CoverageBundle | None, renames: dict[str, str]
+) -> list[dict]:
     rows: list[dict] = []
     for relative in files:
         source = (root / relative).read_text(encoding="utf-8", errors="replace")
         language = language_of(relative)
         assert language is not None, relative
+        # A renamed file is parsed (grammar), filtered and matched to coverage at
+        # its own path, but named after its new path and module, so its functions
+        # keep their identity.
+        shown = renames.get(relative, relative)
+        old_module = module_namespace(relative, str(root))
+        new_module = module_namespace(shown, str(root))
         for function in functions_in_file(language, source, relative, str(root)):
             percent = None
             if bundle is not None:
                 found = bundle.percent_for(function)
                 percent = 0.0 if found is None else found
             entry = make_entry(function, percent)
+            assert entry.namespace.startswith(old_module), (entry.namespace, old_module)
             rows.append(
                 {
-                    "path": relative,
+                    "path": shown,
                     "name": entry.name,
-                    "namespace": entry.namespace,
+                    "namespace": new_module + entry.namespace[len(old_module) :],
                     "startLine": function.start_line,
                     "endLine": function.end_line,
                     "complexity": entry.complexity,
@@ -197,13 +209,21 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--root", type=Path, default=Path("."))
     parser.add_argument("--lcov", type=Path, action="append", default=[])
     parser.add_argument("--top", type=int, default=0, help="also print the worst N to stderr")
+    parser.add_argument(
+        "--rename",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("FILE", "AS"),
+        help="score FILE but report its functions under the path AS",
+    )
     parser.add_argument("files", nargs="*")
     args = parser.parse_args(argv)
     root = args.root.resolve()
     candidates = [normalize(path) for path in args.files] or tracked_src_files(root)
     # A raw changed-file list can name deleted files: there is nothing to score.
     files = sorted({path for path in candidates if is_production(path) and (root / path).is_file()})
-    rows = score(root, files, load_coverage(args.lcov, root, files))
+    rows = score(root, files, load_coverage(args.lcov, root, files), dict(args.rename))
     json.dump(rows, sys.stdout)
     sys.stdout.write("\n")
     if args.top > 0:
