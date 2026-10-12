@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef } from "react";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import { ARTIFACT_ASSET_LIMITS, type ArtifactAssetReader } from "./artifactAssets";
 
 async function readArtifactAsset(api: APIClient, workspaceId: string, path: string) {
@@ -11,6 +12,44 @@ async function readArtifactAsset(api: APIClient, workspaceId: string, path: stri
     maxBytes: ARTIFACT_ASSET_LIMITS.maxAssetBytes,
   });
   return result.success ? result.data : null;
+}
+
+/** The hook's view of the connection: the current client, and reads waiting for one. */
+interface ReaderConnection {
+  api: APIClient | null;
+  waiters: Array<() => void>;
+}
+
+/** The connected client, other than `previous` (the client a cut-off read used). */
+function nextClient(connection: ReaderConnection, previous: APIClient | null): Promise<APIClient> {
+  return connection.api != null && connection.api !== previous
+    ? Promise.resolve(connection.api)
+    : new Promise((resolve) =>
+        connection.waiters.push(() => resolve(nextClient(connection, previous)))
+      );
+}
+
+function createConnectedReader(
+  connection: ReaderConnection,
+  workspaceId: string
+): ArtifactAssetReader {
+  return async (path: string) => {
+    let previous: APIClient | null = null;
+    for (;;) {
+      const client = await nextClient(connection, previous);
+      try {
+        return await readArtifactAsset(client, workspaceId, path);
+      } catch (error) {
+        // Only a read the connection drop cut off is retried, once a new client is there. The
+        // socket close rejects it as an abort before React publishes `api: null`, so the client
+        // may still look current; the reader passes no signal, so no other abort reaches here.
+        // Waiting for a different client keeps a closed socket's instant rejections from
+        // looping.
+        if (connection.api === client && !isAbortError(error)) throw error;
+        previous = client;
+      }
+    }
+  };
 }
 
 /**
@@ -33,10 +72,7 @@ async function readArtifactAsset(api: APIClient, workspaceId: string, path: stri
  */
 export function useArtifactAssetReader(workspaceId: string | null): ArtifactAssetReader | null {
   const { api } = useAPI();
-  const connectionRef = useRef<{ api: APIClient | null; waiters: Array<() => void> }>({
-    api,
-    waiters: [],
-  });
+  const connectionRef = useRef<ReaderConnection>({ api, waiters: [] });
   useEffect(() => {
     const connection = connectionRef.current;
     connection.api = api;
@@ -45,23 +81,8 @@ export function useArtifactAssetReader(workspaceId: string | null): ArtifactAsse
     connection.waiters = [];
     for (const wake of waiters) wake();
   }, [api]);
-  return useMemo(() => {
-    if (workspaceId == null) return null;
-    const connection = connectionRef.current;
-    const nextClient = (): Promise<APIClient> =>
-      connection.api != null
-        ? Promise.resolve(connection.api)
-        : new Promise((resolve) => connection.waiters.push(() => resolve(nextClient())));
-    return async (path: string) => {
-      for (;;) {
-        const client = await nextClient();
-        try {
-          return await readArtifactAsset(client, workspaceId, path);
-        } catch (error) {
-          // Only a read the connection drop cut off is retried; each retry needs a new client.
-          if (connection.api === client) throw error;
-        }
-      }
-    };
-  }, [workspaceId]);
+  return useMemo(
+    () => (workspaceId == null ? null : createConnectedReader(connectionRef.current, workspaceId)),
+    [workspaceId]
+  );
 }
