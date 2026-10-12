@@ -81,6 +81,8 @@ import {
 } from "@/common/types/stream";
 import { MapStore } from "./MapStore";
 import { createDisplayUsage, recomputeUsageCosts } from "@/common/utils/tokens/displayUsage";
+import { getCacheHealth, type TurnCacheHealth } from "@/common/utils/tokens/cacheHealth";
+import { getAssistantMessageModelUsages } from "@/common/utils/tokens/messageModelUsages";
 import { deriveTodoStatus } from "@/common/utils/todoList";
 import { getModelStats } from "@/common/utils/tokens/modelStats";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
@@ -393,7 +395,12 @@ export interface WorkspaceUsageState {
    * it over re-resolving the raw model against a refreshed providers config.
    */
   liveMetadataModel?: string;
+  /** Prompt-cache health of the most recent completed assistant turns, newest first. */
+  recentTurnCacheHealth?: TurnCacheHealth[];
 }
+
+/** Turns shown in the Costs tab's prompt-cache table; bounds work per usage bump. */
+const RECENT_TURN_CACHE_HEALTH_LIMIT = 10;
 
 /**
  * Consumer breakdown requiring tokenization (lazy calculation).
@@ -2951,6 +2958,9 @@ export class WorkspaceStore {
       });
       if (historicalMessages.length > 0) {
         this.lastUserPromptStore.bump(workspaceId);
+        // The per-turn prompt-cache table reads the aggregator's messages: older turns
+        // must show without waiting for an unrelated usage update.
+        this.usageStore.bump(workspaceId);
       }
       return "loaded";
     } catch (error) {
@@ -3380,6 +3390,34 @@ export class WorkspaceStore {
         return undefined;
       })();
 
+      // A turn sums every usage the session ledger charges for its message (its own
+      // usage plus model-backed tool and refused-attempt usage), so a turn's rewrite
+      // cost matches its share of the session cost.
+      const recentTurnCacheHealth: TurnCacheHealth[] = [];
+      for (
+        let i = messages.length - 1;
+        i >= 0 && recentTurnCacheHealth.length < RECENT_TURN_CACHE_HEALTH_LIMIT;
+        i--
+      ) {
+        const msg = messages[i];
+        // Compaction summaries keep `usage` but CompactionHandler strips their
+        // providerMetadata (cache-write counts included), so their cache health is unknown.
+        if (msg.role !== "assistant" || msg.metadata?.compacted) continue;
+        const turnUsage = sumUsageHistory(
+          // No fallback to the current model: a row without a record-time model stays
+          // "unknown" (rewrite cost "-"), as in SessionUsageService's history rebuild.
+          getAssistantMessageModelUsages(msg.metadata, {
+            resolveMetadataModel: (msgModel) => this.resolveMetadataModel(msgModel),
+          }).map((entry) => entry.usage)
+        );
+        if (!turnUsage) continue;
+        recentTurnCacheHealth.push({
+          messageId: msg.id,
+          timestamp: msg.metadata?.timestamp,
+          ...getCacheHealth(turnUsage),
+        });
+      }
+
       // Live streaming data (unchanged)
       const activeStreamId = aggregator.getActiveStreamMessageId();
       // Request-pinned identity stamped by the backend at stream start: a
@@ -3428,6 +3466,7 @@ export class WorkspaceStore {
         liveUsage,
         liveCostUsage,
         liveMetadataModel,
+        recentTurnCacheHealth,
       };
     });
   }
