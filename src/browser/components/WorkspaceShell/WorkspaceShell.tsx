@@ -1,6 +1,7 @@
 import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "@/common/lib/utils";
+import { Button } from "../Button/Button";
 import { LazyFeature } from "../LazyFeature/LazyFeature";
 import {
   LEFT_SIDEBAR_WIDTH_KEY,
@@ -11,8 +12,13 @@ import {
 import { useResizableSidebar } from "@/browser/hooks/useResizableSidebar";
 import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { useOpenTerminal } from "@/browser/hooks/useOpenTerminal";
-import { usePersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { RightSidebar } from "@/browser/features/RightSidebar/RightSidebar";
+import {
+  readPersistedState,
+  updatePersistedState,
+  usePersistedState,
+} from "@/browser/hooks/usePersistedState";
+import { guardCloseTab, holdSidebarInput, type HeldSidebarInput } from "./deferredSidebarInput";
+import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
@@ -87,6 +93,95 @@ interface WorkspaceShellProps {
 const LoadingAnimation = React.lazy(() =>
   import("../LoadingAnimation/LoadingAnimation").then((m) => ({ default: m.LoadingAnimation }))
 );
+
+// T3 #5971: the right sidebar and its panels are off the first load.
+const RightSidebar = React.lazy(async () => ({
+  default: (await import("@/browser/features/RightSidebar/RightSidebar")).RightSidebar,
+}));
+
+/**
+ * While the sidebar chunk loads: hold its input. Once it has mounted: replay that input. After it
+ * failed: only keep Cmd/Ctrl+W from closing the window (the held input is never replayed).
+ */
+function SidebarInput(props: { held: HeldSidebarInput[]; mode: "hold" | "replay" | "failed" }) {
+  useEffect(() => {
+    if (props.mode === "failed") return guardCloseTab();
+    if (props.mode === "hold") return holdSidebarInput(props.held);
+    // An effect of RightSidebar's next sibling, so it runs after RightSidebar's own listeners exist.
+    for (const replay of props.held.splice(0)) replay();
+  }, [props.held, props.mode]);
+  return null;
+}
+
+/**
+ * The full-screen sidebar's Close button while its chunk loads or after it fails (phones, where
+ * Escape is rarely at hand). Like RightSidebar's full-screen view, it makes the covered workspace
+ * inert and moves focus in.
+ */
+function FullscreenSidebarClose(props: { onClose?: () => void }) {
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const button = buttonRef.current;
+    const view = button?.closest<HTMLElement>(".right-sidebar-fullscreen");
+    if (button == null || view == null) return;
+    const restoreOthers = makeOthersInert(view);
+    button.focus();
+    return restoreOthers;
+  }, []);
+  return (
+    <Button ref={buttonRef} variant="outline" size="sm" onClick={props.onClose}>
+      Close
+    </Button>
+  );
+}
+
+/**
+ * RightSidebar, keeping its box (collapsed: its 20 px rail) while its chunk loads or after it fails.
+ * Under immersive review the box covers the workspace above the (still empty) review overlay, so the
+ * loading and failure states stay visible.
+ */
+function LazyRightSidebar(
+  props: React.ComponentProps<typeof RightSidebar> & { held: HeldSidebarInput[] }
+) {
+  const { held, ...sidebarProps } = props;
+  const collapsed = readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+  // The failure state takes the expanded width even when collapsed: the 20 px rail would clip its
+  // Reload button, and the rail's expand control is part of the sidebar that failed to load.
+  const frame = (state: React.ReactNode, kind: "loading" | "failed") => (
+    <div
+      className={cn(
+        "bg-surface-primary flex flex-col overflow-hidden",
+        props.immersiveHidden
+          ? "absolute inset-0 z-[51] items-center justify-center gap-3"
+          : "border-l border-border-light flex-shrink-0 mobile-hide-right-sidebar",
+        props.fullscreen && "right-sidebar-fullscreen items-center justify-center gap-3"
+      )}
+      style={
+        props.immersiveHidden
+          ? undefined
+          : { width: collapsed && kind === "loading" ? 20 : props.width, maxWidth: "100%" }
+      }
+    >
+      {state}
+      {kind === "failed" && <SidebarInput held={held} mode="failed" />}
+      {props.fullscreen && <FullscreenSidebarClose onClose={props.onCloseFullscreen} />}
+    </div>
+  );
+  const pending = (
+    <>
+      <SidebarInput held={held} mode="hold" />
+      {(props.fullscreen === true || props.immersiveHidden === true) && (
+        <span role="status">Loading sidebar...</span>
+      )}
+    </>
+  );
+  return (
+    <LazyFeature name="Sidebar" frame={frame} fallback={pending}>
+      <RightSidebar {...sidebarProps} />
+      <SidebarInput held={held} mode="replay" />
+    </LazyFeature>
+  );
+}
 
 const WorkspacePlaceholder: React.FC<{
   title: string;
@@ -173,6 +268,16 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
 
   const { width: sidebarWidth, isResizing, startResize } = sidebar;
   const addTerminalRef = useRef<((options?: TerminalSessionCreateOptions) => void) | null>(null);
+  // Input held while the sidebar chunk loads belongs to its workspace: a switch drops it (render-time
+  // reset), so a queued terminal never runs its command in the next workspace.
+  const [held, setHeld] = useState(() => ({
+    workspaceId: props.workspaceId,
+    inputs: [] as HeldSidebarInput[],
+  }));
+  if (held.workspaceId !== props.workspaceId) {
+    setHeld({ workspaceId: props.workspaceId, inputs: [] });
+  }
+  const heldSidebarInput = held.inputs;
   const openTerminalPopout = useOpenTerminal();
   const handleOpenTerminal = useCallback(
     (options?: TerminalSessionCreateOptions) => {
@@ -181,11 +286,13 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
       // sidebar itself rather than a touch-only media query.
       if (isWorkspaceRightSidebarHidden(shellRef.current)) {
         void openTerminalPopout(props.workspaceId, props.runtimeConfig, options);
+      } else if (addTerminalRef.current) {
+        addTerminalRef.current(options);
       } else {
-        addTerminalRef.current?.(options);
+        heldSidebarInput.push(() => addTerminalRef.current?.(options)); // sidebar chunk still loading
       }
     },
-    [openTerminalPopout, props.workspaceId, props.runtimeConfig]
+    [openTerminalPopout, props.workspaceId, props.runtimeConfig, heldSidebarInput]
   );
 
   const reviews = useReviews(props.workspaceId);
@@ -322,7 +429,8 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
         sidebarFullscreen={sidebarFullscreen}
       />
 
-      <RightSidebar
+      <LazyRightSidebar
+        held={heldSidebarInput}
         key={props.workspaceId}
         workspaceId={props.workspaceId}
         workspacePath={props.namedWorkspacePath}
