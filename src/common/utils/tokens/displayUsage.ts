@@ -246,8 +246,7 @@ export function createDisplayUsage(
  * persisted session cost aggregates without discarding the raw token counts.
  *
  * Pass `{ aggregatedUsage: true }` for buckets like session `byModel` totals that may span
- * many requests. Tiered pricing is non-linear, so those aggregates cannot be safely repriced
- * from summed tokens alone.
+ * many requests. Tiered pricing is non-linear, so those aggregates keep their recorded costs.
  */
 export function recomputeUsageCosts(
   usage: ChatUsageDisplay,
@@ -272,19 +271,16 @@ export function recomputeUsageCosts(
     };
   }
 
-  // A sum across service tiers cannot be split back into per-tier tokens (#4787).
+  // A sum cannot be split back into per-request tiers: neither service tiers (#4787) nor
+  // context-window tiers, where pricing the summed prompt would bill every request at the
+  // long-context rate. Each request was priced at its own tiers when recorded, so keep those
+  // costs. They are known, not "unknown": that warning is reserved for unpriced models, and
+  // flagging tiered sums showed it for every session that used Haiku 5.5.
   if (
     serviceTier === "mixed" ||
     (options?.aggregatedUsage === true && hasTieredPricing(modelStats))
   ) {
-    // Aggregated `byModel` totals collapse many requests into one bucket. Tiered pricing is
-    // non-linear, so choosing a single tier from the sum can inflate costs once multiple
-    // sub-threshold requests add up past the long-context boundary. Preserve the stored costs
-    // and surface uncertainty instead of fabricating a repriced total.
-    return {
-      ...usage,
-      hasUnknownCosts: true,
-    };
+    return usage;
   }
 
   const pricedStats =
