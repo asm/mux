@@ -128,7 +128,7 @@ describe("loadPluginMcpServers", () => {
     expect(values.map((s) => s.transport).sort()).toEqual(["http", "sse"]);
   });
 
-  test("accepts entry extensions; OAuth settings Xum cannot use yet load with one warning", async () => {
+  test("accepts entry extensions, maps usable OAuth settings and names the rest once", async () => {
     using tmp = new DisposableTempDir("plugin-mcp");
     const plugin = await makePlugin(
       tmp.path,
@@ -169,8 +169,13 @@ describe("loadPluginMcpServers", () => {
       /'provided'.*authorizationUrl' must be an https \(or loopback http\) URL/
     );
     expect(messages[1]).toMatch(
-      /'provided'.*ignores: client\.mode: provided, client\.clientId, tokenUrl, baseScopes$/
+      /'provided'.*ignores: tokenUrl \(discovery supplies the endpoints\)$/
     );
+    const provided = Object.values(servers).find((s) => s.plugin?.serverName === "provided");
+    expect(provided?.transport === "http" && provided.oauth).toEqual({
+      clientId: "docs-client",
+      baseScopes: ["docs:read"],
+    });
   });
 
   test("maps the Codex .mcp.json dialect and never echoes the client secret", async () => {
@@ -200,15 +205,23 @@ describe("loadPluginMcpServers", () => {
     try {
       const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
-      expect(Object.values(servers).map((s) => s.transport)).toEqual(["http", "http"]);
-      const messages = diagnostics.map((d) => d.message);
-      expect(messages).toHaveLength(2);
-      // Messages name the real file, not mcp.json.
-      expect(messages.every((message) => message.startsWith(".mcp.json server '"))).toBe(true);
-      expect(messages[0]).toMatch(/'notion'.*ignores: resource$/);
-      expect(messages[1]).toMatch(
-        /'github'.*ignores: oauth\.client_secret, oauth\.callback_port, client\.mode: provided, client\.clientId$/
-      );
+      const infos = Object.values(servers);
+      expect(infos.map((s) => (s.transport === "http" ? s.oauth : s))).toEqual([
+        { resource: "https://mcp.notion.com" },
+        {
+          clientId: "Iv23li",
+          // Only where to re-read it: the value stays in the consented file.
+          clientSecretSource: {
+            pluginRoot: plugin.rootPath,
+            mcpConfigPath: plugin.mcpConfigPath!,
+            serverName: "github",
+          },
+        },
+      ]);
+      expect(diagnostics.map((d) => d.message)).toEqual([
+        // The real file name, not mcp.json.
+        ".mcp.json server 'github': Xum's MCP OAuth ignores: oauth.callback_port",
+      ]);
       const everything = JSON.stringify([servers, diagnostics, warn.mock.calls]);
       expect(everything).not.toContain(secret);
     } finally {
@@ -309,7 +322,7 @@ describe("loadPluginMcpServers", () => {
     using tmp = new DisposableTempDir("plugin-mcp");
 
     const cases: Array<{ doc: unknown; messagePart: string }> = [
-      { doc: "{ not json", messagePart: "not valid JSON" },
+      { doc: "{ not json", messagePart: "could not be parsed" },
       { doc: [1, 2], messagePart: "must be a JSON object" },
       {
         doc: { $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0, mcpServers: {}, extra: 1 },
@@ -333,6 +346,28 @@ describe("loadPluginMcpServers", () => {
       expect(diagnostics).toHaveLength(1);
       expect(diagnostics[0].severity).toBe("error");
       expect(diagnostics[0].message).toContain(testCase.messagePart);
+    }
+  });
+
+  test("a malformed .mcp.json never reports its secret in a diagnostic or log (#6297)", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    // An unquoted value: the JSON parser quotes it in its error message.
+    const plugin = await makePlugin(
+      tmp.path,
+      "malformed-codex",
+      '{"gh": {"type": "http", "url": "https://x", "oauth": {"client_id": "c", "client_secret": s3cr3tValue}}}',
+      { fileName: ".mcp.json" }
+    );
+    const warn = spyOn(log, "warn");
+    try {
+      const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+      expect(servers).toEqual({});
+      expect(diagnostics.map((d) => d.severity)).toEqual(["error"]);
+      expect(JSON.stringify(diagnostics)).not.toContain("s3cr3tValue");
+      expect(warn).toHaveBeenCalled();
+      expect(JSON.stringify(warn.mock.calls)).not.toContain("s3cr3tValue");
+    } finally {
+      warn.mockRestore();
     }
   });
 

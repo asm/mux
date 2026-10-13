@@ -25,7 +25,12 @@ import {
   readPluginFileWithinRootCapped,
 } from "./discovery";
 import { expandPluginPlaceholders, type PluginPlaceholderValues } from "./expansion";
-import { readOpenAIMcpAuth, translateCodexMcpEntry } from "./openaiMcpAuth";
+import {
+  PLUGIN_MCP_CONFIG_PARSE_ERROR,
+  readOpenAIMcpAuth,
+  toServerOAuthConfig,
+  translateCodexMcpEntry,
+} from "./openaiMcpAuth";
 
 /**
  * Agent Plugins MCP documents become default-disabled, read-only Xum servers.
@@ -587,9 +592,10 @@ export async function loadPluginMcpServers(
   let raw: unknown;
   try {
     raw = JSON.parse(text) as unknown;
-  } catch (error) {
-    // §7.2.2 rule 2: invalid JSON disables MCP for this plugin only.
-    return disableMcp(`${fileLabel} is not valid JSON: ${getErrorMessage(error)}`);
+  } catch {
+    // §7.2.2 rule 2: invalid JSON disables MCP for this plugin only. The parser message is
+    // not reported: it quotes source text, and a Codex `.mcp.json` holds `client_secret` (#6297).
+    return disableMcp(`${fileLabel}: ${PLUGIN_MCP_CONFIG_PARSE_ERROR}`);
   }
 
   if (!isPlainObject(raw)) {
@@ -664,7 +670,7 @@ export async function loadPluginMcpServers(
     }
     const codex = codexDialect
       ? translateCodexMcpEntry(rawEntry)
-      : { entry: rawEntry, ignored: [], warnings: [] };
+      : { entry: rawEntry, ignored: [], warnings: [], hasClientSecret: false };
     const entry = codex.entry;
 
     // §7.2.2 rules 3-4: invalid entries and unknown transports are skipped
@@ -690,15 +696,28 @@ export async function loadPluginMcpServers(
 
     const info = result.info;
     if (info.transport !== "stdio") {
-      // Warnings only: the server still loads with OAuth discovery + DCR.
-      // Messages name fields, never values (see openaiMcpAuth's SECURITY AUDIT).
+      // Unusable settings only warn: the server still loads, and discovery +
+      // DCR cover what the config omits. Messages name fields, never values
+      // (see openaiMcpAuth's SECURITY AUDIT).
       const auth = readOpenAIMcpAuth(entry.extensions);
-      const ignored = [...codex.ignored, ...auth.ignored];
+      const { config: oauth, ignored: unusable } = toServerOAuthConfig(auth.auth, {
+        serverUrl: info.url,
+        ...(codex.hasClientSecret === true
+          ? {
+              clientSecretSource: {
+                pluginRoot: plugin.rootPath,
+                mcpConfigPath: plugin.mcpConfigPath,
+                serverName,
+              },
+            }
+          : {}),
+      });
+      if (oauth !== undefined) info.oauth = oauth;
+      const ignored = [...codex.ignored, ...auth.ignored, ...unusable];
+      if (codex.hasClientSecret === true && oauth?.clientSecretSource === undefined)
+        ignored.push("oauth.client_secret (needs client_id)");
       const messages = [...codex.warnings, ...auth.warnings];
-      if (ignored.length > 0)
-        messages.push(
-          `Xum's MCP OAuth uses discovery and dynamic client registration, so it ignores: ${ignored.join(", ")}`
-        );
+      if (ignored.length > 0) messages.push(`Xum's MCP OAuth ignores: ${ignored.join(", ")}`);
       for (const message of messages) {
         const fullMessage = `${fileLabel} server '${serverName}': ${message}`;
         log.warn(`Agent plugin ${plugin.rootPath}: ${fullMessage}`);
