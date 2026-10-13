@@ -806,6 +806,103 @@ describe("McpOauthService OAuth flows", () => {
     }
   });
 
+  test("logout cancels a sign-in flow already running for that server", async () => {
+    await withAuthServer(async (base) => {
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: { transport: "http", url: `${base}/mcp`, disabled: true, oauth: { clientId: "c" } },
+      });
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "docs",
+        redirectUri: "https://x/cb",
+      });
+      if (!start.success) throw new Error(start.error);
+      await service.logout({ serverUrl: `${base}/mcp/` });
+      expect(await service.waitForServerFlow(start.data.flowId)).toEqual({
+        success: false,
+        error: "Signed out",
+      });
+    });
+  });
+
+  test("a token exchange in flight when the user signs out saves nothing", async () => {
+    let tokenRequested!: () => void;
+    const requested = new Promise<void>((resolve) => (tokenRequested = resolve));
+    let releaseToken!: () => void;
+    const release = new Promise<void>((resolve) => (releaseToken = resolve));
+    const server = createServer((req, res) => {
+      void (async () => {
+        for await (const _chunk of req) {
+          // Drain the body.
+        }
+        if ((req.url ?? "").startsWith("/token")) {
+          tokenRequested();
+          await release;
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ access_token: "late", token_type: "Bearer" }));
+          return;
+        }
+        if ((req.url ?? "").startsWith("/.well-known/oauth-authorization-server")) {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(authServerMetadata(`http://${req.headers.host ?? ""}`)));
+          return;
+        }
+        res.statusCode = (req.url ?? "").startsWith("/mcp") ? 401 : 404;
+        res.end();
+      })();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Failed to bind");
+      const base = `http://127.0.0.1:${address.port}`;
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: {
+          transport: "http",
+          url: `${base}/mcp`,
+          disabled: true,
+          oauth: { clientId: "c" },
+        },
+      });
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "docs",
+        redirectUri: "https://x/cb",
+      });
+      if (!start.success) throw new Error(start.error);
+      // The callback passed its settled check and is waiting on the token endpoint.
+      const exchange = service.handleServerCallbackAndExchange({
+        state: start.data.flowId,
+        code: "the-code",
+        iss: null,
+        error: null,
+      });
+      await requested;
+      await service.logout({ serverUrl: `${base}/mcp` });
+      releaseToken();
+      await exchange;
+      // No tokens at all (hasAuthTokens would also need the deleted client record).
+      expect((await service.getAuthStatus({ serverUrl: `${base}/mcp` })).isLoggedIn).toBe(false);
+      // A flow started after the sign-out saves again.
+      const again = await service.startServerFlow({
+        projectPath,
+        serverName: "docs",
+        redirectUri: "https://x/cb",
+      });
+      if (!again.success) throw new Error(again.error);
+      await service.handleServerCallbackAndExchange({
+        state: again.data.flowId,
+        code: "the-code",
+        iss: null,
+        error: null,
+      });
+      expect(await service.hasAuthTokens({ serverUrl: `${base}/mcp` })).toBe(true);
+    } finally {
+      releaseToken();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   test("a registered client's token endpoint auth method survives a restart", async () => {
     const serverUrl = "https://example.com/mcp";
     await fs.writeFile(

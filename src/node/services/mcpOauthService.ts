@@ -135,6 +135,8 @@ interface OAuthFlowBase {
   resultPromise: Promise<Result<void, string>>;
   resolveResult: (result: Result<void, string>) => void;
   settled: boolean;
+  /** The server key's sign-out generation when the flow started (see signOutGenerations). */
+  signOutGeneration: number;
 }
 
 interface DesktopFlow extends OAuthFlowBase {
@@ -990,11 +992,49 @@ export class McpOauthService {
     };
   }
 
+  /**
+   * Sign-outs per credential key. Settling a flow does not stop a token exchange already in
+   * flight, so each flow remembers the generation it started under, and its saves are dropped
+   * (inside the store lock) once a sign-out bumped it.
+   */
+  private readonly signOutGenerations = new Map<string, number>();
+
+  private signOutGeneration(serverUrlForStoreKey: string): number {
+    return this.signOutGenerations.get(serverUrlForStoreKey) ?? 0;
+  }
+
+  /** True (and logged) when a sign-out happened after the flow started. */
+  private isStaleFlowSave(serverUrl: string, flowGeneration: number | undefined): boolean {
+    if (flowGeneration === undefined || flowGeneration === this.signOutGeneration(serverUrl))
+      return false;
+    log.info("[MCP OAuth] Dropping credentials of a flow started before a sign-out", { serverUrl });
+    return true;
+  }
+
+  /** The credential-store key of a server URL (null for an invalid URL). */
+  credentialKey(serverUrl: string): string | null {
+    return normalizeServerUrlForComparison(serverUrl);
+  }
+
   async logout(input: { serverUrl: string }): Promise<Result<void, string>> {
     const normalizedServerUrl = normalizeServerUrlForComparison(input.serverUrl);
     if (!normalizedServerUrl) {
       return Ok(undefined);
     }
+    // Before any await: an exchange already past its settled check must not save either.
+    this.signOutGenerations.set(
+      normalizedServerUrl,
+      this.signOutGeneration(normalizedServerUrl) + 1
+    );
+    // A flow started before the sign-out must not save its credentials back.
+    await Promise.all([
+      ...[...this.desktopFlows]
+        .filter(([, flow]) => flow.serverUrlForStoreKey === normalizedServerUrl)
+        .map(([id]) => this.finishDesktopFlow(id, Err("Signed out"))),
+      ...[...this.serverFlows]
+        .filter(([, flow]) => flow.serverUrlForStoreKey === normalizedServerUrl)
+        .map(([id]) => this.finishServerFlow(id, Err("Signed out"))),
+    ]);
 
     try {
       await this.storeLock.withLock(this.storeFilePath, async () => {
@@ -1248,6 +1288,7 @@ export class McpOauthService {
       resultPromise,
       resolveResult,
       settled: false,
+      signOutGeneration: this.signOutGeneration(serverUrlForStoreKey),
     };
 
     this.desktopFlows.set(flowId, flow);
@@ -1395,6 +1436,7 @@ export class McpOauthService {
       resultPromise,
       resolveResult,
       settled: false,
+      signOutGeneration: this.signOutGeneration(serverUrlForStoreKey),
     };
 
     this.serverFlows.set(flowId, flow);
@@ -1569,6 +1611,7 @@ export class McpOauthService {
           // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
           tokens: tokens as unknown as MCPOAuthTokens,
           legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
+          flowGeneration: flow.signOutGeneration,
           clientId: flow.clientInformation?.client_id ?? flow.plugin?.config.clientId,
         });
       },
@@ -1639,6 +1682,7 @@ export class McpOauthService {
           serverUrl: flow.serverUrlForStoreKey,
           clientInformation: withoutPluginSecret(next, flow.plugin?.config),
           legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
+          flowGeneration: flow.signOutGeneration,
         });
       },
       state: () => Promise.resolve(flow.flowId),
@@ -2011,10 +2055,13 @@ export class McpOauthService {
     serverUrl: string;
     tokens: MCPOAuthTokens;
     legacyBinding?: AuthorizationServerBinding;
+    /** An interactive flow's sign-out generation; the save is dropped when it is stale. */
+    flowGeneration?: number;
     /** The client the tokens were issued to (the flow's or the refresh's). */
     clientId?: string;
   }): Promise<void> {
     await this.storeLock.withLock(this.storeFilePath, async () => {
+      if (this.isStaleFlowSave(input.serverUrl, input.flowGeneration)) return;
       const store = await this.ensureStoreLoadedLocked();
       // Two plugin servers can share an MCP URL with different clients, and their sign-ins
       // interleave: A saves client A, B saves client B, then A's token lands. One record per
@@ -2058,8 +2105,10 @@ export class McpOauthService {
     serverUrl: string;
     clientInformation: MCPOAuthClientInformation;
     legacyBinding?: AuthorizationServerBinding;
+    flowGeneration?: number;
   }): Promise<void> {
     await this.storeLock.withLock(this.storeFilePath, async () => {
+      if (this.isStaleFlowSave(input.serverUrl, input.flowGeneration)) return;
       const store = await this.ensureStoreLoadedLocked();
       const creds = (store.entries[input.serverUrl] ??= {
         serverUrl: input.serverUrl,

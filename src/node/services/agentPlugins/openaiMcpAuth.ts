@@ -21,7 +21,6 @@
  */
 import { checkResourceAllowed } from "@modelcontextprotocol/client";
 import type { MCPServerOAuthConfig } from "@/common/types/mcp";
-import { getOwn } from "@/common/utils/getOwn";
 import { MAX_PLUGIN_MANIFEST_BYTES, readPluginFileWithinRootCapped } from "./discovery";
 import { isPlainObject } from "./manifest";
 import { OPENAI_EXTENSION_NAMESPACE } from "./openaiExtension";
@@ -390,24 +389,31 @@ export function toServerOAuthConfig(
 }
 
 /**
+/**
  * Fixed message for a plugin MCP config file that is not valid JSON. SECURITY AUDIT: a
  * `JSON.parse` error quotes source text, which can include a nearby `client_secret`, so
  * callers report this category and never the parser message (#6297).
  */
 export const PLUGIN_MCP_CONFIG_PARSE_ERROR = "the plugin's MCP config file could not be parsed";
 
+/** A Codex `.mcp.json` client secret and the `oauth.client_id` it sits next to. */
+export interface PluginClientSecret {
+  clientId: string | undefined;
+  secret: string;
+}
+
 /**
- * Re-read a Codex `.mcp.json` client secret from the consented plugin file
- * (bounded, containment-checked read). The caller keeps it in memory only.
- * The secret is returned only while the file's `oauth.client_id` is still
- * `clientId`: an edit or update can replace the client between the config
- * capture and this read, and a stale flow must not send the replacement
- * secret to the old client's token endpoint (#6297).
+ * Every client secret in a consented Codex `.mcp.json` (bounded,
+ * containment-checked read), keyed by server name, each with the client ID
+ * beside it. One read and parse serves all of the file's servers. The caller
+ * keeps the values in memory only.
  */
-export async function readPluginClientSecret(
-  source: NonNullable<MCPServerOAuthConfig["clientSecretSource"]>,
-  clientId: string
-): Promise<string | undefined> {
+export async function readPluginClientSecrets(
+  source: Pick<
+    NonNullable<MCPServerOAuthConfig["clientSecretSource"]>,
+    "pluginRoot" | "mcpConfigPath"
+  >
+): Promise<Map<string, PluginClientSecret>> {
   const { content } = await readPluginFileWithinRootCapped({
     filePath: source.mcpConfigPath,
     pluginRoot: source.pluginRoot,
@@ -428,9 +434,38 @@ export async function readPluginClientSecret(
         ? raw.mcpServers
         : {}
       : raw;
-  const entry = getOwn(servers, source.serverName);
-  const oauth = isPlainObject(entry) ? entry.oauth : undefined;
-  if (!isPlainObject(oauth) || oauth.client_id !== clientId) return undefined;
-  const secret = oauth.client_secret;
-  return typeof secret === "string" && secret.length > 0 ? secret : undefined;
+  const secrets = new Map<string, PluginClientSecret>();
+  for (const [name, entry] of Object.entries(servers)) {
+    const oauth = isPlainObject(entry) ? entry.oauth : undefined;
+    if (!isPlainObject(oauth)) continue;
+    const secret = oauth.client_secret;
+    if (typeof secret !== "string" || secret.length === 0) continue;
+    const clientId = typeof oauth.client_id === "string" ? oauth.client_id : undefined;
+    secrets.set(name, { clientId, secret });
+  }
+  return secrets;
+}
+
+/**
+ * One server's client secret (see readPluginClientSecrets), returned only
+ * while the file's `oauth.client_id` is still `clientId`: an edit or update
+ * can replace the client between the config capture and this read, and a
+ * stale flow must not send the replacement secret to the old client's token
+ * endpoint (#6297).
+ */
+export function pluginClientSecretFor(
+  secrets: Map<string, PluginClientSecret>,
+  serverName: string,
+  clientId: string
+): string | undefined {
+  const entry = secrets.get(serverName);
+  return entry?.clientId === clientId ? entry.secret : undefined;
+}
+
+/** One server's client secret for the client `clientId` (see pluginClientSecretFor). */
+export async function readPluginClientSecret(
+  source: NonNullable<MCPServerOAuthConfig["clientSecretSource"]>,
+  clientId: string
+): Promise<string | undefined> {
+  return pluginClientSecretFor(await readPluginClientSecrets(source), source.serverName, clientId);
 }
