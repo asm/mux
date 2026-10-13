@@ -11,6 +11,7 @@
  * prefix). A future consumer that opens one MUST resolve it through
  * discovery's realpath containment (ensurePluginPathContained, which also refuses .git) first.
  */
+import { getOwn } from "@/common/utils/getOwn";
 import {
   AGENT_PLUGIN_SCHEMA_ID_1_0_0,
   isPlainObject,
@@ -19,6 +20,30 @@ import {
 } from "./manifest";
 
 export const OPENAI_EXTENSION_NAMESPACE = "com.openai";
+
+/** Presentation metadata. Plain text only: the renderer never parses it as HTML or markdown. */
+export interface OpenAIPluginInterface {
+  displayName: string;
+  shortDescription: string;
+  developerName: string;
+  longDescription?: string;
+  category?: string;
+  capabilities?: string[];
+  websiteURL?: string;
+  privacyPolicyURL?: string;
+  termsOfServiceURL?: string;
+  supportURL?: string;
+  /** The spec allows a string or an array; normalized to an array. */
+  defaultPrompt?: string[];
+  brandColor?: string;
+  brandColorDark?: string;
+  /** Image paths: relative to the plugin root, read only through the contained capped reader. */
+  composerIcon?: string;
+  composerIconDark?: string;
+  logo?: string;
+  logoDark?: string;
+  screenshots?: string[];
+}
 
 /** One `hooks` entry: a relative hooks-file path or an inline hooks object (kept opaque). */
 export type OpenAIPluginHooksEntry = string | Record<string, unknown>;
@@ -30,12 +55,133 @@ export interface OpenAIPluginExtension {
   hooks?: OpenAIPluginHooksEntry[];
   /** Relative path to a packaged skill's SKILL.md. */
   onboardingSkill?: string;
-  // `interface` (presentation metadata) stays opaque in
-  // `manifest.extensions["com.openai"]` until the UI that renders it lands
-  // with its own field validation.
+  interface?: OpenAIPluginInterface;
 }
 
 const FIELD = `extensions["${OPENAI_EXTENSION_NAMESPACE}"]`;
+
+// OpenAI's package-validation limits
+// (https://developers.openai.com/plugins/deploy/submission-errors). Directory
+// submission is stricter (30-char display name and subtitle), but installable
+// packages only pass package validation, so a tighter cap here would drop a
+// valid required name and with it the whole interface.
+type FieldKind = "name" | "text" | "url" | "color" | "path" | "labels" | "prompts" | "paths";
+const INTERFACE_FIELDS: Record<keyof OpenAIPluginInterface, FieldKind> = {
+  displayName: "name",
+  shortDescription: "name",
+  developerName: "name",
+  longDescription: "text",
+  category: "text",
+  capabilities: "labels",
+  websiteURL: "url",
+  privacyPolicyURL: "url",
+  termsOfServiceURL: "url",
+  supportURL: "url",
+  defaultPrompt: "prompts",
+  brandColor: "color",
+  brandColorDark: "color",
+  composerIcon: "path",
+  composerIconDark: "path",
+  logo: "path",
+  logoDark: "path",
+  screenshots: "paths",
+};
+const TEXT_CAPS: Partial<Record<keyof OpenAIPluginInterface, number>> = {
+  displayName: 80,
+  shortDescription: 240,
+  developerName: 120,
+  longDescription: 4000,
+  category: 64,
+};
+const RULES: Record<FieldKind, string> = {
+  name: "a non-empty single line without control or direction characters",
+  text: "a string without control or direction characters",
+  url: "an https URL (max 2048 characters)",
+  color: "a #RRGGBB color",
+  path: "a relative path inside the plugin",
+  labels: "at most 20 strings of at most 120 characters",
+  prompts: "at most 3 strings of at most 512 characters",
+  paths: "at most 10 relative paths inside the plugin",
+};
+
+/**
+ * Characters manifest text must not carry (OpenAI's package rules exclude them too): C0 and C1
+ * controls, the Unicode line and paragraph separators, and the invisible direction controls
+ * (LRM/RLM/ALM, embeddings/overrides, isolates), which can spoof a displayed plugin or developer.
+ * `longDescription` may break lines with \n only.
+ */
+const UNSAFE_TEXT =
+  // eslint-disable-next-line no-control-regex -- the control characters are the point
+  /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/;
+const isText = (value: unknown, max: number, multiline = false): value is string =>
+  typeof value === "string" &&
+  value.length <= max &&
+  !UNSAFE_TEXT.test(value) &&
+  (multiline || !value.includes("\n"));
+const isTextList = (value: unknown, count: number, max: number): value is string[] =>
+  Array.isArray(value) && value.length <= count && value.every((entry) => isText(entry, max));
+
+/** The validated value, or undefined when `value` breaks the rule for `kind`. */
+function parseField(kind: FieldKind, value: unknown, cap: number, multiline: boolean): unknown {
+  switch (kind) {
+    case "name":
+      return isText(value, cap) && value.trim().length > 0 ? value : undefined;
+    case "text":
+      return isText(value, cap, multiline) ? value : undefined;
+    case "url": {
+      if (!isText(value, 2048) || !URL.canParse(value)) return undefined;
+      const url = new URL(value);
+      // The parsed spelling: the renderer checks a literal `https://` prefix,
+      // so `HTTPS://example.com` must reach it normalized.
+      return url.protocol === "https:" && !url.username && !url.password ? url.href : undefined;
+    }
+    case "color":
+      return typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value) ? value : undefined;
+    case "path":
+      return normalizeOpenAIRelativePath(value);
+    case "labels":
+      return isTextList(value, 20, 120) ? value : undefined;
+    case "prompts": {
+      const prompts = typeof value === "string" ? [value] : value;
+      return isTextList(prompts, 3, 512) ? prompts : undefined;
+    }
+    case "paths": {
+      if (!Array.isArray(value) || value.length > 10) return undefined;
+      const paths = value.map(normalizeOpenAIRelativePath);
+      return paths.every((entry) => entry !== undefined) ? paths : undefined;
+    }
+  }
+}
+
+function readInterface(raw: unknown, warnings: string[]): OpenAIPluginInterface | undefined {
+  if (!isPlainObject(raw)) {
+    warnings.push(`'${FIELD}.interface' must be an object; ignoring`);
+    return undefined;
+  }
+  const result: Partial<Record<string, unknown>> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const kind = getOwn(INTERFACE_FIELDS, key);
+    if (kind === undefined) {
+      warnings.push(`Unknown '${FIELD}.interface.${key}' ignored`);
+      continue;
+    }
+    const parsed = parseField(kind, value, getOwn(TEXT_CAPS, key) ?? 0, key === "longDescription");
+    if (parsed !== undefined) result[key] = parsed;
+    else warnings.push(`'${FIELD}.interface.${key}' must be ${RULES[kind]}; ignoring`);
+  }
+  const { displayName, shortDescription, developerName } = result;
+  if (
+    typeof displayName !== "string" ||
+    typeof shortDescription !== "string" ||
+    typeof developerName !== "string"
+  ) {
+    warnings.push(
+      `'${FIELD}.interface' needs displayName, shortDescription and developerName; ignoring the interface`
+    );
+    return undefined;
+  }
+  return { ...result, displayName, shortDescription, developerName };
+}
 
 /**
  * Accept `./skills/`-style package paths: drop trailing slashes, then apply
@@ -96,6 +242,10 @@ export function readOpenAIExtension(manifest: Pick<AgentPluginManifest, "extensi
   if (raw.hooks !== undefined) {
     const hooks = readHooks(raw.hooks, warnings);
     if (hooks !== undefined) extension.hooks = hooks;
+  }
+  if (raw.interface !== undefined) {
+    const parsed = readInterface(raw.interface, warnings);
+    if (parsed !== undefined) extension.interface = parsed;
   }
   return { extension, warnings };
 }

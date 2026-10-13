@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
+import { execFileSync } from "node:child_process";
 import * as path from "node:path";
 import * as jsonc from "jsonc-parser";
 
@@ -121,6 +122,16 @@ async function writePluginFixture(dir: string, opts?: { version?: string }): Pro
       },
     })
   );
+}
+
+/** A PNG signature and IHDR chunk of the given size (enough for the logo header check). */
+function pngHeader(width: number, height: number): Buffer {
+  const ihdr = Buffer.alloc(25);
+  ihdr.writeUInt32BE(13, 0);
+  ihdr.write("IHDR", 4, "latin1");
+  ihdr.writeUInt32BE(width, 8);
+  ihdr.writeUInt32BE(height, 12);
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), ihdr]);
 }
 
 describe("AgentPluginInstallService", () => {
@@ -1832,6 +1843,74 @@ describe("AgentPluginInstallService", () => {
     expect(updated.lockedSha).toBe(cleanHead);
   });
 
+  test("a logo is refused (with a warning) when it decodes too large or is a GIF", async () => {
+    await fsPromises.mkdir(path.join(remoteDir, "assets"));
+    await fsPromises.writeFile(path.join(remoteDir, "assets", "huge.png"), pngHeader(10000, 10000));
+    await fsPromises.writeFile(path.join(remoteDir, "assets", "anim.gif"), "GIF89a");
+    const writeLogo = async (logo: string) => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "plugin.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+          name: "demo-plugin",
+          version: "1.0.0",
+          extensions: {
+            "com.openai": {
+              interface: { displayName: "Demo", shortDescription: "d", developerName: "E", logo },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, `logo ${logo}`);
+    };
+    await writeLogo("./assets/huge.png");
+    const huge = await service.preview({ input: remoteDir });
+    expect(huge.manifest.interface?.logoDataUrl).toBeUndefined();
+    expect(huge.warnings.join("\n")).toContain("10000×10000");
+    await writeLogo("./assets/anim.gif");
+    const gif = await service.preview({ input: remoteDir });
+    expect(gif.manifest.interface?.logoDataUrl).toBeUndefined();
+    expect(gif.warnings.join("\n")).toContain("must be a PNG, JPEG or WebP image");
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "a FIFO logo is refused without blocking the plugin list",
+    async () => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "plugin.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+          name: "demo-plugin",
+          version: "1.0.0",
+          extensions: {
+            "com.openai": {
+              interface: {
+                displayName: "Demo",
+                shortDescription: "d",
+                developerName: "E",
+                logo: "./logo.png",
+              },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, "logo");
+      const preview = await service.preview({ input: remoteDir });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+      // An unmanaged edit: the installed logo becomes a FIFO with no writer.
+      const logo = path.join(pluginsDir(), "demo-plugin", "logo.png");
+      await fsPromises.rm(logo, { force: true });
+      execFileSync("mkfifo", [logo]);
+      // A blocking open would hang list() forever; race it (the test timeout is the backstop).
+      const listed = await Promise.race([
+        service.list(),
+        new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 3000)),
+      ]);
+      expect(listed).not.toBe("blocked");
+      expect(listed !== "blocked" && listed[0].interface?.logoDataUrl).toBeUndefined();
+    }
+  );
+
   test("preview validates skills against their directory names like runtime discovery", async () => {
     // skills/wrong-dir/SKILL.md advertising a different name never loads at
     // runtime (parseSkillMarkdown rejects the mismatch), so the preview must
@@ -1846,6 +1925,72 @@ describe("AgentPluginInstallService", () => {
     const preview = await service.preview({ input: remoteDir });
     expect(preview.skills.map((skill) => skill.name)).toEqual(["greet"]);
     expect(preview.warnings.join("\n")).toContain("skills/wrong-dir");
+  });
+
+  test("preview and list show the interface; the logo is a contained data URL", async () => {
+    // A 16×16 PNG header: the logo check reads the size from IHDR.
+    const png = pngHeader(16, 16);
+    await fsPromises.mkdir(path.join(remoteDir, "assets"));
+    await fsPromises.writeFile(path.join(remoteDir, "assets", "logo.png"), png);
+    // Staging accepts an absolute link outside the managed container; only
+    // the contained reader stands between it and the renderer.
+    const outside = path.join(muxRoot, "outside.png");
+    await fsPromises.writeFile(outside, "outside-secret");
+    await fsPromises.symlink(outside, path.join(remoteDir, "assets", "escape.png"));
+    const writeInterface = async (logo: string): Promise<void> => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "plugin.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+          name: "demo-plugin",
+          version: "1.0.0",
+          extensions: {
+            "com.openai": {
+              interface: {
+                displayName: "Demo",
+                shortDescription: "<b>Demo</b>",
+                developerName: "Example",
+                websiteURL: "HTTPS://Example.com",
+                supportURL: "https://example.com/support",
+                logo,
+              },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, `logo ${logo}`);
+    };
+
+    await writeInterface("./assets/logo.png");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.manifest.interface).toEqual({
+      displayName: "Demo",
+      shortDescription: "<b>Demo</b>",
+      developerName: "Example",
+      // Normalized: the renderer only links a literal `https://` prefix.
+      websiteURL: "https://example.com/",
+      supportURL: "https://example.com/support",
+      logoDataUrl: `data:image/png;base64,${png.toString("base64")}`,
+    });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect((await service.list())[0].interface?.logoDataUrl).toStartWith("data:image/png;base64,");
+    await service.uninstall({ name: "demo-plugin", deletePluginData: true });
+
+    await writeInterface("./assets/escape.png");
+    const escaped = await service.preview({ input: remoteDir });
+    expect(escaped.manifest.interface?.logoDataUrl).toBeUndefined();
+    expect(JSON.stringify(escaped)).not.toContain(Buffer.from("outside-secret").toString("base64"));
+
+    await fsPromises.symlink("../.git/config", path.join(remoteDir, "assets", "git.png"));
+    await writeInterface("./assets/git.png");
+    const intoGit = await service.preview({ input: remoteDir });
+    expect(intoGit.manifest.interface?.logoDataUrl).toBeUndefined();
+    expect(
+      intoGit.warnings.some((w) => w.includes("resolves into the plugin's .git directory"))
+    ).toBe(true);
+    expect(escaped.warnings.some((w) => w.includes("'./assets/escape.png' cannot be shown"))).toBe(
+      true
+    );
   });
 
   test("an update signs out by credential key (rename, respelled URL, issuer) before the final stop", async () => {
