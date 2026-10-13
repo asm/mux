@@ -145,6 +145,25 @@ describe("MCP Apps host router", () => {
     expect(t.initialized()).toBe(1);
   });
 
+  test("a second handshake on the same frame gets no tool-input or tool-result", async () => {
+    // In browser mode a page the frame navigated to posts from the same contentWindow until
+    // its load event; it must not get the call's arguments or result.
+    const t = setup({
+      onInitialized: () => {
+        t.host.sendToolInput({ secret: "args" });
+        t.host.sendToolResult({ content: [], structuredContent: { secret: "result" } });
+      },
+    });
+    const toolData = () =>
+      t.sent.filter((m) => String(m.method).startsWith("ui/notifications/tool-")).length;
+    for (const id of [1, 2]) {
+      await t.request(id, "ui/initialize", {});
+      await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    }
+    expect(t.reply(2)?.result).toBeDefined();
+    expect(toolData()).toBe(2);
+  });
+
   test("unknown methods get -32601 and malformed messages are rejected", async () => {
     const t = setup();
     for (const [id, method] of [
@@ -455,6 +474,8 @@ describe("MCP Apps host router", () => {
     await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
     await t.request(2, "ui/request-display-mode", { mode: "pip" });
     await t.request(3, "ui/request-display-mode", { mode: "theater" });
+    // The window.openai shim's later initialize (no list) keeps the view's declaration.
+    await t.request(6, "ui/initialize", { appCapabilities: {} });
     // The view did not declare fullscreen: the host must not switch it there.
     await t.request(4, "ui/request-display-mode", { mode: "fullscreen" });
     for (const id of [2, 3, 4]) expect(t.reply(id)?.result).toEqual({ mode: "inline" });
