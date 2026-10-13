@@ -5,17 +5,16 @@ import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { DisplayedMessage } from "@/common/types/message";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { mcpToolDisplayName } from "@/common/utils/mcp/mcpToolDisplayName";
+import { mcpServerConsentName, mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 import { MCP_APP_VIEW_RECORDS_MAX_IDS } from "@/common/utils/mcpApps";
-import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
 import { getNestedToolStatus } from "@/browser/features/Tools/Shared/toolUtils";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
 
 /**
- * MCP Apps views (artifacts experiment), per workspace, for the Artifacts tab's "App views"
- * picker group. The group lists every settled view-declaring tool call in the loaded
- * transcript, so views are reachable without first clicking "Open in Artifacts" and after a
- * reload. Views opened from cards outside the loaded transcript window are kept in a
- * session-only list on top. The view resource and result are re-fetched from the backend
+ * MCP Apps views (artifacts experiment), per workspace, for app tabs and the command palette:
+ * every settled view-declaring tool call in the loaded transcript, so a restored tab resolves
+ * its view after a reload. Views opened from cards outside the loaded transcript window are
+ * kept in a session-only list on top. The view resource and result are re-fetched from the backend
  * whenever a view mounts; listing a view never calls the tool again.
  */
 export interface McpAppViewRef {
@@ -23,7 +22,7 @@ export interface McpAppViewRef {
   serverName: string;
   resourceUri: string;
   toolName: string;
-  /** Tool title (or name) shown in the picker. */
+  /** Tool title (or name) shown in the tab label. */
   label: string;
   arguments: unknown;
   /** The call was interrupted or failed: the view gets tool-cancelled instead of a result. */
@@ -36,9 +35,9 @@ export interface McpAppViewRef {
 const SUMMARY_MAX_CHARS = 80;
 
 /**
- * One line naming a call by its arguments (`count: 4, sides: 6`), so the picker can tell
- * several views of the same tool apart. Strings show unquoted; other values as JSON. The model
- * writes the arguments, so control and bidi characters show as visible escapes.
+ * One line naming a call by its arguments (`count: 4, sides: 6`), so the palette and tab labels
+ * can tell several views of the same tool apart. Strings show unquoted; other values as JSON.
+ * The model writes the arguments, so control and bidi characters show as visible escapes.
  */
 export function summarizeToolArguments(args: unknown): string {
   if (typeof args !== "object" || args === null || Array.isArray(args)) return "";
@@ -51,11 +50,11 @@ export function summarizeToolArguments(args: unknown): string {
 }
 
 /**
- * Picker detail per view (same order): the outcome, the argument summary, and `#n` when two
- * views would otherwise read the same (the same call made twice). `#1` is the oldest, so a
- * number stays with its call as newer calls arrive.
+ * Detail per view (same order), for the command palette and app tab labels: the outcome, the
+ * argument summary, and `#n` when two views would otherwise read the same (the same call made
+ * twice). `#1` is the oldest, so a number stays with its call as newer calls arrive.
  */
-export function appViewPickerDetails(views: readonly McpAppViewRef[]): string[] {
+export function appViewDetails(views: readonly McpAppViewRef[]): string[] {
   const details = views.map(
     (view) =>
       `${view.failed ? "failed · " : view.cancelled ? "interrupted · " : ""}` +
@@ -75,7 +74,24 @@ export function appViewPickerDetails(views: readonly McpAppViewRef[]): string[] 
   });
 }
 
-/** Artifacts picker value for an app view; file paths never start with this prefix. */
+/**
+ * The server name shown per view (same order), for app tab labels and palette entries. A plugin
+ * key shows only its server part, unless another view's different key shows the same: then both
+ * keep the plugin's instance marker (`tray (plugin 0123abcd)`), so two installs stay apart.
+ */
+export function appViewServerNames(views: readonly McpAppViewRef[]): string[] {
+  const keysByName = new Map<string, Set<string>>();
+  for (const view of views) {
+    const name = mcpServerDisplayName(view.serverName);
+    keysByName.set(name, (keysByName.get(name) ?? new Set()).add(view.serverName));
+  }
+  return views.map((view) => {
+    const name = mcpServerDisplayName(view.serverName);
+    return (keysByName.get(name)?.size ?? 0) > 1 ? mcpServerConsentName(view.serverName) : name;
+  });
+}
+
+/** The view key of an app view (its app tab is "app:<viewKey>"). */
 export const MCP_APP_SELECTION_PREFIX = "mcp-app:";
 
 export function mcpAppSelectionKey(toolCallId: string): string {
@@ -229,38 +245,6 @@ export function useMcpAppViews(workspaceId: string): readonly McpAppViewRef[] {
 }
 
 /**
- * Add (or refresh) a view, select it in the Artifacts tab, and ask the layout to reveal the
- * tab (OPEN_MCP_APP_VIEW).
- */
-export function openMcpAppView(workspaceId: string, view: McpAppViewRef) {
-  const current = getMcpAppViews(workspaceId).filter((v) => v.toolCallId !== view.toolCallId);
-  viewsByWorkspace.set(workspaceId, [view, ...current]);
-  emit();
-  writeArtifactSelection(workspaceId, {
-    scope: "artifact",
-    path: mcpAppSelectionKey(view.toolCallId),
-    version: null,
-  });
-  window.dispatchEvent(
-    createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId, toolCallId: view.toolCallId })
-  );
-}
-
-/**
- * Close a view: the panel returns to its files. A view from the transcript stays in the
- * picker (it can be reopened); an opened-only view leaves it.
- */
-export function closeMcpAppView(workspaceId: string, toolCallId: string) {
-  const next = getMcpAppViews(workspaceId).filter((v) => v.toolCallId !== toolCallId);
-  if (next.length === 0) viewsByWorkspace.delete(workspaceId);
-  else viewsByWorkspace.set(workspaceId, next);
-  emit();
-  if (readArtifactSelection(workspaceId).path === mcpAppSelectionKey(toolCallId)) {
-    writeArtifactSelection(workspaceId, { scope: "artifact", path: null, version: null });
-  }
-}
-
-/**
  * Lookups of views the loaded transcript lacks, by workspace and tool call: "pending" while the
  * backend is asked, "missing" when it answered that it has no result record, "failed" when the
  * request failed. Only "missing" is final: a failed lookup runs again the next time a tab asks
@@ -397,11 +381,10 @@ export function openMcpAppViewTab(workspaceId: string, view: McpAppViewRef) {
 
 /**
  * Where a view is mounted outside its tool card: its app tab (also on phones, where the sidebar
- * shows full-screen), or the Artifacts tab (which still lists app views). Counted per workspace,
- * tool call and host, so every place that can show a view yields to the others and at most one
- * live instance runs.
+ * shows full-screen). Counted per workspace and tool call, so every place that can show a view
+ * yields to it and at most one live instance runs.
  */
-export type McpAppViewHost = "tab" | "artifacts";
+export type McpAppViewHost = "tab";
 const hostedViews = new Map<string, number>();
 const hostedKey = (workspaceId: string, toolCallId: string, host: McpAppViewHost) =>
   `${workspaceId}\u0000${toolCallId}\u0000${host}`;

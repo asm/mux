@@ -19,7 +19,7 @@ import {
   type McpAppHost,
   type McpAppHostContext,
 } from "./mcpAppHost";
-import { closeMcpAppView, type McpAppViewRef } from "./mcpAppViewsStore";
+import type { McpAppViewRef } from "./mcpAppViewsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
@@ -129,7 +129,7 @@ function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
 }
 
 /**
- * An MCP Apps view (artifacts experiment) in the Artifacts tab: the server's ui:// HTML in the
+ * An MCP Apps view (artifacts experiment) in its app tab or tool card: the server's ui:// HTML in the
  * same sandbox as HTML artifacts, talking JSON-RPC to the host (mcpAppHost.ts).
  *
  * SECURITY AUDIT: a single opaque-origin srcdoc iframe (sandbox exactly "allow-scripts", never
@@ -141,7 +141,7 @@ function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
  * enforces visibility and consent.
  */
 /**
- * Where a view renders. "panel" fills the Artifacts tab and has a Close header. "inline" sits
+ * Where a view renders. "panel" fills its app tab and has a Close header. "inline" sits
  * in an expanded tool card (the spec's inline display mode): the card header already names the
  * server, so there is no header, and the frame takes the height the view reports.
  */
@@ -160,7 +160,7 @@ export function McpAppFrame(props: {
   workspaceId: string;
   view: McpAppViewRef;
   variant?: McpAppFrameVariant;
-  /** Panel only: closes the panel's host (an app tab). Without it, Close leaves Artifacts. */
+  /** Panel only: closes the panel's host (its app tab or sheet). */
   onClose?: () => void;
 }) {
   const inline = props.variant === "inline";
@@ -378,8 +378,7 @@ export function McpAppFrame(props: {
 
   const close = async () => {
     await hostRef.current?.teardown("closed");
-    if (props.onClose) props.onClose();
-    else closeMcpAppView(workspaceId, toolCallId);
+    props.onClose?.();
   };
 
   const header = inline ? null : (
