@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn, mock, jest } from "bun:test";
 import { Ok } from "@/common/types/result";
 import {
   BackgroundProcessManager,
@@ -16,9 +16,11 @@ import { localBgWorkspaceDir, spawnProcess } from "./backgroundProcessExecutor";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { BackgroundHandle, Runtime } from "@/node/runtime/Runtime";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
+import { BASH_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import { createBashTool } from "@/node/services/tools/bash";
 import { createBashOutputTool } from "@/node/services/tools/bash_output";
 import { TestTempDir, createTestToolConfig } from "@/node/services/tools/testHelpers";
@@ -120,8 +122,10 @@ describe("BackgroundProcessManager", () => {
   let runtime: Runtime;
   let bgOutputDir: string;
   const probeHandles: BackgroundHandle[] = [];
-  // Use unique workspace IDs per test run to avoid collisions
-  const testRunId = Date.now().toString(36);
+  // Unique workspace IDs per test run: spawn records live in the shared /tmp/mux-bashes/<id>, and
+  // afterEach deletes that directory. A Date.now() ID collided between runs started in the same
+  // millisecond, so one run's cleanup freed the other's claimed record names (#5591).
+  const testRunId = randomUUID().slice(0, 12);
   const testWorkspaceId = `test-ws1-${testRunId}`;
   const testWorkspaceId2 = `test-ws2-${testRunId}`;
 
@@ -352,7 +356,8 @@ describe("BackgroundProcessManager", () => {
 
     it("probes runtime record directories for non-host runtimes before reusing a name", async () => {
       // A markerless record directory on the runtime (previous-session survivor or preserved
-      // ambiguous spawn) holds the name; an exit-marker-settled one frees it.
+      // ambiguous spawn) holds the name, and so does an exit-marker-settled one: another
+      // backend may still track it (#4889).
       const heldDir = `/tmp/mux-bashes/${testWorkspaceId}/held-job`;
       await fs.mkdir(heldDir, { recursive: true });
       await fs.writeFile(path.join(heldDir, "output.log"), "previous session output");
@@ -378,7 +383,142 @@ describe("BackgroundProcessManager", () => {
       });
       expect(settled.success).toBe(true);
       if (!settled.success) return;
-      expect(settled.processId).toBe("settled-job");
+      expect(settled.processId).toBe("settled-job (2)");
+      expect(await fs.readFile(path.join(settledDir, "exit_code"), "utf-8")).toBe("0");
+    });
+
+    it("claims a name used in earlier sessions in one runtime exec on a non-host runtime", async () => {
+      // #5485: every taken candidate used to cost one exec round-trip, so a name used in k
+      // earlier sessions cost k+1 execs per spawn. One exec now tries a batch of candidates.
+      for (const name of ["reused-job", "reused-job (2)", "reused-job (3)"]) {
+        const dir = `/tmp/mux-bashes/${testWorkspaceId}/${name}`;
+        await fs.mkdir(dir, { recursive: true });
+        await fs.writeFile(path.join(dir, "exit_code"), "0");
+      }
+      const base = new LocalRuntime(process.cwd());
+      let claimExecs = 0;
+      const remote = new Proxy({} as Runtime, {
+        get(_target, prop) {
+          if (prop === "exec") {
+            return (command: string, opts: never) => {
+              if (command.includes("__MUX_SPAWN_NAME_CLAIMED__")) claimExecs++;
+              return base.exec(command, opts);
+            };
+          }
+          const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+          return typeof value === "function"
+            ? (value as (...args: unknown[]) => unknown).bind(base)
+            : value;
+        },
+      });
+
+      const result = await manager.spawn(remote, testWorkspaceId, "echo hi", {
+        cwd: process.cwd(),
+        displayName: "reused-job",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.processId).toBe("reused-job (4)");
+      expect(claimExecs).toBe(1);
+      // The earlier sessions' records are untouched.
+      expect(
+        await fs.readFile(`/tmp/mux-bashes/${testWorkspaceId}/reused-job (3)/exit_code`, "utf-8")
+      ).toBe("0");
+    });
+
+    it("gives concurrent same-name spawns from one backend distinct claimed names on a non-host runtime", async () => {
+      // Batched candidates are reserved in memory before the claim exec, so a concurrent
+      // same-name spawn in this backend never targets (or releases) another spawn's name.
+      const busyDir = `/tmp/mux-bashes/${testWorkspaceId}/busy-job`;
+      await fs.mkdir(busyDir, { recursive: true });
+      const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+      const results = await Promise.all(
+        [0, 1, 2].map(() =>
+          manager.spawn(remote, testWorkspaceId, "echo hi", {
+            cwd: process.cwd(),
+            displayName: "busy-job",
+          })
+        )
+      );
+      expect(results.every((r) => r.success)).toBe(true);
+      const dirs = results.map((r) => (r.success ? r.outputDir : r.error));
+      expect(new Set(dirs).size).toBe(3);
+      expect(dirs).not.toContain(busyDir);
+      // The held directory is untouched: no spawn wrote into it.
+      expect(await fs.readdir(busyDir)).toEqual([]);
+    });
+
+    it("gives concurrent same-name spawns from two backends distinct directories on a non-host runtime", async () => {
+      // No cross-backend lock serialises non-host runtimes: the atomic mkdir claim must pick
+      // exactly one winner per directory (#4889).
+      const other = new BackgroundProcessManager(bgOutputDir);
+      const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+      try {
+        const results = await Promise.all(
+          [manager, other].map((m) =>
+            m.spawn(remote, testWorkspaceId, "sleep 5", {
+              cwd: process.cwd(),
+              displayName: "race-job",
+            })
+          )
+        );
+        const dirs = results.map((r) => (r.success ? r.outputDir : r.error));
+        expect(results.every((r) => r.success)).toBe(true);
+        expect(new Set(dirs).size).toBe(2);
+      } finally {
+        await other.cleanup(testWorkspaceId);
+      }
+    });
+
+    it("removes the claimed record directory when a seal refuses a non-host spawn", async () => {
+      // A cleanup, archive or removal that seals the workspace while the remote claim runs
+      // refuses the spawn after its mkdir; the empty claimed directory must not stay behind.
+      const base = new LocalRuntime(process.cwd());
+      const seals: Disposable[] = [];
+      const remote = new Proxy({} as Runtime, {
+        get(_target, prop) {
+          if (prop === "exec") {
+            return async (command: string, opts: never) => {
+              const stream = await base.exec(command, opts);
+              if (command.includes("__MUX_SPAWN_NAME_CLAIMED__")) {
+                seals.push(manager.sealAdmissions(testWorkspaceId));
+              }
+              return stream;
+            };
+          }
+          const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+          return typeof value === "function"
+            ? (value as (...args: unknown[]) => unknown).bind(base)
+            : value;
+        },
+      });
+      try {
+        const result = await manager.spawn(remote, testWorkspaceId, "echo hi", {
+          cwd: process.cwd(),
+          displayName: "sealed-job",
+        });
+        expect(result.success).toBe(false);
+        expect(seals.length).toBe(1);
+        expect(
+          await fs.stat(`/tmp/mux-bashes/${testWorkspaceId}/sealed-job`).catch(() => null)
+        ).toBeNull();
+      } finally {
+        for (const seal of seals) seal[Symbol.dispose]();
+      }
+    });
+
+    it("removes the claimed record directory when a non-host spawn fails its cwd check", async () => {
+      // The claim creates the directory before spawnProcess runs; a leftover empty directory
+      // would hold the name and fail the remote crash-orphan probe closed.
+      const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+      const result = await manager.spawn(remote, testWorkspaceId, "echo hi", {
+        cwd: path.join(bgOutputDir, "missing-cwd"),
+        displayName: "cwd-job",
+      });
+      expect(result.success).toBe(false);
+      expect(await fs.stat(`/tmp/mux-bashes/${testWorkspaceId}/cwd-job`).catch(() => null)).toBe(
+        null
+      );
     });
   });
 
@@ -2862,6 +3002,127 @@ describe("BackgroundProcessManager", () => {
       expect(ws2Processes.length).toBeGreaterThanOrEqual(1);
       expect(ws2Processes.some((p) => p.status === "running")).toBe(true);
     });
+
+    it("lets session disposal finish once a migration it waits for becomes stopping", async () => {
+      // #5589: disposal can start while a migration is still on its way to registering. If the
+      // migration then fails and its command's exit is never confirmed, it never settles; the
+      // disposal drain must notice the stopping transition instead of waiting on it forever.
+      const migration = manager.beginMigration(testWorkspaceId);
+      expect(migration.admitted).toBe(true);
+      const disposal = manager.cleanup(testWorkspaceId).then(() => "finished");
+      await Bun.sleep(50);
+      migration.markStopping();
+      expect(await Promise.race([disposal, Bun.sleep(2_000).then(() => "waiting")])).toBe(
+        "finished"
+      );
+      // Removal still waits for it (and fails closed at its drain deadline).
+      const removal = manager
+        .cleanup(testWorkspaceId, { failClosedAfterDrainTimeout: true })
+        .then(() => "finished");
+      expect(await Promise.race([removal, Bun.sleep(200).then(() => "waiting")])).toBe("waiting");
+      migration[Symbol.dispose]();
+      expect(await removal).toBe("finished");
+    });
+  });
+
+  describe("cleanup with a hung spawn", () => {
+    it("gives up on a spawn stuck in a hung runtime call and fails closed", async () => {
+      // #5477 item 2: cleanup() waits for admitted spawns, and archive/removal wait for
+      // cleanup() before deleting a checkout. A spawn hung in a runtime call must not hold them
+      // open forever: the drain is bounded and throws, so the caller keeps the checkout.
+      const base = new LocalRuntime(process.cwd());
+      const hang = Promise.withResolvers<void>();
+      const hungRuntime = new Proxy({} as Runtime, {
+        get(_target, prop) {
+          if (prop === "tempDir") {
+            return async () => {
+              await hang.promise;
+              return base.tempDir();
+            };
+          }
+          const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+          return typeof value === "function"
+            ? (value as (...args: unknown[]) => unknown).bind(base)
+            : value;
+        },
+      });
+      const spawned = manager.spawn(hungRuntime, testWorkspaceId, "true", {
+        cwd: process.cwd(),
+        displayName: "hung-spawn",
+      });
+
+      jest.useFakeTimers();
+      let outcome: "pending" | "resolved" | Error = "pending";
+      try {
+        const cleanupDone = manager
+          .cleanup(testWorkspaceId, { failClosedAfterDrainTimeout: true })
+          .then(
+            () => {
+              outcome = "resolved";
+            },
+            (error: unknown) => {
+              outcome = error instanceof Error ? error : new Error(String(error));
+            }
+          );
+        (jest as unknown as { advanceTimersByTime: (ms: number) => void }).advanceTimersByTime(
+          10 * 60_000
+        );
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        expect(outcome).toBeInstanceOf(Error);
+        await cleanupDone;
+      } finally {
+        jest.useRealTimers();
+        hang.resolve();
+        await spawned;
+        await manager.cleanup(testWorkspaceId);
+      }
+    });
+
+    it("keeps waiting for a hung spawn when session disposal cleans up", async () => {
+      // Disposal lifts the seal when cleanup() returns, so giving up there would let the spawn
+      // register later with no cleanup left to stop it: only archive and removal are bounded.
+      const base = new LocalRuntime(process.cwd());
+      const hang = Promise.withResolvers<void>();
+      const hungRuntime = new Proxy({} as Runtime, {
+        get(_target, prop) {
+          if (prop === "tempDir") {
+            return async () => {
+              await hang.promise;
+              return base.tempDir();
+            };
+          }
+          const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+          return typeof value === "function"
+            ? (value as (...args: unknown[]) => unknown).bind(base)
+            : value;
+        },
+      });
+      const spawned = manager.spawn(hungRuntime, testWorkspaceId, "true", {
+        cwd: process.cwd(),
+        displayName: "hung-dispose",
+      });
+
+      jest.useFakeTimers();
+      let settled = false;
+      let cleanupDone: Promise<void> | undefined;
+      try {
+        cleanupDone = manager.cleanup(testWorkspaceId).finally(() => {
+          settled = true;
+        });
+        (jest as unknown as { advanceTimersByTime: (ms: number) => void }).advanceTimersByTime(
+          10 * 60_000
+        );
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        expect(settled).toBe(false);
+      } finally {
+        jest.useRealTimers();
+        hang.resolve();
+        await spawned;
+        await cleanupDone;
+      }
+      // The spawn settled before cleanup() returned, so nothing is left running.
+      expect((await manager.list(testWorkspaceId)).length).toBe(0);
+    });
   });
 
   describe("terminateAll", () => {
@@ -3104,6 +3365,232 @@ describe("BackgroundProcessManager", () => {
       expect(resumed.success).toBe(true);
       if (!resumed.success) return;
       expect(resumed.output).toContain("partialdone");
+    });
+
+    describe("per-read cap", () => {
+      // Reads every page of the process's pending output (timeout 0 each), checking each page
+      // against foreground bash's byte cap.
+      async function readAllPages(processId: string, filter?: string, filterExclude?: boolean) {
+        const pages: string[] = [];
+        const notes: Array<string | undefined> = [];
+        for (let attempt = 0; attempt < 50; attempt++) {
+          const read = await manager.getOutput(processId, filter, filterExclude, 0);
+          expect(read.success).toBe(true);
+          if (!read.success) throw new Error(read.error);
+          expect(Buffer.byteLength(read.output, "utf8")).toBeLessThanOrEqual(BASH_MAX_TOTAL_BYTES);
+          pages.push(read.output);
+          notes.push(read.note);
+          if (!read.note?.includes("more bytes are unread")) return { pages, notes, last: read };
+        }
+        throw new Error("output never drained");
+      }
+
+      it("pages output over the cap instead of returning it in one read", async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        const lines = Array.from({ length: 1_000 }, (_, i) => `line ${i} ${"é".repeat(30)}`);
+        await fs.appendFile(path.join(result.outputDir, "output.log"), `${lines.join("\n")}\n`);
+
+        const { pages, notes } = await readAllPages(result.processId);
+        expect(pages.length).toBeGreaterThan(2);
+        expect(notes[0]).toContain(
+          `bash_output(process_id: "${result.processId}", timeout_secs: 0)`
+        );
+        expect(pages.join("\n")).toBe(lines.join("\n"));
+      });
+
+      it("splits a single line over the byte cap across reads", async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        const longLine = "x".repeat(BASH_MAX_TOTAL_BYTES * 2 + 5);
+        await fs.appendFile(path.join(result.outputDir, "output.log"), `${longLine}\nafter\n`);
+
+        const { pages } = await readAllPages(result.processId);
+        // Two full pages of the line's head, then its tail and the next line.
+        expect(pages).toHaveLength(3);
+        expect(pages.join("")).toBe(`${longLine}\nafter`);
+      });
+
+      // The tail of a split line no longer starts with what made its whole line match ("^M"),
+      // or starts with what the exclude filter drops ("^x"). It must still be returned.
+      it.each([
+        { name: "filter", filter: "^M", exclude: false },
+        { name: "filter_exclude", filter: "^x", exclude: true },
+      ])("keeps a split line's tail under its line's $name decision", async (testCase) => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        const longLine = `M${"x".repeat(BASH_MAX_TOTAL_BYTES * 2)}`;
+        const log = [longLine, testCase.exclude ? "xdrop" : "skip", "M after", ""].join("\n");
+        await fs.appendFile(path.join(result.outputDir, "output.log"), log);
+
+        const { pages } = await readAllPages(result.processId, testCase.filter, testCase.exclude);
+        expect(pages.join("")).toBe(`${longLine}\nM after`);
+      });
+
+      it("names the filter mode in the next-read call", async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        const lines = Array.from({ length: 1_000 }, (_, i) => `keep ${i} ${"y".repeat(40)}`);
+        await fs.appendFile(path.join(result.outputDir, "output.log"), `${lines.join("\n")}\n`);
+
+        const read = await manager.getOutput(result.processId, "^drop", true, 0);
+        expect(read.success && read.note).toContain(
+          `bash_output(process_id: "${result.processId}", timeout_secs: 0, filter: "^drop", filter_exclude: true)`
+        );
+      });
+
+      it("keeps at most a few pages of unread output in memory", async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        // About 30 pages of output, plus one line longer than the retention bound.
+        const lines = Array.from({ length: 8_000 }, (_, i) => `line ${i} ${"z".repeat(50)}`);
+        lines.splice(4_000, 0, "L".repeat(BASH_MAX_TOTAL_BYTES * 5));
+        const text = `${lines.join("\n")}\n`;
+        await fs.appendFile(path.join(result.outputDir, "output.log"), text);
+
+        const first = await manager.getOutput(result.processId, undefined, undefined, 0);
+        expect(first.success).toBe(true);
+        const proc = await manager.getProcess(result.processId);
+        if (proc == null) throw new Error("process missing");
+        const retained = Buffer.byteLength(proc.incompleteLineBuffer, "utf8");
+        expect(retained).toBeLessThanOrEqual(4 * BASH_MAX_TOTAL_BYTES);
+        // The rest stays on disk: the cursor sits right after what is in memory.
+        expect(proc.outputBytesRead).toBeLessThan(Buffer.byteLength(text, "utf8"));
+
+        // Nothing lost or read twice. (A split line's pieces come back as separate pages, so
+        // compare without line breaks.)
+        const { pages } = await readAllPages(result.processId);
+        const all = [first.success ? first.output : "", ...pages].join("").replaceAll("\n", "");
+        expect(all).toBe(lines.join(""));
+      });
+
+      // The cursor counts raw bytes and the text is decoded: an invalid byte decodes to U+FFFD
+      // (3 UTF-8 bytes for 1 raw byte), so a rewind by the text's size moved it too far back.
+      describe("output that is not valid UTF-8", () => {
+        async function readEverything(processId: string, logSize: number) {
+          const pages: string[] = [];
+          for (let attempt = 0; attempt < 200; attempt++) {
+            const read = await manager.getOutput(processId, undefined, undefined, 0);
+            expect(read.success).toBe(true);
+            if (!read.success) throw new Error(read.error);
+            const proc = await manager.getProcess(processId);
+            expect(proc?.outputBytesRead).toBeGreaterThanOrEqual(0);
+            expect(proc?.outputBytesRead).toBeLessThanOrEqual(logSize);
+            pages.push(read.output);
+            if (!read.note?.includes("more bytes are unread")) return pages;
+          }
+          throw new Error("output never drained");
+        }
+
+        it("reads 120 KB of 0xff bytes back once, in order", async () => {
+          const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+            cwd: process.cwd(),
+            displayName: "test",
+          });
+          expect(result.success).toBe(true);
+          if (!result.success) return;
+          // 120 lines of 1,000 0xff bytes: each decodes to 1,000 U+FFFD (3,000 bytes).
+          const line = Buffer.alloc(1_000, 0xff);
+          const raw = Buffer.concat(
+            Array.from({ length: 120 }, (_, i) =>
+              Buffer.concat([Buffer.from(`${i}:`), line, Buffer.from("\n")])
+            )
+          );
+          await fs.appendFile(path.join(result.outputDir, "output.log"), raw);
+
+          const pages = await readEverything(result.processId, raw.length);
+          expect(pages.length).toBeGreaterThan(4);
+          const expected = Array.from({ length: 120 }, (_, i) => `${i}:${"\uFFFD".repeat(1_000)}`);
+          expect(pages.join("\n")).toBe(expected.join("\n"));
+        });
+
+        it("still rewinds over valid text after an invalid byte", async () => {
+          const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+            cwd: process.cwd(),
+            displayName: "test",
+          });
+          expect(result.success).toBe(true);
+          if (!result.success) return;
+          const lines = Array.from({ length: 4_000 }, (_, i) => `line ${i} ${"z".repeat(50)}`);
+          const raw = Buffer.concat([
+            Buffer.from([0xff, 0x0a]),
+            Buffer.from(`${lines.join("\n")}\n`),
+          ]);
+          await fs.appendFile(path.join(result.outputDir, "output.log"), raw);
+
+          const first = await manager.getOutput(result.processId, undefined, undefined, 0);
+          expect(first.success).toBe(true);
+          const retained = (await manager.getProcess(result.processId))?.incompleteLineBuffer ?? "";
+          expect(Buffer.byteLength(retained, "utf8")).toBeLessThanOrEqual(4 * BASH_MAX_TOTAL_BYTES);
+          const rest = await readEverything(result.processId, raw.length);
+          const pages = [first.success ? first.output : "", ...rest];
+          // The invalid byte is in the first page: the rest is valid, so memory stays bounded.
+          expect(pages.join("\n")).toBe(["\uFFFD", ...lines].join("\n"));
+        });
+
+        it("keeps a character cut at a read boundary once, with the lines around it", async () => {
+          const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+            cwd: process.cwd(),
+            displayName: "test",
+          });
+          expect(result.success).toBe(true);
+          if (!result.success) return;
+          const outputPath = path.join(result.outputDir, "output.log");
+          const lines = Array.from({ length: 4_000 }, (_, i) => `line ${i} ${"z".repeat(50)}`);
+          // The first read ends inside "é" (0xC3 0xA9): its two halves decode separately.
+          const head = Buffer.concat([
+            Buffer.from(`${lines.join("\n")}\ncut-`),
+            Buffer.from([0xc3]),
+          ]);
+          await fs.appendFile(outputPath, head);
+          const first = await manager.getOutput(result.processId, undefined, undefined, 0);
+          expect(first.success).toBe(true);
+          const tail = Buffer.concat([Buffer.from([0xa9]), Buffer.from("-end\nafter\n")]);
+          await fs.appendFile(outputPath, tail);
+
+          const rest = await readEverything(result.processId, head.length + tail.length);
+          const all = [first.success ? first.output : "", ...rest].join("\n");
+          expect(all).toBe([...lines, "cut-\uFFFD\uFFFD-end", "after"].join("\n"));
+        });
+      });
+
+      it("keeps the rest after exit readable", async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "seq 1 20000", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        for (let attempt = 0; attempt < 100; attempt++) {
+          if ((await manager.getProcess(result.processId))?.status !== "running") break;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+
+        const { pages, last } = await readAllPages(result.processId);
+        expect(last.success && last.status).toBe("exited");
+        const expected = Array.from({ length: 20_000 }, (_, i) => String(i + 1)).join("\n");
+        expect(pages.join("\n")).toBe(expected);
+      });
     });
 
     it("should return stderr from a running process", async () => {

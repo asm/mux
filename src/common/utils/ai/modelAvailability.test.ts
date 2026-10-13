@@ -211,7 +211,7 @@ describe("isModelServableWithProvidersConfig", () => {
     test("an OAuth-only config serves OAuth-allowed models directly", () => {
       expect(
         isModelServableWithProvidersConfig({
-          canonicalModel: "openai:gpt-5.5",
+          canonicalModel: "openai:gpt-6.1-sol",
           routePriority: ["direct"],
           providersConfig: openaiProviders({ codexOauthSet: true }),
         })
@@ -224,7 +224,7 @@ describe("isModelServableWithProvidersConfig", () => {
       // not claim the model (a configured gateway should win instead).
       expect(
         isModelServableWithProvidersConfig({
-          canonicalModel: "openai:gpt-5.5",
+          canonicalModel: "openai:gpt-6.1-sol",
           routePriority: ["direct"],
           providersConfig: openaiProviders({ codexOauthSet: true, wireFormat: "chatCompletions" }),
         })
@@ -238,7 +238,7 @@ describe("isModelServableWithProvidersConfig", () => {
       // key still serves the Chat Completions send.
       expect(
         isModelServableWithProvidersConfig({
-          canonicalModel: "openai:gpt-5.5",
+          canonicalModel: "openai:gpt-6.1-sol",
           routePriority: ["direct"],
           providersConfig: openaiProviders({ codexOauthSet: true }),
           openaiWireFormat: "chatCompletions",
@@ -246,7 +246,7 @@ describe("isModelServableWithProvidersConfig", () => {
       ).toBe(false);
       expect(
         isModelServableWithProvidersConfig({
-          canonicalModel: "openai:gpt-5.5",
+          canonicalModel: "openai:gpt-6.1-sol",
           routePriority: ["direct"],
           providersConfig: openaiProviders({ apiKeySet: true }),
           openaiWireFormat: "chatCompletions",

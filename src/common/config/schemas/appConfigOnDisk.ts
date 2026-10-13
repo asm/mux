@@ -52,7 +52,6 @@ export const AgentAiDefaultsEntrySchema = z.object({
   autoModelRouting: z.boolean().optional(),
   autoThinkingLevel: z.boolean().optional(),
   enabled: z.boolean().optional(),
-  advisorEnabled: z.boolean().optional(),
   subagent: AgentAiSubagentProfileSchema.optional(),
 });
 
@@ -132,7 +131,6 @@ export const AppConfigMigrationsSchema = z
      * not re-run their exec split migration.
      */
     execSubagentDefaultsSplit: z.boolean().optional(),
-    userPreferencesInitialized: z.boolean().optional(),
     // Default seeding must not claim legacy local-only hidden preferences.
     hiddenModelsInitialized: z.boolean().optional(),
     /** One-time seed of SEEDED_MODEL_FALLBACKS; not re-applied while true. */
@@ -177,6 +175,8 @@ export const AppConfigOnDiskSchema = z
     keepScreenAwake: z.boolean().optional(),
     /** Defer MCP tool definitions behind tool_catalog_search. Absent = on. */
     toolSearchEnabled: z.boolean().optional(),
+    /** Route AI calls from bash tool commands through Xum's cost-tracking proxy. Absent = off. */
+    bashAiProxyEnabled: z.boolean().optional(),
     /** Expose the `heartbeat` tool so agents can schedule their own recurring turns. Absent = off. */
     agentHeartbeatsEnabled: z.boolean().optional(),
     heartbeatDefaultPrompt: z.string().optional(),
@@ -232,11 +232,6 @@ export const AppConfigOnDiskSchema = z
       .optional()
       .catch(undefined),
     defaultModel: z.string().optional(),
-    advisorModelString: z.string().optional(),
-    advisorThinkingLevel: ThinkingLevelSchema.optional(),
-    advisorReasoningMode: OpenAIReasoningModeSchema.optional(),
-    advisorMaxUsesPerTurn: z.number().int().positive().nullable().optional(),
-    advisorMaxOutputTokens: z.number().int().positive().nullable().optional(),
     hiddenModels: z.array(z.string()).optional(),
     preferredCompactionModel: z.string().optional(),
     agentAiDefaults: AgentAiDefaultsSchema.optional(),

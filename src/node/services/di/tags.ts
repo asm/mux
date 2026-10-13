@@ -21,6 +21,7 @@ import type {
 } from "@/node/config";
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import type { AgentStatusService } from "@/node/services/agentStatusService";
+import type { BashAiProxyService } from "@/node/services/bashAiProxy/bashAiProxyService";
 import type { AIService } from "@/node/services/aiService";
 import type { AutoModelRouter } from "@/node/services/autoModelRouter";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
@@ -39,6 +40,7 @@ import type { ContextManagementService } from "@/node/services/contextManagement
 import type { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import type { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import type { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { ReviewStateService } from "@/node/services/reviewStateService";
@@ -226,6 +228,10 @@ export class DesktopSessionManagerTag extends Context.Service<
   DesktopSessionManagerTag,
   DesktopSessionManager
 >()("xum/DesktopSessionManager") {}
+export class ComputerUseServiceTag extends Context.Service<
+  ComputerUseServiceTag,
+  ComputerUseService
+>()("xum/ComputerUseService") {}
 export class DesktopTokenManagerTag extends Context.Service<
   DesktopTokenManagerTag,
   DesktopTokenManager
@@ -301,6 +307,9 @@ export class Timeline extends Context.Service<Timeline, TimelineService>()("xum/
 export class Refine extends Context.Service<Refine, RefineService>()("xum/Refine") {}
 export class AgentStatus extends Context.Service<AgentStatus, AgentStatusService>()(
   "xum/AgentStatus"
+) {}
+export class BashAiProxy extends Context.Service<BashAiProxy, BashAiProxyService>()(
+  "xum/BashAiProxy"
 ) {}
 
 /** The process's config stores (`ConfigStores`), one tag per store. */
@@ -378,6 +387,7 @@ export type BrowserTags =
   | BrowserBridgeServerTag;
 export type DesktopBridgeTags =
   | DesktopSessionManagerTag
+  | ComputerUseServiceTag
   | DesktopTokenManagerTag
   | DesktopBridgeServerTag;
 export type TerminalEditorTags = PTY | Terminal | Editor | Tokenizer | Instructions;
@@ -397,7 +407,7 @@ export type MiscDesktopTags =
   | WorkspaceLifecycleHooksTag
   | WorktreeArchiveSnapshot;
 export type OauthTags = McpOauth | MuxGatewayOauth | CodexOauth | CoderOauth | CopilotOauth;
-export type WorkerTags = IdleCompaction | Heartbeat | Timeline | Refine | AgentStatus;
+export type WorkerTags = IdleCompaction | Heartbeat | Timeline | Refine | AgentStatus | BashAiProxy;
 export type DesktopTags =
   | BrowserTags
   | DesktopBridgeTags

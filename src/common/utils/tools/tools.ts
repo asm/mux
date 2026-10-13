@@ -6,11 +6,7 @@ import { type LanguageModel, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
-import {
-  isGrokFrontierModel,
-  type OpenAIReasoningMode,
-  type ThinkingLevel,
-} from "@/common/types/thinking";
+import { isGrokFrontierModel, type ThinkingLevel } from "@/common/types/thinking";
 import type { ProviderName } from "@/common/constants/providers";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
 import type { AvailableModel } from "@/common/utils/ai/selectableModels";
@@ -25,7 +21,6 @@ import { createFileEditReplaceStringTool } from "@/node/services/tools/file_edit
 import { createFileEditInsertTool } from "@/node/services/tools/file_edit_insert";
 import { createAskUserQuestionTool } from "@/node/services/tools/ask_user_question";
 import { createIntuitionTool } from "@/node/services/tools/intuition";
-import { createAdvisorTool } from "@/node/services/tools/advisor";
 import { createProposePlanTool } from "@/node/services/tools/propose_plan";
 import { createTodoWriteTool, createTodoReadTool } from "@/node/services/tools/todo";
 import {
@@ -37,11 +32,15 @@ import { createSetGoalTool } from "@/node/services/tools/set_goal";
 import { createGetGoalTool } from "@/node/services/tools/get_goal";
 import { createCompleteGoalTool } from "@/node/services/tools/complete_goal";
 import { createNotifyTool } from "@/node/services/tools/notify";
+import { createArtifactListTool } from "@/node/services/tools/artifact_list";
+import { createArtifactTool } from "@/node/services/tools/artifact";
+import { createArtifactReadTool } from "@/node/services/tools/artifact_read";
 import { createTimelineEventTool } from "@/node/services/tools/timeline_event";
 import { createToolSearchTool } from "@/node/services/tools/toolSearch";
 import { createMcpPromptGetTool } from "@/node/services/tools/mcp_prompt_get";
 import { createAnalyticsQueryTool } from "@/node/services/tools/analyticsQuery";
 import { createDesktopTools } from "@/node/services/tools/desktopTools";
+import { createComputerTool } from "@/node/services/tools/computerTool";
 import type { XumToolScope } from "@/common/types/toolScope";
 import { createTaskTool } from "@/node/services/tools/task";
 import { createTaskApplyGitPatchTool } from "@/node/services/tools/task_apply_git_patch";
@@ -94,6 +93,7 @@ import * as os from "os";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import type { TaskService } from "@/node/services/taskService";
 import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import type { MemoryIndexEntry, MemoryService } from "@/node/services/memoryService";
@@ -108,7 +108,6 @@ import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { FileState } from "@/node/services/agentSession";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
-import type { ModelMessage } from "@/common/types/message";
 import type { GoalDefaults } from "@/constants/goals";
 import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
 
@@ -122,20 +121,6 @@ export interface ToolModelUsageEvent {
   providerMetadata?: Record<string, unknown>;
   toolCallId?: string;
   timestamp: number;
-}
-
-export interface AdvisorToolCallSnapshot {
-  toolCallId: string;
-  toolName: "advisor";
-  input: Record<string, unknown>;
-  stepText: string;
-  stepReasoning: string;
-}
-
-export interface AdvisorStepCaptureRef {
-  currentStepText: string;
-  currentStepReasoning: string;
-  frozenSnapshotsByToolCallId: Map<string, AdvisorToolCallSnapshot>;
 }
 
 export type WorkspaceHeartbeatSettings = NonNullable<WorkspaceMetadata["heartbeat"]>;
@@ -203,6 +188,8 @@ export interface ToolConfiguration {
   workspaceExecutionRootPath?: string;
   /** Workspace session directory (e.g. ~/.xum/sessions/<workspaceId>) for persistent tool state */
   workspaceSessionDir?: string;
+  /** Host root of the cross-workspace artifact shelf (<xumRoot>/artifacts); see artifactShelf.ts. */
+  artifactShelfRoot?: string;
   /** Workspace ID for tracking background processes and plan storage */
   workspaceId?: string;
   /** Resolved agent identity of the turn executing the tools (workflow wake provenance). */
@@ -366,6 +353,7 @@ export interface ToolConfiguration {
     /** Continuous compaction takes precedence over token-budget rollover (new_context). */
     continuousCompaction?: boolean;
     memory?: boolean;
+    artifacts?: boolean;
     /** claude-skills-compat: discover skills from .claude/skills and ~/.claude/skills (read-only). */
     claudeSkillsCompat?: boolean;
   };
@@ -399,29 +387,6 @@ export interface ToolConfiguration {
     maxUsesPerTurn: number;
     /** Shared by every tool rebuild in this parent turn (including refusal fallback). */
     usesThisTurn: number;
-    createModel: NonNullable<ToolConfiguration["advisorRuntime"]>["createModel"];
-    resolveAgentBody: () => Promise<string | null>;
-    /** Evaluation recall; present only for the built-in body with a bound EvaluationService. */
-    createEvaluationModel?: ProviderModelFactory["createEvaluationModel"];
-    evaluationService?: EvaluationService;
-    abortSignal: AbortSignal;
-  };
-  /** Runtime bundle for the advisor tool (present only when advisor is eligible for this stream). */
-  advisorRuntime?: {
-    /** The advisor model string (e.g. "anthropic:claude-sonnet-4-20250514") */
-    advisorModelString: string;
-    /** Optional reasoning/thinking level metadata for the advisor request. */
-    reasoningLevel?: string;
-    /** Independent of the parent chat's reasoning mode and advisor effort. */
-    reasoningMode?: OpenAIReasoningMode;
-    /** Normalized max uses per turn: null = unlimited, positive integer = exact cap */
-    maxUsesPerTurn: number | null;
-    /** Normalized max output tokens cap for advisor responses: undefined = unlimited, positive integer = explicit cap */
-    maxOutputTokens?: number;
-    /** Returns the live conversation transcript up to the current tool call */
-    getTranscriptSnapshot: () => ModelMessage[];
-    /** Returns the frozen same-step capture snapshot for a specific advisor tool call, if available. */
-    takeToolCallSnapshot: (toolCallId: string) => AdvisorToolCallSnapshot | undefined;
     /**
      * Creates a model and pins its request identity, route, and config together.
      * Coder identities retain their actual instance and scoped aliases; option
@@ -442,7 +407,10 @@ export interface ToolConfiguration {
       optionsMuxProviderOptions?: MuxProviderOptions;
       optionsRouteProvider?: ProviderName;
     }>;
-    /** The abort signal from the parent stream */
+    resolveAgentBody: () => Promise<string | null>;
+    /** Evaluation recall; present only for the built-in body with a bound EvaluationService. */
+    createEvaluationModel?: ProviderModelFactory["createEvaluationModel"];
+    evaluationService?: EvaluationService;
     abortSignal: AbortSignal;
   };
   /**
@@ -460,6 +428,8 @@ export interface ToolConfiguration {
   mcpPromptRuntime?: MCPPromptRuntime;
   /** Desktop session manager for desktop automation tools */
   desktopSessionManager?: DesktopSessionManager;
+  /** Native host computer use; the `computer` tool exists only for the owning workspace. */
+  computerUseService?: ComputerUseService;
 }
 
 export interface MCPPromptRuntime {
@@ -567,10 +537,12 @@ function wrapToolsWithModelOnlyNotifications(
 
   const engine = new NotificationEngine([
     new TodoListReminderSource({ workspaceSessionDir: config.workspaceSessionDir }),
-    // Only commands on this host can clutter this host's home dir. XUM_SCRATCH_DIR is exported
-    // exactly for local/worktree runtimes (turnRequestBuilder), including multi-project ones
-    // whose MultiProjectRuntime wrapper is not a LocalBaseRuntime.
-    ...(config.xumEnv?.XUM_SCRATCH_DIR != null
+    // Only commands on this host can clutter this host's home dir, so gate on the runtime type
+    // (XUM_RUNTIME), not on XUM_SCRATCH_DIR, which SSH/Docker/devcontainer export too. The
+    // env value also covers multi-project local workspaces, whose MultiProjectRuntime wrapper is
+    // not a LocalBaseRuntime. The reminder points at $XUM_SCRATCH_DIR, so it must be set.
+    ...((config.xumEnv?.XUM_RUNTIME === "local" || config.xumEnv?.XUM_RUNTIME === "worktree") &&
+    config.xumEnv.XUM_SCRATCH_DIR != null
       ? [
           new HomeClutterReminderSource({
             // The host user's real home is where clutter piles up. A HOME override (project
@@ -953,11 +925,25 @@ export async function getToolsForModel(
     mux_config_write: createXumConfigWriteTool(config),
     skills_catalog_search: createSkillsCatalogSearchTool(config),
     skills_catalog_read: createSkillsCatalogReadTool(config),
-    ...(config.advisorRuntime ? { advisor: createAdvisorTool(config) } : {}),
     ...(config.intuitionRuntime ? { intuition: createIntuitionTool(config) } : {}),
     ...(config.toolSearchRuntime ? { tool_catalog_search: createToolSearchTool(config) } : {}),
     ...(config.mcpPromptRuntime ? { mcp_prompt_get: createMcpPromptGetTool(config) } : {}),
     ...(config.timelineService ? { timeline_event: createTimelineEventTool(config) } : {}),
+    // Only where $XUM_SCRATCH_DIR exists: without it the description's
+    // "$XUM_SCRATCH_DIR/artifacts/" would expand to "/artifacts/".
+    ...(config.experiments?.artifacts && config.xumEnv?.XUM_SCRATCH_DIR != null
+      ? { artifact_list: createArtifactListTool(config) }
+      : {}),
+    // Versions live in the session dir, so publishing also needs one.
+    ...(config.experiments?.artifacts &&
+    config.xumEnv?.XUM_SCRATCH_DIR != null &&
+    config.workspaceSessionDir != null
+      ? { artifact: createArtifactTool(config) }
+      : {}),
+    // The shelf is host-local, so reading it needs no scratch dir.
+    ...(config.experiments?.artifacts && config.artifactShelfRoot != null
+      ? { artifact_read: createArtifactReadTool(config) }
+      : {}),
     ask_user_question: createAskUserQuestionTool(config),
     propose_plan: createProposePlanTool(config),
     // propose_name and propose_status are intentionally NOT registered here —
@@ -1006,13 +992,29 @@ export async function getToolsForModel(
   };
 
   const desktopTools = await getDesktopTools(config);
+  // Each stream keeps the grant it starts with: turning computer use off takes effect
+  // immediately, and turning it back on applies from the next stream.
+  const computerUseGrant =
+    config.workspaceId == null ? null : config.computerUseService?.grantFor(config.workspaceId);
+  const computerUseTools: Record<string, Tool> =
+    computerUseGrant != null ? { computer: createComputerTool(computerUseGrant) } : {};
 
   // Base tools available for all models
   const baseTools: Record<string, Tool> = {
     ...runtimeTools,
     ...nonRuntimeTools,
     ...desktopTools,
+    ...computerUseTools,
   };
+
+  // Tool hooks (.xum/tool_pre, .xum/tool_post) can run only here (trusted project). A
+  // provider-native tool runs on the provider, so no hook can gate it. While hooks can run,
+  // fetch goes through Xum's hook-wrapped client web_fetch instead of native fetch
+  // (Anthropic web_fetch_20250910, Google url_context), so every fetch is gated, including
+  // after a hook is added mid-turn: withHooks finds hook files again on each call. User
+  // decision (#5840, Option A): trusted projects lose native fetch even with no hook file.
+  // Native web search has no client version and stays unhooked.
+  const hooksCanRun = deriveToolHookConfig(config) !== null;
 
   // Try to add provider-specific web search tools if available
   // Lazy-load providers to avoid loading all AI SDKs at startup
@@ -1029,9 +1031,8 @@ export async function getToolsForModel(
         // Known limitations when the native override is active:
         // - Cannot reach private/localhost URLs (Anthropic's servers can't see workspace network).
         // - Not bridgeable in the PTC sandbox because provider-native tools have no execute().
-        // - Tool hooks (.xum/tool_pre/.xum/tool_post) are skipped because withHooks() returns
-        //   early when execute() is absent — same limitation as web_search (provider-native).
-        if (supportsAnthropicNativeWebFetch(capabilityModelId)) {
+        // - Tool hooks are skipped (no execute()), so it is used only where hooks cannot run.
+        if (supportsAnthropicNativeWebFetch(capabilityModelId) && !hooksCanRun) {
           allTools = {
             ...baseTools,
             ...(mcpTools ?? {}),
@@ -1108,7 +1109,8 @@ export async function getToolsForModel(
             // Google exposes native Search and URL Context as provider-executed tools for
             // Gemini 3+. These coexist with Xum function tools in the standard streaming API.
             google_search: google.tools.googleSearch({}) as Tool,
-            url_context: google.tools.urlContext({}) as Tool,
+            // URL Context fetches on Google's side, past tool hooks; client web_fetch covers it.
+            ...(!hooksCanRun && { url_context: google.tools.urlContext({}) as Tool }),
           };
         }
         break;
@@ -1127,11 +1129,12 @@ export async function getToolsForModel(
       enableFamilyMessaging: config.enableFamilyMessaging,
       enableAnalyticsQuery: Boolean(config.analyticsService),
       enableDynamicWorkflows: Boolean(config.workflowService),
-      enableAdvisor: Boolean(config.advisorRuntime),
       enableIntuition: Boolean(config.intuitionRuntime),
       enableSessionHistory: config.experiments?.tokenBudget === true,
       enableMemory: Boolean(config.memoryService && config.experiments?.memory),
       enableTimelineEvent: Boolean(config.timelineService),
+      enableArtifacts:
+        config.experiments?.artifacts === true && config.xumEnv?.XUM_SCRATCH_DIR != null,
       enableToolSearch: Boolean(config.toolSearchRuntime),
       enableMcpPromptGet: Boolean(config.mcpPromptRuntime),
       // The Review pane belongs to the user-facing parent workspace. config

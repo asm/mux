@@ -24,12 +24,11 @@ import {
 } from "@/browser/hooks/usePersistedState";
 import {
   ARCHIVED_WORKSPACES_CACHE_MAX_CHARS,
-  getAgentIdKey,
   getAgentsInitNudgeKey,
   getArchivedWorkspacesKey,
   getArchivedWorkspacesExpandedKey,
-  getProjectScopeId,
 } from "@/common/constants/storage";
+import { updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { trimArrayToChars } from "@/browser/utils/boundedPersistedValue";
 import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
@@ -266,7 +265,7 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
 
   const handleRunAgentsInit = useCallback(() => {
     // Switch project-scope mode to exec.
-    updatePersistedState(getAgentIdKey(getProjectScopeId(projectPath)), "exec");
+    updateUserPreferences({ ai: { projectDefaults: { [projectPath]: { agentId: "exec" } } } });
 
     // Run the /init skill and start the creation chat.
     if (chatInputRef.current) {
@@ -317,7 +316,8 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
     <AgentProvider projectPath={projectPath}>
       <ThinkingProvider projectPath={projectPath}>
         {/* Flex container to fill parent space */}
-        <div className="bg-surface-primary relative flex flex-1 flex-col overflow-hidden">
+        {/* No workspace is open, so this page is the one `main` landmark (#5969). */}
+        <main className="bg-surface-primary relative flex flex-1 flex-col overflow-hidden">
           {/* Draggable header bar - matches WorkspaceMenuBar for consistency */}
           <div
             className={cn(
@@ -404,7 +404,7 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
               projectName={projectName}
             />
           </div>
-        </div>
+        </main>
       </ThinkingProvider>
     </AgentProvider>
   );

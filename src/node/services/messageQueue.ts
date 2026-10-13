@@ -1,15 +1,17 @@
 import type { CompactionReplacementCapture } from "./compactionCancellation";
 import { Err, type Result } from "@/common/types/result";
 import { randomUUID } from "node:crypto";
-import type { GoalSyntheticMessageKind } from "@/constants/goals";
+import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import assert from "@/common/utils/assert";
 import type { FilePart, SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import { AGENT_PEER_MESSAGE_DEDUPE_PREFIX } from "@/constants/agentMessaging";
 import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelope";
 import type { SendMessageError } from "@/common/types/errors";
-import type { MuxMessage } from "@/common/types/message";
+import type { ArtifactInteractionMetadata, MuxMessage } from "@/common/types/message";
+import { ArtifactInteractionMetadataSchema } from "@/common/orpc/schemas/stream";
 import type { ReviewNoteData } from "@/common/types/review";
 import type { TurnAcceptanceOrigin, TurnAdmissionToken } from "./taskWorkspaceSeam";
+import type { SendIdentity } from "./sendIds";
 
 // Type guard for compaction request metadata (for display text)
 interface CompactionMetadata {
@@ -125,6 +127,27 @@ export interface RefusedManualSend {
   displayText: string;
   attachmentCount: number;
   reviewCount: number;
+  /** The send ids of every add behind `message`: a re-send (held Retry) reuses them all. */
+  sendIdentities?: SendIdentity[];
+}
+
+/**
+ * The entry's send ids as `sendIdentities` when it has any (none otherwise). `forDispatch`: the
+ * entry's one publication, so a minted id keeps `unpublished`; any other copy (held input, which
+ * can be re-sent after a publication) drops it.
+ */
+function sendIdentitiesOf(
+  entry: QueueEntry,
+  forDispatch = false
+): { sendIdentities?: SendIdentity[] } {
+  if (entry.sendIdentities.length === 0) return {};
+  return {
+    sendIdentities: entry.sendIdentities.map(({ id, digest, unpublished }) => ({
+      id,
+      digest,
+      ...(forDispatch && unpublished === true ? { unpublished } : {}),
+    })),
+  };
 }
 
 /** onCanceled text for a send whose cancel signal fired before the turn was accepted. */
@@ -147,9 +170,16 @@ export type QueueCutCutter =
   | { stage: "queued"; muxMetadata: unknown; dispatchMode: QueueDispatchMode };
 
 interface QueuedMessageInternalOptions {
+  /**
+   * The send ids this message carries (idempotent sends): one for a new manual send, several
+   * for a held batch re-sent as one message. Their row stamps them all (one publication).
+   */
+  sendIdentities?: SendIdentity[];
   acceptanceOrigin?: TurnAcceptanceOrigin;
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
+  /** Automatic sub-agent turn provenance; binds to exactly one dispatch like goalKind. */
+  taskTurnKind?: TaskTurnKind;
   synthetic?: boolean;
   agentInitiated?: boolean;
   /**
@@ -239,6 +269,7 @@ interface QueueEntry {
   entryId: string;
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
+  taskTurnKind?: TaskTurnKind;
   messages: string[];
   /**
    * Same index as `messages`: the text the user authored for that message (its
@@ -246,6 +277,12 @@ interface QueueEntry {
    * review notes formatted into the message are restored only as structured reviews.
    */
   authoredMessages: string[];
+  /**
+   * Send ids of the entry's adds, in order (idempotent sends). The entry publishes as one row,
+   * so its ids are accepted together or not at all. `dedupeKey` ties an id to its add for
+   * selective removal.
+   */
+  sendIdentities: Array<SendIdentity & { dedupeKey?: string }>;
   /** First muxMetadata added to this entry (never overwritten by later batched adds). */
   muxMetadata?: unknown;
   latestOptions?: SendMessageOptions;
@@ -470,8 +507,7 @@ export class MessageQueue {
    * Hidden tool-end and withdrawn entries between the two stay ahead (FIFO): a live hidden
    * tool-end entry there dispatches first and cuts on its own, and a withdrawn one cuts nothing.
    * Stopping at such an entry instead (the earlier trailing-run rule) left a promoted report
-   * behind a hidden turn-end entry whenever a hidden tool-end or withdrawn entry followed it
-   * (formal/message-queue, invariant PromotedNotBlockedByHidden).
+   * behind a hidden turn-end entry whenever a hidden tool-end or withdrawn entry followed it.
    */
   private promotedToolEndInsertIndex(): number {
     let floor = this.entries.length;
@@ -685,6 +721,7 @@ export class MessageQueue {
     const entry = this.addInternal(message, options, internal, dedupeKey);
     if (entry != null && dedupeKey !== undefined) {
       entry.dedupeKeys.add(dedupeKey);
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       entry.acceptanceOrigins.at(-1)!.dedupeKey = dedupeKey;
     }
     return entry != null;
@@ -705,6 +742,24 @@ export class MessageQueue {
       return undefined;
     }
 
+    // An id already queued is not queued twice: the queued copy carries it, and its row accepts it
+    // once. Any other overlap with queued ids (another payload, or a re-send that is only partly
+    // queued) is queued on its own, never batched into a row with the other copy: the in-lock check
+    // at its publication then refuses it whole, held.
+    const incomingSendIds = internal?.sendIdentities ?? [];
+    const queuedDigests = new Map(
+      this.entries.flatMap((queued) => queued.sendIdentities.map((x) => [x.id, x.digest] as const))
+    );
+    if (
+      incomingSendIds.length > 0 &&
+      incomingSendIds.every((identity) => queuedDigests.get(identity.id) === identity.digest)
+    ) {
+      return undefined;
+    }
+    const overlapsQueuedSendIds = incomingSendIds.some((identity) =>
+      queuedDigests.has(identity.id)
+    );
+
     const incomingHasAcceptedCallbacks =
       internal?.onAccepted != null ||
       internal?.onAcceptedPreStreamFailure != null ||
@@ -717,6 +772,7 @@ export class MessageQueue {
     // must not leak onto batched follow-ups.
     const incomingIsSealed =
       internal?.sealed === true ||
+      overlapsQueuedSendIds ||
       internal?.removableDedupeKey === true ||
       isAgentSkillMetadata(options?.muxMetadata) ||
       isWorkspaceTurnMetadata(options?.muxMetadata) ||
@@ -733,6 +789,8 @@ export class MessageQueue {
       internal?.skipOnSendCompaction === true ||
       internal?.turnAdmission != null ||
       internal?.goalKind != null ||
+      // Task-turn provenance classifies one dispatch; batching would lend it to other messages.
+      internal?.taskTurnKind != null ||
       // An ACP prompt's turn binds the one dispatch that carries its correlation (#5170):
       // batching would drop that correlation or lend it to other messages.
       options?.acpPromptId != null ||
@@ -765,12 +823,14 @@ export class MessageQueue {
         fileParts: [],
         dedupeKeys: new Set<string>(),
         messageDedupeKeys: [],
+        sendIdentities: [],
         dispatchMode: incomingMode,
         sealed: incomingIsSealed,
         userAuthored: incomingIsUserAuthored,
         workspaceTurnContinuation: internal?.workspaceTurnContinuation === true,
         goalKind: internal?.goalKind,
         goalId: internal?.goalId,
+        taskTurnKind: internal?.taskTurnKind,
         addCount: 0,
         syntheticCount: 0,
         agentInitiatedCount: 0,
@@ -801,6 +861,12 @@ export class MessageQueue {
       entry.authoredMessages.push((options?.authoredText ?? trimmedMessage).trim());
       entry.messageDedupeKeys.push(dedupeKey);
     }
+    entry.sendIdentities.push(
+      ...incomingSendIds.map((identity) => ({
+        ...identity,
+        ...(dedupeKey != null ? { dedupeKey } : {}),
+      }))
+    );
 
     if (options) {
       // authoredText describes this add only: it must not ride along as the entry's options.
@@ -909,6 +975,15 @@ export class MessageQueue {
     return this.entries.filter((entry) => entry.userAuthored);
   }
 
+  /** The entry's artifact-send metadata (Artifacts M5b); entries carrying it are sealed sends. */
+  private artifactInteractionOf(entry: QueueEntry): ArtifactInteractionMetadata | undefined {
+    const value = (entry.muxMetadata as { artifactInteraction?: unknown } | undefined)
+      ?.artifactInteraction;
+    if (value === undefined || entry.messages.length !== 1) return undefined;
+    const parsed = ArtifactInteractionMetadataSchema.safeParse(value);
+    return parsed.success ? parsed.data : undefined;
+  }
+
   private getMessagesForEntries(entries: readonly QueueEntry[]): string[] {
     return entries.flatMap((entry) => entry.messages);
   }
@@ -965,7 +1040,20 @@ export class MessageQueue {
 
   /** Get display text for user-visible entries only. */
   getVisibleDisplayText(): string {
-    return this.getDisplayTextForEntries(this.getVisibleEntries());
+    // An artifact send shows the text the user confirmed, not its model-facing payload.
+    return this.getDisplayTextForEntries(this.getVisibleEntries(), (entry) => {
+      const interaction = this.artifactInteractionOf(entry);
+      return interaction != null ? [interaction.text] : entry.messages;
+    });
+  }
+
+  /**
+   * Metadata of the visible queue when it is exactly one artifact send, so the renderer can show
+   * it like the sent message. With other visible entries the display text covers it instead.
+   */
+  getVisibleArtifactInteraction(): ArtifactInteractionMetadata | undefined {
+    const visible = this.getVisibleEntries();
+    return visible.length === 1 ? this.artifactInteractionOf(visible[0]) : undefined;
   }
 
   /** Get accumulated file parts across all entries. */
@@ -984,6 +1072,16 @@ export class MessageQueue {
   }
 
   /** ACP prompt ids of all queued entries, in queue order (an ACP entry is sealed to one prompt). */
+  /** Send ids of every queued add, in queue order (see AgentSession.getPendingSendIds). */
+  getSendIdentities(): SendIdentity[] {
+    return this.entries.flatMap((entry) => entry.sendIdentities);
+  }
+
+  /** Send ids of the user-visible entries, in queue order. */
+  getVisibleSendIds(): string[] {
+    return this.getVisibleEntries().flatMap((entry) => entry.sendIdentities.map(({ id }) => id));
+  }
+
   getAcpPromptIds(): string[] {
     return this.entries.flatMap((entry) => entry.latestOptions?.acpPromptId ?? []);
   }
@@ -991,6 +1089,27 @@ export class MessageQueue {
   /** Stop restores authored input, including an entry already dequeued into preparation. */
   getInputForRestore(): QueuedInput | undefined {
     return this.inputForRestore(this.entries);
+  }
+
+  /**
+   * {@link getInputForRestore} per restorable entry, with the entry's send ids (one entry
+   * publishes as one row, so its ids go together).
+   */
+  getInputsForRestore(): Array<{
+    text: string;
+    fileParts?: FilePart[];
+    reviews?: ReviewNoteData[];
+    sendIds: string[];
+  }> {
+    return this.restorableEntries(this.entries).map((entry) => {
+      const reviews = this.getReviewsForEntries([entry]);
+      return {
+        text: this.getDisplayTextForEntries([entry], (queued) => queued.authoredMessages),
+        ...(entry.fileParts.length > 0 ? { fileParts: entry.fileParts } : {}),
+        ...(reviews ? { reviews } : {}),
+        sendIds: entry.sendIdentities.map(({ id }) => id),
+      };
+    });
   }
 
   /**
@@ -1112,6 +1231,9 @@ export class MessageQueue {
       };
       const keptMessages = entry.messages.filter(isKept);
       if (keptMessages.length > 0) {
+        entry.sendIdentities = entry.sendIdentities.filter(
+          (identity) => identity.dedupeKey == null || !matchingKeySet.has(identity.dedupeKey)
+        );
         entry.messages = keptMessages;
         entry.authoredMessages = entry.authoredMessages.filter(isKept);
         entry.messageDedupeKeys = entry.messageDedupeKeys.filter(isKept);
@@ -1254,6 +1376,7 @@ export class MessageQueue {
       displayText: this.getDisplayTextForEntries([entry], (queued) => queued.authoredMessages),
       attachmentCount: entry.fileParts.length,
       reviewCount,
+      ...sendIdentitiesOf(entry),
     };
   }
 
@@ -1347,6 +1470,7 @@ export class MessageQueue {
         : undefined;
     const hasInternalOptions =
       automaticAcceptance ||
+      entry.taskTurnKind != null ||
       allAddsAreSynthetic ||
       allAddsAreAgentInitiated ||
       entry.onAccepted != null ||
@@ -1358,13 +1482,16 @@ export class MessageQueue {
       entry.turnAdmission != null ||
       refreshCompactionAdmission != null ||
       readCompactionAdmission != null ||
-      (entry.preTurnMessages?.length ?? 0) > 0;
+      (entry.preTurnMessages?.length ?? 0) > 0 ||
+      entry.sendIdentities.length > 0;
     const internal = hasInternalOptions
       ? {
+          ...sendIdentitiesOf(entry, true),
           ...(automaticAcceptance ? { acceptanceOrigin: "automatic" as const } : {}),
           ...(allAddsAreSynthetic ? { synthetic: true } : {}),
           ...(allAddsAreAgentInitiated ? { agentInitiated: true } : {}),
           ...(entry.goalKind != null ? { goalKind: entry.goalKind, goalId: entry.goalId } : {}),
+          ...(entry.taskTurnKind != null ? { taskTurnKind: entry.taskTurnKind } : {}),
           ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
           ...(entry.cancelState != null ? { cancelState: entry.cancelState } : {}),
           ...(entry.cancelSignal != null ? { cancelSignal: entry.cancelSignal } : {}),

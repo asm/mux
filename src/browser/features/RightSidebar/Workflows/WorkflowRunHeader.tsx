@@ -17,7 +17,7 @@ import {
 const BTN_BASE =
   "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors disabled:cursor-default disabled:opacity-50";
 const BTN_DEFAULT = `${BTN_BASE} border-border bg-surface-secondary text-foreground hover:bg-hover`;
-const BTN_ACCENT = `${BTN_BASE} border-accent bg-accent text-white hover:opacity-90`;
+const BTN_ACCENT = `${BTN_BASE} border-accent bg-accent text-accent-foreground hover:bg-accent-button-hover`;
 
 function isInlineWorkflowPath(scriptPath: string): boolean {
   return scriptPath.startsWith("inline://");
@@ -81,14 +81,17 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
   // guard + error state) so they satisfy onClick's void-return contract.
   const interrupt = () => {
     void runAction(() =>
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       api!.workflows.interrupt({ workspaceId: props.workspaceId, runId: run.id })
     );
   };
   const resume = () => {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     void runAction(() => api!.workflows.resume({ workspaceId: props.workspaceId, runId: run.id }));
   };
   const retry = () => {
     void runAction(() =>
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       api!.workflows.retryFromCheckpoint({ workspaceId: props.workspaceId, runId: run.id })
     );
   };
@@ -97,6 +100,7 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
       return;
     }
     void runAction(() =>
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       api!.workflows.start({
         workspaceId: props.workspaceId,
         scriptPath: rerunScriptPath,

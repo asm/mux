@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useRouting } from "@/browser/hooks/useRouting";
 import { useWorkspaceState, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import {
@@ -18,10 +17,9 @@ import { extractStagedAttachmentNotices } from "@/browser/features/ChatInput/sta
 import { parseCommand } from "@/browser/utils/slashCommands/parser";
 import { resolveThinkingInput } from "@/common/utils/thinking/policy";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { AGENT_AI_DEFAULTS_KEY } from "@/common/constants/storage";
+import { useAppConfig } from "@/browser/stores/AppConfigStore";
 import { isProviderConfigFixableError } from "@/common/utils/messages/retryEligibility";
 import type { FilePart, ProvidersConfigMap } from "@/common/orpc/types";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import {
   buildAgentSkillMetadata,
   buildMcpPromptUserText,
@@ -47,7 +45,8 @@ function findTriggerUserMessage(
 ): Extract<DisplayedMessage, { type: "user" }> | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
-    if (msg.type === "user") {
+    // Token Budget warnings are notices, never the request to re-send.
+    if (msg.type === "user" && msg.contextBudgetWarning == null) {
       return msg;
     }
   }
@@ -219,14 +218,8 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
 
   const showCompactionUI = isContextExceeded || isCompactionRecoveryFlow;
 
-  const [agentAiDefaults] = usePersistedState<AgentAiDefaults>(
-    AGENT_AI_DEFAULTS_KEY,
-    {},
-    {
-      listener: true,
-    }
-  );
-  const configuredCompactionModel = agentAiDefaults.compact?.modelString ?? "";
+  const configuredCompactionModel =
+    useAppConfig((config) => config.agentAiDefaults?.compact?.modelString) ?? "";
 
   useEffect(() => {
     if (!api) return;

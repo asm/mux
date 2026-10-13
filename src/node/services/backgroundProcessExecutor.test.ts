@@ -74,6 +74,75 @@ describe("spawnProcess", () => {
     await fs.access(`${tempDir}/mux-bashes/${workspaceId}/ambiguous/output.log`);
   });
 
+  it("removes a record directory on cwd failure only when the caller claimed it", async () => {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-cwd-claim-"));
+    cleanupDirs.push(hostDir);
+    const runtime = new LocalRuntime(hostDir);
+    const workspaceId = `cwd-claim-${Date.now()}`;
+    const workspaceDir = `${await runtime.tempDir()}/mux-bashes/${workspaceId}`;
+    cleanupDirs.push(workspaceDir);
+    const recordDir = (name: string) => path.join(workspaceDir, name);
+    // An existing record the caller did not claim (e.g. another backend's) must survive.
+    await fs.mkdir(recordDir("existing"), { recursive: true });
+    await fs.writeFile(path.join(recordDir("existing"), "output.log"), "kept");
+    await fs.mkdir(recordDir("claimed"), { recursive: true });
+
+    for (const [processId, recordDirClaimed] of [
+      ["existing", false],
+      ["claimed", true],
+    ] as const) {
+      const result = await spawnProcess(runtime, "echo hi", {
+        cwd: path.join(hostDir, "missing"),
+        workspaceId,
+        processId,
+        recordDirClaimed,
+      });
+      expect(result.success).toBe(false);
+    }
+
+    expect(await fs.readFile(path.join(recordDir("existing"), "output.log"), "utf-8")).toBe("kept");
+    expect(await fs.stat(recordDir("claimed")).catch(() => null)).toBeNull();
+  });
+
+  it("removes a claimed record directory when the cwd check throws", async () => {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-cwd-throw-"));
+    cleanupDirs.push(hostDir);
+    const base = new LocalRuntime(hostDir);
+    const workspaceId = `cwd-throw-${Date.now()}`;
+    const recordDir = `${await base.tempDir()}/mux-bashes/${workspaceId}/claimed`;
+    cleanupDirs.push(path.dirname(recordDir));
+    await fs.mkdir(recordDir, { recursive: true });
+    // Transport error on the cwd check only (the only command that starts with printf).
+    const runtime = new Proxy({} as LocalRuntime, {
+      get(_target, prop) {
+        if (prop === "exec") {
+          return (command: string, opts: never) => {
+            if (command.startsWith("printf")) throw new Error("SSH channel error");
+            return base.exec(command, opts);
+          };
+        }
+        const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof value === "function"
+          ? (value as (...args: unknown[]) => unknown).bind(base)
+          : value;
+      },
+    });
+
+    let threw = false;
+    try {
+      await spawnProcess(runtime, "echo hi", {
+        cwd: hostDir,
+        workspaceId,
+        processId: "claimed",
+        recordDirClaimed: true,
+      });
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+    expect(await fs.stat(recordDir).catch(() => null)).toBeNull();
+  });
+
   it("runs the wrapper from the cwd mapped into the exec namespace", async () => {
     const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-exec-host-"));
     const execDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-exec-container-"));
@@ -218,5 +287,91 @@ describe("spawnProcess", () => {
     // fail (feeding monitor retirement) rather than report a still-running process forever.
     const probe = await result.handle.getExitCodeForMonitor?.();
     expect(probe?.success).toBe(false);
+  });
+
+  /**
+   * Spawns a script that creates $READY_FILE once its traps and children are in place, and waits
+   * for it: a stop that lands while bash is still starting its first child would test startup.
+   */
+  async function spawnLive(script: string, tag: string) {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), `bg-${tag}-`));
+    cleanupDirs.push(hostDir);
+    const readyFile = path.join(hostDir, "ready");
+    const runtime = new LocalRuntime(hostDir);
+    const result = await spawnProcess(runtime, script, {
+      cwd: hostDir,
+      workspaceId: `${tag}-${Date.now()}`,
+      processId: tag,
+      env: { READY_FILE: readyFile },
+    });
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error(result.error);
+    handles.push(result.handle);
+    cleanupDirs.push(result.outputDir);
+    const ready = () =>
+      fs.access(readyFile).then(
+        () => true,
+        () => false
+      );
+    for (let attempt = 0; attempt < 500; attempt++) {
+      if (await ready()) return { result, runtime };
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`${tag}: the script never became ready`);
+  }
+
+  function groupAlive(pgid: number): boolean {
+    try {
+      process.kill(-pgid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("concurrent terminate calls share one kill sequence", async () => {
+    const { result, runtime } = await spawnLive(
+      'sleep 30 & : > "$READY_FILE"; wait',
+      "terminate-once"
+    );
+
+    const execSpy = spyOn(runtime, "exec");
+    try {
+      // task_stop and the timeout timer can both reach a running process's handle.
+      await Promise.all([result.handle.terminate(), result.handle.terminate()]);
+      await result.handle.terminate();
+      const killSequences = execSpy.mock.calls.filter(([command]) => command.includes("kill -15"));
+      expect(killSequences).toHaveLength(1);
+    } finally {
+      execSpy.mockRestore();
+    }
+    // Recorded by the wrapper's TERM trap (bash alone would record 0).
+    expect(await result.handle.getExitCode()).toBe(143);
+  });
+
+  it("a stop keeps the exit code the script's own TERM trap recorded", async () => {
+    const { result } = await spawnLive(
+      'trap "exit 7" TERM; sleep 30 & : > "$READY_FILE"; wait',
+      "own-term-trap"
+    );
+    await result.handle.terminate();
+    // The kill command publishes 143 only when no exit_code exists.
+    expect(await result.handle.getExitCode()).toBe(7);
+  });
+
+  it("a member that ignores SIGTERM is killed after the wrapper recorded its exit", async () => {
+    const { result } = await spawnLive(
+      `sh -c 'trap "" TERM; : > "$READY_FILE"; exec sleep 30' & wait`,
+      "ignores-term"
+    );
+    await result.handle.terminate();
+    // The wrapper's TERM trap recorded 143, but the member kept the group alive, so the
+    // escalation sent SIGKILL and kept the recorded code.
+    expect(await result.handle.getExitCode()).toBe(143);
+    // Killed members can stay visible as zombies until their reaper collects them.
+    for (let attempt = 0; attempt < 200 && groupAlive(result.pid); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(groupAlive(result.pid)).toBe(false);
   });
 });

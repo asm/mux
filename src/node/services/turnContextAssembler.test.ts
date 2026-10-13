@@ -10,7 +10,7 @@ import { createMuxMessage } from "@/common/types/message";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectsConfig } from "@/common/types/project";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
-import { getPlanFilePath } from "@/common/utils/planStorage";
+import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
 import { buildWorkflowRunCardMessage } from "@/common/utils/workflowRunMessages";
 import {
   buildPlanReviewMetadata,
@@ -19,7 +19,9 @@ import {
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import { jsonSchema, tool, type Tool } from "ai";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import { RuntimeError } from "@/node/runtime/Runtime";
+import { RuntimeError, type Runtime } from "@/node/runtime/Runtime";
+import type { PlanFileLocation } from "@/node/utils/runtime/planLocation";
+import { createRemoteProjectId } from "@/node/runtime/remoteProjectLayout";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createTestHistoryService } from "./testHistoryService";
 import { createContextBudgetWarning } from "./contextWindowRollover";
@@ -130,6 +132,17 @@ async function buildSystemContextForTest(args: {
     intuitionToolAvailable: args.intuitionToolAvailable,
     instructionSources: args.instructionSources,
   });
+}
+
+/** A local runtime's plan location (no shared legacy fallback; see planLocation.ts). */
+function localPlanLocation(
+  runtime: Runtime,
+  metadata: { id: string; name: string; projectName: string }
+): PlanFileLocation {
+  return {
+    planPath: getPlanFilePath(metadata.name, metadata.projectName, runtime.getXumHome()),
+    legacyIdPath: getLegacyPlanFilePath(metadata.id, runtime.getXumHome()),
+  };
 }
 
 describe("prepareProviderRequestMessages", () => {
@@ -461,6 +474,79 @@ describe("assemblePromptPayload", () => {
       ...overrides,
     });
 
+  test("puts request context at the start of the newest user message, or last without one", async () => {
+    const context = createMuxMessage("ctx", "user", "VIEW-CONTEXT");
+    const turns = [
+      createMuxMessage("u1", "user", "FIRST"),
+      createMuxMessage("a1", "assistant", "ANSWER"),
+    ];
+    const order = async (history: typeof turns) => {
+      const payload = await assemble({ history, requestContextMessage: context });
+      // Request-only: never part of the rows the request was built from.
+      expect(payload.providerRequestMessages.some((m) => m.id === "ctx")).toBe(false);
+      const wire = JSON.stringify(payload.messages);
+      return ["FIRST", "ANSWER", "VIEW-CONTEXT", "NEWEST"]
+        .filter((text) => wire.includes(text))
+        .sort((a, b) => wire.indexOf(a) - wire.indexOf(b));
+    };
+    expect(await order([...turns, createMuxMessage("u2", "user", "NEWEST")])).toEqual([
+      "FIRST",
+      "ANSWER",
+      "VIEW-CONTEXT",
+      "NEWEST",
+    ]);
+    // At the provider the two user rows are one message (mergeConsecutiveUserMessages): the
+    // context block first, then the user's text.
+    const merged = await assemble({
+      history: [...turns, createMuxMessage("u2", "user", "NEWEST")],
+      requestContextMessage: context,
+    });
+    expect(merged.messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(JSON.stringify(merged.messages[2])).toContain("VIEW-CONTEXT\\nNEWEST");
+    expect(await order(turns)).toEqual(["FIRST", "ANSWER", "VIEW-CONTEXT"]);
+    const plain = await assemble({ history: turns });
+    const withContext = await assemble({ history: turns, requestContextMessage: context });
+    expect(withContext.system).toEqual(plain.system);
+  });
+
+  test("request context keeps every part of the user message it merges into", async () => {
+    const context = createMuxMessage("ctx", "user", "VIEW-CONTEXT");
+    const svg = `data:image/svg+xml;base64,${Buffer.from("<svg><text>SVG-BODY</text></svg>").toString("base64")}`;
+    const history = [
+      createMuxMessage("u1", "user", "NEWEST", undefined, [
+        { type: "file", mediaType: "image/svg+xml", url: svg, filename: "chart.svg" },
+      ]),
+    ];
+    const payload = await assemble({ history, requestContextMessage: context });
+    expect(payload.messages.map((m) => m.role)).toEqual(["user"]);
+    const wire = JSON.stringify(payload.messages);
+    // The SVG reaches the provider as text, after the context and the user's own text.
+    expect(wire).toContain("SVG-BODY");
+    expect(wire.indexOf("VIEW-CONTEXT")).toBeLessThan(wire.indexOf("NEWEST"));
+    expect(wire.indexOf("NEWEST")).toBeLessThan(wire.indexOf("SVG-BODY"));
+  });
+
+  test("puts request context before the request a trailing partial assistant continues", async () => {
+    const context = createMuxMessage("ctx", "user", "VIEW-CONTEXT");
+    // The refusal fallback (and an interrupted turn) ends the history in the partial reply.
+    const history = [
+      createMuxMessage("u1", "user", "FIRST"),
+      createMuxMessage("a1", "assistant", "ANSWER"),
+      createMuxMessage("u2", "user", "NEWEST"),
+      createMuxMessage("a2", "assistant", "PARTIAL", { partial: true }),
+    ];
+    const payload = await assemble({ history, requestContextMessage: context });
+    const wire = JSON.stringify(payload.messages);
+    const order = ["FIRST", "ANSWER", "VIEW-CONTEXT", "NEWEST", "PARTIAL"]
+      .filter((text) => wire.includes(text))
+      .sort((a, b) => wire.indexOf(a) - wire.indexOf(b));
+    expect(order).toEqual(["FIRST", "ANSWER", "VIEW-CONTEXT", "NEWEST", "PARTIAL"]);
+    // Nothing but the continuation sentinel follows the partial reply.
+    const afterPartial = wire.slice(wire.indexOf("PARTIAL"));
+    expect(afterPartial).not.toContain("VIEW-CONTEXT");
+    expect(afterPartial).toContain("[CONTINUE]");
+  });
+
   test("replays tool_catalog_search results as tool references only for deferred tools", async () => {
     const history = [
       createMuxMessage("user", "user", "find it"),
@@ -743,6 +829,7 @@ describe("buildPlanInstructions", () => {
     const outcome = await buildPlanInstructions({
       runtime,
       metadata,
+      planLocation: localPlanLocation(runtime, metadata),
       workspaceId: metadata.id,
       workspacePath: projectPath,
       effectiveMode: "exec",
@@ -787,6 +874,7 @@ describe("buildPlanInstructions", () => {
     const result = await buildPlanInstructions({
       runtime,
       metadata,
+      planLocation: localPlanLocation(runtime, metadata),
       workspaceId: metadata.id,
       workspacePath: projectPath,
       effectiveMode: "plan",
@@ -862,6 +950,7 @@ describe("buildPlanInstructions", () => {
     const fromSlicedPayload = await buildPlanInstructions({
       runtime,
       metadata,
+      planLocation: localPlanLocation(runtime, metadata),
       workspaceId: metadata.id,
       workspacePath: projectPath,
       effectiveMode: "exec",
@@ -879,6 +968,7 @@ describe("buildPlanInstructions", () => {
     const fromFullHistory = await buildPlanInstructions({
       runtime,
       metadata,
+      planLocation: localPlanLocation(runtime, metadata),
       workspaceId: metadata.id,
       workspacePath: projectPath,
       effectiveMode: "exec",
@@ -1385,4 +1475,69 @@ describe("buildStreamSystemContext", () => {
       }
     });
   }
+
+  // #5174: SSH ancestors are listed by their installation-scoped path only. One from an older build
+  // that has not migrated yet is left out (its plan is not at that path yet), and a turn never
+  // points the agent at a legacy plan file.
+  test("lists migrated SSH ancestors by their installation-scoped path, and no legacy path", async () => {
+    using tempRoot = new DisposableTempDir("stream-system-context");
+    const projectPath = path.join(tempRoot.path, "project");
+    const xumHome = path.join(tempRoot.path, "mux-home");
+    await fs.mkdir(projectPath, { recursive: true });
+    const ssh = { type: "ssh", host: "box", srcBaseDir: "~/xum" } as const;
+    const metadata = createWorkspaceMetadata({
+      id: "self-ws",
+      name: "self-workspace",
+      projectName: "project",
+      projectPath,
+      parentWorkspaceId: "child-ws",
+    });
+    const row = (id: string, name: string, extra: Record<string, unknown>) => ({
+      path: path.join(projectPath, name),
+      id,
+      name,
+      runtimeConfig: ssh,
+      ...extra,
+    });
+    const cfg: ProjectsConfig = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              row("parent-ws", "parent-workspace", {}),
+              row("child-ws", "child-workspace", {
+                parentWorkspaceId: "parent-ws",
+                remotePlanMigrated: true,
+              }),
+            ],
+          },
+        ],
+      ]),
+    };
+    const installationId = "00000000-0000-4000-8000-000000000001";
+    const scoped = (name: string) =>
+      `${xumHome}/plans/installation-${installationId}/${createRemoteProjectId(projectPath)}/${name}.md`;
+
+    const result = await buildStreamSystemContext({
+      runtime: new TestRuntime(projectPath, xumHome),
+      metadata: { ...metadata, runtimeConfig: ssh },
+      workspacePath: projectPath,
+      workspaceId: metadata.id,
+      agentDefinition: { id: "exec", scope: "built-in" },
+      effectiveMode: "exec",
+      agentDiscoveryRuntime: new TestRuntime(projectPath, xumHome),
+      agentDiscoveryPath: projectPath,
+      isSubagentWorkspace: true,
+      effectiveAdditionalInstructions: undefined,
+      installationId,
+      modelString: "openai:gpt-5.2",
+      cfg,
+      providersConfig: null,
+      mcpServers: {},
+    });
+
+    expect(result.ancestorPlanFilePaths).toEqual([scoped("child-workspace")]);
+  });
 });

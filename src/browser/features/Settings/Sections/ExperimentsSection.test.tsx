@@ -3,7 +3,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "b
 import { GlobalWindow } from "happy-dom";
 import type { ReactNode } from "react";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import * as ActualExperimentsModule from "@/browser/contexts/ExperimentsContext";
+import * as ActualExperimentsModule from "@/browser/hooks/useExperiments";
 import * as ActualTelemetryModule from "@/browser/hooks/useTelemetry";
 import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
 
@@ -12,7 +12,7 @@ const actualExperiments = { ...ActualExperimentsModule };
 const actualTelemetry = { ...ActualTelemetryModule };
 
 afterAll(() => {
-  void mock.module("@/browser/contexts/ExperimentsContext", () => actualExperiments);
+  void mock.module("@/browser/hooks/useExperiments", () => actualExperiments);
   void mock.module("@/browser/hooks/useTelemetry", () => actualTelemetry);
 });
 
@@ -31,6 +31,7 @@ function createDeferred<T>() {
 let mockApi: TestApiOverrides<APIClient>;
 let experimentEnabled = false;
 let experimentValues: Record<string, boolean> = {};
+let writeExperiment: () => Promise<void> = () => Promise.resolve();
 
 // Inject the current client through the real provider; mocking the API module leaks across
 // files. The wrapper reads mockApi on every render, so rerenders pick up swapped clients.
@@ -38,12 +39,13 @@ function ApiWrapper(props: { children: ReactNode }) {
   return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
 }
 
-void mock.module("@/browser/contexts/ExperimentsContext", () => ({
+void mock.module("@/browser/hooks/useExperiments", () => ({
   ...actualExperiments,
   useExperiment: (experimentId: string) => [
     experimentValues[experimentId] ?? experimentEnabled,
     (enabled: boolean) => {
       experimentValues[experimentId] = enabled;
+      return writeExperiment();
     },
   ],
   useExperimentValue: (experimentId: string) => experimentValues[experimentId] ?? experimentEnabled,
@@ -106,6 +108,7 @@ describe("PortableDesktopExperimentWarning", () => {
     globalThis.window.api = { platform: "linux", versions: {} };
     experimentEnabled = true;
     experimentValues = {};
+    writeExperiment = () => Promise.resolve();
     const stoppedServerStatus = {
       running: false,
       baseUrl: null,
@@ -173,6 +176,26 @@ describe("PortableDesktopExperimentWarning", () => {
         [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: enabled,
         [EXPERIMENT_IDS.TOKEN_BUDGET]: enabled,
       });
+    }
+  );
+
+  test.each([true, false])(
+    "turning LAN exposure off resets the bind settings only once the write is saved (saved=%p)",
+    async (saved) => {
+      experimentEnabled = false;
+      experimentValues = { [EXPERIMENT_IDS.CONFIGURABLE_BIND_URL]: true };
+      let settle!: () => void;
+      writeExperiment = () =>
+        new Promise<void>((resolve, reject) => {
+          settle = () => (saved ? resolve() : reject(new Error("offline")));
+        });
+      const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
+      fireEvent.click(view.getByRole("switch", { name: "Toggle Expose API server on LAN/VPN" }));
+      await act(() => Promise.resolve());
+      expect(mockApi.server?.setApiServerSettings).not.toHaveBeenCalled();
+      settle();
+      await act(() => Promise.resolve());
+      expect(mockApi.server?.setApiServerSettings).toHaveBeenCalledTimes(saved ? 1 : 0);
     }
   );
 

@@ -16,6 +16,11 @@ import {
 } from "@/constants/autoModelRouting";
 import type { ProvidersConfigStore } from "@/node/config/providersConfigStore";
 import {
+  isSessionTapeReplayMode,
+  SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
+} from "@/node/services/sessionTapes/sessionTapeReplaySource";
+import { isMockAiMode, MOCK_AI_MODEL_REFUSED_MESSAGE } from "@/node/services/mock/mockAiMode";
+import {
   buildAIProviderRequestHeaders,
   normalizeAnthropicBaseURL,
   normalizeOpenAICompatibleBaseURL,
@@ -138,6 +143,14 @@ export function createEvaluationModel(
   deps: EvaluationModelFactoryDeps
 ): Effect.Effect<Result<Experimental_EvaluationModelV4, EvaluationModelFailure>> {
   return Effect.gen(function* () {
+    // Perf harness replay mode (XUM_REPLAY_TAPES): no provider call, by construction.
+    if (isSessionTapeReplayMode()) {
+      return Err({ code: "provider_disabled", message: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE });
+    }
+    // Mock AI mode (XUM_MOCK_AI, #5604): auto model routing makes no provider call either.
+    if (isMockAiMode()) {
+      return Err({ code: "provider_disabled", message: MOCK_AI_MODEL_REFUSED_MESSAGE });
+    }
     const target = resolveEvaluationModelTarget(modelString, deps);
     if (!target.success) return target;
     const { provider, modelId, settings, organization } = target.data;

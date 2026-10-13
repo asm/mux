@@ -20,6 +20,7 @@ import type { ResolvedAgentSkill } from "@/node/services/agentSkills/agentSkills
 import * as agentSkillsModule from "@/node/services/agentSkills/agentSkillsService";
 import * as continuousCompactionSummaryModule from "@/node/services/continuousCompactionSummary";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
   COMPACTION_SUMMARY_WITHHELD_MESSAGE,
   PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE,
@@ -201,6 +202,10 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
   }
 
   /** Report a fixed recorded usage (threshold 90%, no force) so the routed pending-payload estimate decides. */
+  // The pending-payload tests size their payloads against a 200k routed window; the
+  // `haiku` alias now resolves to Haiku 5.5 (1M), where the same payloads round to nothing.
+  const SMALL_CLASS_200K = "anthropic:claude-haiku-4-5+0";
+
   function stubCompactionMonitor(session: object, usagePercentage: number): void {
     (
       session as unknown as { contextController: { compactionMonitor: unknown } }
@@ -953,6 +958,13 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       clearPendingContinuationForManualUserMessage: () => Promise.resolve(),
       suppressBudgetWrapupForManualUserMessage: () => Promise.resolve(),
       acknowledgeUser: () => Promise.resolve(Ok(undefined)),
+      beginStreamAccountingReceipt: () => undefined,
+      settleStreamAccountingReceipt: () => undefined,
+      releaseUnaccountedStreamAccountingReceipt: () => undefined,
+      recordUserStoppedStream: () => undefined,
+      resetStreamErrorResumeEpisode: () => undefined,
+      cancelStreamErrorResume: () => undefined,
+      wakeContinuationBlockedByUserInput: () => undefined,
       requestContinuationAfterStreamEnd,
     } as unknown as WorkspaceGoalService;
     // The harness's emitter exists only after creation; the handle factory runs later.
@@ -1427,7 +1439,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       });
       const { session, historyService } = await createRoutingHarness({
         workspacePath,
-        configValues: { modelClasses: { small: "haiku+0" } },
+        configValues: { modelClasses: { small: SMALL_CLASS_200K } },
       });
       // 86% recorded: under the 90% cutoff on its own; a 50k-char body adds
       // ~6% of haiku's window, a one-line body next to nothing.
@@ -1499,7 +1511,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       }
       const { session, historyService } = await createRoutingHarness({
         workspacePath,
-        configValues: { modelClasses: { small: "haiku+0" } },
+        configValues: { modelClasses: { small: SMALL_CLASS_200K } },
       });
       stubCompactionMonitor(session, 86);
       const result = await session.sendMessage(
@@ -1596,7 +1608,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     });
     const { session, historyService } = await createRoutingHarness({
       workspacePath,
-      configValues: { modelClasses: { small: "haiku+0" } },
+      configValues: { modelClasses: { small: SMALL_CLASS_200K } },
     });
     stubCompactionMonitor(session, 86);
     // ~60k decoded chars (≈15k tokens, ≈7.5% of haiku's window) as a data URL.
@@ -2089,6 +2101,8 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       false,
       undefined,
       undefined,
+      undefined,
+      undefined,
       gate
     );
     expect(prepared).toHaveLength(1);
@@ -2110,7 +2124,12 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       workspacePath,
       configValues: { modelClasses: { small: "haiku+0" } },
     };
-    const { session, streamed } = await createRoutingHarness(harnessArgs);
+    const { session, streamed, aiService } = await createRoutingHarness(harnessArgs);
+    // Token-budget windows require Agent Memory (the session checkpoint scope); both come
+    // from the experiments service, never from the send options.
+    spyOn(aiService, "isExperimentEnabled").mockImplementation(
+      (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
+    );
     const internals = session as unknown as {
       aiService: { prepareStreamMessage: { mock: { calls: unknown[][] } } };
       contextController: { beforeSend: (input: { stage: string }) => Promise<unknown> };
@@ -2141,11 +2160,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
       )
     );
 
-    const result = await session.sendMessage(
-      "Use skill done",
-      // Token-budget windows require Agent Memory (the session checkpoint scope).
-      skillSendOptions({ experiments: { tokenBudget: true, memory: true } })
-    );
+    const result = await session.sendMessage("Use skill done", skillSendOptions());
     expect(result.success).toBe(true);
     expect(streamed).toHaveLength(1);
     const prepared = internals.aiService.prepareStreamMessage.mock.calls;
@@ -3168,7 +3183,7 @@ describe("AgentSession.sendMessage (per-skill model routing)", () => {
     });
     const { session, historyService } = await createRoutingHarness({
       workspacePath,
-      configValues: { modelClasses: { small: "haiku+0" } },
+      configValues: { modelClasses: { small: SMALL_CLASS_200K } },
     });
     stubCompactionMonitor(session, 60);
     const pdf = `%PDF-1.4\n${Array.from(

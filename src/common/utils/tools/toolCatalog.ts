@@ -26,6 +26,7 @@ import type {
   ToolResultPart,
 } from "ai";
 import type { ModelMessage, MuxMessage } from "@/common/types/message";
+import type { ToolSearchToolResult } from "@/common/types/tools";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 
@@ -55,6 +56,27 @@ export const TOOL_SEARCH_MAX_LIMIT = 25;
  */
 export const NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS = 24_000;
 
+/**
+ * Keyword-search auto-load cap on a single deferred tool definition
+ * (description + JSON input schema chars). A weak keyword match must not
+ * silently load an oversized definition: once loaded it is carried for the
+ * rest of the session (wire tokens on every request plus permanent
+ * context-window pressure), while an explicit exact-name lookup costs one
+ * extra search round trip (roughly one cached transcript re-read).
+ *
+ * Chosen from a real 178-tool deferred catalog (2026-10): P95 is ~6.7k chars
+ * and the 8-15k band holds frequently wanted tools (page/issue editors), so a
+ * lower cap taxes ordinary searches with spurious round trips. Only three
+ * pathological query tools exceed 16k (17k/22k/80k chars; the 80k one ranked
+ * first for an unrelated query and cost ~31k tokens for the session, #5413
+ * audit). At 16k the smallest guarded tool (~6.4k tokens) already costs more
+ * to carry over a median ~45-request session than the one re-search trip.
+ */
+export const TOOL_SEARCH_MAX_AUTOLOAD_DEFINITION_CHARS = 16_000;
+
+/** Wire chars per token for approximate model-facing size labels (same measurement as #5405). */
+const TOOL_SEARCH_WIRE_CHARS_PER_TOKEN = 2.7;
+
 /** Size proxy for a tool definition on the wire: description plus JSON input schema. */
 function toolDefinitionChars(tool: Tool): number {
   const description = typeof tool.description === "string" ? tool.description.length : 0;
@@ -70,6 +92,13 @@ export interface ToolCatalogEntry {
   paramText: string;
   /** MCP server that provides this tool, when known (used for the catalog overview + scoring). */
   serverName?: string;
+  /**
+   * Definition size (description + JSON input schema chars) for the keyword
+   * auto-load cap. Optional so hand-built test entries stay small;
+   * buildToolCatalog, the only production constructor, always sets it, and an
+   * absent value is treated as small (never guarded).
+   */
+  definitionChars?: number;
 }
 
 /**
@@ -98,7 +127,7 @@ export interface ToolSearchStreamState {
 /**
  * Per-send runtime holder shared between tool creation (getToolsForModel) and
  * stream wiring. `state` is only assigned after the post-policy gate decides
- * the feature is active (mirrors the advisorRuntime mutable-ref precedent).
+ * the feature is active.
  */
 export interface ToolSearchRuntime {
   state?: ToolSearchStreamState;
@@ -203,6 +232,7 @@ export function buildToolCatalog(inputs: ToolCatalogInputs): ToolCatalogClassifi
       description: typeof tool.description === "string" ? tool.description : "",
       paramText: extractParamText(tool),
       serverName: inputs.mcpToolServers?.[name],
+      definitionChars: toolDefinitionChars(tool),
     });
   }
 
@@ -576,6 +606,7 @@ export function rebuildToolSearchState(
   state.allToolNames = prepared.state.allToolNames;
   state.native = prepared.state.native;
   state.activatedToolNames = new Set(
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     [...state.activatedToolNames].filter((name) => prepared.state!.deferredToolNames.has(name))
   );
   return { tools: prepared.tools };
@@ -665,13 +696,72 @@ export function searchToolCatalog(
   }
 
   scored.sort((a, b) => b.score - a.score || a.entry.name.localeCompare(b.entry.name));
-  return scored.slice(0, effectiveLimit).map(({ entry }) => ({
+  return scored.slice(0, effectiveLimit).map(({ entry }) => toToolSearchMatch(entry));
+}
+
+function toToolSearchMatch(entry: ToolCatalogEntry): ToolSearchMatch {
+  return {
     name: entry.name,
     description: entry.description,
     // Display label, not the raw name: an unbounded server-map key repeated
     // across up to 25 matches could inflate the result past provider limits.
     ...(entry.serverName !== undefined ? { serverName: displayServerLabel(entry.serverName) } : {}),
-  }));
+  };
+}
+
+export const TOOL_SEARCH_DISCOVERY_NOTE =
+  "No tools were loaded: a matched definition exceeds the auto-load size cap. " +
+  "To load a tool (any size), search again with its exact name as the entire query; " +
+  "narrow the keywords to load only the smaller candidates.";
+
+/**
+ * Resolve one tool_catalog_search query against the deferred catalog.
+ *
+ * Two paths (documented in the tool description):
+ * - Exact lookup: a query that is exactly one catalog tool's name (trimmed,
+ *   case-insensitive) returns and loads just that tool, any size, skipping
+ *   fuzzy ranking. This is the escape hatch the discovery note points at; it
+ *   cannot be re-guarded, so a discovery result never loops.
+ * - Keyword search: ranking unchanged. When any ranked match's definition
+ *   exceeds TOOL_SEARCH_MAX_AUTOLOAD_DEFINITION_CHARS, nothing is loaded
+ *   (`matches` stays empty, so activation, native tool_reference output, and
+ *   restart replay all skip it by construction) and every ranked candidate is
+ *   listed with its approximate token size instead — explicit discovery, never
+ *   a silent skip or a partial load the model cannot see in native mode
+ *   (a tool_result cannot mix tool_reference blocks with text).
+ */
+export function resolveToolSearchQuery(
+  catalog: readonly ToolCatalogEntry[],
+  query: string,
+  limit?: number | null
+): { query: string; matches: ToolSearchMatch[]; discovery?: ToolSearchToolResult["discovery"] } {
+  const trimmed = query.trim().toLowerCase();
+  const exact = catalog.find((entry) => entry.name.toLowerCase() === trimmed);
+  if (exact !== undefined) {
+    return { query, matches: [toToolSearchMatch(exact)] };
+  }
+  const matches = searchToolCatalog(catalog, query, limit);
+  const definitionChars = new Map(catalog.map((entry) => [entry.name, entry.definitionChars ?? 0]));
+  const isOversized = (name: string) =>
+    (definitionChars.get(name) ?? 0) > TOOL_SEARCH_MAX_AUTOLOAD_DEFINITION_CHARS;
+  if (!matches.some((match) => isOversized(match.name))) {
+    return { query, matches };
+  }
+  return {
+    query,
+    matches: [],
+    discovery: {
+      candidates: matches.map((match) => ({
+        name: match.name,
+        ...(match.serverName !== undefined ? { serverName: match.serverName } : {}),
+        approxTokens: Math.round(
+          (definitionChars.get(match.name) ?? 0) / TOOL_SEARCH_WIRE_CHARS_PER_TOKEN
+        ),
+        ...(isOversized(match.name) ? { oversized: true as const } : {}),
+      })),
+      note: TOOL_SEARCH_DISCOVERY_NOTE,
+    },
+  };
 }
 
 /** Read `matches[].name` strings from a defensively-parsed tool_catalog_search result value. */
@@ -978,18 +1068,168 @@ export function countToolReferences(messages: readonly unknown[]): Map<string, n
         continue;
       }
       for (const item of output.value as unknown[]) {
-        const providerOptions =
-          isPlainRecord(item) && item.type === "custom" ? item.providerOptions : undefined;
-        const anthropic = isPlainRecord(providerOptions) ? providerOptions.anthropic : undefined;
-        if (
-          isPlainRecord(anthropic) &&
-          anthropic.type === "tool-reference" &&
-          typeof anthropic.toolName === "string"
-        ) {
-          counts.set(anthropic.toolName, (counts.get(anthropic.toolName) ?? 0) + 1);
+        const name = nativeToolReferenceName(item);
+        if (name !== undefined) {
+          counts.set(name, (counts.get(name) ?? 0) + 1);
         }
       }
     }
   }
   return counts;
+}
+
+/** Tool name of a native `tool_reference` content item, undefined for anything else. */
+function nativeToolReferenceName(item: unknown): string | undefined {
+  const providerOptions =
+    isPlainRecord(item) && item.type === "custom" ? item.providerOptions : undefined;
+  const anthropic = isPlainRecord(providerOptions) ? providerOptions.anthropic : undefined;
+  return isPlainRecord(anthropic) &&
+    anthropic.type === "tool-reference" &&
+    typeof anthropic.toolName === "string"
+    ? anthropic.toolName
+    : undefined;
+}
+
+/**
+ * Request-only projection that drops a native `tool_reference` whose tool an
+ * earlier result in the same request already references: Anthropic expands
+ * every occurrence into the full definition, repeats included (#5413), so a
+ * repeat only re-pays the schema. Decided purely from the references present
+ * in `messages`, in transcript order — persisted results keep their raw
+ * matches, and a compacted prefix that dropped the first referencing result
+ * lets a later result reference the tool again. A result left with no
+ * references becomes a deterministic text result (Anthropic rejects an empty
+ * content list). Untouched messages keep their identity, and appending
+ * messages never changes the projection of an earlier prefix, so exact-append
+ * budget anchors and the cached transcript prefix stay intact. Applied
+ * wherever final per-request messages are produced (history pipeline and
+ * per-step transforms), keeping live and replayed requests byte-identical.
+ */
+export function dedupeNativeToolReferences(messages: ModelMessage[]): ModelMessage[] {
+  const seen = new Set<string>();
+  let anyChanged = false;
+  const deduped = messages.map((message) => {
+    if (message.role !== "tool") {
+      return message;
+    }
+    let changed = false;
+    const content: ToolModelMessage["content"] = message.content.map((part) => {
+      if (
+        part.type !== "tool-result" ||
+        !isMuxToolSearchName(part.toolName) ||
+        part.output.type !== "content"
+      ) {
+        return part;
+      }
+      const kept: typeof part.output.value = [];
+      const dropped: string[] = [];
+      for (const item of part.output.value) {
+        const name = nativeToolReferenceName(item);
+        if (name !== undefined && seen.has(name)) {
+          dropped.push(name);
+          continue;
+        }
+        if (name !== undefined) {
+          seen.add(name);
+        }
+        kept.push(item);
+      }
+      if (dropped.length === 0) {
+        return part;
+      }
+      changed = true;
+      const output: ToolResultOutput =
+        kept.length > 0
+          ? { type: "content", value: kept }
+          : { type: "text", value: `All matched tools are already loaded: ${dropped.join(", ")}` };
+      // The projection must stay invertible: the AI SDK carries returned
+      // (projected) messages into later steps and across fallback restarts,
+      // and a prefix swap can drop the occurrence the projection kept, so the
+      // swap path restores the raw output from this stash
+      // (unprojectNativeToolReferences). Adapters serialize only their own
+      // providerOptions namespace, so `mux` never reaches the wire. Stored as
+      // a JSON string because the output union is not typed as a JSONValue; a
+      // re-projection of an already-projected part keeps the original stash.
+      return {
+        ...part,
+        output,
+        providerOptions: {
+          ...part.providerOptions,
+          mux: {
+            rawToolSearchOutput: stashedRawToolSearchJson(part) ?? JSON.stringify(part.output),
+          },
+        },
+      };
+    });
+    if (!changed) {
+      return message;
+    }
+    anyChanged = true;
+    return { ...message, content };
+  });
+  return anyChanged ? deduped : messages;
+}
+
+/** Serialized raw output stashed on a projected tool-search result, undefined otherwise. */
+function stashedRawToolSearchJson(part: ToolResultPart): string | undefined {
+  const mux = isPlainRecord(part.providerOptions) ? part.providerOptions.mux : undefined;
+  const raw = isPlainRecord(mux) ? mux.rawToolSearchOutput : undefined;
+  return typeof raw === "string" ? raw : undefined;
+}
+
+/** Validated raw output parsed from the stash, undefined for anything malformed. */
+function stashedRawToolSearchOutput(part: ToolResultPart): ToolResultOutput | undefined {
+  const json = stashedRawToolSearchJson(part);
+  if (json === undefined) {
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(json);
+    return isPlainRecord(parsed) && parsed.type === "content" && Array.isArray(parsed.value)
+      ? (parsed as ToolResultOutput)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Inverse of the dedupe projection: restore each projected result's stashed
+ * raw output so a prefix swap re-decides every reference against the swapped
+ * transcript (dedupeNativeToolReferences then re-projects whatever is still a
+ * repeat). Applied only to in-memory step arrays mux itself produced: the
+ * stash never reaches disk or the wire, and persisted results replay as raw
+ * matches, so crafted history cannot inject references through this path.
+ */
+export function unprojectNativeToolReferences(messages: ModelMessage[]): ModelMessage[] {
+  let anyChanged = false;
+  const restored = messages.map((message) => {
+    if (message.role !== "tool") {
+      return message;
+    }
+    let changed = false;
+    const content: ToolModelMessage["content"] = message.content.map((part) => {
+      if (part.type !== "tool-result" || !isMuxToolSearchName(part.toolName)) {
+        return part;
+      }
+      const raw = stashedRawToolSearchOutput(part);
+      if (raw === undefined) {
+        return part;
+      }
+      changed = true;
+      const { mux: _stash, ...remaining } = part.providerOptions ?? {};
+      if (Object.keys(remaining).length > 0) {
+        return { ...part, output: raw, providerOptions: remaining };
+      }
+      // Omit an emptied providerOptions entirely so the round trip is byte-exact.
+      const { providerOptions: _omitted, ...bare } = part;
+      return { ...bare, output: raw };
+    });
+    if (!changed) {
+      return message;
+    }
+    anyChanged = true;
+    return { ...message, content };
+  });
+  return anyChanged ? restored : messages;
 }

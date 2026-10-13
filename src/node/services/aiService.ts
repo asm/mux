@@ -5,11 +5,10 @@ import * as path from "path";
 import { EventEmitter } from "events";
 import * as fs from "fs/promises";
 
-import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
 
-import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
@@ -60,6 +59,8 @@ import {
 } from "@/node/utils/journal/durableEventJournal";
 import type { InitStateManager } from "./initStateManager";
 import { log } from "./log";
+import { resolveAgentForStream } from "./agentResolution";
+import { formatSendMessageError } from "./utils/sendMessageError";
 import {
   StreamManager,
   type TurnCompletion,
@@ -89,8 +90,8 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { validateJsonSchemaSubsetSchema } from "@/common/utils/jsonSchemaSubset";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
-import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
+import { isMockAiMode } from "./mock/mockAiMode";
 import { ProviderModelFactory } from "./providerModelFactory";
 
 interface ToolExecutionContext {
@@ -225,7 +226,7 @@ export class AIService extends EventEmitter {
     void this.ensureSessionsDir();
     this.mockModeEnabled = false;
 
-    if (resolveXumEnvironmentValue("MOCK_AI", process.env) === "1") {
+    if (isMockAiMode()) {
       log.info("AIService running in MUX_MOCK_AI mode");
       this.enableMockMode();
     }
@@ -256,7 +257,9 @@ export class AIService extends EventEmitter {
    */
   async buildMemorySessionContext(
     workspaceId: string,
-    modelString: string,
+    // The byte-budgeted context no longer depends on the model; the parameter
+    // keeps AgentSession's per-model cache contract unchanged.
+    _modelString: string,
     options?: {
       includeHotMemories?: boolean;
       /**
@@ -298,13 +301,11 @@ export class AIService extends EventEmitter {
         this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET) === true
       ) {
         try {
-          const metadataModel = resolveModelForMetadata(
-            modelString,
-            this.providerService.getConfig()
-          );
-          const tokenizer = await getTokenizerForModel(modelString, metadataModel);
+          // Sub-agents preload pinned files only: auto-hot files mirror the
+          // parent's usage, and every child would otherwise pay for the same
+          // block again. The index and on-demand reads stay available.
           const items = await this.turnRequestBuilderBindings.memoryService.listHotMemories(ctx, {
-            countTokens: (text) => tokenizer.countTokens(text),
+            pinnedOnly: metadata.parentWorkspaceId != null,
             excludeProjectSkillContent: options?.excludeProjectSkillContent === true,
           });
           hotMemoriesBlock = items.length === 0 ? null : formatHotMemoriesBlock(items);
@@ -313,7 +314,7 @@ export class AIService extends EventEmitter {
           );
         } catch (error) {
           // Hot preloading is best-effort context. Preserve the pull-based
-          // memory index when tokenizer setup or ranked selection fails.
+          // memory index when ranked selection fails.
           log.warn("Failed to build hot memories; continuing with memory index only", {
             workspaceId,
             error,
@@ -524,6 +525,12 @@ export class AIService extends EventEmitter {
     this.mockAiStreamPlayer?.releaseStreamStartGate(workspaceId);
   }
 
+  /** Release a mock stream held before its tool calls (MockAiRouterReply.holdToolCalls). */
+  releaseMockToolCalls(workspaceId: string): void {
+    assert(this.mockAiStreamPlayer, "mock mode is off");
+    this.mockAiStreamPlayer.releaseToolCalls(workspaceId);
+  }
+
   enableMockMode(): void {
     this.mockModeEnabled = true;
 
@@ -717,6 +724,40 @@ export class AIService extends EventEmitter {
 
   private getMultiProjectExecutionDisabledMessage(workspaceId: string): string {
     return `Workspace ${workspaceId} reached multi-project AI runtime execution while ${EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES} is disabled`;
+  }
+
+  /**
+   * Pre-dispatch check for an automatic goal turn (#5402): the same strict resolution its stream
+   * runs, returning why the agent cannot run, or null. The stream-time resolution stays the
+   * authoritative gate, so a failed check (runtime unreachable, not ready) returns null.
+   */
+  async getAutomaticGoalTurnAgentRefusal(
+    workspaceId: string,
+    options: Pick<SendMessageOptions, "agentId" | "disableWorkspaceAgents">
+  ): Promise<string | null> {
+    try {
+      const metadata = await this.getWorkspaceMetadata(workspaceId);
+      if (!metadata.success) return null;
+      const context = this.createWorkspaceRuntimeContext(workspaceId, metadata.data);
+      if (!context.success) return null;
+      const ready = await context.data.runtime.ensureReady();
+      if (!ready.ready) return null;
+      const resolution = await resolveAgentForStream({
+        workspaceId,
+        metadata: metadata.data,
+        runtime: context.data.runtime,
+        workspacePath: context.data.workspacePath,
+        requestedAgentId: options.agentId,
+        disableWorkspaceAgents: options.disableWorkspaceAgents ?? false,
+        automaticGoalTurn: true,
+        callerToolPolicy: undefined,
+        cfg: this.config.loadConfigOrDefault(),
+        emitError: () => undefined,
+      });
+      return resolution.success ? null : formatSendMessageError(resolution.error).message;
+    } catch {
+      return null; // unreadable runtime: the stream-time gate decides
+    }
   }
 
   /** Builds the runtime context shared by stream startup and MCP prompt discovery. */

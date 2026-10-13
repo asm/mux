@@ -41,6 +41,10 @@ import type { WindowService } from "@/node/services/windowService";
 import { log } from "@/node/services/log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import {
+  readPriorCoderCatalog,
+  reconcileProviderCatalog,
+} from "@/node/services/coderGatewayCatalogMerge";
+import {
   isCoderOauthAuthExpired,
   parseCoderOauthAuth,
   type CoderOauthAuth,
@@ -924,12 +928,15 @@ export class CoderOauthService {
         args.channel
       );
 
-      // Model discovery runs only after the flow is committed: Cancel is no
+      // Provider discovery runs only after the flow is committed: Cancel is no
       // longer possible, so this network await cannot strand half-cancelled
       // state (persisted auth with a cancelled flow). Its Result is folded
-      // and ignored like the pre-Effect fire-and-forget refresh.
+      // and ignored like the pre-Effect fire-and-forget refresh. Model
+      // catalogs are NOT fetched here: a deployment can expose thousands of
+      // IDs, and a loaded catalog switches Coder routing into catalog-gated
+      // mode, so loading it is an explicit user action (refreshModels).
       if (committed) {
-        yield* toWireResult(self.refreshBridgeModelsEffect(tokenResult.auth));
+        yield* toWireResult(self.refreshGatewayProvidersEffect(tokenResult.auth));
       }
     });
   }
@@ -2260,10 +2267,9 @@ export class CoderOauthService {
   }
 
   /**
-   * Re-discover the deployment's AI Gateway providers and model catalogs with
-   * the stored credential. Runs automatically after login; exposed to the UI
-   * as the Settings "Refresh models" action so new providers/models don't
-   * require a re-login.
+   * Load the deployment's AI Gateway providers and model catalogs with the
+   * stored credential. User-triggered only (Settings "Load model catalog" and
+   * the command palette); login discovers provider instances only.
    */
   async refreshModels(): Promise<Result<void, string>> {
     return Effect.runPromise(this.refreshModelsEffect());
@@ -2286,6 +2292,32 @@ export class CoderOauthService {
       Effect.catchDefect((defect) =>
         Effect.succeed(
           Err(`Failed to refresh Coder models: ${getErrorMessage(defect)}`) as Result<void, string>
+        )
+      )
+    );
+  }
+
+  /** Re-list provider instances with the stored credential (no catalogs). */
+  async refreshProviders(): Promise<Result<void, string>> {
+    return Effect.runPromise(this.refreshProvidersEffect());
+  }
+
+  refreshProvidersEffect(): Effect.Effect<Result<void, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const authResult = yield* self.getValidAuthEffect();
+      if (!authResult.success) {
+        return Err(authResult.error);
+      }
+      return yield* toWireResult(self.refreshGatewayProvidersEffect(authResult.data));
+    }).pipe(
+      Effect.catchDefect((defect) =>
+        Effect.succeed(
+          Err(`Failed to refresh Coder providers: ${getErrorMessage(defect)}`) as Result<
+            void,
+            string
+          >
         )
       )
     );
@@ -2342,6 +2374,100 @@ export class CoderOauthService {
     return Effect.acquireUseRelease(
       Effect.promise(() => self.catalogRefreshMutex.acquire()),
       () => self.refreshBridgeModelsSerializedEffect(auth),
+      (lock) => Effect.promise(() => lock[Symbol.asyncDispose]())
+    );
+  }
+
+  /**
+   * Provider-instance discovery only: persists `discoveredProviders` from the
+   * admin listing under the same locked commit rules as the catalog refresh,
+   * fetching no catalogs. No per-instance /models probing
+   * when the listing is unavailable: probing is what loads catalogs, and
+   * members can declare custom-named instances via additionalProviders.
+   */
+  private refreshGatewayProvidersEffect(
+    auth: CoderOauthAuth
+  ): Effect.Effect<void, CoderOauthError> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.acquireUseRelease(
+      Effect.promise(() => self.catalogRefreshMutex.acquire()),
+      () =>
+        Effect.gen(function* () {
+          const refreshStartGeneration = sanitizeGenerationCounter(
+            (
+              self.providersConfigStore.loadProvidersConfig()?.coder as
+                | { coderCatalogGeneration?: unknown }
+                | undefined
+            )?.coderCatalogGeneration
+          );
+          const listing = yield* self.retryTransientEffect(self.fetchGatewayProvidersEffect(auth));
+          if (listing.kind !== "ok") {
+            return yield* Effect.fail(
+              new CoderOauthError({
+                reason:
+                  listing.kind === "unavailable"
+                    ? "Listing AI Gateway providers requires provider read access on the deployment"
+                    : "Failed to list the deployment's AI Gateway providers",
+              })
+            );
+          }
+          let supersededByConcurrentRefresh = false;
+          const setResult = yield* Effect.promise(() =>
+            self.providerService.updateProviderSection("coder", (section) => {
+              const stored = parseCoderOauthAuth(section?.coderOauth);
+              if (
+                !stored ||
+                stored.sessionId !== auth.sessionId ||
+                stored.deploymentUrl !== auth.deploymentUrl
+              ) {
+                return null;
+              }
+              const currentCatalogGeneration = sanitizeGenerationCounter(
+                section?.coderCatalogGeneration
+              );
+              if (currentCatalogGeneration !== refreshStartGeneration) {
+                supersededByConcurrentRefresh = true;
+                return null;
+              }
+              // A loaded catalog keeps only instances still listed under the
+              // type their models were fetched with (the catalog refresh's
+              // carry-forward rule): removed instances' models must stop
+              // passing the catalog gate, and a retyped instance's must not go
+              // out over its new wire.
+              const previousProviders = parseCoderGatewayProviders(section?.discoveredProviders);
+              const next = separateDiscoveredModels(section ?? {});
+              if (Array.isArray(next.discoveredModels)) {
+                next.discoveredModels = next.discoveredModels.filter((id) => {
+                  if (typeof id !== "string") {
+                    return false;
+                  }
+                  const name = id.split("/", 1)[0];
+                  const previousType =
+                    previousProviders.find((provider) => provider.name === name)?.type ?? name;
+                  return listing.providers.some(
+                    (provider) => provider.name === name && provider.type === previousType
+                  );
+                });
+              }
+              next.discoveredProviders = listing.providers;
+              next.coderCatalogGeneration = currentCatalogGeneration + 1;
+              return { value: next };
+            })
+          );
+          if (!setResult.success) {
+            return yield* Effect.fail(new CoderOauthError({ reason: setResult.error }));
+          }
+          if (!setResult.data.applied) {
+            return yield* Effect.fail(
+              new CoderOauthError({
+                reason: supersededByConcurrentRefresh
+                  ? "Provider refresh superseded by a concurrent refresh; try again"
+                  : "Provider refresh superseded by a newer login; try again",
+              })
+            );
+          }
+        }),
       (lock) => Effect.promise(() => lock[Symbol.asyncDispose]())
     );
   }
@@ -2464,111 +2590,15 @@ export class CoderOauthService {
           }
           // Prior catalog state must be read INSIDE the locked mutation (a
           // concurrent login/refresh may have changed it since discovery began).
-          const previousKnown = Array.isArray(section?.discoveredModels);
-          const previousDiscovered = Array.isArray(section?.discoveredModels)
-            ? section.discoveredModels.filter((id): id is string => typeof id === "string")
-            : [];
-          // Catalog IDs carried through an earlier inconclusive refresh (the
-          // authoritative catalog was deleted then; this marker is all that
-          // remains of it). Never authoritative prior state — it only carries a
-          // provider's entries forward across consecutive failed refreshes.
-          const staleDiscovered = Array.isArray(section?.staleDiscoveredModels)
-            ? section.staleDiscoveredModels.filter((id): id is string => typeof id === "string")
-            : [];
-          const previousProviders = parseCoderGatewayProviders(section?.discoveredProviders);
-
-          // Per-provider conclusiveness: "ok" replaces the provider's entries,
-          // "unavailable" (404) conclusively clears them, and a transient "error"
-          // carries the provider's previous entries forward — one provider whose
-          // upstream rejects /models (Bedrock) or merely flaked must not poison
-          // every other provider's refresh, and a recovered provider heals on the
-          // next refresh instead of the next login. Carry-forward requires PRIOR
-          // STATE for that provider (a prior catalog naming it, or prior entries
-          // under its prefix): an errored provider without prior state — fresh
-          // login, or an instance the admin just added — makes the whole catalog
-          // inconclusive, because persisting the other providers' lists would
-          // read as an authoritative catalog that blocks every model of the
-          // failed provider until a later successful refresh.
-          const modelIds: string[] = [];
-          const nextProviders: CoderGatewayProvider[] = [];
-          for (const { provider, result } of results) {
-            const previous = previousProviders.find((prev) => prev.name === provider.name);
-            // Prior state must also TYPE-match under an authoritative listing:
-            // when the admin changes an instance's type (same name), the old
-            // type's model IDs are not valid carry-forward state — the write
-            // persists the NEW type, so carried entries would stay selectable and
-            // be sent over the new wire protocol until a successful refresh.
-            // A name with no stored metadata previously resolved via the
-            // name === type default, so that default is its effective prior type.
-            // The probe path persists `previous` (not the probe default), so no
-            // type change can occur there and the check is skipped.
-            const previousType = previous?.type ?? provider.name;
-            const typeUnchanged = !authoritative || previousType === provider.type;
-            const hasPriorState =
-              previousKnown &&
-              typeUnchanged &&
-              (previous !== undefined ||
-                previousDiscovered.some((id) => id.startsWith(`${provider.name}/`)));
-            if (result.kind === "ok") {
-              modelIds.push(...result.ids);
-              if (!authoritative) {
-                // The probe confirmed the route exists; prefer previously stored
-                // metadata (its type may come from an earlier authoritative
-                // listing) over the probe-derived name === type default.
-                nextProviders.push(previous ?? provider);
-              }
-            } else if (result.kind === "error") {
-              if (!hasPriorState) {
-                catalogInconclusive = true;
-                // Consecutive failed refreshes: after an inconclusive refresh the
-                // authoritative catalog is gone (previousKnown false), so a
-                // transiently failing provider has no carry-forward state — but
-                // its stale entries must not vanish (a later successful refresh
-                // would otherwise start from nothing). The catalog stays
-                // inconclusive, so these IDs land back in staleDiscoveredModels,
-                // never in discoveredModels. Type-gated like authoritative
-                // carry-forward.
-                if (typeUnchanged) {
-                  modelIds.push(
-                    ...staleDiscovered.filter((id) => id.startsWith(`${provider.name}/`))
-                  );
-                }
-                continue;
-              }
-              modelIds.push(
-                ...previousDiscovered.filter((id) => id.startsWith(`${provider.name}/`))
-              );
-              if (!authoritative && previous) {
-                nextProviders.push(previous);
-              }
-            } else if (!authoritative && previous !== undefined) {
-              // "unavailable" on the PROBE path for an instance recorded by an
-              // earlier authoritative listing: the 404 proves only that the
-              // upstream serves no /models route — not that the admin removed
-              // the gateway instance (only an authoritative listing can say
-              // that). Dropping it would leave manually configured
-              // coder:<custom>/<model> entries unresolvable until a listing
-              // succeeds again, so keep the metadata and carry prior entries
-              // forward like a transient error.
-              nextProviders.push(previous);
-              if (previousKnown) {
-                modelIds.push(
-                  ...previousDiscovered.filter((id) => id.startsWith(`${provider.name}/`))
-                );
-              } else {
-                // No authoritative prior catalog: stale entries must not be
-                // promoted into a conclusive write.
-                catalogInconclusive = true;
-                modelIds.push(
-                  ...staleDiscovered.filter((id) => id.startsWith(`${provider.name}/`))
-                );
-              }
-            }
-            // "unavailable" otherwise: the authoritative listing already names
-            // every existing instance (a listed instance whose /models 404s
-            // conclusively serves no catalog), and probe-default names carry no
-            // recorded metadata — the route is conclusively absent; drop it.
-          }
+          const prior = readPriorCoderCatalog(section);
+          // Per-provider rules (carry-forward, type gating, conclusiveness):
+          // see reconcileProviderCatalog.
+          const contributions = results.map(({ provider, result }) =>
+            reconcileProviderCatalog(provider, result, prior, authoritative)
+          );
+          const modelIds = contributions.flatMap((contribution) => contribution.ids);
+          const nextProviders = contributions.flatMap((contribution) => contribution.providers);
+          catalogInconclusive = contributions.some((contribution) => contribution.inconclusive);
 
           if (catalogInconclusive) {
             // The catalog cannot be written as authoritative. Keep/flip it to

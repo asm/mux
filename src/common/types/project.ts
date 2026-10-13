@@ -20,7 +20,7 @@ import type { AutoModelRoutingConfig } from "./autoModelRouting";
 import type { RuntimeEnablementId } from "./runtime";
 import type { TaskSettings } from "./tasks";
 import type { LayoutPresetsConfig } from "./uiLayouts";
-import type { OpenAIReasoningMode, ThinkingLevel } from "./thinking";
+import type { ThinkingLevel } from "./thinking";
 import type { GoalDefaults } from "@/constants/goals";
 
 export type Workspace = z.infer<typeof WorkspaceConfigSchema>;
@@ -105,6 +105,12 @@ export interface ProjectsConfig {
    */
   toolSearchEnabled?: boolean;
   /**
+   * Route Anthropic/OpenAI calls from bash tool commands through Xum's local proxy so their
+   * spend shows in the Costs tab and Analytics. Absent = off: with it on, agent CLIs such as
+   * `claude -p` bill the Xum API key instead of a subscription login.
+   */
+  bashAiProxyEnabled?: boolean;
+  /**
    * Expose the `heartbeat` tool so agents can schedule their own recurring (paid) turns.
    * Absent = off; users opt in from Settings.
    */
@@ -149,25 +155,9 @@ export interface ProjectsConfig {
    */
   skillModelClasses?: Record<string, string>;
 
-  /**
-   * Default model used for new workspaces (shared via ~/.xum/config.json).
-   * Mirrors the browser localStorage cache (DEFAULT_MODEL_KEY).
-   */
+  /** Default model used for new workspaces (shared via ~/.xum/config.json). */
   defaultModel?: string;
-  /** Global advisor model override for the experimental advisor tool. */
-  advisorModelString?: string;
-  /** Global advisor reasoning override for the experimental advisor tool. */
-  advisorThinkingLevel?: ThinkingLevel;
-  /** Advisor Pro/Standard selection, independent of effort and the parent chat mode. */
-  advisorReasoningMode?: OpenAIReasoningMode;
-  /** Positive per-turn advisor cap; null/undefined means unlimited. */
-  advisorMaxUsesPerTurn?: number | null;
-  /** Positive max-output-tokens cap for advisor responses; null/undefined means unlimited. */
-  advisorMaxOutputTokens?: number | null;
-  /**
-   * Hidden model IDs (shared via ~/.xum/config.json).
-   * Mirrors the browser localStorage cache (HIDDEN_MODELS_KEY).
-   */
+  /** Hidden model IDs (shared via ~/.xum/config.json). */
   hiddenModels?: string[];
   /**
    * Default model/thinking/reasoning overrides per agentId. Base fields are the

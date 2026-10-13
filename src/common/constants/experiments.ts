@@ -4,7 +4,7 @@ export const EXPERIMENTS_WRITE_TIMEOUT_MS = 10_000;
  * Experiments System
  *
  * Global feature flags for experimental features.
- * State is persisted in localStorage as `experiment:${experimentId}`.
+ * State is persisted by the backend ExperimentsService in `feature_flags.json`.
  */
 
 export const EXPERIMENT_IDS = {
@@ -21,60 +21,23 @@ export const EXPERIMENT_IDS = {
   CLAUDE_SKILLS_COMPAT: "claude-skills-compat",
   CLAUDE_DESIGN_MCP: "claude-design-mcp",
   SKILL_DYNAMIC_CONTEXT: "skill-dynamic-context",
+  ARTIFACTS: "artifacts",
   CONTINUOUS_COMPACTION: "continuous-compaction",
   TOKEN_BUDGET: "tokenBudget",
   AUTO_MODEL_ROUTING: "auto-model-routing",
+  SESSION_TAPES: "sessionTapes",
+  PERF_FLIGHT_RECORDER: "perfFlightRecorder",
 } as const;
 
 export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
 
 /**
- * Pre-merge experiment ID: "PTC Exclusive Mode" was a separate experiment
- * before Programmatic Tool Calling became exclusive-only. Persistence layers
- * (backend feature_flags.json, renderer localStorage) alias a stored `true`
- * onto the merged PTC key on read and mirror the merged PTC value back onto
- * this key on write, so upgrades keep the user's exclusive posture and a
- * downgraded build runs exclusive mode instead of the removed (~2x cost)
- * supplement mode.
- */
-export const LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID = "programmatic-tool-calling-exclusive";
-
-/**
- * Read-side alias for persisted experiment-flag objects (camelCase form used
- * by taskExperiments snapshots and startup-retry send options): a legacy
- * exclusive `true` opted into exactly the posture merged PTC activates, so it
- * wins even over an explicit `programmaticToolCalling: false`.
- */
-export function aliasLegacyPtcExclusive<
-  T extends { programmaticToolCalling?: boolean; programmaticToolCallingExclusive?: boolean },
->(
-  experiments: T | undefined
-): (Omit<T, "programmaticToolCalling"> & { programmaticToolCalling?: boolean }) | undefined {
-  if (experiments?.programmaticToolCallingExclusive !== true) return experiments;
-  if (experiments.programmaticToolCalling === true) return experiments;
-  return { ...experiments, programmaticToolCalling: true };
-}
-
-/**
- * Write-side mirror for persisted experiment-flag objects: an enabled merged
- * PTC also stamps the legacy exclusive key so a downgraded build runs the
- * exclusive posture instead of reading bare PTC as the removed (~2x cost)
- * supplement mode.
- */
-export function withLegacyPtcExclusiveMirror<T extends { programmaticToolCalling?: boolean }>(
-  experiments: T | undefined
-): (T & { programmaticToolCallingExclusive?: boolean }) | undefined {
-  if (experiments?.programmaticToolCalling !== true) return experiments;
-  return { ...experiments, programmaticToolCallingExclusive: true };
-}
-
-/**
- * Former experiment IDs whose features are now always on. CLI `-e` parsing
- * accepts them as no-ops so existing automation (for example terminal-bench)
+ * Former experiment IDs whose features are now always on or retired. CLI `-e`
+ * parsing accepts them as no-ops so existing automation (for example terminal-bench)
  * keeps working instead of failing on an unknown experiment.
  */
 export const PROMOTED_EXPERIMENT_IDS: ReadonlySet<string> = new Set([
-  "advisor-tool",
+  "advisor-tool", // Retired; accepted only for CLI compatibility.
   "agent-plugins",
   "dynamic-workflows",
   "timeline",
@@ -232,11 +195,35 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     enabledByDefault: false,
     showInSettings: true,
   },
+  [EXPERIMENT_IDS.ARTIFACTS]: {
+    id: EXPERIMENT_IDS.ARTIFACTS,
+    name: "Artifacts",
+    description:
+      "Show files the agent writes to $XUM_SCRATCH_DIR/artifacts in an Artifacts tab, with previews for Markdown, JSON, CSV, images, diffs, Mermaid and sandboxed HTML/SVG. Works on every runtime with a scratch dir (devcontainers need a local Docker daemon).",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
   [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: {
     id: EXPERIMENT_IDS.AUTO_MODEL_ROUTING,
     name: "Auto model routing",
     description:
       "Add Auto entries to the composer model and thinking selectors. Prompts sent with Auto are classified by difficulty with your chosen AI SDK evaluation model and run on the model and thinking level mapped to the chosen tier",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  [EXPERIMENT_IDS.SESSION_TAPES]: {
+    id: EXPERIMENT_IDS.SESSION_TAPES,
+    name: "Session tapes",
+    description:
+      "Record each chat subscription as a JSONL tape under the Xum home (perf/tapes) for local performance replay. Tapes are not masked: they contain the full chat, tool data and metadata, so treat them as sensitive. They stay on the machine running the Xum backend this window is connected to (this machine for the desktop app) and are never uploaded or included in diagnostics. Do not share them. Applies to chats opened after you enable it.",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  [EXPERIMENT_IDS.PERF_FLIGHT_RECORDER]: {
+    id: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
+    name: "Performance flight recorder",
+    description:
+      "Record event-loop delay, garbage collection, heap and long-frame samples in memory to help diagnose slowness. After a detected stall it also writes a short CPU profile of the activity that follows (not the stall itself) to perf/captures in the Xum home folder (~/.xum by default). Starting a profile pauses the backend for a moment (over a second on a busy machine). Samples and profiles stay on the machine running the Xum backend this window is connected to (this machine for the desktop app); nothing is sent to any other service",
     enabledByDefault: false,
     showInSettings: true,
   },
@@ -258,16 +245,9 @@ function getPlatformDisplayName(platform: NodeJS.Platform): string {
 /**
  * Token budget hard-depends on Agent Memory: an agent keeps its rollover checkpoint in the
  * /memories/session/ scope, so without the memory tool a fresh window could not recover its state.
- * A missing explicit flag falls back to the backend value, like every other experiment read.
  */
-export function isTokenBudgetActive(
-  experiments: { tokenBudget?: boolean; memory?: boolean } | undefined,
-  isEnabled: (id: ExperimentId) => boolean
-): boolean {
-  return (
-    (experiments?.tokenBudget ?? isEnabled(EXPERIMENT_IDS.TOKEN_BUDGET)) &&
-    (experiments?.memory ?? isEnabled(EXPERIMENT_IDS.MEMORY))
-  );
+export function isTokenBudgetActive(isEnabled: (id: ExperimentId) => boolean): boolean {
+  return isEnabled(EXPERIMENT_IDS.TOKEN_BUDGET) && isEnabled(EXPERIMENT_IDS.MEMORY);
 }
 
 export function isExperimentSupportedOnPlatform(
@@ -304,23 +284,6 @@ export function getExperimentPlatformRestrictionLabel(
 
   const lastPlatform = platformLabels[platformLabels.length - 1];
   return `Only available on ${platformLabels.slice(0, -1).join(", ")}, and ${lastPlatform}`;
-}
-
-/**
- * Get localStorage key for an experiment.
- * Format: "experiment:{experimentId}"
- */
-export function getExperimentKey(experimentId: ExperimentId): string {
-  return `experiment:${experimentId}`;
-}
-
-/**
- * localStorage key of the removed exclusive experiment (see
- * LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID). Kept out of getExperimentKey's
- * signature so ordinary call sites can't target a removed experiment.
- */
-export function getLegacyPtcExclusiveExperimentKey(): string {
-  return `experiment:${LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID}`;
 }
 
 /**

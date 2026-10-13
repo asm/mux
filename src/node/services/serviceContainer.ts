@@ -2,16 +2,25 @@ import type { RestartBlocker } from "@/common/orpc/types";
 import { inFlightProcedureCount } from "@/node/orpc/inFlightProcedures";
 import { inProcessWorkflowWorkspaceCount } from "@/node/services/workflows/workflowArchiveAdmission";
 import assert from "@/common/utils/assert";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import {
+  createArtifactInteractionDeps,
+  listWorkspacesWithPendingInteractions,
+  replayPendingArtifactInteractions,
+} from "@/node/services/artifactInteractions";
 import { log } from "@/node/services/log";
 import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { SLOW_STARTUP_WARN_THRESHOLD_MS } from "@/constants/startup";
 import {
+  SESSION_TAPE_FLUSH_TIMEOUT_MS,
   STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS,
   STARTUP_STEP_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
 import type { CoreServices } from "@/node/services/coreServices";
 import type { DesktopWindowManager } from "@/desktop/desktopWindowManager";
+import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
+import type { ComputerUseHostBridge } from "@/node/services/computerUse/hostBridge";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
 import type { ProjectService } from "@/node/services/projectService";
 import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
@@ -41,11 +50,21 @@ import type { SessionTimingService } from "@/node/services/sessionTimingService"
 import type { TimelineService } from "@/node/services/timelineService";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
+import { FlightRecorder } from "@/node/services/perf/flightRecorder";
+import {
+  getXumPerfCapturesDir,
+  getXumPerfReportsDir,
+  getXumPerfTapesDir,
+} from "@/common/constants/paths";
+import { createBackendCpuProfiler } from "@/node/services/perf/backendCpuProfiler";
+import { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
+import { PerfReportService } from "@/node/services/perf/perfReportService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import type { McpOauthService } from "@/node/services/mcpOauthService";
 import type { HeartbeatService } from "@/node/services/heartbeatService";
 import type { AgentStatusService } from "@/node/services/agentStatusService";
+import type { BashAiProxyService } from "@/node/services/bashAiProxy/bashAiProxyService";
 import type { IdleCompactionService } from "@/node/services/idleCompactionService";
 import type { IdleDispatcher } from "@/node/services/idleDispatcher";
 import type { CoderService } from "@/node/services/coderService";
@@ -69,10 +88,16 @@ import {
 import { AppLive } from "@/node/services/di/layers/app";
 import { shutdownStep } from "@/node/services/shutdownStep";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { stopSessionTapeCaptures } from "@/node/services/sessionTapes/sessionTapeRecorder";
+import {
+  SessionTapeFolderService,
+  type SessionTapesFolderRevealer,
+} from "@/node/services/sessionTapes/sessionTapeFolderService";
 import {
   AgentBrowserSessionDiscovery,
   AgentPluginInstall,
   AgentStatus,
+  BashAiProxy,
   AI,
   Analytics,
   BackgroundProcessManagerTag,
@@ -88,6 +113,7 @@ import {
   CopilotOauth,
   DesktopBridgeServerTag,
   DesktopSessionManagerTag,
+  ComputerUseServiceTag,
   DesktopTokenManagerTag,
   DevTools,
   ReviewState,
@@ -249,9 +275,18 @@ export class ServiceContainer {
   public readonly browserSessionStateHub: BrowserSessionStateHub;
   public readonly analyticsService: AnalyticsService;
   public readonly experimentsService: ExperimentsService;
+  // Opt-in perf flight recorder (experiment perfFlightRecorder). Constructed directly (no DI
+  // tag): it has no dependencies, and construction creates no observers or timers.
+  public readonly perfFlightRecorder = new FlightRecorder();
+  // Triggered CPU profiles after recorder trips (same experiment). Holds no listener while off.
+  public readonly perfCaptures: PerfCaptureService;
+  // "Report slowness" bundles (same experiment): writes only when asked.
+  public readonly perfReports: PerfReportService;
+  public readonly sessionTapes: SessionTapeFolderService;
   public readonly coderService: CoderService;
   public readonly serverAuthService: ServerAuthService;
   public readonly desktopSessionManager: DesktopSessionManager;
+  public readonly computerUseService: ComputerUseService;
   public readonly desktopTokenManager: DesktopTokenManager;
   public readonly desktopBridgeServer: DesktopBridgeServer;
   public readonly sshPromptService: SshPromptService;
@@ -259,6 +294,7 @@ export class ServiceContainer {
   public readonly idleDispatcher: IdleDispatcher;
   public readonly heartbeatService: HeartbeatService;
   public readonly agentStatusService: AgentStatusService;
+  public readonly bashAiProxy: BashAiProxyService;
   // Shared between initializeCore() and runStartupHousekeeping() so the completion log still
   // reports every step and the total wall time from the start of core init.
   private startupStartedAt: number | undefined;
@@ -291,6 +327,23 @@ export class ServiceContainer {
     this.appFiberScope = get(AppFiberScopeTag);
     this.workflowRuntimeFactory = get(QuickJSRuntimeFactoryTag);
     this.config = get(ConfigTag);
+    this.perfCaptures = new PerfCaptureService({
+      dir: getXumPerfCapturesDir(this.config.rootDir),
+      recorder: this.perfFlightRecorder,
+      backendProfiler: createBackendCpuProfiler(),
+    });
+    this.perfReports = new PerfReportService({
+      reportsDir: getXumPerfReportsDir(this.config.rootDir),
+      capturesDir: getXumPerfCapturesDir(this.config.rootDir),
+      recorder: this.perfFlightRecorder,
+      captures: this.perfCaptures,
+      // Read at call time: experimentsService is assigned later in this constructor.
+      isExperimentEnabled: (experimentId) =>
+        this.experimentsService.isExperimentEnabled(experimentId),
+    });
+    this.sessionTapes = new SessionTapeFolderService({
+      dir: getXumPerfTapesDir(this.config.rootDir),
+    });
     this.sessionLocator = get(SessionLocatorTag);
     this.providersConfigStore = get(ProvidersConfigStoreTag);
     this.secretsStore = get(SecretsStoreTag);
@@ -348,6 +401,7 @@ export class ServiceContainer {
     this.coderService = get(Coder);
     this.serverAuthService = get(ServerAuth);
     this.desktopSessionManager = get(DesktopSessionManagerTag);
+    this.computerUseService = get(ComputerUseServiceTag);
     this.desktopTokenManager = get(DesktopTokenManagerTag);
     this.desktopBridgeServer = get(DesktopBridgeServerTag);
     this.sshPromptService = get(SshPrompt);
@@ -355,6 +409,7 @@ export class ServiceContainer {
     this.idleDispatcher = get(IdleDispatcherTag);
     this.heartbeatService = get(Heartbeat);
     this.agentStatusService = get(AgentStatus);
+    this.bashAiProxy = get(BashAiProxy);
     assert(
       new Set(this.startupCoreSteps.map((step) => step.name)).size === this.startupCoreSteps.length,
       "startupCoreSteps names must be unique (they key stepDurationsMs)"
@@ -395,7 +450,16 @@ export class ServiceContainer {
       run: () => this.coderOauthService.separateDiscoveredModelsOnce(),
       bestEffort: true,
     },
-    { name: "experimentsService.initialize", run: () => this.experimentsService.initialize() },
+    {
+      name: "experimentsService.initialize",
+      run: async () => {
+        await this.experimentsService.initialize();
+        this.syncPerfFlightRecorder();
+      },
+    },
+    // Bash commands that outlived a restart still hold the proxy URL and key: bind the saved
+    // port again before clients connect. Best-effort: a proxy problem never blocks startup.
+    { name: "bashAiProxy.restore", run: () => this.bashAiProxy.restore(), bestEffort: true },
     // Best-effort: a slow or failing recovery (e.g. a large instance re-launching many tasks)
     // must not keep the server from starting, and a fatal timeout crash-loops under a supervisor
     // that restarts xum, re-driving the same partial recovery each time. The listener still waits
@@ -613,6 +677,29 @@ export class ServiceContainer {
       log.warn("Background xum SSH config setup failed", { error });
     });
 
+    // Artifact interactions confirmed before a restart but not yet delivered (M5b). Best-effort
+    // and after the periodic services start: each replayed send awaits the workspace send path,
+    // which has no bound, so a hung send must not keep idle compaction or heartbeats off.
+    if (!signal.aborted && this.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)) {
+      try {
+        await this.recordStartupStep("artifactInteractions.replayPending", async () => {
+          const deps = createArtifactInteractionDeps({
+            config: this.config,
+            workspaceService: this.workspaceService,
+            historyService: this.historyService,
+          });
+          for (const workspaceId of await listWorkspacesWithPendingInteractions(
+            this.config.sessionsDir
+          )) {
+            if (signal.aborted) return;
+            await replayPendingArtifactInteractions(deps, workspaceId);
+          }
+        });
+      } catch (error: unknown) {
+        log.error("[startup] Artifact interaction replay failed", { error });
+      }
+    }
+
     const totalMs = Date.now() - (this.startupStartedAt ?? Date.now());
     const completedPayload = { totalMs, stepDurationsMs: this.startupStepDurationsMs };
     if (totalMs > SLOW_STARTUP_WARN_THRESHOLD_MS) {
@@ -682,6 +769,10 @@ export class ServiceContainer {
       telemetryService: this.telemetryService,
       analyticsService: this.analyticsService,
       experimentsService: this.experimentsService,
+      perfFlightRecorder: this.perfFlightRecorder,
+      perfCaptures: this.perfCaptures,
+      perfReports: this.perfReports,
+      sessionTapes: this.sessionTapes,
       sessionUsageService: this.sessionUsageService,
       evaluationService: this.evaluationService,
       workspaceGoalService: this.workspaceGoalService,
@@ -701,6 +792,7 @@ export class ServiceContainer {
       serverAuthService: this.serverAuthService,
       sshPromptService: this.sshPromptService,
       desktopSessionManager: this.desktopSessionManager,
+      computerUseService: this.computerUseService,
       desktopTokenManager: this.desktopTokenManager,
       desktopBridgeServer: this.desktopBridgeServer,
     };
@@ -710,14 +802,19 @@ export class ServiceContainer {
    * Shutdown services that need cleanup
    */
   async shutdown(): Promise<void> {
+    // Releases the global stop shortcut and cancels any in-flight host input.
+    this.computerUseService.disable();
     // Viewers must release held input before their VNC bridge is revoked.
     await this.desktopSessionManager.closeAll();
     await this.desktopBridgeServer.stop();
     this.desktopTokenManager.dispose();
     this.heartbeatService.stop();
     this.agentStatusService.stop();
+    this.perfFlightRecorder.stop();
+    await this.perfCaptures.dispose();
     this.idleCompactionService.stop();
     await this.browserBridgeServer.stop();
+    await this.bashAiProxy.stop();
     this.browserSessionStateHub.dispose();
     this.browserBridgeTokenManager.dispose();
     await this.timelineService.flush();
@@ -725,12 +822,29 @@ export class ServiceContainer {
     await this.telemetryService.shutdown();
   }
 
+  /** Starts or stops the perf flight recorder to match the persisted experiment state. */
+  private syncPerfFlightRecorder(): void {
+    const enabled = this.experimentsService.isExperimentEnabled(
+      EXPERIMENT_IDS.PERF_FLIGHT_RECORDER
+    );
+    this.perfFlightRecorder.setEnabled(enabled);
+    this.perfCaptures.setEnabled(enabled);
+  }
+
   setProjectDirectoryPicker(picker: (initialPath?: string | null) => Promise<string | null>): void {
     this.projectService.setDirectoryPicker(picker);
   }
 
+  setSessionTapesFolderRevealer(revealer: SessionTapesFolderRevealer): void {
+    this.sessionTapes.setRevealer(revealer);
+  }
+
   setDesktopWindowManager(manager: DesktopWindowManager): void {
     this.desktopSessionManager.setDesktopWindowManager(manager);
+  }
+
+  setComputerUseHostBridge(bridge: ComputerUseHostBridge): void {
+    this.computerUseService.setHostBridge(bridge);
   }
 
   setTerminalWindowManager(manager: TerminalWindowManager): void {
@@ -836,6 +950,18 @@ export class ServiceContainer {
     // stream-abort over the bridges; bounded and idempotent, and never rejects
     // (di/appRuntime.ts).
     await closeScopeBounded(this.appFiberScope);
+    // Session tapes (experiment, off by default) live in memory until finalized: write the open
+    // ones now, after the stream-abort events above reached them, or a normal quit loses them.
+    await shutdownStep("sessionTapes.stop", async () => {
+      const stopped = await raceWithAbortAndTimeout(stopSessionTapeCaptures(), {
+        timeoutMs: SESSION_TAPE_FLUSH_TIMEOUT_MS,
+      });
+      if (stopped.kind === "timeout") {
+        log.warn("[shutdown] session tapes still writing; teardown continues", {
+          timeoutMs: SESSION_TAPE_FLUSH_TIMEOUT_MS,
+        });
+      }
+    });
     // Viewers must release held input before their VNC bridge is revoked.
     await shutdownStep("desktopSessionManager.closeAll", () =>
       this.desktopSessionManager.closeAll()
@@ -849,7 +975,10 @@ export class ServiceContainer {
     // generateWorkspaceStatus against services that are about to be torn
     // down below.
     shutdownStep("agentStatusService.stop", () => this.agentStatusService.stop());
+    shutdownStep("perfFlightRecorder.stop", () => this.perfFlightRecorder.stop());
+    await shutdownStep("perfCaptures.dispose", () => this.perfCaptures.dispose());
     await shutdownStep("browserBridgeServer.stop", () => this.browserBridgeServer.stop());
+    await shutdownStep("bashAiProxy.stop", () => this.bashAiProxy.stop());
     shutdownStep("browserSessionStateHub.dispose", () => this.browserSessionStateHub.dispose());
     shutdownStep("browserBridgeTokenManager.dispose", () =>
       this.browserBridgeTokenManager.dispose()

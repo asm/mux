@@ -7,6 +7,7 @@ export {
   normalizeOpenAICompatibleBaseURL,
 } from "@/common/utils/providers/baseUrl";
 import assert from "node:assert";
+import { createHash } from "node:crypto";
 import { Effect } from "effect";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type {
@@ -53,7 +54,11 @@ import type { Config, ProviderConfig, ProvidersConfig } from "@/node/config";
 import { ProvidersConfigStore } from "@/node/config";
 import type { MuxProviderOptions, OpenAIWireFormat } from "@/common/types/providerOptions";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { ServiceTierSchema, type XAIServiceTier } from "@/common/config/schemas/providersConfig";
+import {
+  ServiceTierSchema,
+  type ServiceTier,
+  type XAIServiceTier,
+} from "@/common/config/schemas/providersConfig";
 import {
   OpenAICyberAccessProgramSchema,
   type OpenAICyberAccessProgram,
@@ -70,7 +75,8 @@ import {
   isBuiltInProvider,
   isCustomProviderConfig,
 } from "@/common/utils/providers/customProviders";
-import { isGatewayModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
+import { createGatewayRouting } from "@/common/utils/providers/gatewayModelCatalog";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import {
   maybeGetProviderModelEntryId,
   resolveModelForMetadata,
@@ -95,6 +101,7 @@ import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coder
 import type { DevToolsService } from "@/node/services/devToolsService";
 import {
   captureAndStripDevToolsHeader,
+  recordPromptCacheWire,
   resolveDevToolsCaptureBody,
 } from "@/node/services/devToolsHeaderCapture";
 import { createDevToolsMiddleware } from "@/node/services/devToolsMiddleware";
@@ -105,6 +112,17 @@ import {
 } from "@/node/services/languageModelCleanup";
 import { createOpenAIWebSocketTransportFetch } from "@/node/services/openAIWebSocketTransportFetch";
 import { log } from "@/node/services/log";
+import type { TimelineRecorder } from "@/node/services/timelineRecorder";
+import {
+  PromptCachePrefixMonitor,
+  type PromptCacheRouteIdentity,
+  type PromptCacheTurnScope,
+} from "@/node/services/promptCachePrefixMonitor";
+import {
+  isSessionTapeReplayMode,
+  SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
+} from "@/node/services/sessionTapes/sessionTapeReplaySource";
+import { isMockAiMode, MOCK_AI_MODEL_REFUSED_MESSAGE } from "@/node/services/mock/mockAiMode";
 import { resolveProviderOptionsNamespaceKey } from "@/common/utils/ai/providerOptions";
 import { resolveRoute, type RouteContext } from "@/common/routing";
 import {
@@ -114,6 +132,7 @@ import {
 import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { isDeferLoadingTool } from "@/common/utils/tools/toolCatalog";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
+import { MUX_GATEWAY_AI_BASE_URL } from "@/common/constants/muxGatewayOAuth";
 import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/appAttribution";
 import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 import {
@@ -290,7 +309,8 @@ function injectProviderOptionsDefaults(
     doGenerate: (options: never) => unknown;
   },
   namespace: string,
-  defaults: Record<string, unknown>
+  defaults: Record<string, unknown>,
+  liveOverrides?: () => Record<string, unknown>
 ): void {
   interface CallOptions {
     providerOptions?: Record<string, unknown>;
@@ -303,6 +323,8 @@ function injectProviderOptionsDefaults(
       [namespace]: {
         ...defaults,
         ...(options.providerOptions?.[namespace] as Record<string, unknown> | undefined),
+        // A chat-local speed change supersedes its already-prepared request options.
+        ...liveOverrides?.(),
       },
     },
   });
@@ -366,6 +388,101 @@ function wrapFetchWithJsonBodyPatch(
   };
 
   return Object.assign(patchedFetch, baseFetch) as typeof fetch;
+}
+
+/**
+ * Gemini's OpenAI-compatible endpoint streams each tool call whole in its own
+ * chunk, with an id but no `index`. @ai-sdk/openai's chat chunk schema
+ * requires the index, so every Gemini tool-call turn through a Coder gateway
+ * failed with "Type validation failed". Fill it in from the call id (an id-less
+ * continuation delta keeps the previous index) before the SDK parses the stream.
+ */
+function wrapFetchWithChatToolCallIndexes(baseFetch: typeof fetch): typeof fetch {
+  const indexedFetch = async (
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1]
+  ): Promise<Response> => {
+    const response = await baseFetch(input, init);
+    if (
+      response.body == null ||
+      response.headers.get("content-type")?.includes("text/event-stream") !== true
+    ) {
+      return response;
+    }
+
+    const indexesById = new Map<string, number>();
+    let previousIndex: number | undefined;
+    const indexToolCalls = (line: string): string => {
+      if (!line.startsWith("data:") || !line.includes('"tool_calls"')) {
+        return line;
+      }
+      let chunk: unknown;
+      try {
+        chunk = JSON.parse(line.slice("data:".length));
+      } catch {
+        return line;
+      }
+      if (!isPlainObject(chunk) || !Array.isArray(chunk.choices)) {
+        return line;
+      }
+      let changed = false;
+      for (const choice of chunk.choices) {
+        const toolCalls =
+          isPlainObject(choice) && isPlainObject(choice.delta) ? choice.delta.tool_calls : null;
+        if (!Array.isArray(toolCalls)) {
+          continue;
+        }
+        for (const toolCall of toolCalls) {
+          if (!isPlainObject(toolCall) || typeof toolCall.index === "number") {
+            continue;
+          }
+          const id = typeof toolCall.id === "string" && toolCall.id ? toolCall.id : null;
+          let index = id == null ? previousIndex : indexesById.get(id);
+          if (index == null) {
+            index = indexesById.size;
+            if (id != null) {
+              indexesById.set(id, index);
+            }
+          }
+          toolCall.index = index;
+          previousIndex = index;
+          changed = true;
+        }
+      }
+      return changed ? `data: ${JSON.stringify(chunk)}` : line;
+    };
+
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
+    let pending = "";
+    const body = response.body.pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        transform(bytes, controller) {
+          pending += decoder.decode(bytes, { stream: true });
+          const lines = pending.split("\n");
+          pending = lines.pop() ?? "";
+          if (lines.length > 0) {
+            controller.enqueue(encoder.encode(`${lines.map(indexToolCalls).join("\n")}\n`));
+          }
+        },
+        flush(controller) {
+          pending += decoder.decode();
+          if (pending) {
+            controller.enqueue(encoder.encode(indexToolCalls(pending)));
+          }
+        },
+      })
+    );
+    const headers = new Headers(response.headers);
+    headers.delete("content-length");
+    return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  };
+
+  return Object.assign(indexedFetch, baseFetch) as typeof fetch;
 }
 
 /** Set reasoning effort "none" on either OpenAI wire format's request body. */
@@ -473,6 +590,54 @@ function createOpenAIModelWithPreservedOptions(
       wrapStream: ({ params, doStream }) => {
         const call = createPreservingCall(params);
         return call ? call.model.doStream(call.params) : doStream();
+      },
+    },
+  });
+}
+
+// Ollama servers before v0.6.6 (ollama/ollama#9434) parse a tool schema `type` only as a string,
+// on /api/chat and on the OpenAI-compatible /v1 (both decode the same Go structs), so one `type`
+// array fails the whole request. zod >= 4.5 emits nullable fields as `type: [X, "null"]` (MCP
+// schemas can too), so these routes send the equivalent `anyOf`. Recurse only into subschemas:
+// const, enum, default and examples hold data.
+const TOOL_SUBSCHEMA_KEY =
+  /^(items|prefixItems|additionalItems|contains|additionalProperties|propertyNames|not|if|then|else|anyOf|allOf|oneOf|unevaluatedItems|unevaluatedProperties)$/;
+const TOOL_SCHEMA_MAP_KEY = /^(properties|patternProperties|\$defs|definitions|dependentSchemas)$/;
+function toolTypeArraysToAnyOf(node: unknown, depth: "schema" | "map" = "schema"): unknown {
+  if (Array.isArray(node)) return node.map((item) => toolTypeArraysToAnyOf(item));
+  if (node === null || typeof node !== "object") return node;
+  const entries = Object.entries(node as Record<string, unknown>).map(([key, value]) => {
+    if (depth === "map" || TOOL_SUBSCHEMA_KEY.test(key)) return [key, toolTypeArraysToAnyOf(value)];
+    return [key, TOOL_SCHEMA_MAP_KEY.test(key) ? toolTypeArraysToAnyOf(value, "map") : value];
+  });
+  const out = Object.fromEntries(entries) as { type?: unknown; allOf?: unknown };
+  if (depth === "map" || !Array.isArray(out.type)) return out;
+  const { type: types, ...rest } = out as { type: unknown[]; allOf?: unknown };
+  if (types.length === 1) return { ...rest, type: types[0] };
+  const union = types.map((type) => ({ type }));
+  if (!("anyOf" in rest)) return { ...rest, anyOf: union };
+  // An existing anyOf is a separate constraint: the type union joins it via allOf.
+  return {
+    ...rest,
+    allOf: [...(Array.isArray(rest.allOf) ? (rest.allOf as unknown[]) : []), { anyOf: union }],
+  };
+}
+
+function withToolTypeArraysAsAnyOf(model: Parameters<typeof wrapLanguageModel>[0]["model"]) {
+  return wrapLanguageModel({
+    model,
+    middleware: {
+      specificationVersion: "v4",
+      transformParams: ({ params }) => {
+        const tools = params.tools?.map((tool) =>
+          tool.type === "function"
+            ? {
+                ...tool,
+                inputSchema: toolTypeArraysToAnyOf(tool.inputSchema) as typeof tool.inputSchema,
+              }
+            : tool
+        );
+        return Promise.resolve({ ...params, tools });
       },
     },
   });
@@ -667,6 +832,72 @@ function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void 
 }
 
 /**
+ * One fetch attempt of the Anthropic cache wrapper, recording its outcome on the request's
+ * DevTools step when the wrapper knows its route (see recordPromptCacheWire).
+ */
+/**
+ * Whether the runtime monitor observes this response. Only a request Anthropic accepted with
+ * cache markers: one that rejected before reaching it (auth refresh, connection error) or that
+ * it refused (overloaded, rate limited) neither creates nor breaks a cache entry, so it must
+ * not move the baseline or record a break. Nor does a response that arrived after the
+ * request's abort fired (a fetch that ignored the cancellation): the turn already finalized
+ * that DevTools step as aborted without a wire record, so the replay audit cannot count it,
+ * and the monitor must not either.
+ */
+function isObservableResponse(
+  response: Response,
+  cacheMarkersInjected: boolean,
+  signal: AbortSignal | null | undefined
+): boolean {
+  return cacheMarkersInjected && response.ok && signal?.aborted !== true;
+}
+
+/** Orders observations within one process (see DevToolsPromptCacheWire.observedSeq). */
+let promptCacheObservationSeq = 0;
+
+async function fetchRecordingPromptCacheWire(
+  baseFetch: typeof fetch,
+  input: Parameters<typeof fetch>[0],
+  init: RequestInit,
+  wire: {
+    /** The caller's headers: they still carry the synthetic DevTools step id. */
+    stepHeaders: HeadersInit | undefined;
+    options: { routeIdentity?: Omit<PromptCacheRouteIdentity, "endpoint"> } | undefined;
+    cacheMarkersInjected: boolean;
+  }
+): Promise<Response> {
+  const routeIdentity = wire.options?.routeIdentity;
+  if (routeIdentity == null) return baseFetch(input, init);
+  const record = (outcome: { dispatched: boolean; observedAt?: string; observedSeq?: number }) =>
+    recordPromptCacheWire(wire.stepHeaders, {
+      ...routeIdentity,
+      // The monitor keys by the request's endpoint too (another base URL, another cache).
+      endpoint: requestEndpoint(requestUrlOf(input)),
+      cacheMarkersInjected: wire.cacheMarkersInjected,
+      ...outcome,
+    });
+  let response: Response;
+  try {
+    response = await baseFetch(input, init);
+  } catch (error) {
+    record({ dispatched: false });
+    throw error;
+  }
+  // Taken when the monitor observes (right after this returns), so the audit measures the
+  // cache TTL from the same time.
+  record(
+    response.ok
+      ? {
+          dispatched: true,
+          observedAt: new Date().toISOString(),
+          observedSeq: ++promptCacheObservationSeq,
+        }
+      : { dispatched: true }
+  );
+  return response;
+}
+
+/**
  * Wrap fetch to normalize Anthropic cache_control directly on the final request body.
  *
  * This keeps routed Anthropic payloads aligned with Xum's manual cache markers
@@ -682,7 +913,21 @@ function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void 
 export function wrapFetchWithAnthropicCacheControl(
   baseFetch: typeof fetch,
   cacheTtl?: AnthropicCacheTtl | null,
-  options?: { injectCacheControl?: boolean }
+  options?: {
+    injectCacheControl?: boolean;
+    /**
+     * Sees the final JSON body and its request URL once the request was
+     * dispatched (prompt-cache prefix detection). Not called when cache
+     * markers are stripped: with prompt caching off there is no cache to break.
+     */
+    observeFinalBody?: (body: Record<string, unknown>, requestUrl: string) => void;
+    /**
+     * The route identity the prompt-cache monitor keys this wire by. When set, each attempt
+     * of a DevTools-tracked request records it with the dispatch outcome on the step, so the
+     * replay audit can apply the monitor's rules (see recordPromptCacheWire).
+     */
+    routeIdentity?: Omit<PromptCacheRouteIdentity, "endpoint">;
+  }
 ): typeof fetch {
   const injectCacheControl = options?.injectCacheControl ?? true;
   const cachingFetch = async (
@@ -694,8 +939,10 @@ export function wrapFetchWithAnthropicCacheControl(
       return baseFetch(input, init);
     }
 
+    let json: Record<string, unknown>;
+    let newBody: string;
     try {
-      const json = JSON.parse(init.body) as Record<string, unknown>;
+      json = JSON.parse(init.body) as Record<string, unknown>;
 
       if (!injectCacheControl) {
         stripAnthropicCacheControlMarkers(json);
@@ -753,14 +1000,28 @@ export function wrapFetchWithAnthropicCacheControl(
       }
 
       // Update body with modified JSON
-      const newBody = JSON.stringify(json);
-      const outHeaders = new Headers(init.headers);
-      outHeaders.delete("content-length"); // Body size changed
-      return baseFetch(input, { ...init, headers: outHeaders, body: newBody });
+      newBody = JSON.stringify(json);
     } catch {
       // If JSON parsing fails we can't touch the body; forward unchanged.
       return baseFetch(input, init);
     }
+    const outHeaders = new Headers(init.headers);
+    outHeaders.delete("content-length"); // Body size changed
+    // Outside the try above: a rejected dispatch must not be re-sent unchanged.
+    const response = await fetchRecordingPromptCacheWire(
+      baseFetch,
+      input,
+      { ...init, headers: outHeaders, body: newBody },
+      { stepHeaders: init.headers, options, cacheMarkersInjected: injectCacheControl }
+    );
+    if (isObservableResponse(response, injectCacheControl, init.signal)) {
+      try {
+        options?.observeFinalBody?.(json, requestUrlOf(input));
+      } catch {
+        // Observation is diagnostic only and must never affect the request.
+      }
+    }
+    return response;
   };
 
   return Object.assign(cachingFetch, baseFetch) as typeof fetch;
@@ -827,6 +1088,44 @@ function wrapFetchStrippingEmptyAuthHeaders(baseFetch: typeof fetch): typeof fet
     return baseFetch(input, { ...init, headers });
   };
   return Object.assign(wrappedFetch, baseFetch) as typeof fetch;
+}
+
+function requestUrlOf(input: Parameters<typeof fetch>[0]): string {
+  return input instanceof Request ? input.url : String(input);
+}
+
+/** First 16 hex chars of sha256: tells values apart without revealing them. */
+function shortHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+/** `?sha256:<hash>` for a non-empty query string, else "". */
+function hashedQuery(search: string): string {
+  return search.length > 0 ? `?sha256:${shortHash(search)}` : "";
+}
+
+/**
+ * The prompt-cache route of a mux-gateway account. Signing in as another account keeps the
+ * base URL but reaches another cache, so the account joins the baseline key, as a short
+ * hash: the credential never reaches keys, logs or events.
+ */
+export function muxGatewayPromptCacheRoute(couponCode: string): string {
+  return `mux-gateway:${shortHash(couponCode)}`;
+}
+
+/**
+ * The cache endpoint of a request URL: origin and path, plus a short hash of the query.
+ * normalizeAnthropicBaseURL keeps base-URL query parameters, and a proxy can pick an account
+ * or cache by them (`?token=...`), so another query is another cache. The query can hold
+ * credentials, so only its hash reaches baseline keys, logs and DevTools records.
+ */
+export function requestEndpoint(requestUrl: string): string {
+  try {
+    const url = new URL(requestUrl);
+    return `${url.origin}${url.pathname}${hashedQuery(url.search)}`;
+  } catch {
+    return `unparsed:sha256:${shortHash(requestUrl)}`;
+  }
 }
 
 /**
@@ -1180,30 +1479,6 @@ function getConfiguredProviderModelIds(providerConfig: ProviderConfig | undefine
   });
 }
 
-function createGatewayModelAccessibilityChecker(providersConfig: ProvidersConfig) {
-  // discoveredModels/removedModels are Coder-specific keys (other gateways
-  // have no server-discovered catalog marker), and ProvidersConfig's
-  // loosely-typed Record variant widens them to unknown — validate the shape
-  // once here.
-  const rawDiscovered = providersConfig.coder?.discoveredModels;
-  const coderDiscoveredModels = Array.isArray(rawDiscovered)
-    ? rawDiscovered.filter((id): id is string => typeof id === "string")
-    : undefined;
-  const rawRemoved = providersConfig.coder?.removedModels;
-  const coderRemovedModels = Array.isArray(rawRemoved)
-    ? rawRemoved.filter((id): id is string => typeof id === "string")
-    : undefined;
-  return (gateway: string, gatewayModelId: string): boolean => {
-    return isGatewayModelAccessibleFromAuthoritativeCatalog(
-      gateway,
-      gatewayModelId,
-      providersConfig[gateway]?.models,
-      gateway === "coder" ? coderDiscoveredModels : undefined,
-      gateway === "coder" ? coderRemovedModels : undefined
-    );
-  };
-}
-
 function formatCustomProviderRequirementError(
   provider: string,
   error: ProviderRequirementError
@@ -1337,6 +1612,10 @@ interface CreateModelOptions {
   agentInitiated?: boolean;
   workspaceId?: string;
   routeContext?: RouteContext;
+  /** Chat-local override, sampled at the next model call without changing other chats or routing. */
+  getServiceTierOverride?: () => ServiceTier | undefined;
+  /** Chat turns only: enables prompt-cache prefix-break detection on Anthropic wires. */
+  promptCacheScope?: PromptCacheTurnScope;
   /**
    * Providers-config snapshot to create the model from. Passed by
    * resolveAndCreateModel so routing, the returned coderWire snapshot,
@@ -1386,6 +1665,7 @@ export class ProviderModelFactory {
   private readonly devToolsService?: DevToolsService;
   private readonly oauthServices?: OauthServiceBindings;
   private readonly providersConfigStore: ProvidersConfigStore;
+  private readonly promptCachePrefixMonitor = new PromptCachePrefixMonitor();
 
   constructor(
     config: Config,
@@ -1399,6 +1679,35 @@ export class ProviderModelFactory {
     this.oauthServices = oauthServices;
     this.devToolsService = devToolsService;
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
+  }
+
+  /** A chat turn's prompt-cache scope (see PromptCachePrefixMonitor.createTurnScope). */
+  createPromptCacheTurnScope(
+    workspaceId: string,
+    recorder: TimelineRecorder
+  ): PromptCacheTurnScope {
+    return this.promptCachePrefixMonitor.createTurnScope(workspaceId, recorder);
+  }
+
+  /**
+   * Final-body observer for an Anthropic wire, or undefined for requests outside a chat turn.
+   * The request's endpoint joins the route identity: a changed base URL reaches another cache
+   * (another proxy or account), so its first request must not compare with the old baseline.
+   */
+  private promptCacheObserver(
+    opts: CreateModelOptions | undefined,
+    identity: Omit<PromptCacheRouteIdentity, "endpoint">
+  ): ((body: Record<string, unknown>, requestUrl: string) => void) | undefined {
+    const scope = opts?.promptCacheScope;
+    if (scope == null) {
+      return undefined;
+    }
+    return (body, requestUrl) =>
+      this.promptCachePrefixMonitor.observe(
+        scope,
+        { ...identity, endpoint: requestEndpoint(requestUrl) },
+        body
+      );
   }
 
   private isProviderAvailableForRouting(
@@ -1493,6 +1802,20 @@ export class ProviderModelFactory {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
+      // Perf harness replay mode (XUM_REPLAY_TAPES): no provider call, by construction. Every
+      // chat, status, title, compaction, refine, memory and intuition model is created
+      // through here, so no per-service gate is needed.
+      if (isSessionTapeReplayMode()) {
+        return Err<SendMessageError>({
+          type: "session_tape_replay",
+          message: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
+        });
+      }
+      // Mock AI mode (XUM_MOCK_AI, #5604): the same choke point keeps background features
+      // from reaching a real provider while chat turns are mocked.
+      if (isMockAiMode()) {
+        return Err<SendMessageError>({ type: "unknown", raw: MOCK_AI_MODEL_REFUSED_MESSAGE });
+      }
       const result = yield* self.createModelCoreEffect(modelString, muxProviderOptions, opts);
       if (!result.success) {
         return result;
@@ -1542,15 +1865,18 @@ export class ProviderModelFactory {
   private createModelCoreEffect(
     modelString: string,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: {
-      agentInitiated?: boolean;
-      routeContext?: RouteContext;
-      providersConfig?: ProvidersConfig;
-    }
+    opts?: CreateModelOptions
   ): Effect.Effect<Result<LanguageModel, SendMessageError>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
-    let serviceTierDefault: { namespace: string; option: string; value: string } | undefined;
+    let serviceTierDefault:
+      | {
+          namespace: string;
+          option: string;
+          value?: ServiceTier;
+          liveOverrides?: () => Record<string, ServiceTier | undefined>;
+        }
+      | undefined;
     let anthropicFastModePinned = false;
     // The explicit annotation restores the contextual typing the old async
     // signature provided, so the wire-error literals below stay narrowed.
@@ -1656,15 +1982,19 @@ export class ProviderModelFactory {
           muxProviderOptions?.openai?.serviceTier ?? providersConfig.openai?.serviceTier
         );
         const serviceTierProvidersConfig = self.providerService.getConfig(providersConfig);
-        const serviceTierAvailable = openaiServiceTierAvailable(modelString, {
+        const serviceTierRouteOptions = {
           providersConfig: serviceTierProvidersConfig,
           openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
-        });
+        };
+        const serviceTierAvailable = openaiServiceTierAvailable(
+          modelString,
+          serviceTierRouteOptions
+        );
         if (
           serviceTier.success &&
           serviceTierAvailable &&
           // Ultrafast is model-gated: drop it rather than send a tier the model rejects.
-          openaiModelSupportsServiceTier(modelString, serviceTier.data, serviceTierProvidersConfig)
+          openaiModelSupportsServiceTier(modelString, serviceTier.data, serviceTierRouteOptions)
         ) {
           serviceTierDefault = {
             namespace: "openai",
@@ -1678,6 +2008,27 @@ export class ProviderModelFactory {
           };
         } else if (muxProviderOptions?.openai) {
           delete muxProviderOptions.openai.serviceTier;
+        }
+
+        if (serviceTierAvailable && opts?.getServiceTierOverride) {
+          // The API can change tier between calls, not inside an in-flight response.
+          // Read only this turn's override; global preference edits must not affect
+          // another ongoing chat. Keep capabilities pinned to this model's route.
+          serviceTierDefault ??= { namespace: "openai", option: "serviceTier" };
+          const tierOptions = serviceTierDefault;
+          tierOptions.liveOverrides = () => {
+            const tier = opts.getServiceTierOverride?.();
+            if (tier == null) return {};
+            return {
+              [tierOptions.option]: openaiModelSupportsServiceTier(
+                modelString,
+                tier,
+                serviceTierRouteOptions
+              )
+                ? tier
+                : undefined,
+            };
+          };
         }
 
         // Anthropic Fast mode is a first-party-API-only beta. Pin it at creation
@@ -1760,7 +2111,8 @@ export class ProviderModelFactory {
                 headers: { ...muxAttributionHeaders },
                 fetch: providerFetch,
               });
-              return Ok(provider(modelId));
+              // These endpoints include old Ollama's /v1 (see withToolTypeArraysAsAnyOf).
+              return Ok(withToolTypeArraysAsAnyOf(provider(modelId)));
             }
             case "openai-responses": {
               const { createOpenAI } = yield* Effect.promise(async () =>
@@ -1789,6 +2141,7 @@ export class ProviderModelFactory {
               // Honor beta disablement like the built-in Anthropic path: strict
               // ZDR proxies reject cache_control when beta features are off.
               const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
+              const customRoute = { route: `custom:${providerName}`, modelString };
               const provider = createAnthropic({
                 baseURL: normalizeAnthropicBaseURL(credentials.baseURL),
                 apiKey: isolatedApiKey,
@@ -1796,7 +2149,11 @@ export class ProviderModelFactory {
                 fetch: wrapFetchWithAnthropicCacheControl(
                   customAdapterFetch,
                   effectiveAnthropicCacheTtl,
-                  { injectCacheControl: !disableBeta }
+                  {
+                    injectCacheControl: !disableBeta,
+                    observeFinalBody: self.promptCacheObserver(opts, customRoute),
+                    routeIdentity: customRoute,
+                  }
                 ),
               });
               return Ok(provider(modelId));
@@ -1837,11 +2194,16 @@ export class ProviderModelFactory {
           // Use getProviderFetch to preserve any user-configured custom fetch (e.g., proxies)
           const baseFetch = getProviderFetch(providerConfig);
           const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
+          const anthropicRoute = { route: "anthropic", modelString };
           // Wrap for cache_control normalization; skip injection when beta features are off.
           const fetchWithCacheControl = wrapFetchWithAnthropicCacheControl(
             baseFetch,
             effectiveAnthropicCacheTtl,
-            { injectCacheControl: !disableBeta }
+            {
+              injectCacheControl: !disableBeta,
+              observeFinalBody: self.promptCacheObserver(opts, anthropicRoute),
+              routeIdentity: anthropicRoute,
+            }
           );
           const providerFetch = fetchWithCacheControl;
           const provider = createAnthropic({
@@ -2220,7 +2582,7 @@ export class ProviderModelFactory {
             // Use strict mode for better compatibility with Ollama API
             compatibility: "strict",
           });
-          return Ok(provider(modelId));
+          return Ok(withToolTypeArraysAsAnyOf(provider(modelId)));
         }
 
         // Handle OpenRouter provider
@@ -2390,26 +2752,29 @@ export class ProviderModelFactory {
           // The gateway server still expects spec-v3 string-encoded file parts;
           // rewrite the v4 `{ type: "data" | "url" }` objects the 4.x SDK emits
           // so image attachments are not rejected as "invalid request".
-          const baseFetch = wrapFetchWithGatewayFilePartNormalization(
-            getProviderFetch(providerConfig)
-          );
+          const baseFetch = getProviderFetch(providerConfig);
           const isAnthropicModel = modelId.startsWith("anthropic/");
           const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
           // For Anthropic models via gateway, wrap for cache_control normalization;
-          // skip injection when beta features are off.
+          // skip injection when beta features are off. It sits inside the file-part
+          // normalization, so its prefix observer sees the body the gateway receives
+          // (normalization does not touch cache markers, so the order is otherwise neutral).
+          const gatewayRoute = { route: muxGatewayPromptCacheRoute(couponCode), modelString };
           const fetchWithCacheControl = isAnthropicModel
             ? wrapFetchWithAnthropicCacheControl(baseFetch, effectiveAnthropicCacheTtl, {
                 injectCacheControl: !disableBeta,
+                observeFinalBody: self.promptCacheObserver(opts, gatewayRoute),
+                // The same per-account route as the monitor, so the audit keys alike.
+                routeIdentity: gatewayRoute,
               })
             : baseFetch;
           const fetchWithAutoLogout = wrapFetchWithMuxGatewayAutoLogout(
-            fetchWithCacheControl,
+            wrapFetchWithGatewayFilePartNormalization(fetchWithCacheControl),
             self.providerService
           );
           const providerFetch = fetchWithAutoLogout;
           // Use configured baseURL or fall back to default gateway URL
-          const gatewayBaseURL =
-            providerConfig.baseURL ?? "https://gateway.mux.coder.com/api/v1/ai-gateway/v1/ai";
+          const gatewayBaseURL = providerConfig.baseURL ?? MUX_GATEWAY_AI_BASE_URL;
 
           // 1M context beta header is injected per-request via buildRequestHeaders() →
           // streamText({ headers }), not at provider creation time.
@@ -2575,6 +2940,10 @@ export class ProviderModelFactory {
           }
 
           const { createOpenAI } = yield* Effect.promise(async () => PROVIDER_REGISTRY.openai());
+          // Apply the live pick after translating Copilot's public options; otherwise
+          // their stale tier would overwrite the new OpenAI-wire value.
+          const liveTierOverrides = serviceTierDefault?.liveOverrides;
+          if (serviceTierDefault) serviceTierDefault.liveOverrides = undefined;
           const providerOptionsNamespace = resolveProviderOptionsNamespaceKey(
             "openai",
             "github-copilot"
@@ -2601,6 +2970,7 @@ export class ProviderModelFactory {
                       openai: {
                         ...params.providerOptions?.openai,
                         ...params.providerOptions?.[providerOptionsNamespace],
+                        ...liveTierOverrides?.(),
                       },
                     },
                   }),
@@ -2703,12 +3073,17 @@ export class ProviderModelFactory {
           const gatewayBaseUrl = coderAibridgeBaseUrl(deploymentUrl, gatewayProvider.name);
           if (wire === "anthropic") {
             const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
+            const coderRoute = { route: `coder:${gatewayProvider.name}`, modelString };
             // Same cache_control normalization as direct Anthropic / mux-gateway:
             // the bridge forwards origin-shaped payloads to the real Anthropic API.
             const providerFetch = wrapFetchWithAnthropicCacheControl(
               coderFetch,
               effectiveAnthropicCacheTtl,
-              { injectCacheControl: !disableBeta }
+              {
+                injectCacheControl: !disableBeta,
+                observeFinalBody: self.promptCacheObserver(opts, coderRoute),
+                routeIdentity: coderRoute,
+              }
             );
             const { createAnthropic } = yield* Effect.promise(async () =>
               PROVIDER_REGISTRY.anthropic()
@@ -2734,7 +3109,11 @@ export class ProviderModelFactory {
               ? provider.responses(originModelId)
               : provider.chat(originModelId);
           };
-          const coderModel = createOpenAIModelWithPreservedOptions(createCoderModel, coderFetch, {
+          // Chat upstreams include Gemini's OpenAI compatibility layer (google-type
+          // instances, or openai-compat ones fronting it).
+          const openAIFetch =
+            wire === "openai-chat" ? wrapFetchWithChatToolCallIndexes(coderFetch) : coderFetch;
+          const coderModel = createOpenAIModelWithPreservedOptions(createCoderModel, openAIFetch, {
             serviceTierAvailable,
             wireModelId: originModelId,
           });
@@ -2767,10 +3146,9 @@ export class ProviderModelFactory {
           const resolvedApiKey = creds.apiKey;
 
           // Lazy-load and create provider using factoryName from definition
-          // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
           const providerModule = (yield* Effect.promise(async () =>
             providerDef.import()
-          )) as unknown as Record<
+          )) as Record<
             string,
             (config: Record<string, unknown>) => (modelId: string) => LanguageModel
           >;
@@ -2808,9 +3186,12 @@ export class ProviderModelFactory {
         if (result.success && serviceTierDefault && typeof result.data !== "string") {
           // Headless callers may never rebuild providerOptions. Pin the validated
           // creation-time tier on both model methods, without rereading config.
-          injectProviderOptionsDefaults(result.data, serviceTierDefault.namespace, {
-            [serviceTierDefault.option]: serviceTierDefault.value,
-          });
+          injectProviderOptionsDefaults(
+            result.data,
+            serviceTierDefault.namespace,
+            { [serviceTierDefault.option]: serviceTierDefault.value },
+            serviceTierDefault.liveOverrides
+          );
         }
         if (result.success && anthropicFastModePinned && typeof result.data !== "string") {
           // @ai-sdk/anthropic adds the fast-mode beta header for this option.
@@ -2919,6 +3300,16 @@ export class ProviderModelFactory {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
+      // Perf harness replay mode (XUM_REPLAY_TAPES): see createModelEffect. The typed error has
+      // no free text, so the reason is logged.
+      if (isSessionTapeReplayMode()) {
+        log.warn("Evaluation model refused", { error: SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE });
+        return Err<EvaluationResolveError>({ reason: "unsupported-route" });
+      }
+      if (isMockAiMode()) {
+        log.debug("Evaluation model refused", { error: MOCK_AI_MODEL_REFUSED_MESSAGE });
+        return Err<EvaluationResolveError>({ reason: "unsupported-route" });
+      }
       // ONE providers.jsonc read for the shadow check, routing, credentials and
       // construction (same single-snapshot rule as resolveAndCreateModelEffect).
       const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
@@ -3163,7 +3554,7 @@ export class ProviderModelFactory {
     modelString: string,
     thinkingLevel: ThinkingLevel | undefined,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: Pick<CreateModelOptions, "agentInitiated" | "workspaceId" | "providersConfig">
+    opts?: Omit<CreateModelOptions, "routeContext">
   ): Promise<Result<ResolveAndCreateModelResult, SendMessageError>> {
     return Effect.runPromise(
       this.resolveAndCreateModelEffect(modelString, thinkingLevel, muxProviderOptions, opts)
@@ -3174,7 +3565,7 @@ export class ProviderModelFactory {
     modelString: string,
     thinkingLevel: ThinkingLevel | undefined,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: Pick<CreateModelOptions, "agentInitiated" | "workspaceId" | "providersConfig">
+    opts?: Omit<CreateModelOptions, "routeContext">
   ): Effect.Effect<Result<ResolveAndCreateModelResult, SendMessageError>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -3274,9 +3665,7 @@ export class ProviderModelFactory {
       );
       if (rawCoderGatewayModelId != null) {
         const appConfig = self.config.loadConfigOrDefault();
-        const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(
-          providersConfigForShadowCheck
-        );
+        const { isGatewayModelAccessible } = createGatewayRouting(providersConfigForShadowCheck);
         const coderProviderRoutable = self.isProviderAvailableForRouting(
           "coder",
           providersConfigForShadowCheck,
@@ -3481,7 +3870,8 @@ export class ProviderModelFactory {
     // providers.jsonc state (see createModel's providersConfig option).
     const providersConfig =
       providersConfigSnapshot ?? this.providersConfigStore.loadProvidersConfig() ?? {};
-    const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(providersConfig);
+    const { isGatewayModelAccessible, resolveGatewayModelId } =
+      createGatewayRouting(providersConfig);
     return resolveRoute(
       canonicalModel,
       config.routePriority ?? ["direct"],
@@ -3499,7 +3889,8 @@ export class ProviderModelFactory {
           openaiWireFormat
         );
       },
-      isGatewayModelAccessible
+      isGatewayModelAccessible,
+      resolveGatewayModelId
     );
   }
 
@@ -3582,7 +3973,8 @@ export class ProviderModelFactory {
 
     const originProvider = originProviderName as ProviderName;
     const config = this.config.loadConfigOrDefault();
-    const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(providersConfig);
+    const { isGatewayModelAccessible, resolveGatewayModelId } =
+      createGatewayRouting(providersConfig);
     const routeContext =
       typeof modelKeyOrRouteContext === "object" && modelKeyOrRouteContext != null
         ? modelKeyOrRouteContext
@@ -3607,10 +3999,9 @@ export class ProviderModelFactory {
                 openaiWireFormat
               );
             },
-            isGatewayModelAccessible
+            isGatewayModelAccessible,
+            resolveGatewayModelId
           );
-
-    let resolvedRouteProvider = routeContext.routeProvider;
 
     // Preserve an explicit gateway prefix from the raw model string when that
     // gateway can still route the canonical origin. This keeps deliberate
@@ -3627,6 +4018,9 @@ export class ProviderModelFactory {
         // coder:<origin>/<model> absent from the discovered catalog would be
         // sent to AI Bridge (and fail there) instead of using the fallback
         // route already resolved above.
+        // The static rebuild is the literal explicit ID: only default-named
+        // coder instances canonicalize (coder:anthropic/x), so it can never
+        // land on a canonicalRoutes-mapped instance.
         const explicitGatewayModelId =
           explicitGatewayDefinition.toGatewayModelId?.(originProvider, originModelId) ??
           originModelId;
@@ -3634,30 +4028,28 @@ export class ProviderModelFactory {
           explicitGatewayRoutes.includes(originProvider) &&
           isGatewayModelAccessible(explicitGateway, explicitGatewayModelId)
         ) {
-          resolvedRouteProvider = explicitGateway;
+          return `${explicitGateway}:${explicitGatewayModelId}`;
         }
       }
     }
 
-    if (resolvedRouteProvider === originProvider) {
+    const resolvedRouteProvider = routeContext.routeProvider;
+    if (
+      resolvedRouteProvider === originProvider ||
+      PROVIDER_DEFINITIONS[resolvedRouteProvider].kind !== "gateway"
+    ) {
       return canonicalModelString;
     }
 
-    const routeDefinition = PROVIDER_DEFINITIONS[resolvedRouteProvider];
-
-    if (routeDefinition.kind !== "gateway") {
-      return canonicalModelString;
-    }
-
-    const gatewayRoutes: readonly ProviderName[] = routeDefinition.routes;
-    if (!gatewayRoutes.includes(originProvider)) {
-      return canonicalModelString;
-    }
-
-    if (!("toGatewayModelId" in routeDefinition) || !routeDefinition.toGatewayModelId) {
-      return canonicalModelString;
-    }
-
-    return `${resolvedRouteProvider}:${routeDefinition.toGatewayModelId(originProvider, originModelId)}`;
+    // Same resolver resolveRoute used, so a Coder canonicalRoutes mapping
+    // lands on its instance (anthropic:x -> coder:<mapped-instance>/x).
+    const gatewayModelId = resolveGatewayModelId(
+      resolvedRouteProvider,
+      originProvider,
+      originModelId
+    );
+    return gatewayModelId == null
+      ? canonicalModelString
+      : `${resolvedRouteProvider}:${gatewayModelId}`;
   }
 }

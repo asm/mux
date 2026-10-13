@@ -1,6 +1,6 @@
 import { useCallback, useSyncExternalStore } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { getAppConfigStore, useAppConfig } from "@/browser/stores/AppConfigStore";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
 import {
   DEFAULT_ROUTE_PRIORITY,
@@ -12,7 +12,7 @@ import {
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { isRouteProviderConfigured } from "@/common/utils/ai/modelAvailability";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
-import { isGatewayModelAccessibleForUi } from "@/common/utils/providers/gatewayModelCatalog";
+import { createGatewayRouting } from "@/common/utils/providers/gatewayModelCatalog";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 
 import { useProvidersConfig } from "./useProvidersConfig";
@@ -82,13 +82,12 @@ export function useRouting(): RoutingState {
   // app session) instead of per-mount fetches: surfaces render one picker per
   // row, so per-instance subscriptions fanned out O(rows) backend reads.
   const store = getAppConfigStore();
-  const appConfig = useSyncExternalStore(store.subscribe, store.getSnapshot);
-  const routePriority = appConfig?.routePriority ?? DEFAULT_ROUTE_PRIORITY;
-  const routeOverrides = appConfig?.routeOverrides ?? EMPTY_ROUTE_OVERRIDES;
+  const routePriority = useAppConfig((config) => config.routePriority) ?? DEFAULT_ROUTE_PRIORITY;
+  const routeOverrides = useAppConfig((config) => config.routeOverrides) ?? EMPTY_ROUTE_OVERRIDES;
   // Until the store's first snapshot lands, routePriority is the built-in
   // default — availability verdicts computed against it can be wrong for
   // gateway-routed setups, so consumers gating UI on route reachability wait.
-  const loaded = appConfig != null;
+  const loaded = useSyncExternalStore(store.subscribe, () => store.getSnapshot() != null);
 
   // Shared predicates: the send-path availability check
   // (isModelServableWithProvidersConfig) uses these same definitions, so the
@@ -99,13 +98,9 @@ export function useRouting(): RoutingState {
     [providersConfig]
   );
 
-  // Catalog-aware so route pickers, availability, and resolution never offer a
-  // gateway route the backend rejects at send time.
-  const isGatewayModelAccessible = useCallback(
-    (gateway: string, modelId: string) =>
-      isGatewayModelAccessibleForUi(providersConfig, gateway, modelId),
-    [providersConfig]
-  );
+  // Catalog- and canonicalRoutes-aware so route pickers, availability, and
+  // resolution never offer a gateway route the backend rejects at send time.
+  const { isGatewayModelAccessible, resolveGatewayModelId } = createGatewayRouting(providersConfig);
 
   const persistRoutePreferences = useCallback(
     (priority: string[], overrides: Record<string, string>) => {
@@ -167,7 +162,8 @@ export function useRouting(): RoutingState {
         routePriority,
         routeOverrides,
         isConfigured,
-        isGatewayModelAccessible
+        isGatewayModelAccessible,
+        resolveGatewayModelId
       );
 
       const route = resolved.routeProvider === resolved.origin ? "direct" : resolved.routeProvider;
@@ -184,7 +180,7 @@ export function useRouting(): RoutingState {
         displayName: getRouteDisplayName(route),
       };
     },
-    [isConfigured, isGatewayModelAccessible, routeOverrides, routePriority]
+    [isConfigured, isGatewayModelAccessible, resolveGatewayModelId, routeOverrides, routePriority]
   );
 
   const resolveEffectiveRoute = (modelString: string): string => {
@@ -208,7 +204,8 @@ export function useRouting(): RoutingState {
       routePriority,
       routeOverrides,
       isConfigured,
-      isGatewayModelAccessible
+      isGatewayModelAccessible,
+      resolveGatewayModelId
     );
     return resolved.routeProvider === resolved.origin ? "direct" : resolved.routeProvider;
   };
@@ -222,7 +219,8 @@ export function useRouting(): RoutingState {
         routePriority,
         {}, // empty overrides — priority-walk only
         isConfigured,
-        isGatewayModelAccessible
+        isGatewayModelAccessible,
+        resolveGatewayModelId
       );
 
       const route = resolved.routeProvider === resolved.origin ? "direct" : resolved.routeProvider;
@@ -232,13 +230,18 @@ export function useRouting(): RoutingState {
         displayName: getRouteDisplayName(route),
       };
     },
-    [isConfigured, isGatewayModelAccessible, routePriority]
+    [isConfigured, isGatewayModelAccessible, resolveGatewayModelId, routePriority]
   );
 
   const availableRoutes = useCallback(
     (canonicalModel: string): AvailableRoute[] =>
-      listAvailableRoutes(canonicalModel, isConfigured, isGatewayModelAccessible),
-    [isConfigured, isGatewayModelAccessible]
+      listAvailableRoutes(
+        canonicalModel,
+        isConfigured,
+        isGatewayModelAccessible,
+        resolveGatewayModelId
+      ),
+    [isConfigured, isGatewayModelAccessible, resolveGatewayModelId]
   );
 
   return {

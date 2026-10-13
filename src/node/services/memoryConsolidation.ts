@@ -458,7 +458,8 @@ export async function runMemoryConsolidation(args: {
       args.beforeDispatch === undefined
         ? undefined
         : async () => {
-            if (!stale && !(await args.beforeDispatch!())) {
+            const beforeDispatch = args.beforeDispatch;
+            if (beforeDispatch !== undefined && !stale && !(await beforeDispatch())) {
               stale = true;
               gate.abort(new Error(CONSOLIDATION_INPUT_STALE_MESSAGE));
             }

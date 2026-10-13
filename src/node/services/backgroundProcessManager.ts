@@ -9,6 +9,7 @@ import type {
 import {
   spawnProcess,
   localBgWorkspaceDir,
+  legacyMigratedBgRecordsRoot,
   spawnRecordsAreHostLocal,
   quotePathForShell,
   BG_META_FILENAME,
@@ -21,7 +22,7 @@ import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "./log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import { BASH_MAX_LINE_BYTES } from "@/common/constants/toolLimits";
+import { BASH_MAX_LINE_BYTES, BASH_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import { stripAnsiControlChars } from "@/node/utils/ansi";
 import { truncateUtf8Prefix } from "@/node/utils/utf8";
 import type { BashMonitorFailedOperation } from "@/common/types/message";
@@ -40,6 +41,17 @@ const MAX_BACKGROUND_BASH_TAIL_BYTES = 1_000_000;
 export const SPAWN_NAME_LOCK_FILENAME = ".spawn-name.lock";
 // Held from the name probe until the new record's meta.json is written (one local spawn).
 const SPAWN_NAME_LOCK_TIMEOUT_MS = 30_000;
+// Candidate names one non-host claim exec tries in order (#5485): a name used in k earlier
+// sessions costs ceil((k + 1) / batch) exec round-trips instead of k + 1.
+const RUNTIME_SPAWN_NAME_CLAIM_BATCH = 8;
+// Upper bound on a fail-closed cleanup() (archive, removal) waiting for pending spawns and
+// migrations, shared by both of its drains (#5477). Each wait is normally bounded by its own
+// steps (the 30 s name lock, 10 s claim execs), but a hung runtime probe or spawnProcess call
+// is not; archive and removal must then fail closed and keep the checkout instead of waiting as
+// long as that call hangs.
+const PENDING_ADMISSION_DRAIN_TIMEOUT_MS = 60_000;
+const SPAWN_REFUSED_WHILE_SEALED_ERROR =
+  "This workspace's background processes are being stopped (archive, removal or session cleanup); the process was not started.";
 const MONITOR_POLL_INTERVAL_MS_LOCAL = 100;
 const MONITOR_POLL_INTERVAL_MS_REMOTE = 1_000;
 const MONITOR_MAX_PENDING_LINES = 50;
@@ -431,8 +443,17 @@ export interface BackgroundProcess {
   outputLock: AsyncMutex;
   /** Tracks how many times getOutput() has been called (for polling detection) */
   getOutputCallCount: number;
-  /** Buffer for incomplete lines (no trailing newline) from previous read */
+  /**
+   * Output already consumed from output.log that no read has returned yet: the incomplete
+   * trailing line, plus every line after a capped (or interrupted) read's cut.
+   */
   incompleteLineBuffer: string;
+  /**
+   * True when incompleteLineBuffer starts with the tail of a line a capped read split (a kept
+   * line over BASH_MAX_TOTAL_BYTES). The next read keeps that tail without testing the filter:
+   * the tail alone can stop matching the filter its whole line matched.
+   */
+  unreadStartsWithKeptLine?: boolean;
   /** Optional write-time monitor that wakes the agent on matching output lines. */
   monitor?: BackgroundProcessMonitorState;
 }
@@ -480,6 +501,184 @@ export interface BackgroundProcessManagerEvents {
   "monitor:stopped": [workspaceId: string, payload: MonitorStoppedPayload];
 }
 
+interface BackgroundOutputPage {
+  /** What this read returns (lines joined by "\n"). */
+  output: string;
+  /** Raw output this read leaves for the next one; it starts at the first line not returned. */
+  unread: string;
+  /** True when the read stopped at the cap with complete lines still unread. */
+  capped: boolean;
+  /** True when `unread` starts with the tail of a kept line this read split. */
+  unreadStartsWithKeptLine: boolean;
+}
+
+/**
+ * Cut one getOutput read to foreground bash's byte cap (BASH_MAX_TOTAL_BYTES), so the tool
+ * result has the same bound in-turn and on replay. Nothing is dropped: the raw rest stays unread
+ * for the next read. No line cap: the byte cap already bounds the context cost, and a line cap
+ * would multiply the reads for logs of short lines. A single line over the byte cap returns
+ * its head and leaves its tail as the first unread line; `firstLineKept` tells the next read to
+ * keep that tail whatever the filter says, because its whole line was kept.
+ *
+ * While the process runs, the last element of the split is an incomplete fragment (or "" after a
+ * trailing newline), which always stays unread. On exit every line counts and, as before, empty
+ * lines are not returned.
+ */
+function takeBackgroundOutputPage(
+  raw: string,
+  exited: boolean,
+  firstLineKept: boolean,
+  keepLine: (line: string) => boolean
+): BackgroundOutputPage {
+  const lines = raw.split("\n");
+  const fragment = exited ? null : (lines.pop() ?? "");
+  const { shown, rest, splitLine } = takeLinesWithinByteCap(
+    lines,
+    pageLineFilter(exited, firstLineKept, keepLine)
+  );
+  const capped = rest.length > 0;
+  if (fragment != null) rest.push(fragment);
+  return {
+    output: shown.join("\n"),
+    unread: rest.join("\n"),
+    capped,
+    // A complete continuation line that did not fit stays the first unread line.
+    unreadStartsWithKeptLine: splitLine || (firstLineKept && shown.length === 0 && capped),
+  };
+}
+
+/** Which lines a page keeps: the continuation of a split kept line, then the filter's picks. */
+function pageLineFilter(
+  exited: boolean,
+  firstLineKept: boolean,
+  keepLine: (line: string) => boolean
+): (line: string, index: number) => boolean {
+  return (line, index) => {
+    if (index === 0 && firstLineKept) return true;
+    // On exit, empty lines are not returned (the trailing "" of a final newline included).
+    return (!exited || line.length > 0) && keepLine(line);
+  };
+}
+
+/**
+ * Leading kept lines whose "\n"-joined size fits BASH_MAX_TOTAL_BYTES, and every line after
+ * them. When the first kept line alone is over the cap, its head is shown and its tail becomes
+ * the first remaining line, so each read makes progress.
+ */
+function takeLinesWithinByteCap(
+  lines: string[],
+  keepLine: (line: string, index: number) => boolean
+): { shown: string[]; rest: string[]; splitLine: boolean } {
+  const shown: string[] = [];
+  let bytes = 0;
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    if (!keepLine(line, index)) continue;
+    const lineBytes = Buffer.byteLength(line, "utf8") + (shown.length > 0 ? 1 : 0);
+    if (bytes + lineBytes <= BASH_MAX_TOTAL_BYTES) {
+      shown.push(line);
+      bytes += lineBytes;
+      continue;
+    }
+    if (shown.length > 0) return { shown, rest: lines.slice(index), splitLine: false };
+    const head = truncateUtf8Prefix(line, BASH_MAX_TOTAL_BYTES);
+    const tail = [line.slice(head.length), ...lines.slice(index + 1)];
+    return { shown: [head], rest: tail, splitLine: true };
+  }
+  return { shown, rest: [], splitLine: false };
+}
+
+/** Tells the model how to read what a capped getOutput read left unread. */
+function formatCappedReadNote(
+  processId: string,
+  unreadBytes: number,
+  toolName: string,
+  filter: string | undefined,
+  filterExclude: boolean | undefined
+): string {
+  // The exact call, filter mode included: a read without filter_exclude would keep the lines
+  // this read dropped and drop the ones it kept.
+  const filterArgs =
+    filter == null
+      ? ""
+      : `, filter: ${JSON.stringify(filter)}${filterExclude === true ? ", filter_exclude: true" : ""}`;
+  const call =
+    toolName === "task_await"
+      ? `task_await(task_ids: ["bash:${processId}"], timeout_secs: 0${filterArgs})`
+      : `${toolName}(process_id: "${processId}", timeout_secs: 0${filterArgs})`;
+  return (
+    `Output capped at ${BASH_MAX_TOTAL_BYTES} bytes per read; ` +
+    `${unreadBytes} more bytes are unread. Read the next part with ${call}.`
+  );
+}
+
+// Unread output kept in memory between reads, at most this many pages. A read still loads from
+// the cursor to the end of output.log; the rest past this bound goes back to the file: the
+// cursor moves back over it, so the next reads load it again.
+const MAX_RETAINED_UNREAD_BYTES = 4 * BASH_MAX_TOTAL_BYTES;
+
+/**
+ * Keep at most MAX_RETAINED_UNREAD_BYTES of `unread` (whole lines when one fits), and move the
+ * file cursor back over the rest, so the next reads load it from output.log again.
+ *
+ * `unread` is the end of what the reads consumed, and `decodedThisRead` is the text this call
+ * decoded from the bytes just before the cursor (both end at the cursor). The cursor counts raw
+ * bytes, the text is decoded: an invalid byte (Latin-1, binary, a character cut at a read
+ * boundary) decodes to U+FFFD, 3 bytes for 1. So the cursor only moves back over text that
+ * maps 1:1 onto raw bytes: a suffix of `decodedThisRead` with no U+FFFD (every other character
+ * decodes from exactly its own UTF-8 bytes). What cannot be rewound stays in memory, as it did
+ * before reads were capped.
+ */
+function retainUnreadOutput(
+  proc: BackgroundProcess,
+  unread: string,
+  decodedThisRead: string
+): void {
+  const head = truncateUtf8Prefix(unread, MAX_RETAINED_UNREAD_BYTES);
+  if (head.length === unread.length) {
+    proc.incompleteLineBuffer = unread;
+    return;
+  }
+  const lastNewline = head.lastIndexOf("\n");
+  const dropped = unread.slice(lastNewline >= 0 ? lastNewline + 1 : head.length);
+  const rewound = dropped.slice(rewindableStart(dropped, decodedThisRead.length));
+  const outputBytesRead = proc.outputBytesRead - Buffer.byteLength(rewound, "utf8");
+  // Checked before any state changes: a failed assert must leave the process as it was.
+  assert(outputBytesRead >= 0, "the rewound unread output must come from output.log");
+  proc.incompleteLineBuffer = unread.slice(0, unread.length - rewound.length);
+  proc.outputBytesRead = outputBytesRead;
+}
+
+/** Where the rewindable part of `dropped` starts (see retainUnreadOutput). */
+function rewindableStart(dropped: string, decodedThisReadLength: number): number {
+  const afterLastReplacement = dropped.lastIndexOf("\uFFFD") + 1;
+  return Math.max(afterLastReplacement, dropped.length - decodedThisReadLength);
+}
+
+/** Polling guidance for getOutput (see the callers' 3+ call heuristics). */
+function formatPollingNote(
+  callCount: number,
+  filterExclude: boolean | undefined,
+  running: boolean,
+  pollingToolName: string
+): string | undefined {
+  if (callCount < 3 || !running) return undefined;
+  if (!filterExclude) {
+    return (
+      `STOP POLLING. You've called ${pollingToolName} 3+ times on this process. ` +
+      "This wastes tokens and clutters the conversation. " +
+      "Instead, make ONE call with: filter='⏳|progress|waiting|\\\\\\.\\\\\\.\\\\\\.', " +
+      "filter_exclude=true, timeout_secs=120. This blocks until meaningful output arrives."
+    );
+  }
+  return (
+    "You're using filter_exclude but still polling frequently. " +
+    "Your filter pattern may not be matching the actual output. " +
+    "Try a broader pattern like: filter='\\\\.|\\\\d+%|running|progress|pending|⏳|waiting'. " +
+    "Wait for the FULL timeout before checking again."
+  );
+}
+
 export class BackgroundProcessManager extends EventEmitter<BackgroundProcessManagerEvents> {
   // NOTE: This map is in-memory only. Background processes use nohup/setsid so they
   // could survive app restarts, but we kill all tracked processes on shutdown via
@@ -496,16 +695,28 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   // candidate is chosen; released when the spawn registers or fails.
   private readonly reservedProcessIds = new Set<string>();
   /**
-   * Foreground commands mid-migration, by workspace (#4805): they have left foreground tracking
-   * but are not in `processes` until migrateToBackground's file setup returns. cleanup() waits
-   * for them so a removal cannot delete the checkout under a command that registers afterwards.
+   * Commands on their way into `processes`, by workspace: foreground commands mid-migration
+   * (#4805), which have left foreground tracking but register only once migrateToBackground's
+   * file setup returns, and background spawns from admission to registration (B2: a spawn can
+   * wait for its record name, then start its child, before it registers). cleanup() waits for
+   * them so a removal or archive cannot delete the checkout under a command that registers
+   * afterwards.
    */
-  private readonly pendingMigrations = new Map<string, Set<Promise<void>>>();
+  private readonly pendingAdmissions = new Map<string, Set<Promise<void>>>();
   /**
-   * Open migration seals per workspace (#4967), counted: while any is held, beginMigration()
-   * refuses. cleanup() holds one for its own duration; a removal holds one until it settles.
+   * Pending entries of migrations whose command is being terminated (refused or failed): they
+   * never register, and they stay pending until the command's exit is confirmed, which may be
+   * never (#5589). Only cleanups that delete the checkout afterwards wait for them.
    */
-  private readonly migrationSeals = new Map<string, number>();
+  private readonly stoppingAdmissions = new WeakSet<Promise<void>>();
+  /** Resolved and replaced on each markStopping(), so a disposal drain already waiting re-checks. */
+  private stoppingMarked = Promise.withResolvers<void>();
+  /**
+   * Open admission seals per workspace (#4967), counted: while any is held, beginMigration() and
+   * spawn() refuse. cleanup() holds one for its own duration; a removal or archive holds one
+   * until it settles.
+   */
+  private readonly admissionSeals = new Map<string, number>();
 
   // Base directory for process output files
   private readonly bgOutputDir: string;
@@ -1437,58 +1648,131 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * the command leaves foreground tracking and dispose it once the command is registered (or
    * terminated after a failed migration); cleanup() waits for it in between.
    *
-   * While the workspace is sealed (sealMigrations) the migration is not `admitted`: the caller
+   * While the workspace is sealed (sealAdmissions) the migration is not `admitted`: the caller
    * must terminate the command as on a failed migration. It is still tracked until disposed, so
    * a running cleanup() also waits for that termination.
+   *
+   * `markStopping()` says the command is being terminated and will never register: a removal or
+   * archive cleanup keeps waiting for it (and fails closed at its deadline), but session disposal,
+   * which deletes nothing, does not (#5589).
    */
-  beginMigration(workspaceId: string): Disposable & { readonly admitted: boolean } {
-    const admitted = !this.migrationSeals.has(workspaceId);
+  beginMigration(
+    workspaceId: string
+  ): Disposable & { readonly admitted: boolean; markStopping(): void } {
+    const admitted = !this.admissionSeals.has(workspaceId);
+    const pending = this.trackPendingAdmission(workspaceId);
+    return {
+      admitted,
+      markStopping: () => {
+        this.stoppingAdmissions.add(pending.settled);
+        this.stoppingMarked.resolve();
+        this.stoppingMarked = Promise.withResolvers<void>();
+      },
+      [Symbol.dispose]: () => pending[Symbol.dispose](),
+    };
+  }
+
+  /**
+   * B2: admit a background spawn into `workspaceId`, or return null while the workspace is
+   * sealed. An admitted spawn stays pending (cleanup() waits for it) until the returned handle
+   * is disposed, which spawn() does once the process is registered in `processes` or the spawn
+   * failed, so a spawn still waiting for its record name cannot register after cleanup() looked.
+   */
+  private admitSpawn(workspaceId: string): Disposable | null {
+    if (this.admissionSeals.has(workspaceId)) return null;
+    return this.trackPendingAdmission(workspaceId);
+  }
+
+  /** Counts a command as pending in `workspaceId` until the returned handle is disposed. */
+  private trackPendingAdmission(
+    workspaceId: string
+  ): Disposable & { readonly settled: Promise<void> } {
     const settled = Promise.withResolvers<void>();
-    let pending = this.pendingMigrations.get(workspaceId);
+    let pending = this.pendingAdmissions.get(workspaceId);
     if (pending === undefined) {
       pending = new Set();
-      this.pendingMigrations.set(workspaceId, pending);
+      this.pendingAdmissions.set(workspaceId, pending);
     }
     pending.add(settled.promise);
     return {
-      admitted,
+      settled: settled.promise,
       [Symbol.dispose]: () => {
-        const current = this.pendingMigrations.get(workspaceId);
+        const current = this.pendingAdmissions.get(workspaceId);
         current?.delete(settled.promise);
-        if (current?.size === 0) this.pendingMigrations.delete(workspaceId);
+        if (current?.size === 0) this.pendingAdmissions.delete(workspaceId);
         settled.resolve();
       },
     };
   }
 
   /**
-   * Refuse new migrations in `workspaceId` until the returned seal is disposed (#4967). A
-   * command that was still before beginMigration when cleanup() looked (claiming its record
-   * name, or in the exit grace) would otherwise register afterwards and outlive the cleanup.
+   * Refuse new migrations and spawns in `workspaceId` until the returned seal is disposed
+   * (#4967, B2). A command that was still before beginMigration or spawn() when cleanup() looked
+   * (claiming its record name, or in the exit grace) would otherwise register afterwards and
+   * outlive the cleanup.
    */
-  sealMigrations(workspaceId: string): Disposable {
-    this.migrationSeals.set(workspaceId, (this.migrationSeals.get(workspaceId) ?? 0) + 1);
+  sealAdmissions(workspaceId: string): Disposable {
+    this.admissionSeals.set(workspaceId, (this.admissionSeals.get(workspaceId) ?? 0) + 1);
     let released = false;
     return {
       [Symbol.dispose]: () => {
         if (released) return;
         released = true;
-        const count = this.migrationSeals.get(workspaceId) ?? 0;
-        assert(count > 0, `migration seal count underflow for ${workspaceId}`);
-        if (count === 1) this.migrationSeals.delete(workspaceId);
-        else this.migrationSeals.set(workspaceId, count - 1);
+        const count = this.admissionSeals.get(workspaceId) ?? 0;
+        assert(count > 0, `admission seal count underflow for ${workspaceId}`);
+        if (count === 1) this.admissionSeals.delete(workspaceId);
+        else this.admissionSeals.set(workspaceId, count - 1);
       },
     };
   }
 
-  /** Waits until no migration is pending in `workspaceId`, including ones added meanwhile. */
-  private async drainPendingMigrations(workspaceId: string): Promise<void> {
-    for (
-      let pending = this.pendingMigrations.get(workspaceId);
-      pending !== undefined;
-      pending = this.pendingMigrations.get(workspaceId)
-    ) {
-      await Promise.all([...pending]);
+  /**
+   * Waits until no migration or spawn is pending in `workspaceId`, including later ones. With a
+   * `deadline` (epoch ms), throws once it passes (#5477), so a caller that deletes the checkout
+   * afterwards (archive, removal) fails closed instead of hanging with a stuck runtime call.
+   * Without one (session disposal, which deletes nothing), it skips migrations whose command is
+   * stopping: their exit may never be confirmed, and waiting would hang disposal with its admission
+   * seal held (#5589). They stay pending, so removal and archive still wait for them.
+   */
+  private async drainPendingAdmissions(
+    workspaceId: string,
+    deadline: number | null
+  ): Promise<void> {
+    if (deadline === null) {
+      for (
+        let pending = this.pendingAdmissions.get(workspaceId);
+        pending !== undefined;
+        pending = this.pendingAdmissions.get(workspaceId)
+      ) {
+        const registering = [...pending].filter((entry) => !this.stoppingAdmissions.has(entry));
+        if (registering.length === 0) return;
+        // A migration may become stopping while this waits (disposal can start before a migration
+        // fails): wake up and re-check rather than wait on an entry that may never settle.
+        await Promise.race([Promise.all(registering), this.stoppingMarked.promise]);
+      }
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<"timed-out">((resolve) => {
+      timer = setTimeout(() => resolve("timed-out"), Math.max(0, deadline - Date.now()));
+    });
+    try {
+      for (
+        let pending = this.pendingAdmissions.get(workspaceId);
+        pending !== undefined;
+        pending = this.pendingAdmissions.get(workspaceId)
+      ) {
+        const settled = await Promise.race([Promise.all([...pending]), timedOut]);
+        if (settled === "timed-out") {
+          throw new Error(
+            `A background process start or migration in this workspace did not settle within ${
+              PENDING_ADMISSION_DRAIN_TIMEOUT_MS / 1000
+            } s (a runtime call may be hung); its background processes were not all stopped. Retry once the runtime responds.`
+          );
+        }
+      }
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -1637,6 +1921,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   > {
     log.debug(`BackgroundProcessManager.spawn() called for workspace ${workspaceId}`);
 
+    // B2: no spawn may start while the workspace is sealed (cleanup, archive, removal), and an
+    // admitted one is pending until this method returns: disposed last (declared first), after
+    // the name lock and after the process is registered in `processes` or the spawn failed.
+    using admission = this.admitSpawn(workspaceId);
+    if (admission === null) return { success: false, error: SPAWN_REFUSED_WHILE_SEALED_ERROR };
+
     let processId = this.generateUniqueProcessId(config.displayName);
     // Reserved synchronously in the same tick each candidate is chosen (see
     // reservedProcessIds): the awaits below would otherwise let a concurrent same-name spawn
@@ -1658,7 +1948,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // reusing a settled one may clobber a record the other backend still tracks (see
     // recordDirIsFree). Host-local records are probed on the local filesystem; all other
     // layouts (SSH/Coder, Docker, devcontainer) live in the runtime's exec namespace and are
-    // probed through the runtime instead.
+    // claimed through the runtime with an atomic mkdir instead (claimRuntimeSpawnDir).
     // Cross-process claim (#4873): two backends on one XUM_ROOT (desktop + `xum server`) have
     // separate in-memory reservations but share the host records root, so both could probe a
     // name as free and spawn into one directory. Host-local spawns therefore hold a
@@ -1706,12 +1996,34 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     } else {
       let suffix = 2;
       for (;;) {
-        const probe = await this.runtimeSpawnDirMayHoldLiveProcess(runtime, workspaceId, processId);
-        if (probe === "free") break;
-        if (probe !== "held") {
-          // Unreachable/garbled probe: abort rather than loop forever against a dead host.
-          // Nothing was written under this name, so the reservation is safe to release.
-          return { success: false, error: probe.error };
+        // One exec tries a batch of candidates (#5485). Every candidate is reserved before the
+        // await, like processId itself, so a concurrent same-name spawn in this backend never
+        // targets one of them and never releases a name this spawn claimed.
+        const candidates = [processId];
+        while (candidates.length < RUNTIME_SPAWN_NAME_CLAIM_BATCH) {
+          let candidate: string;
+          do {
+            candidate = `${config.displayName} (${suffix})`;
+            suffix++;
+          } while (this.processes.has(candidate) || this.reservedProcessIds.has(candidate));
+          this.reservedProcessIds.add(candidate);
+          candidates.push(candidate);
+        }
+        const claim = await this.claimRuntimeSpawnDir(runtime, workspaceId, candidates);
+        // Keep only the claimed name reserved (processId on error: the disposer releases it).
+        const kept = typeof claim === "number" ? candidates[claim] : processId;
+        for (const candidate of candidates) {
+          if (candidate !== kept) this.reservedProcessIds.delete(candidate);
+        }
+        if (typeof claim === "number") {
+          processId = kept;
+          break;
+        }
+        if (claim !== "held") {
+          // Unreachable/garbled reply: abort rather than loop forever against a dead host.
+          // Releasing the reservations is safe even if a mkdir landed before the reply was
+          // lost: a same-session retry then finds the directory and takes a suffix.
+          return { success: false, error: claim.error };
         }
         this.reservedProcessIds.delete(processId);
         do {
@@ -1722,6 +2034,18 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       }
     }
 
+    // B2: a cleanup that sealed the workspace while this spawn waited for its name is waiting
+    // for it; refuse rather than start a child that cleanup would only have to stop.
+    if (this.admissionSeals.has(workspaceId)) {
+      // A non-host claim already created the (empty) record directory: drop it so it neither
+      // holds the name nor fails the remote crash-orphan probe closed for the archive or
+      // removal that sealed the workspace.
+      if (!spawnRecordsAreHostLocal(runtime)) {
+        await this.releaseRuntimeSpawnDir(runtime, workspaceId, processId);
+      }
+      return { success: false, error: SPAWN_REFUSED_WHILE_SEALED_ERROR };
+    }
+
     // Spawn via executor with background infrastructure
     // spawnProcess uses runtime.tempDir() internally for output directory
     const result = await spawnProcess(runtime, script, {
@@ -1730,6 +2054,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       processId,
       env: config.env,
       pathEnv: config.pathEnv,
+      recordDirClaimed: !spawnRecordsAreHostLocal(runtime),
     });
 
     if (!result.success) {
@@ -2282,8 +2607,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // await to settle, then remains deliverable if its matched output was filtered out.
     using _readTracker = this.trackMonitorWakeBlockingRead(proc, filter, noteToolName);
 
-    // Track call count for polling detection
-    proc.getOutputCallCount++;
+    // Track call count for polling detection. Reading what a capped read left unread is paging,
+    // not polling, so it does not count.
+    if (!proc.incompleteLineBuffer.includes("\n")) proc.getOutputCallCount++;
     const callCount = proc.getOutputCallCount;
 
     log.debug(
@@ -2348,8 +2674,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // When using filter_exclude, check if we have meaningful (non-excluded) output.
       // We only consider complete lines as "meaningful" here; fragments are buffered for the next read.
       const filteredOutput = applyFilter(completeLines);
+      // A split line's tail counts too: the read returns it whatever the filter says.
       const hasMeaningfulOutput = filterExclude
-        ? filteredOutput.trim().length > 0
+        ? filteredOutput.trim().length > 0 ||
+          (proc.unreadStartsWithKeptLine === true && completeLines.length > 0)
         : completeLines.length > 0;
 
       // Return immediately if:
@@ -2388,7 +2716,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         // so preserve them in the line buffer; otherwise the next getOutput() would resume past
         // this content and silently drop it. This matters now that task_await aborts a still-
         // pending bash read once min_completed is satisfied (not just on user interrupt).
-        proc.incompleteLineBuffer = previousBuffer + accumulatedRaw;
+        retainUnreadOutput(proc, previousBuffer + accumulatedRaw, accumulatedRaw);
         const elapsed_ms = Date.now() - startTime;
         return {
           success: true,
@@ -2440,19 +2768,17 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         }
       }
     }
-    const rawWithBuffer = previousBuffer + accumulatedRaw;
-    const allLines = rawWithBuffer.split("\n");
-    const hasTrailingNewline = rawWithBuffer.endsWith("\n");
-
-    // On process exit, include incomplete line; otherwise keep it buffered
-    const linesToReturn =
-      currentStatus !== "running"
-        ? allLines.filter((l) => l.length > 0) // Include all non-empty lines on exit
-        : allLines.slice(0, -1); // While running, drop the trailing fragment (buffered for next read)
-
-    // Update buffer for next call (clear on exit, keep incomplete line otherwise)
-    proc.incompleteLineBuffer =
-      currentStatus === "running" && !hasTrailingNewline ? allLines[allLines.length - 1] : "";
+    // On exit, include the incomplete line; otherwise keep it buffered. The page also leaves
+    // everything past the per-read cap buffered for the next call.
+    const page = takeBackgroundOutputPage(
+      previousBuffer + accumulatedRaw,
+      currentStatus !== "running",
+      proc.unreadStartsWithKeptLine === true,
+      (line) => !filterRegex || filterRegex.test(line) !== (filterExclude === true)
+    );
+    const unreadBytes = Buffer.byteLength(page.unread, "utf8");
+    retainUnreadOutput(proc, page.unread, accumulatedRaw);
+    proc.unreadStartsWithKeptLine = page.unreadStartsWithKeptLine;
 
     const shownThroughOffsetBeforeRead = proc.shownThroughOffset;
     const terminalStatusShownBeforeRead = proc.terminalStatusShownToAgent;
@@ -2494,10 +2820,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     }
 
     log.debug(
-      `BackgroundProcessManager.getOutput: read rawLen=${accumulatedRaw.length}, completeLines=${linesToReturn.length}`
+      `BackgroundProcessManager.getOutput: read rawLen=${accumulatedRaw.length}, returnedChars=${page.output.length}, capped=${page.capped}`
     );
-
-    const filteredOutput = applyFilter(linesToReturn);
 
     if (
       proc.shownThroughOffset > shownThroughOffsetBeforeRead ||
@@ -2515,35 +2839,16 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       });
     }
 
-    // Suggest filter_exclude if polling too frequently on a running process
-    const shouldSuggestFilterExclude =
-      callCount >= 3 && !filterExclude && currentStatus === "running";
-
-    // Suggest better pattern if using filter_exclude but still polling frequently
-    const shouldSuggestBetterPattern =
-      callCount >= 3 && filterExclude && currentStatus === "running";
-
     const pollingToolName = noteToolName ?? "bash_output";
-
-    let note: string | undefined;
-    if (shouldSuggestFilterExclude) {
-      note =
-        `STOP POLLING. You've called ${pollingToolName} 3+ times on this process. ` +
-        "This wastes tokens and clutters the conversation. " +
-        "Instead, make ONE call with: filter='⏳|progress|waiting|\\\\\\.\\\\\\.\\\\\\.', " +
-        "filter_exclude=true, timeout_secs=120. This blocks until meaningful output arrives.";
-    } else if (shouldSuggestBetterPattern) {
-      note =
-        "You're using filter_exclude but still polling frequently. " +
-        "Your filter pattern may not be matching the actual output. " +
-        "Try a broader pattern like: filter='\\\\.|\\\\d+%|running|progress|pending|⏳|waiting'. " +
-        "Wait for the FULL timeout before checking again.";
-    }
+    // A capped read must say how to read the rest; polling advice would contradict it.
+    const note = page.capped
+      ? formatCappedReadNote(processId, unreadBytes, pollingToolName, filter, filterExclude)
+      : formatPollingNote(callCount, filterExclude, currentStatus === "running", pollingToolName);
 
     return {
       success: true,
       status: currentStatus,
-      output: filteredOutput,
+      output: page.output,
       exitCode:
         currentStatus !== "running"
           ? ((await this.getProcess(processId))?.exitCode ?? undefined)
@@ -2675,12 +2980,50 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     options?: { extraRecordDirs?: string[] }
   ): Promise<boolean> {
     assert(workspaceId.length > 0, "hasOrphanedRunningBackgroundProcesses requires workspaceId");
-    const roots: Array<{ dir: string; pidsAreHostNamespace: boolean }> = [
-      { dir: localBgWorkspaceDir(workspaceId), pidsAreHostNamespace: true },
-      ...(options?.extraRecordDirs ?? []).map((dir) => ({ dir, pidsAreHostNamespace: false })),
+    const candidates: Array<{
+      dir: string;
+      pidsAreHostNamespace: boolean;
+      skipTrackedNames: boolean;
+    }> = [
+      // Local spawns and (in production) migrations: the shared host root.
+      { dir: localBgWorkspaceDir(workspaceId), pidsAreHostNamespace: true, skipTrackedNames: true },
+      // This manager's own migrations (bgOutputDir is the shared root in production).
+      {
+        dir: nodePath.join(this.bgOutputDir, workspaceId),
+        pidsAreHostNamespace: true,
+        skipTrackedNames: true,
+      },
+      // Builds before the shared root migrated under os.tmpdir() (macOS /var/folders/...,
+      // TMPDIR): keep their live commands visible across an upgrade. Nothing this manager tracks
+      // lives here unless it is also one of the roots above (deduplicated below, first wins), so
+      // a tracked name must not hide another backend's same-named record.
+      {
+        dir: nodePath.join(legacyMigratedBgRecordsRoot(), workspaceId),
+        pidsAreHostNamespace: true,
+        skipTrackedNames: false,
+      },
+      ...(options?.extraRecordDirs ?? []).map((dir) => ({
+        dir,
+        pidsAreHostNamespace: false,
+        skipTrackedNames: true,
+      })),
     ];
-    for (const root of roots) {
-      if (await this.recordRootHoldsOrphan(workspaceId, root.dir, root.pidsAreHostNamespace)) {
+    // Deduplicate by filesystem identity, not spelling: TMPDIR=/private/tmp on macOS (where
+    // /tmp -> /private/tmp) names the shared root again, and rescanning it without the tracked
+    // name skip would read this manager's own migrated command as foreign evidence.
+    const seen = new Set<string>();
+    for (const root of candidates) {
+      const identity = await fsPromises.realpath(root.dir).catch(() => nodePath.resolve(root.dir));
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      if (
+        await this.recordRootHoldsOrphan(
+          workspaceId,
+          root.dir,
+          root.pidsAreHostNamespace,
+          root.skipTrackedNames
+        )
+      ) {
         return true;
       }
     }
@@ -2691,7 +3034,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   private async recordRootHoldsOrphan(
     workspaceId: string,
     workspaceDir: string,
-    pidsAreHostNamespace: boolean
+    pidsAreHostNamespace: boolean,
+    skipTrackedNames: boolean
   ): Promise<boolean> {
     let entries: Dirent[];
     try {
@@ -2719,7 +3063,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // Tracked processes (directory name = process ID) are covered by the in-memory
       // live-activity gates, whose statuses refresh via list(); this probe only reports
       // processes nobody tracks. ID-based so migrated records (pid 0) are matched too.
-      if (trackedProcessIds.has(entry.name)) continue;
+      if (skipTrackedNames && trackedProcessIds.has(entry.name)) continue;
       const processDir = nodePath.join(workspaceDir, entry.name);
       let meta: { pid: number; status: string } | null = null;
       try {
@@ -2785,45 +3129,94 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
   /**
    * Counterpart of spawn()'s host-local name probe (recordDirIsFree) for runtimes whose spawn
-   * records are NOT host-local (SSH/Coder, Docker, devcontainer — see spawnRecordsAreHostLocal): the record
-   * layout lives in the runtime's exec namespace, so probe it through the runtime. Only the
-   * exit marker (or directory absence) proves the name safe to reuse — a markerless
-   * directory may belong to a live detached process from a previous session or a preserved
-   * ambiguous spawn, and reusing it would truncate its output and let either process's exit
-   * marker settle the other. No PID probe: recorded PIDs are only meaningful in the exec
-   * namespace and a stale-but-settled record merely costs a suffixed name (fail closed).
+   * records are NOT host-local (SSH/Coder, Docker, devcontainer, multi-project — see
+   * spawnRecordsAreHostLocal): the record layout lives in the runtime's exec namespace, so the
+   * name is claimed through the runtime. No host file lock can serialise backends there, so
+   * the claim is a plain `mkdir` (no -p) of the record directory: it is atomic on the target
+   * filesystem, so of two backends spawning the same name (or one spawning after the other)
+   * exactly one creates the directory, and the other moves on to a suffixed name (#4889).
+   *
+   * An existing directory is never reused, not even a settled one with an exit marker: nothing
+   * on the runtime says which backend spawned it, another backend on this Xum root may still
+   * track it (its output/status reads would then describe the new command), and a markerless
+   * one may hold a live detached process from a previous session or a preserved ambiguous
+   * spawn. Cost: a name used before gets a suffix until its old record is removed (the
+   * host-local age-based prune needs the name lock, which remote runtimes lack, #5485).
+   *
+   * The script tries `candidates` in order and stops at the first directory it creates, so
+   * taken names cost no extra round-trips (#5485). Returns the claimed candidate's index, or
+   * "held" when every candidate exists.
+   *
    * Marker matching is substring-based because SSH login banners can prefix stdout (the same
    * garbling that produces ambiguous PID echoes); a reply with neither marker or a failed
    * exec is an error so callers abort instead of looping forever against a dead host.
    */
-  private async runtimeSpawnDirMayHoldLiveProcess(
+  private async claimRuntimeSpawnDir(
     runtime: Runtime,
     workspaceId: string,
-    processId: string
-  ): Promise<"free" | "held" | { error: string }> {
+    candidates: readonly string[]
+  ): Promise<number | "held" | { error: string }> {
+    assert(candidates.length > 0, "claimRuntimeSpawnDir requires at least one candidate");
+    const firstName = JSON.stringify(candidates[0]);
     try {
       const tempDir = await runtime.tempDir();
-      const processDir = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}/${processId}`;
-      const exitMarkerPath = `${processDir}/${BG_EXIT_CODE_FILENAME}`;
-      const script = `if [ ! -e ${quotePathForShell(processDir)} ] || [ -e ${quotePathForShell(
-        exitMarkerPath
-      )} ]; then echo __MUX_SPAWN_NAME_FREE__; else echo __MUX_SPAWN_NAME_HELD__; fi`;
+      const workspaceDir = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
+      // `[ -L ]` too: a dangling symlink planted at the name makes mkdir fail but `[ -e ]` false.
+      // Any other mkdir failure exits 1, so the caller aborts instead of skipping the name.
+      const script = [
+        `mkdir -p ${quotePathForShell(workspaceDir)} || exit 1`,
+        `claim() {`,
+        `  if mkdir "$1" 2>/dev/null; then echo "__MUX_SPAWN_NAME_CLAIMED__:$2:"; exit 0; fi`,
+        `  [ -e "$1" ] || [ -L "$1" ] || exit 1`,
+        `}`,
+        ...candidates.map(
+          (candidate, index) =>
+            `claim ${quotePathForShell(`${workspaceDir}/${candidate}`)} ${index}`
+        ),
+        `echo __MUX_SPAWN_NAME_HELD__`,
+      ].join("\n");
       const result = await execBuffered(runtime, script, { cwd: "/tmp", timeout: 10 });
       if (result.exitCode === 0) {
-        if (result.stdout.includes("__MUX_SPAWN_NAME_FREE__")) return "free";
+        const claimed = /__MUX_SPAWN_NAME_CLAIMED__:(\d+):/.exec(result.stdout);
+        if (claimed) {
+          const index = Number(claimed[1]);
+          assert(
+            Number.isInteger(index) && index >= 0 && index < candidates.length,
+            `claimRuntimeSpawnDir: claimed index ${claimed[1]} out of range`
+          );
+          return index;
+        }
         if (result.stdout.includes("__MUX_SPAWN_NAME_HELD__")) return "held";
       }
       return {
-        error: `Could not verify that background process name ${JSON.stringify(
-          processId
-        )} is free on the runtime (exit ${result.exitCode}): ${result.stderr || result.stdout}`,
+        error: `Could not claim background process name ${firstName} on the runtime (exit ${result.exitCode}): ${result.stderr || result.stdout}`,
       };
     } catch (error) {
       return {
-        error: `Could not verify that background process name ${JSON.stringify(
-          processId
-        )} is free on the runtime: ${getErrorMessage(error)}`,
+        error: `Could not claim background process name ${firstName} on the runtime: ${getErrorMessage(error)}`,
       };
+    }
+  }
+
+  /**
+   * Undo claimRuntimeSpawnDir for a spawn that is refused before anything ran. `rmdir` removes
+   * only an empty directory, so it cannot delete output another process wrote. Best-effort: a
+   * leftover empty directory only costs a suffixed name and fails the remote orphan probe closed.
+   */
+  private async releaseRuntimeSpawnDir(
+    runtime: Runtime,
+    workspaceId: string,
+    processId: string
+  ): Promise<void> {
+    try {
+      const tempDir = await runtime.tempDir();
+      const processDir = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}/${processId}`;
+      await execBuffered(runtime, `rmdir ${quotePathForShell(processDir)}`, {
+        cwd: "/tmp",
+        timeout: 10,
+      });
+    } catch (error) {
+      log.debug(`Keeping claimed background record ${processId}: ${getErrorMessage(error)}`);
     }
   }
 
@@ -3071,14 +3464,31 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * Terminates running processes and removes from memory.
    * Output directories are left on disk (cleaned by OS for /tmp, or on workspace deletion for local).
    */
-  async cleanup(workspaceId: string): Promise<void> {
+  async cleanup(
+    workspaceId: string,
+    options?: {
+      /**
+       * Archive and removal (they delete the checkout afterwards): throw instead of waiting
+       * longer than PENDING_ADMISSION_DRAIN_TIMEOUT_MS for pending spawns and migrations
+       * (#5477). Session disposal keeps waiting: it lifts the seal on return, so a spawn it gave
+       * up on could register afterwards with no cleanup left to stop it.
+       */
+      failClosedAfterDrainTimeout?: boolean;
+    }
+  ): Promise<void> {
     log.debug(`BackgroundProcessManager.cleanup(${workspaceId}) called`);
-    // #4967: no migration may begin while cleanup runs; one that tries is refused and its command
-    // terminated. The seal lifts when cleanup returns, so archive and session disposal leave the
-    // workspace able to background commands again; a removal holds its own seal until it settles.
-    using _seal = this.sealMigrations(workspaceId);
-    // A migrating command registers in `processes` once its migration settles (#4805).
-    await this.drainPendingMigrations(workspaceId);
+    const drainDeadline =
+      options?.failClosedAfterDrainTimeout === true
+        ? Date.now() + PENDING_ADMISSION_DRAIN_TIMEOUT_MS
+        : null;
+    // #4967, B2: no migration or spawn may begin while cleanup runs; a migration that tries is
+    // refused and its command terminated, a spawn is refused. The seal lifts when cleanup
+    // returns, so session disposal leaves the workspace able to background commands again; a
+    // removal or archive holds its own seal until it settles.
+    using _seal = this.sealAdmissions(workspaceId);
+    // A migrating command registers in `processes` once its migration settles (#4805), an
+    // admitted spawn once its child runs (B2).
+    await this.drainPendingAdmissions(workspaceId, drainDeadline);
     const matching = Array.from(this.processes.values()).filter(
       (p) => p.workspaceId === workspaceId
     );
@@ -3093,7 +3503,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       this.processes.delete(p.id);
     }
     // Commands refused by the seal meanwhile are still stopping; wait for them too.
-    await this.drainPendingMigrations(workspaceId);
+    await this.drainPendingAdmissions(workspaceId, drainDeadline);
 
     log.debug(`Cleaned up ${matching.length} process(es) for workspace ${workspaceId}`);
   }

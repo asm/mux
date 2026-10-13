@@ -17,15 +17,13 @@ import {
 import { copyToClipboard } from "@/browser/utils/clipboard";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { getDefaultModel, useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
-import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
-import { resolveAdvisorEnabledForAgent } from "@/common/constants/advisor";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { useWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import {
-  AGENT_AI_DEFAULTS_KEY,
-  GLOBAL_SCOPE_ID,
-  getAgentIdKey,
-  getModelKey,
-} from "@/common/constants/storage";
+  getAppConfigStore,
+  updateUserPreferences,
+  useUserPreferences,
+} from "@/browser/stores/AppConfigStore";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import {
@@ -51,7 +49,6 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { AdvisorConfig } from "./AdvisorConfig";
 import { FALLBACK_AGENTS, deriveTasksSectionAgentGroups } from "./TasksSection.agents";
 
 const INHERIT = "__inherit__";
@@ -97,7 +94,6 @@ function updateAgentDefaultEntry(
     updated.autoModelRouting === undefined &&
     updated.autoThinkingLevel === undefined &&
     updated.enabled === undefined &&
-    updated.advisorEnabled === undefined &&
     updated.subagent === undefined
   ) {
     delete next[normalizedId];
@@ -224,23 +220,6 @@ function renderPolicySummary(agent: AgentDefinitionDescriptor): React.ReactNode 
   );
 }
 
-function getAdvisorSwitchState(
-  agentId: string,
-  advisorEnabledOverride: boolean | undefined
-): { checked: boolean; title: string } {
-  const checked = resolveAdvisorEnabledForAgent(agentId, advisorEnabledOverride);
-  const title =
-    advisorEnabledOverride === undefined
-      ? checked
-        ? "Advisor enabled by default."
-        : "Advisor disabled by default."
-      : advisorEnabledOverride
-        ? "Advisor enabled (local override)."
-        : "Advisor disabled (local override).";
-
-  return { checked, title };
-}
-
 function areTaskSettingsEqual(a: TaskSettings, b: TaskSettings): boolean {
   return (
     a.maxParallelAgentTasks === b.maxParallelAgentTasks &&
@@ -294,9 +273,6 @@ function areAgentAiDefaultsEqual(a: AgentAiDefaults, b: AgentAiDefaults): boolea
       return false;
     }
     if ((aEntry?.enabled ?? undefined) !== (bEntry?.enabled ?? undefined)) {
-      return false;
-    }
-    if ((aEntry?.advisorEnabled ?? undefined) !== (bEntry?.advisorEnabled ?? undefined)) {
       return false;
     }
     if (!areSubagentProfilesEqual(aEntry?.subagent, bEntry?.subagent)) {
@@ -367,8 +343,7 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
       <div className="space-y-1">
         <div className="text-muted text-xs">Reasoning</div>
         <div className="flex items-center gap-2">
-          {/* Shared composer picker so settings inherit the same features
-            (route-aware Pro mode, provider Fast mode) as the chat input. */}
+          {/* Reasoning defaults share the composer picker; speed remains a per-chat choice. */}
           <ThinkingSelectorControl
             modelString={props.effectiveModel}
             modelCapabilitiesDeferred={props.modelCapabilitiesDeferred}
@@ -379,6 +354,7 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
             reasoningModeInherited={props.reasoningModeInherited}
             onReasoningModeChange={props.onReasoningModeChange}
             allowReasoningModes={props.allowReasoningModes}
+            allowFastMode={false}
             variant="box"
             inheritOption={{
               label: inheritLabel,
@@ -432,14 +408,9 @@ export function TasksSection() {
   const pendingSaveRef = useRef<TasksSectionSavePayload | null>(null);
 
   const { models, hiddenModelsForSelector } = useModelsFromSettings();
-  const [globalDefaultAgentIdRaw, setGlobalDefaultAgentIdRaw] = usePersistedState<string>(
-    getAgentIdKey(GLOBAL_SCOPE_ID),
-    WORKSPACE_DEFAULTS.agentId,
-    {
-      listener: true,
-    }
+  const newWorkspaceDefaultAgentId = coerceAgentId(
+    useUserPreferences((preferences) => preferences.ai?.globalDefaults?.agentId)
   );
-  const newWorkspaceDefaultAgentId = coerceAgentId(globalDefaultAgentIdRaw);
   const portableDesktopEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   // Dream only runs when both flags are on (see memoryConsolidationService);
@@ -454,15 +425,8 @@ export function TasksSection() {
   // "Inherit", we show thinking levels for the workspace model (falling back to
   // the global default). This mirrors the workspace model resolution chain used when sending messages.
   const selectedWorkspaceId = selectedWorkspace?.workspaceId ?? null;
-  const defaultModel = getDefaultModel();
-  const workspaceModelStorageKey = selectedWorkspaceId
-    ? getModelKey(selectedWorkspaceId)
-    : "__tasks_workspace_model_fallback__";
-  const [workspaceModelRaw] = usePersistedState<unknown>(workspaceModelStorageKey, defaultModel, {
-    listener: true,
-  });
-  const inheritedEffectiveModel =
-    (typeof workspaceModelRaw === "string" ? workspaceModelRaw.trim() : "") || defaultModel;
+  const workspaceModel = useWorkspaceAiSelection(selectedWorkspaceId ?? "").model;
+  const inheritedEffectiveModel = selectedWorkspaceId ? workspaceModel : getDefaultModel();
 
   const lastSyncedTaskSettingsRef = useRef<TaskSettings | null>(null);
   const lastSyncedAgentAiDefaultsRef = useRef<AgentAiDefaults | null>(null);
@@ -481,7 +445,6 @@ export function TasksSection() {
         setTaskSettings(normalizedTaskSettings);
         const normalizedAgentDefaults = normalizeAgentAiDefaults(cfg.agentAiDefaults);
         setAgentAiDefaults(normalizedAgentDefaults);
-        updatePersistedState(AGENT_AI_DEFAULTS_KEY, normalizedAgentDefaults);
 
         setLoadFailed(false);
         lastSyncedTaskSettingsRef.current = normalizedTaskSettings;
@@ -563,8 +526,8 @@ export function TasksSection() {
       return;
     }
 
-    // Keep agent defaults cache up-to-date for any syncers/non-react readers.
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, agentAiDefaults);
+    // Readers of the shared store see the edit before the debounced save lands.
+    getAppConfigStore().updateOptimistically({ agentAiDefaults });
 
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current);
@@ -688,7 +651,7 @@ export function TasksSection() {
   };
 
   const setNewWorkspaceDefaultAgentId = (agentId: string) => {
-    setGlobalDefaultAgentIdRaw(coerceAgentId(agentId));
+    updateUserPreferences({ ai: { globalDefaults: { agentId: coerceAgentId(agentId) } } });
   };
 
   const setAgentModel = (agentId: string, value: string) => {
@@ -859,22 +822,6 @@ export function TasksSection() {
     );
   };
 
-  const setAgentAdvisorEnabled = (agentId: string, value: boolean) => {
-    setAgentAiDefaults((prev) =>
-      updateAgentDefaultEntry(prev, agentId, (updated) => {
-        updated.advisorEnabled = value;
-      })
-    );
-  };
-
-  const resetAgentAdvisorEnabled = (agentId: string) => {
-    setAgentAiDefaults((prev) =>
-      updateAgentDefaultEntry(prev, agentId, (updated) => {
-        delete updated.advisorEnabled;
-      })
-    );
-  };
-
   const listedAgents = agents.length > 0 ? agents : FALLBACK_AGENTS;
   const enabledAgentIdSet = new Set(enabledAgentIds);
 
@@ -920,8 +867,6 @@ export function TasksSection() {
     const modelValue = entry?.modelString ?? INHERIT;
     const thinkingValue = entry?.thinkingLevel ?? INHERIT;
     const enabledOverride = entry?.enabled;
-    const advisorEnabledOverride = entry?.advisorEnabled;
-    const advisorSwitchState = getAdvisorSwitchState(agent.id, advisorEnabledOverride);
 
     const enablementLocked =
       agent.id === "exec" || agent.id === "plan" || agent.id === "compact" || agent.id === "mux";
@@ -1051,34 +996,6 @@ export function TasksSection() {
                 </Button>
               ) : null}
             </div>
-            {agent.id !== "intuition" ? (
-              <div className="flex items-center gap-3">
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <div className="flex items-center gap-2">
-                      <div className="text-muted text-xs">Advisor</div>
-                      <Switch
-                        checked={advisorSwitchState.checked}
-                        onCheckedChange={(checked) => setAgentAdvisorEnabled(agent.id, checked)}
-                        aria-label={`Toggle ${agent.id} advisor`}
-                      />
-                    </div>
-                  </TooltipTrigger>
-                  <TooltipContent>{advisorSwitchState.title}</TooltipContent>
-                </Tooltip>
-                {advisorEnabledOverride !== undefined ? (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className="px-2"
-                    onClick={() => resetAgentAdvisorEnabled(agent.id)}
-                  >
-                    Reset
-                  </Button>
-                ) : null}
-              </div>
-            ) : null}
           </div>
         </div>
 
@@ -1121,7 +1038,7 @@ export function TasksSection() {
           <div className="text-muted mt-1 text-xs">
             Unset fields use the calling chat’s Exec settings at task creation, falling back to UI
             Exec defaults when no chat selection exists. Model capabilities are enforced at launch.
-            Enabled and advisor settings stay shared with UI Exec.
+            Enabled settings stay shared with UI Exec.
           </div>
         </div>
 
@@ -1148,8 +1065,6 @@ export function TasksSection() {
     const entry = agentAiDefaults[agentId];
     const modelValue = entry?.modelString ?? INHERIT;
     const thinkingValue = entry?.thinkingLevel ?? INHERIT;
-    const advisorEnabledOverride = entry?.advisorEnabled;
-    const advisorSwitchState = getAdvisorSwitchState(agentId, advisorEnabledOverride);
     // Base-chain model wins over the ambient default (see renderAgentDefaults).
     const inheritedDefaults = resolveBaseChainDefaults(agentId);
     const effectiveModel =
@@ -1166,32 +1081,6 @@ export function TasksSection() {
           <div>
             <div className="text-foreground text-sm font-medium">{agentId}</div>
             <div className="text-muted text-xs">Not discovered in the current workspace</div>
-          </div>
-          <div className="flex shrink-0 items-center gap-3">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <div className="flex items-center gap-2">
-                  <div className="text-muted text-xs">Advisor</div>
-                  <Switch
-                    checked={advisorSwitchState.checked}
-                    onCheckedChange={(checked) => setAgentAdvisorEnabled(agentId, checked)}
-                    aria-label={`Toggle ${agentId} advisor`}
-                  />
-                </div>
-              </TooltipTrigger>
-              <TooltipContent>{advisorSwitchState.title}</TooltipContent>
-            </Tooltip>
-            {advisorEnabledOverride !== undefined ? (
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="px-2"
-                onClick={() => resetAgentAdvisorEnabled(agentId)}
-              >
-                Reset
-              </Button>
-            ) : null}
           </div>
         </div>
 
@@ -1301,15 +1190,6 @@ export function TasksSection() {
         </div>
 
         {saveError ? <div className="text-danger-light mt-4 text-xs">{saveError}</div> : null}
-      </div>
-
-      <div>
-        <h3 className="text-foreground mb-1 text-sm font-medium">Advisor</h3>
-        <div className="text-muted mb-3 text-xs">
-          Agents can consult a stronger model for strategic guidance. Choose an advisor model to
-          enable the advisor tool.
-        </div>
-        <AdvisorConfig />
       </div>
 
       <div>

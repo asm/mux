@@ -33,6 +33,7 @@ jobs:
       backend: ${{ steps.filter.outputs.backend }}
       browser: ${{ steps.filter.outputs.browser }}
       nix_deps: ${{ steps.filter.outputs.nix_deps }}
+      docker: ${{ steps.filter.outputs.docker }}
       # Shared job gates, computed once instead of repeated in every job.
       # tests: code or CI config changed, and this isn't the merge queue's post-merge
       # push to main (the merge_group run already validated that exact commit).
@@ -90,8 +91,40 @@ jobs:
             nix_deps:
               - 'package.json'
               - 'bun.lock'
+              - 'patches/**'
               - 'flake.nix'
+              - 'nix/**'
               - 'flake.lock'
+            # Server image inputs: everything the Dockerfile copies into the build stage
+            # (keep in sync with its COPY list), plus this workflow. Smoke / Docker runs on
+            # PRs that touch them (#5605), not only in the merge queue.
+            docker:
+              - 'Dockerfile'
+              - '.dockerignore'
+              - 'package.json'
+              - 'bun.lock'
+              - 'bunfig.toml'
+              - 'patches/**'
+              - 'Makefile'
+              - 'fmt.mk'
+              - 'src/**'
+              - 'tsconfig.json'
+              - 'tsconfig.main.json'
+              - 'scripts/generate-version.sh'
+              - 'scripts/generate-builtin-agents.sh'
+              - 'scripts/generate-builtin-skills.sh'
+              - 'scripts/gen_builtin_skills.ts'
+              - 'scripts/gen_workflow_runtime_sources.ts'
+              - 'scripts/precompress-static.ts'
+              - 'scripts/check-analytics-worker.cjs'
+              - 'docs/**'
+              - 'index.html'
+              - 'terminal.html'
+              - 'desktop.html'
+              - 'vite.config.ts'
+              - 'public/**'
+              - 'static/**'
+              - '.github/workflows/pr.yml'
 
   static-check:
     name: Static Checks
@@ -158,8 +191,8 @@ jobs:
         env:
           MUX_ESLINT_CONCURRENCY: 4
 
-  flake-hash-check:
-    name: Flake Hash Check
+  nix-build:
+    name: Nix Build
     needs: [changes]
     if: ${{ needs.changes.outputs.nix_deps == 'true' && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
     runs-on: ubuntu-latest
@@ -172,7 +205,7 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      - run: make flake-hash-check
+      - run: nix build .#xum --no-link -L
 
   lint-actions:
     name: Lint Actions
@@ -215,10 +248,28 @@ jobs:
         env:
           SHARD_INDEX: ${{ matrix.shard }}
           SHARD_TOTAL: ${{ strategy.job-total }}
+      # A shard writes one report per process: coverage/lcov.info for the shared
+      # process, plus coverage/isolated/<n>/ and coverage/tooling/ (see
+      # scripts/test-unit-ci.sh). Upload them all.
+      - name: List coverage reports
+        id: lcov
+        run: echo "files=$(find coverage -name lcov.info 2>/dev/null | LC_ALL=C sort | paste -sd, -)" >>"$GITHUB_OUTPUT"
+      # Quality / CRAP merges every shard's report; keep them only briefly. A
+      # failed shard's report is incomplete, so it uploads none and the summary
+      # shows partial coverage. Informational: an upload error must not fail
+      # this required job.
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        if: ${{ success() && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        with:
+          name: crap-lcov-unit-${{ matrix.shard }}
+          path: coverage/**/lcov.info
+          if-no-files-found: ignore
+          retention-days: 3
       - uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage/lcov.info
+          files: ${{ steps.lcov.outputs.files }}
           flags: unit-tests
           fail_ci_if_error: false
 
@@ -289,12 +340,73 @@ jobs:
           BACKEND: ${{ needs.changes.outputs.backend }}
           BROWSER: ${{ needs.changes.outputs.browser }}
           SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+      # Quality / CRAP merges every shard's report; keep them only briefly. A
+      # failed shard's report is incomplete, so it uploads none and the summary
+      # shows partial coverage. Informational: an upload error must not fail
+      # this required job.
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        if: ${{ success() && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        with:
+          name: crap-lcov-integration-${{ matrix.shard }}
+          path: coverage/lcov.info
+          if-no-files-found: ignore
+          retention-days: 3
       - uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage/lcov.info
           flags: integration-tests
           fail_ci_if_error: false
+
+  crap:
+    name: Quality / CRAP
+    # Informational: not in Required, and scripts/crap/ci.ts always exits 0. A
+    # skipped or failed test shard leaves no report, which the summary shows as
+    # partial coverage.
+    needs: [changes, test-unit, test-integration]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    continue-on-error: true
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      # Compare against the merge commit's first parent: the base GitHub built
+      # the merge ref on. pull_request.base.sha can differ (a stacked PR's base
+      # branch merges into its own test ref, main moves), and then the report
+      # scores other PRs' changes. Read the parent from the raw commit object
+      # and fetch only it, so no PR commit enters the history: check.ts then
+      # reads no Crap-Debt trailers here, and in CI the crap-debt label is the
+      # escape hatch (trailers are for the local hook).
+      - name: Fetch the merge base
+        id: base
+        run: |
+          set -euo pipefail
+          sha=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)
+          git fetch --no-tags --depth=1 origin "$sha"
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@b7a1c7ccf290d58743029c4f6903da283811b979 # v2.1.0
+        with:
+          bun-version: 1.4.3
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          pattern: crap-lcov-*
+          path: coverage-shards
+      - name: CRAP report
+        env:
+          BASE_REF: ${{ steps.base.outputs.sha }}
+          LCOV_DIR: coverage-shards
+          # Shard counts of the test-unit and test-integration matrices above.
+          EXPECTED_UNIT: "6"
+          EXPECTED_INTEGRATION: "3"
+          CRAP_DEBT_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'crap-debt') }}
+        run: bun scripts/crap/ci.ts
 
   test-storybook:
     name: Test / Storybook
@@ -360,6 +472,12 @@ jobs:
       # Bound browser setup; Playwright downloads can stall after progress reaches 100%.
       - uses: ./.github/actions/setup-playwright
         timeout-minutes: 10
+      # The bug-bash repros (make test-bugbash-repros) run once, on linux shard 1. Their browser
+      # comes from @e2e-dev/web's own playwright-core, not the Playwright version above.
+      - name: Install bug-bash repro browser
+        if: matrix.shard == '1/4'
+        timeout-minutes: 10
+        run: node_modules/.bin/e2e-web install chromium
       - name: Run tests
         if: matrix.os == 'linux'
         # Native focus and clipboard are shared by every Electron app on this display.
@@ -367,11 +485,52 @@ jobs:
         env:
           ELECTRON_DISABLE_SANDBOX: 1
           SHARD: ${{ matrix.shard }}
+          # No provider secrets here, so the repros' app uses the mock AI.
+          BUGBASH_REPROS: ${{ matrix.shard == '1/4' && '1' || '0' }}
       - name: Run tests
         if: matrix.os == 'macos'
         env:
           NODE_OPTIONS: --max-old-space-size=4096
+          BUGBASH_REPROS: "0"
         run: make test-e2e PLAYWRIGHT_ARGS="tests/e2e/scenarios/windowLifecycle.spec.ts"
+      # A failed bug-bash repro writes its screen (accessibility tree, focus) under
+      # tests/bugbash/.e2e/, next to the report. On the host the app log goes to e2e.config.ts's
+      # default, .e2e/logs/app.log. Upload them, so a flaky failure (#5810) leaves evidence.
+      - name: Upload bug-bash repro failures
+        if: failure() && matrix.shard == '1/4'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: bugbash-repro-failures
+          path: |
+            tests/bugbash/.e2e/repros*/artifacts/**/failure/
+            tests/bugbash/.e2e/repros*/artifacts/**/screenshots/*-failure.png
+            tests/bugbash/.e2e/repros*/report.json
+            tests/bugbash/.e2e/logs/app.log
+          # Every path is under the hidden .e2e folder, which upload-artifact skips by default.
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
+
+  bugbash-sandbox:
+    # The bug-bash sandbox (#5714, #5931): its self-check (isolation, proxy and export refusals,
+    # against a fake upstream) and the repros of fixed bugs through its launcher, on the mock app
+    # AI. No secrets and no model. The launcher pulls the pinned image by digest without
+    # credentials, and exits nonzero on a refusal, a failed check or a container left `unknown`.
+    # E2E shard 1 still runs the same repros on the host until this job proves stable.
+    name: Test / Bug-bash sandbox
+    needs: [changes]
+    if: needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == ''
+    timeout-minutes: 30
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-xum
+      - name: Sandbox self-check
+        run: make bug-bash-sandbox-check
+      - name: Repros in the sandbox
+        run: make test-bugbash-repros-sandbox
 
   test-windows:
     name: Test / Windows
@@ -395,10 +554,13 @@ jobs:
       - name: Run unit tests (Windows smoke)
         shell: pwsh
         run: |
-          bun test src/node/utils/paths.test.ts src/node/utils/gitNoHooksEnv.discovery.test.ts src/node/utils/main/bashPath.test.ts src/node/utils/main/resolveLocalPtyShell.test.ts src/node/runtime/SSH2ConnectionPool.test.ts src/node/services/historyService.statusLock.test.ts
+          bun test src/node/utils/paths.test.ts src/node/utils/findExecutableOnPath.test.ts src/node/utils/gitNoHooksEnv.discovery.test.ts src/node/utils/main/bashPath.test.ts src/node/utils/main/resolveLocalPtyShell.test.ts src/node/runtime/SSH2ConnectionPool.test.ts src/node/services/historyService.statusLock.test.ts
       - name: Verify Windows plugin path aliases
         shell: pwsh
         run: bun test src/node/services/agentPlugins/discovery.test.ts -t "coalesces Windows case aliases"
+      - name: Verify Windows namespaced filesystem roots
+        shell: pwsh
+        run: bun test src/node/utils/pathUtils.test.ts -t "refuses Windows namespaced roots"
       - name: Run Windows integration smoke tests
         shell: pwsh
         run: |
@@ -450,8 +612,12 @@ jobs:
   smoke-docker:
     name: Smoke / Docker
     needs: [changes]
-    # Only run on merge queue (not every PR, not on merge-queue push to main)
-    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.actor != 'github-merge-queue[bot]')
+    # Merge queue, non-queue pushes to main, and PRs that touch server image inputs
+    # (changes.docker). Not on every PR, and not on the merge queue's push to main.
+    if: >-
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && github.actor != 'github-merge-queue[bot]') ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true')
     runs-on: ${{ needs.changes.outputs.linux-runner }}
     permissions:
       contents: read
@@ -484,6 +650,17 @@ jobs:
           done
           curl -sf http://localhost:3000/health | grep -q '"status":"ok"'
           curl -sf http://localhost:3000/version | grep -q '"mode":"server"'
+          # The runtime stage copies dist/ files by extension (#5964). Fetch one
+          # public/ file, one icon and the font the served page preloads, so a dropped
+          # pattern fails here.
+          curl -sf http://localhost:3000/manifest.json | grep -q '"icons"'
+          curl -sf -o /dev/null http://localhost:3000/icon-192.png
+          font=$(curl -sf http://localhost:3000/ | grep -o 'as="font"[^>]*href="\./[^"]*\.woff2"' | sed 's/.*href="\.\///; s/"$//')
+          test -n "$font"
+          curl -sf -o /dev/null "http://localhost:3000/$font"
+          # /health passes without the analytics worker, which starts lazily (#5603).
+          # Start the shipped worker bundle and open a DuckDB database through it.
+          docker exec -i mux-test node - /app/dist/runtime/analyticsWorker.js < scripts/check-analytics-worker.cjs
       - if: failure()
         run: docker logs mux-test
       - if: always()
@@ -640,6 +817,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # Codex starts reviewing the same push that started this job, so give it
         # time to finish. Reviews take a few minutes; the slowest test jobs take longer.
+        # Usage-limit notices pass; actionable findings still fail the gate.
         run: ./scripts/check_codex_comments.sh ${{ github.event.pull_request.number }} --wait-for-review 900
 
   # Single required check - configure branch protection to require only this job
@@ -649,13 +827,14 @@ jobs:
     needs:
       - changes
       - static-check
-      - flake-hash-check
+      - nix-build
       - lint-actions
       - test-unit
       - test-integration
       - test-storybook
       - test-windows
       - test-e2e
+      - bugbash-sandbox
       - smoke-server
       - smoke-docker
       - build-linux

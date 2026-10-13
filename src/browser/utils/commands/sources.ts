@@ -4,9 +4,10 @@ import type { CommandAction } from "@/browser/contexts/CommandRegistryContext";
 import type { APIClient } from "@/browser/contexts/API";
 import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogContext";
 import { getContextResetSuccessMessage } from "@/browser/utils/contextResetFeedback";
+import { showFeedbackToast as showCommandFeedbackToast } from "@/browser/utils/feedbackToast";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { PinnedMoveDirection } from "@/browser/utils/ui/pinnedReorder";
-import type { AutoRoutingDimension } from "@/browser/utils/modelChange";
+import type { AutoRoutingDimension } from "@/browser/utils/aiSelectionIntent";
 import {
   THINKING_LEVELS,
   type OpenAIReasoningMode,
@@ -14,7 +15,7 @@ import {
 } from "@/common/types/thinking";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
-import { getFastModeProvider } from "@/browser/utils/fastModeServiceTier";
+import { getFastModeProvider, ultrafastModeAvailable } from "@/browser/utils/fastModeServiceTier";
 import { openaiCyberModeAvailable } from "@/common/utils/ai/cyberMode";
 import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import {
@@ -26,25 +27,53 @@ import assert from "@/common/utils/assert";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
-  DEFAULT_TERMINAL_BADGE_CONFIG,
   RIGHT_SIDEBAR_COLLAPSED_KEY,
-  SIDEBAR_HIDE_SUBAGENTS_KEY,
-  SIDEBAR_FLAT_MODE_KEY,
-  TERMINAL_BADGE_CONFIG_KEY,
   normalizeTerminalBadgeConfig,
-  type TerminalBadgeConfig,
 } from "@/common/constants/storage";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getUserPreferences, updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import { CommandIds } from "@/browser/utils/commandIds";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { stopStream } from "@/browser/utils/stopStream";
 import { publishPluginsSectionIntent } from "@/browser/features/Settings/Sections/pluginsSectionIntents";
+import {
+  openArtifactsTab,
+  pinAndOpenArtifact,
+} from "@/browser/features/RightSidebar/ArtifactsTab/openArtifact";
+import {
+  appViewDetails,
+  appViewServerNames,
+  getMcpAppViews,
+  openMcpAppViewTab,
+  transcriptViews,
+  type McpAppViewRef,
+} from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
+
+/**
+ * The workspace's MCP App views (the loaded transcript's, then ones opened this session), each
+ * with its detail (appViewDetails).
+ */
+function appViewEntries(
+  workspaceId: string,
+  messages: Parameters<typeof transcriptViews>[1]
+): Array<{ view: McpAppViewRef; server: string; detail: string }> {
+  const fromTranscript = transcriptViews(workspaceId, messages);
+  const known = new Set(fromTranscript.map((view) => view.toolCallId));
+  const views = [
+    ...fromTranscript,
+    ...getMcpAppViews(workspaceId).filter((view) => !known.has(view.toolCallId)),
+  ];
+  const details = appViewDetails(views);
+  const servers = appViewServerNames(views);
+  return views.map((view, i) => ({ view, server: servers[i], detail: details[i] }));
+}
 import { isTabType, type TabType } from "@/browser/types/rightSidebar";
 import {
   getOrderedBaseTabIds,
   getTabConfig,
   type BaseTabType,
 } from "@/browser/features/RightSidebar/Tabs/tabConfig";
+import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import {
   getEffectiveSlotKeybind,
   getLayoutsConfigOrDefault,
@@ -53,8 +82,8 @@ import {
 import { formatProjectHierarchyLabel, getTopLevelProjectEntries } from "@/common/utils/subProjects";
 import type { LayoutPresetsConfig, LayoutSlotNumber } from "@/common/types/uiLayouts";
 import {
-  addToolToFocusedTabset,
   hasTab,
+  openToolFromNewTab,
   selectTabInTabset,
   setFocusedTabset,
   splitFocusedTabset,
@@ -70,6 +99,7 @@ import type { ProjectConfig } from "@/node/config";
 import { removeWorkspaceConfirmOptions } from "@/browser/utils/commands/removeWorkspaceConfirm";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { BranchListResult } from "@/common/orpc/types";
+import type { Result } from "@/common/types/result";
 import type { WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { UpdateChannel } from "@/common/types/project";
@@ -79,7 +109,10 @@ import { UPDATE_CHANNEL_LABELS } from "@/constants/updateChannels";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { getErrorMessage } from "@/common/utils/errors";
 import { parseGoalBudgetCents } from "@/browser/utils/slashCommands/registry";
-import { setGoalWithConflictRetry } from "@/browser/utils/goals/setGoalWithConflictRetry";
+import {
+  intendedGoalIdOf,
+  setGoalForIntendedGoal,
+} from "@/browser/utils/goals/setGoalForIntendedGoal";
 import { loadGoalDefaults, resolveGoalSetIntent } from "@/browser/utils/goals/resolveGoalSetIntent";
 import {
   hasGoalBudgetLimit,
@@ -122,6 +155,12 @@ export interface BuildSourcesParams {
   ) => void;
   getFastMode: () => boolean;
   onToggleFastMode: () => void | Promise<void>;
+  getUltrafastMode: () => boolean;
+  onToggleUltrafastMode: () => void | Promise<void>;
+  /** config.json keepScreenAwake from the shared app config cache; undefined until it loads. */
+  getKeepScreenAwake?: () => boolean | undefined;
+  /** Native host computer use for the selected workspace; null when unsupported or no workspace. */
+  computerUse?: { enabled: boolean; onToggle: () => void | Promise<void> } | null;
   /** auto-model-routing experiment: gates the composer's Auto toggles in the palette. */
   autoModelRoutingEnabled?: boolean;
   /** Composer Auto flag for one dimension, keyed by workspace or creation scope. */
@@ -144,6 +183,12 @@ export interface BuildSourcesParams {
   onStartWorkspaceCreation: (projectPath: string) => void;
   onStartMultiProjectWorkspaceCreation: () => void;
   multiProjectWorkspacesEnabled: boolean;
+  /** artifacts experiment: gates "Open Artifacts" and "Open File as Artifact…". */
+  artifactsEnabled?: boolean;
+  /** perfFlightRecorder experiment: gates "Report slowness". */
+  perfFlightRecorderEnabled?: boolean;
+  /** sessionTapes experiment: gates "Save open session tapes" and "Reveal session tapes folder". */
+  sessionTapesEnabled?: boolean;
   onArchiveMergedWorkspacesInProject: (projectPath: string) => Promise<void>;
   getBranchesForProject: (projectPath: string) => Promise<BranchListResult>;
   onSelectWorkspace: (sel: {
@@ -175,11 +220,12 @@ export interface BuildSourcesParams {
   // Layout slots
   layoutPresets?: LayoutPresetsConfig | null;
   onApplyLayoutSlot?: (workspaceId: string, slot: LayoutSlotNumber) => void;
+  /** Errs with a user-facing message when the layout cannot be saved. */
   onCaptureLayoutSlot?: (
     workspaceId: string,
     slot: LayoutSlotNumber,
     name: string
-  ) => Promise<void>;
+  ) => Promise<Result<void>>;
   onClearTimingStats?: (workspaceId: string) => void;
 }
 
@@ -248,36 +294,26 @@ const getAnalyticsRebuildDatabase = (
   return typeof rebuildDatabase === "function" ? rebuildDatabase : null;
 };
 
+/**
+ * Palette sources rebuild on every render, so re-entry is tracked at module level: a second
+ * "Save open session tapes" while one runs is ignored.
+ */
+let sessionTapesSaveRunning = false;
+
+/**
+ * Toasts that show the session tapes folder path stay up longer than the 3 s success default:
+ * in server mode the toast is the only place the path appears, so users need time to read or
+ * select it.
+ */
+const SESSION_TAPES_PATH_TOAST_MS = 15_000;
+
+const NO_BACKGROUND_PROCESSES_MESSAGE = "No background processes are running in this workspace.";
+
 const NO_RUNNABLE_PLAN_MESSAGE =
   "No plan to implement: the latest plan's Implement / Continue in Auto is missing or disabled.";
 
-const showCommandFeedbackToast = (feedback: {
-  type: "success" | "error";
-  message: string;
-  title?: string;
-}) => {
-  if (typeof window === "undefined") {
-    return;
-  }
-
-  // Analytics view does not mount ChatInput, so keep a basic alert fallback
-  // for command palette actions that need user feedback.
-  const hasChatInputToastHost =
-    typeof document !== "undefined" &&
-    document.querySelector('[data-component="ChatInputSection"]') !== null;
-
-  if (hasChatInputToastHost) {
-    window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, feedback));
-    return;
-  }
-
-  const alertMessage = feedback.title
-    ? `${feedback.title}\n\n${feedback.message}`
-    : feedback.message;
-  if (typeof window.alert === "function") {
-    window.alert(alertMessage);
-  }
-};
+// Module-level: palette sources are rebuilt on every render, so a closure flag would reset.
+let reportSlownessRunning = false;
 
 const findFirstTerminalSessionTab = (
   node: RightSidebarLayoutState["root"]
@@ -293,13 +329,23 @@ const findFirstTerminalSessionTab = (
 };
 
 /**
+ * Whether right-sidebar commands have a visible sidebar to act on. Narrow layouts hide the
+ * sidebar entirely, so opening tabs there would produce no visible result (the keyboard
+ * shortcuts refuse for the same reason). Without a DOM (command-source unit tests) there is no
+ * layout to check.
+ */
+function isRightSidebarShown(): boolean {
+  return typeof HTMLElement === "undefined" || !isWorkspaceRightSidebarHidden(document.body);
+}
+
+/**
  * Build a "Hide/Show <Name>" command for a config-defined tab.
  *
  * Each command-source factory is re-invoked per palette render, so the
  * Hide/Show title is up-to-date without any explicit subscription wiring.
  *
- * This is secondary discoverability only; default visibility is controlled by
- * `inDefaultLayout` in `tabConfig.ts` and enforced by the layout migration.
+ * This is secondary discoverability only; the New tab launcher is the primary way to open
+ * tools, and every tab can be closed from the strip.
  */
 function buildToggleTabCommand(
   workspaceId: string,
@@ -313,6 +359,7 @@ function buildToggleTabCommand(
     title: `${visible ? "Hide" : "Show"} ${reg.name}`,
     section: navigationSection,
     keywords: reg.paletteKeywords ?? [tabId],
+    visible: isRightSidebarShown,
     run: () => {
       updateRightSidebarLayout(workspaceId, (s) => toggleTab(s, tabId as TabType));
       if (!visible) {
@@ -366,11 +413,11 @@ function showUnpricedCurrentModelGoalFeedback(): void {
 async function requireGoalSetSuccess(
   api: APIClient,
   workspaceId: string,
-  input: GoalPaletteSetGoalInput
+  input: GoalPaletteSetGoalInput,
+  // The goal the palette listed this command for. See setGoalForIntendedGoal.
+  intendedGoalId: string | null | undefined
 ): Promise<boolean> {
-  // Shared retry helper centralized in `@/browser/utils/goals/` to avoid the
-  // three-way drift Coder-agents-review P3 DEREM-25 flagged.
-  const result = await setGoalWithConflictRetry(api, workspaceId, input);
+  const result = await setGoalForIntendedGoal(api, workspaceId, input, intendedGoalId);
   if (!result.success) {
     showCommandFeedbackToast({ type: "error", message: getGoalSetErrorMessage(result.error) });
     return false;
@@ -386,6 +433,12 @@ function openGoalPanel(workspaceId: string, openCompleteInput = false): void {
     createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, { workspaceId, openCompleteInput })
   );
 }
+
+/** Subtitle for an On/Off toggle backed by config.json; `fallback` until the value is known. */
+function describeConfigToggle(value: boolean | undefined, fallback: string): string {
+  return value === undefined ? fallback : `Current: ${value ? "On" : "Off"}`;
+}
+
 export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandAction[]> {
   const actions: Array<() => CommandAction[]> = [];
 
@@ -407,6 +460,13 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       run: () => p.onStartWorkspaceCreation(targetProjectPath),
     };
   };
+
+  // Side chats live in their parent's pane, not as selectable workspaces. Read lazily so all
+  // palette lists (and their submit handlers) see the same current membership.
+  const selectableWorkspaces = () =>
+    Array.from(p.workspaceMetadata.values()).filter(
+      (meta) => meta.sideChatParentWorkspaceId == null
+    );
 
   // Workspaces
   actions.push(() => {
@@ -431,7 +491,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
 
     // Switch to workspace
     // Iterate through all workspace metadata (now keyed by workspace ID)
-    for (const meta of p.workspaceMetadata.values()) {
+    for (const meta of selectableWorkspaces()) {
       const isCurrent = selected?.workspaceId === meta.id;
       const isStreaming = p.streamingModels?.has(meta.id) ?? false;
       // Title is primary (if set), name is secondary identifier
@@ -460,71 +520,73 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     if (selected?.namedWorkspacePath) {
       const workspaceDisplayName = `${selected.projectName}/${selected.namedWorkspacePath.split("/").pop() ?? selected.namedWorkspacePath}`;
       const selectedMeta = p.workspaceMetadata.get(selected.workspaceId);
-      list.push({
-        id: CommandIds.workspaceOpenTerminalCurrent(),
-        title: "New Terminal Window",
-        subtitle: workspaceDisplayName,
-        section: section.workspaces,
-        // Note: Cmd/Ctrl+T opens integrated terminal in sidebar (not shown here since this opens a popout)
-        run: () => {
-          p.onOpenWorkspaceInTerminal(selected.workspaceId, selectedMeta?.runtimeConfig);
-        },
-      });
-      // A sub-agent gets the user-confirmed removal that lists its unpreserved work (#5106); the
-      // plain remove below refuses a dirty checkout, and a model's task_remove refuses it too.
-      if (selectedMeta?.parentWorkspaceId != null) {
+      if (selectedMeta?.sideChatParentWorkspaceId == null) {
         list.push({
-          id: CommandIds.workspaceRemoveSubagent(),
-          title: "Remove Current Sub-agent…",
+          id: CommandIds.workspaceOpenTerminalCurrent(),
+          title: "New Terminal Window",
           subtitle: workspaceDisplayName,
           section: section.workspaces,
-          run: () =>
-            p.onRemoveSubagent(selected.workspaceId, selectedMeta.title ?? selectedMeta.name),
-        });
-      } else {
-        list.push({
-          id: CommandIds.workspaceRemove(),
-          title: "Remove Current Workspace…",
-          subtitle: workspaceDisplayName,
-          section: section.workspaces,
-          run: async () => {
-            const branchName =
-              selectedMeta?.name ??
-              selected.namedWorkspacePath.split("/").pop() ??
-              selected.namedWorkspacePath;
-            const ok = await p.confirmDialog(
-              removeWorkspaceConfirmOptions("Remove current workspace?", {
-                name: branchName,
-                runtimeConfig: selectedMeta?.runtimeConfig,
-                projects: selectedMeta?.projects,
-                kind: selectedMeta?.kind,
-              })
-            );
-            if (ok) await p.onRemoveWorkspace(selected.workspaceId);
+          // Note: Cmd/Ctrl+T opens integrated terminal in sidebar (not shown here since this opens a popout)
+          run: () => {
+            p.onOpenWorkspaceInTerminal(selected.workspaceId, selectedMeta?.runtimeConfig);
           },
         });
-      }
-      // #4983: the keyboard path for the interrupted-delegated-setup banner's Keep button.
-      if (selectedMeta?.delegatedCreationInterrupted === true) {
-        list.push({
-          id: CommandIds.workspaceKeepInterruptedDelegated(),
-          title: "Keep Workspace After Interrupted Setup",
-          subtitle: workspaceDisplayName,
-          section: section.workspaces,
-          run: async () => {
-            if (!p.api) return;
-            const result = await p.api.workspace.keepInterruptedDelegatedWorkspace({
-              workspaceId: selected.workspaceId,
-            });
-            if (!result.success) {
-              showCommandFeedbackToast({
-                type: "error",
-                title: "Could not keep the workspace",
-                message: result.error,
+        // A sub-agent gets the user-confirmed removal that lists its unpreserved work (#5106); the
+        // plain remove below refuses a dirty checkout, and a model's task_remove refuses it too.
+        if (selectedMeta?.parentWorkspaceId != null) {
+          list.push({
+            id: CommandIds.workspaceRemoveSubagent(),
+            title: "Remove Current Sub-agent…",
+            subtitle: workspaceDisplayName,
+            section: section.workspaces,
+            run: () =>
+              p.onRemoveSubagent(selected.workspaceId, selectedMeta.title ?? selectedMeta.name),
+          });
+        } else {
+          list.push({
+            id: CommandIds.workspaceRemove(),
+            title: "Remove Current Workspace…",
+            subtitle: workspaceDisplayName,
+            section: section.workspaces,
+            run: async () => {
+              const branchName =
+                selectedMeta?.name ??
+                selected.namedWorkspacePath.split("/").pop() ??
+                selected.namedWorkspacePath;
+              const ok = await p.confirmDialog(
+                removeWorkspaceConfirmOptions("Remove current workspace?", {
+                  name: branchName,
+                  runtimeConfig: selectedMeta?.runtimeConfig,
+                  projects: selectedMeta?.projects,
+                  kind: selectedMeta?.kind,
+                })
+              );
+              if (ok) await p.onRemoveWorkspace(selected.workspaceId);
+            },
+          });
+        }
+        // #4983: the keyboard path for the interrupted-delegated-setup banner's Keep button.
+        if (selectedMeta?.delegatedCreationInterrupted === true) {
+          list.push({
+            id: CommandIds.workspaceKeepInterruptedDelegated(),
+            title: "Keep Workspace After Interrupted Setup",
+            subtitle: workspaceDisplayName,
+            section: section.workspaces,
+            run: async () => {
+              if (!p.api) return;
+              const result = await p.api.workspace.keepInterruptedDelegatedWorkspace({
+                workspaceId: selected.workspaceId,
               });
-            }
-          },
-        });
+              if (!result.success) {
+                showCommandFeedbackToast({
+                  type: "error",
+                  title: "Could not keep the workspace",
+                  message: result.error,
+                });
+              }
+            },
+          });
+        }
       }
       list.push({
         id: CommandIds.workspaceEditTitle(),
@@ -576,7 +638,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         const pinned = isWorkspacePinned(selectedMeta);
         list.push({
           id: CommandIds.workspaceTogglePinned(),
-          title: pinned ? "Unpin Current Chat" : "Pin Current Chat",
+          title: pinned ? "Unpin Current Workspace" : "Pin Current Workspace",
           subtitle: workspaceDisplayName,
           shortcutHint: formatKeybind(KEYBINDS.PIN_WORKSPACE),
           section: section.workspaces,
@@ -593,7 +655,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           // commands stay listed whenever the chat is pinned.
           list.push({
             id: CommandIds.workspaceMovePinnedUp(),
-            title: "Move Pinned Chat Up",
+            title: "Move Pinned Workspace Up",
             subtitle: workspaceDisplayName,
             shortcutHint: formatKeybind(KEYBINDS.MOVE_PINNED_UP),
             section: section.workspaces,
@@ -601,7 +663,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           });
           list.push({
             id: CommandIds.workspaceMovePinnedDown(),
-            title: "Move Pinned Chat Down",
+            title: "Move Pinned Workspace Down",
             subtitle: workspaceDisplayName,
             shortcutHint: formatKeybind(KEYBINDS.MOVE_PINNED_DOWN),
             section: section.workspaces,
@@ -611,7 +673,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       }
     }
 
-    if (p.workspaceMetadata.size > 0) {
+    if (selectableWorkspaces().length > 0) {
       list.push({
         id: CommandIds.workspaceOpenTerminal(),
         title: "Open Terminal Window for Workspace…",
@@ -626,7 +688,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               label: "Workspace",
               placeholder: "Search workspaces…",
               getOptions: () =>
-                Array.from(p.workspaceMetadata.values()).map((meta) => {
+                selectableWorkspaces().map((meta) => {
                   // Use workspace name instead of extracting from path
                   const label = `${meta.projectName} / ${meta.name}`;
                   return {
@@ -644,7 +706,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             },
           ],
           onSubmit: (vals) => {
-            const meta = p.workspaceMetadata.get(vals.workspaceId);
+            const meta = selectableWorkspaces().find((entry) => entry.id === vals.workspaceId);
+            if (!meta) return;
             p.onOpenWorkspaceInTerminal(vals.workspaceId, meta?.runtimeConfig);
           },
         },
@@ -663,7 +726,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               label: "Select workspace",
               placeholder: "Search workspaces…",
               getOptions: () =>
-                Array.from(p.workspaceMetadata.values()).map((meta) => {
+                selectableWorkspaces().map((meta) => {
                   const label = `${meta.projectName} / ${meta.name}`;
                   return {
                     id: meta.id,
@@ -684,9 +747,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               label: "New title",
               placeholder: "Enter new workspace title",
               getInitialValue: (values) => {
-                const meta = Array.from(p.workspaceMetadata.values()).find(
-                  (m) => m.id === values.workspaceId
-                );
+                const meta = selectableWorkspaces().find((m) => m.id === values.workspaceId);
                 return meta?.title ?? meta?.name ?? "";
               },
               validate: (v) => (!v.trim() ? "Title is required" : null),
@@ -711,7 +772,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               label: "Select workspace",
               placeholder: "Search workspaces…",
               getOptions: () =>
-                Array.from(p.workspaceMetadata.values()).map((meta) => {
+                selectableWorkspaces().map((meta) => {
                   const label = `${meta.projectName}/${meta.name}`;
                   return {
                     id: meta.id,
@@ -728,10 +789,9 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             },
           ],
           onSubmit: async (vals) => {
-            const meta = Array.from(p.workspaceMetadata.values()).find(
-              (m) => m.id === vals.workspaceId
-            );
-            if (meta?.parentWorkspaceId != null) {
+            const meta = selectableWorkspaces().find((m) => m.id === vals.workspaceId);
+            if (!meta) return;
+            if (meta.parentWorkspaceId != null) {
               // Sub-agents get the confirmation that lists their unpreserved work (#5106).
               await p.onRemoveSubagent(meta.id, meta.title ?? meta.name);
               return;
@@ -784,44 +844,42 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       {
         id: CommandIds.navToggleHideSubAgents(),
         title: "Toggle Hide Sub-Agents in Sidebar",
-        subtitle: `Current: ${readPersistedState(SIDEBAR_HIDE_SUBAGENTS_KEY, false) ? "Hidden" : "Shown"}`,
+        subtitle: `Current: ${getUserPreferences().ui?.sidebarHideSubAgents ? "Hidden" : "Shown"}`,
         section: section.navigation,
         keywords: ["sub-agents", "subagents", "hide", "show", "sidebar"],
         run: () => {
-          updatePersistedState<boolean>(SIDEBAR_HIDE_SUBAGENTS_KEY, (prev) => !prev, false);
+          const hidden = getUserPreferences().ui?.sidebarHideSubAgents ?? false;
+          updateUserPreferences({ ui: { sidebarHideSubAgents: !hidden } });
         },
       },
       {
         id: CommandIds.navToggleFlatChatList(),
         title: "Toggle Flat Chat List",
-        subtitle: `Current: ${readPersistedState(SIDEBAR_FLAT_MODE_KEY, false) ? "Flat" : "Grouped"}`,
+        subtitle: `Current: ${getUserPreferences().ui?.sidebarFlatMode ? "Flat" : "Grouped"}`,
         section: section.navigation,
         keywords: ["flat", "chat", "list", "projects", "folders", "sidebar"],
         run: () => {
-          updatePersistedState<boolean>(SIDEBAR_FLAT_MODE_KEY, (prev) => !prev, false);
+          const flat = getUserPreferences().ui?.sidebarFlatMode ?? false;
+          updateUserPreferences({ ui: { sidebarFlatMode: !flat } });
         },
       },
       {
         id: CommandIds.navToggleTerminalBadge(),
         title: "Toggle Terminal Badge",
         subtitle: `Current: ${
-          normalizeTerminalBadgeConfig(
-            readPersistedState(TERMINAL_BADGE_CONFIG_KEY, DEFAULT_TERMINAL_BADGE_CONFIG)
-          ).enabled
+          normalizeTerminalBadgeConfig(getUserPreferences().appearance?.terminalBadgeConfig).enabled
             ? "Shown"
             : "Hidden"
         }`,
         section: section.navigation,
         keywords: ["terminal", "badge", "watermark", "overlay", "workspace", "tab"],
         run: () => {
-          updatePersistedState<TerminalBadgeConfig>(
-            TERMINAL_BADGE_CONFIG_KEY,
-            (prev) => {
-              const config = normalizeTerminalBadgeConfig(prev);
-              return { ...config, enabled: !config.enabled };
-            },
-            DEFAULT_TERMINAL_BADGE_CONFIG
+          const config = normalizeTerminalBadgeConfig(
+            getUserPreferences().appearance?.terminalBadgeConfig
           );
+          updateUserPreferences({
+            appearance: { terminalBadgeConfig: { ...config, enabled: !config.enabled } },
+          });
         },
       },
     ];
@@ -831,15 +889,14 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     if (wsId) {
       const canReviewDiffs = hasWorkspaceRepository(p.workspaceMetadata.get(wsId));
       list.push(
-        // Generic per-tab "Hide/Show <Name>" commands are only for optional tabs.
-        // Default-layout tabs (Stats/Review/Instructions) are auto-restored by
-        // the layout migration, so exposing hide commands for them would be a
-        // no-op and obscure the fact that they are meant to be visible by default.
+        // "Hide/Show <Name>" for every tool: no tab is re-added automatically anymore, so
+        // hiding any of them sticks. Experiment-gated tabs are left out (their panel only
+        // exists while the experiment is on), as is Review without a repository.
         ...getOrderedBaseTabIds()
-          .filter((tabId) => {
-            const config = getTabConfig(tabId);
-            return config.inDefaultLayout !== true && config.featureFlag == null;
-          })
+          .filter(
+            (tabId) =>
+              getTabConfig(tabId).featureFlag == null && (canReviewDiffs || tabId !== "review")
+          )
           .map((tabId) => buildToggleTabCommand(wsId, tabId, section.navigation)),
         {
           id: CommandIds.navOpenLogFile(),
@@ -854,6 +911,56 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             window.open(toFileUrl(logPath), "_blank", "noopener");
           },
         },
+        ...(p.artifactsEnabled === true
+          ? [
+              {
+                id: CommandIds.navOpenArtifacts(),
+                title: "Open Artifacts",
+                section: section.navigation,
+                shortcutHint: formatKeybind(KEYBINDS.OPEN_ARTIFACTS_TAB),
+                keywords: ["artifacts", "preview", "versions"],
+                run: () => openArtifactsTab(wsId),
+              },
+              // One per MCP App view of the workspace (transcript or opened this session): opens
+              // its tab or focuses the one it has, the keyboard path to "Open in tab".
+              // The subtitle carries each call's detail, so several calls of one tool differ.
+              ...appViewEntries(wsId, p.selectedWorkspaceState?.messages ?? []).map(
+                ({ view, server, detail }) => ({
+                  id: CommandIds.navOpenAppView(view.toolCallId),
+                  title: `Open App View: ${view.label}`,
+                  subtitle: detail === "" ? server : `${server} · ${detail}`,
+                  section: section.navigation,
+                  keywords: ["app", "view", "mcp", "tab", view.serverName],
+                  run: () => openMcpAppViewTab(wsId, view),
+                })
+              ),
+              {
+                id: CommandIds.navOpenFileAsArtifact(),
+                title: "Open File as Artifact…",
+                section: section.navigation,
+                keywords: ["artifacts", "pin", "file", "preview"],
+                run: () => undefined,
+                prompt: {
+                  title: "Open File as Artifact",
+                  fields: [
+                    {
+                      type: "text" as const,
+                      name: "path",
+                      label: "File path",
+                      placeholder: "Path inside the workspace, e.g. docs/report.md",
+                      validate: (v: string) => (!v.trim() ? "Path is required" : null),
+                    },
+                  ],
+                  onSubmit: async (vals: Record<string, string>) => {
+                    if (!p.api) return;
+                    // Not trimmed: edge whitespace is part of the file name (validate only
+                    // refuses blank input).
+                    await pinAndOpenArtifact(p.api, wsId, vals.path);
+                  },
+                },
+              },
+            ]
+          : []),
         {
           id: CommandIds.navRightSidebarFocusTerminal(),
           title: "Right Sidebar: Focus Terminal",
@@ -880,6 +987,20 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           title: "Right Sidebar: Split Vertically",
           section: section.navigation,
           run: () => updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "vertical")),
+        },
+        {
+          id: CommandIds.navRightSidebarNewTab(),
+          title: "Right Sidebar: New Tab",
+          section: section.navigation,
+          shortcutHint: formatKeybind(KEYBINDS.NEW_SIDEBAR_TAB),
+          keywords: ["new tab", "launcher", "tools", "open"],
+          visible: isRightSidebarShown,
+          // The sidebar opens it, as for "+" and the shortcut, so the launcher also takes focus.
+          run: () => {
+            window.dispatchEvent(
+              createCustomEvent(CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB, { workspaceId: wsId })
+            );
+          },
         },
         {
           id: CommandIds.navRightSidebarAddTool(),
@@ -936,7 +1057,17 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 return;
               }
 
-              updateRightSidebarLayout(wsId, (s) => addToolToFocusedTabset(s, tool));
+              // Same as picking the tool in the focused pane's New tab: it takes the New tab's
+              // place, or is selected where it is already open.
+              updateRightSidebarLayout(wsId, (s) => openToolFromNewTab(s, s.focusedTabsetId, tool));
+              // While the sidebar is hidden (phones) that tab cannot be seen, so WorkspaceMenuBar
+              // shows it in the full-screen sidebar; with the sidebar visible it ignores the event.
+              // "costs" is the Stats tab's id.
+              if (tool === "costs") {
+                window.dispatchEvent(
+                  createCustomEvent(CUSTOM_EVENTS.OPEN_STATS_DIALOG, { workspaceId: wsId })
+                );
+              }
             },
           },
         }
@@ -996,7 +1127,16 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               },
             ],
             onSubmit: async (vals) => {
-              await p.onCaptureLayoutSlot?.(selected.workspaceId, slot, vals.name.trim());
+              const result = await p.onCaptureLayoutSlot?.(
+                selected.workspaceId,
+                slot,
+                vals.name.trim()
+              );
+              // The palette has already closed and ignores the submit promise, so a toast is the
+              // only way the user learns the capture was refused.
+              if (result && !result.success) {
+                showCommandFeedbackToast({ type: "error", message: result.error });
+              }
             },
           },
         });
@@ -1050,6 +1190,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
 
     const api = p.api;
     const goal = p.selectedWorkspaceState?.goal ?? null;
+    // Without loaded workspace state the displayed goal is unknown (not "no goal"): read it.
+    const intendedGoalId = p.selectedWorkspaceState == null ? undefined : intendedGoalIdOf(goal);
     const list: CommandAction[] = [
       {
         id: CommandIds.goalSetObjective(),
@@ -1121,11 +1263,16 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               showUnpricedCurrentModelGoalFeedback();
               return;
             }
-            const ok = await requireGoalSetSuccess(api, workspaceId, {
-              objective: intent.objective,
-              budgetCents: intent.budgetCents,
-              ...(intent.turnCap != null ? { turnCap: intent.turnCap } : {}),
-            });
+            const ok = await requireGoalSetSuccess(
+              api,
+              workspaceId,
+              {
+                objective: intent.objective,
+                budgetCents: intent.budgetCents,
+                ...(intent.turnCap != null ? { turnCap: intent.turnCap } : {}),
+              },
+              intendedGoalId
+            );
             if (!ok) return;
             openGoalPanel(workspaceId);
           },
@@ -1143,7 +1290,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["target", "objective"],
         run: async () => {
           assert(api, "Goal palette actions require a connected backend");
-          await requireGoalSetSuccess(api, workspaceId, { status: "paused" });
+          await requireGoalSetSuccess(api, workspaceId, { status: "paused" }, intendedGoalId);
         },
       });
     }
@@ -1156,14 +1303,14 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["target", "objective"],
         run: async () => {
           assert(api, "Goal palette actions require a connected backend");
-          await requireGoalSetSuccess(api, workspaceId, { status: "active" });
+          await requireGoalSetSuccess(api, workspaceId, { status: "active" }, intendedGoalId);
         },
       });
     }
 
     if (
       !isPendingGoalPersistence &&
-      (goal?.status === "active" || goal?.status === "budget_limited")
+      (goal?.status === "active" || goal?.status === "paused" || goal?.status === "budget_limited")
     ) {
       list.push({
         id: CommandIds.goalMarkComplete(),
@@ -1186,10 +1333,12 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             assert(api, "Goal palette actions require a connected backend");
             const completionSummary = values.summary.trim();
             assert(completionSummary.length > 0, "Completion summary is required");
-            const ok = await requireGoalSetSuccess(api, workspaceId, {
-              status: "complete",
-              completionSummary,
-            });
+            const ok = await requireGoalSetSuccess(
+              api,
+              workspaceId,
+              { status: "complete", completionSummary },
+              intendedGoalId
+            );
             if (!ok) return;
             openGoalPanel(workspaceId);
           },
@@ -1346,6 +1495,23 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         },
       });
       list.push({
+        id: CommandIds.chatFocusBackgroundProcesses(),
+        title: "Focus Background Processes",
+        subtitle: "Arrows select, Enter shows output, Backspace terminates",
+        section: section.chat,
+        shortcutHint: formatKeybind(KEYBINDS.FOCUS_BACKGROUND_PROCESSES),
+        run: () => {
+          const request = createCustomEvent(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, {
+            workspaceId: id,
+            handled: false,
+          });
+          window.dispatchEvent(request);
+          if (!request.detail.handled) {
+            showCommandFeedbackToast({ type: "error", message: NO_BACKGROUND_PROCESSES_MESSAGE });
+          }
+        },
+      });
+      list.push({
         id: CommandIds.chatClearTimingStats(),
         title: "Clear Timing Stats",
         subtitle: "Reset session timing data for this workspace",
@@ -1401,6 +1567,13 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     const providerOptionRoute = providerOptionGateModel
       ? p.getRouteForModel?.(normalizeToCanonical(providerOptionGateModel))
       : undefined;
+    // Fast and Ultrafast are one mutually exclusive tier preference, so both actions report the
+    // same current tier instead of each calling the other's active tier "Standard".
+    const premiumTierLabel = p.getFastMode()
+      ? "Fast — faster responses at higher cost"
+      : p.getUltrafastMode()
+        ? "Ultrafast — fastest responses, highest cost"
+        : "Standard";
     const fastModeAction: CommandAction | null =
       p.providersConfig != null &&
       getFastModeProvider(providerOptionGateModel ?? "", {
@@ -1410,10 +1583,25 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         ? {
             id: CommandIds.toggleFastMode(),
             title: "Toggle Fast Mode",
-            subtitle: `Current: ${p.getFastMode() ? "Fast — faster responses at higher cost" : "Standard"}`,
+            subtitle: `Current: ${premiumTierLabel}`,
             section: section.mode,
             shortcutHint: formatKeybind(KEYBINDS.TOGGLE_FAST_MODE),
             run: p.onToggleFastMode,
+          }
+        : null;
+    const ultrafastModeAction: CommandAction | null =
+      p.providersConfig != null &&
+      ultrafastModeAvailable(providerOptionGateModel ?? "", {
+        providersConfig: p.providersConfig,
+        resolvedRouteProvider: providerOptionRoute,
+      })
+        ? {
+            id: CommandIds.toggleUltrafastMode(),
+            title: "Toggle Ultrafast Mode",
+            subtitle: `Current: ${premiumTierLabel}`,
+            section: section.mode,
+            shortcutHint: formatKeybind(KEYBINDS.TOGGLE_ULTRAFAST_MODE),
+            run: p.onToggleUltrafastMode,
           }
         : null;
     // The picker rows are the only pointer path to Auto; the model-cycle and thinking-step
@@ -1536,6 +1724,18 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       if (fastModeAction) {
         list.push(fastModeAction);
       }
+      if (ultrafastModeAction) list.push(ultrafastModeAction);
+      const computerUse = p.computerUse;
+      if (computerUse != null) {
+        list.push({
+          id: CommandIds.toggleComputerUse(),
+          title: computerUse.enabled ? "Turn Off Computer Use" : "Turn On Computer Use",
+          subtitle: "Let agents in this workspace see the screen and use the mouse and keyboard",
+          section: section.mode,
+          shortcutHint: formatKeybind(KEYBINDS.TOGGLE_COMPUTER_USE),
+          run: computerUse.onToggle,
+        });
+      }
 
       // Pro and Cyber reasoning modes are only meaningful for models that support them
       // on routes that deliver the native provider option (direct OpenAI, plus
@@ -1593,6 +1793,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       // Creation composers use their project-scoped preferences before a workspace exists.
       list.push(...autoRoutingActions);
       if (fastModeAction) list.push(fastModeAction);
+      if (ultrafastModeAction) list.push(ultrafastModeAction);
     }
 
     return list;
@@ -1613,6 +1814,123 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       },
     },
   ]);
+
+  // Report slowness (experiment perfFlightRecorder). App.tsx runs this same action for
+  // the keyboard shortcut, so hiding it here also turns the shortcut off.
+  if (p.perfFlightRecorderEnabled) {
+    actions.push(() => [
+      {
+        id: CommandIds.perfReportSlowness(),
+        title: "Report slowness",
+        subtitle: "Save a local performance report folder",
+        section: section.help,
+        keywords: ["perf", "performance", "slow", "lag", "report", "profile"],
+        shortcutHint: formatKeybind(KEYBINDS.REPORT_SLOWNESS),
+        run: async () => {
+          if (!p.api) {
+            showCommandFeedbackToast({
+              type: "error",
+              title: "Report slowness failed",
+              message: "Not connected to the Xum backend.",
+            });
+            return;
+          }
+          // A repeat press while a report is being written does nothing: the toast host
+          // shows one toast, so the backend's "in progress" refusal would be replaced by
+          // the pending report's result a moment later anyway.
+          if (reportSlownessRunning) return;
+          reportSlownessRunning = true;
+          try {
+            const report = await p.api.perfReports.create();
+            showCommandFeedbackToast({
+              type: "success",
+              message: report.revealed
+                ? `Saved slowness report to ${report.dir} and opened it in your file manager.`
+                : `Saved slowness report to ${report.dir}`,
+              // In `xum server` the toast is the only place the path appears.
+              copyText: report.dir,
+            });
+          } catch (error) {
+            showCommandFeedbackToast({
+              type: "error",
+              title: "Report slowness failed",
+              message: getErrorMessage(error),
+            });
+          } finally {
+            reportSlownessRunning = false;
+          }
+        },
+      },
+    ]);
+  }
+
+  // Session tapes (experiment): only counts and the folder path are shown, never tape content.
+  if (p.sessionTapesEnabled === true) {
+    const api = p.api;
+    const notConnected = () =>
+      showCommandFeedbackToast({ type: "error", message: "Not connected to the Xum backend." });
+    actions.push(() => [
+      {
+        id: CommandIds.sessionTapesSave(),
+        title: "Save open session tapes",
+        section: section.help,
+        keywords: ["session tapes", "perf", "record", "finalize"],
+        shortcutHint: formatKeybind(KEYBINDS.SAVE_SESSION_TAPES),
+        run: async () => {
+          if (!api) return notConnected();
+          if (sessionTapesSaveRunning) return;
+          sessionTapesSaveRunning = true;
+          try {
+            const { written, failed, dir } = await api.sessionTapes.saveOpen();
+            const saved = `Saved ${written} session ${written === 1 ? "tape" : "tapes"} to ${dir}`;
+            if (failed.length > 0) {
+              // Name each failed tape and why, so "nothing was open" is never confused with
+              // "the write failed" (#5609). Error toasts stay until dismissed.
+              const failures = failed.map((f) => `${f.tape} (${f.error})`).join(", ");
+              showCommandFeedbackToast({
+                type: "error",
+                message: `${saved}. Could not write ${failed.length}: ${failures}`,
+              });
+              return;
+            }
+            showCommandFeedbackToast({
+              type: "success",
+              message: written === 0 ? `No open session tapes to save. Folder: ${dir}` : saved,
+              duration: SESSION_TAPES_PATH_TOAST_MS,
+            });
+          } catch (error) {
+            showCommandFeedbackToast({
+              type: "error",
+              message: `Could not save session tapes: ${getErrorMessage(error)}`,
+            });
+          } finally {
+            sessionTapesSaveRunning = false;
+          }
+        },
+      },
+      {
+        id: CommandIds.sessionTapesReveal(),
+        title: "Reveal session tapes folder",
+        section: section.help,
+        keywords: ["session tapes", "perf", "folder", "open"],
+        shortcutHint: formatKeybind(KEYBINDS.REVEAL_SESSION_TAPES),
+        run: async () => {
+          if (!api) return notConnected();
+          try {
+            const { dir, revealed } = await api.sessionTapes.revealFolder();
+            showCommandFeedbackToast({
+              type: "success",
+              // Server mode cannot open a folder on the user's machine: show where it is.
+              message: revealed ? `Opened ${dir}` : `Session tapes folder: ${dir}`,
+              duration: revealed ? undefined : SESSION_TAPES_PATH_TOAST_MS,
+            });
+          } catch (error) {
+            showCommandFeedbackToast({ type: "error", message: getErrorMessage(error) });
+          }
+        },
+      },
+    ]);
+  }
 
   // Updates: the About dialog owns the controls and shows status, blockers, and errors, so each
   // command starts the operation and opens the dialog.
@@ -1832,7 +2150,12 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           {
             id: CommandIds.settingsToggleKeepScreenAwake(),
             title: "Toggle Keep Screen Awake",
-            subtitle: "Prevent display sleep while agents are working",
+            // Show the current state like the local-state toggles do (#5791). Until the config
+            // has loaded, describe the toggle instead of guessing a state.
+            subtitle: describeConfigToggle(
+              p.getKeepScreenAwake?.(),
+              "Prevent display sleep while agents are working"
+            ),
             section: section.settings,
             keywords: ["awake", "sleep", "screen", "display", "lock", "power", "caffeinate"],
             run: async () => {
@@ -1844,6 +2167,23 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           },
         ]
   );
+
+  // Keyboard route for the Settings → Providers → Bash commands switch.
+  actions.push(() => [
+    {
+      id: CommandIds.settingsToggleBashAiProxy(),
+      title: "Toggle Count AI Calls from Bash Commands",
+      subtitle: "Route bash commands' Anthropic and OpenAI calls through Xum to count their cost",
+      section: section.settings,
+      keywords: ["bash", "proxy", "cost", "usage", "anthropic", "openai", "billing"],
+      run: async () => {
+        if (!p.api) return;
+        // The flag lives in config.json (not localStorage), so read the current value first.
+        const cfg = await p.api.config.getConfig();
+        await p.api.config.updateBashAiProxyEnabled({ enabled: !cfg.bashAiProxyEnabled });
+      },
+    },
+  ]);
 
   // Settings
   if (p.onOpenSettings) {
@@ -2207,8 +2547,38 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     ]);
   }
 
-  // Coder disconnect: calls the RPC directly (no settings UI needed), so it is
-  // not gated on onOpenSettings like the section-opening commands above.
+  // Coder commands call their RPCs directly (no settings UI needed), so they
+  // are not gated on onOpenSettings like the section-opening commands above.
+  const coderCommand =
+    (
+      failureTitle: string,
+      successMessage: string,
+      operation: (api: APIClient) => Promise<Result<void, string>>
+    ) =>
+    async () => {
+      if (!p.api) {
+        showCommandFeedbackToast({
+          type: "error",
+          title: failureTitle,
+          message: "Xum API not connected.",
+        });
+        return;
+      }
+      try {
+        const result = await operation(p.api);
+        if (!result.success) {
+          showCommandFeedbackToast({ type: "error", title: failureTitle, message: result.error });
+          return;
+        }
+        showCommandFeedbackToast({ type: "success", message: successMessage });
+      } catch (error) {
+        showCommandFeedbackToast({
+          type: "error",
+          title: failureTitle,
+          message: getErrorMessage(error),
+        });
+      }
+    };
   actions.push(() => [
     {
       id: CommandIds.coderDisconnect(),
@@ -2220,78 +2590,35 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       // previously configured deployment URL must stay revocable — the
       // backend revokes against the blob's own issuer.
       visible: () => p.providersConfig?.coder?.coderOauthCredentialStored === true,
-      run: async () => {
-        if (!p.api) {
-          showCommandFeedbackToast({
-            type: "error",
-            title: "Coder Disconnect Failed",
-            message: "Xum API not connected.",
-          });
-          return;
-        }
-        try {
-          const result = await p.api.coderOauth.disconnect();
-          if (!result.success) {
-            showCommandFeedbackToast({
-              type: "error",
-              title: "Coder Disconnect Failed",
-              message: result.error,
-            });
-            return;
-          }
-          showCommandFeedbackToast({
-            type: "success",
-            message: "Coder account disconnected.",
-          });
-        } catch (error) {
-          showCommandFeedbackToast({
-            type: "error",
-            title: "Coder Disconnect Failed",
-            message: getErrorMessage(error),
-          });
-        }
-      },
+      run: coderCommand("Coder Disconnect Failed", "Coder account disconnected.", (api) =>
+        api.coderOauth.disconnect()
+      ),
     },
     {
       id: CommandIds.coderRefreshModels(),
-      title: "Settings: Refresh Coder Models",
-      subtitle: "Re-discover the deployment's AI Gateway providers and models",
+      title: "Settings: Load Coder model catalog",
+      subtitle: "Load or refresh the deployment's AI Gateway providers and model catalogs",
       section: section.settings,
       keywords: ["coder", "models", "refresh", "discover", "gateway", "aibridge"],
       // Gated on routability (not mere credential presence): discovery needs a
       // credential that is valid for the currently effective deployment.
       visible: () => p.providersConfig?.coder?.coderOauthSet === true,
-      run: async () => {
-        if (!p.api) {
-          showCommandFeedbackToast({
-            type: "error",
-            title: "Coder Model Refresh Failed",
-            message: "Xum API not connected.",
-          });
-          return;
-        }
-        try {
-          const result = await p.api.coderOauth.refreshModels();
-          if (!result.success) {
-            showCommandFeedbackToast({
-              type: "error",
-              title: "Coder Model Refresh Failed",
-              message: result.error,
-            });
-            return;
-          }
-          showCommandFeedbackToast({
-            type: "success",
-            message: "Coder model catalog refreshed.",
-          });
-        } catch (error) {
-          showCommandFeedbackToast({
-            type: "error",
-            title: "Coder Model Refresh Failed",
-            message: getErrorMessage(error),
-          });
-        }
-      },
+      run: coderCommand(
+        "Coder Model Catalog Refresh Failed",
+        "Coder model catalog refreshed.",
+        (api) => api.coderOauth.refreshModels()
+      ),
+    },
+    {
+      id: CommandIds.coderRefreshProviders(),
+      title: "Settings: Refresh Coder providers",
+      subtitle: "Re-list the deployment's AI Gateway providers without loading model catalogs",
+      section: section.settings,
+      keywords: ["coder", "providers", "instances", "refresh", "gateway", "routing"],
+      visible: () => p.providersConfig?.coder?.coderOauthSet === true,
+      run: coderCommand("Coder Provider Refresh Failed", "Coder providers refreshed.", (api) =>
+        api.coderOauth.refreshProviders()
+      ),
     },
   ]);
 

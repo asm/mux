@@ -313,7 +313,8 @@ export async function runMemoryHarvest(args: {
         args.beforeDispatch === undefined
           ? undefined
           : async () => {
-              if (!stale && !(await args.beforeDispatch!())) {
+              const beforeDispatch = args.beforeDispatch;
+              if (beforeDispatch !== undefined && !stale && !(await beforeDispatch())) {
                 stale = true;
                 gate.abort(new Error(HARVEST_INPUT_STALE_MESSAGE));
               }

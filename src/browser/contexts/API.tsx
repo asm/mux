@@ -19,6 +19,7 @@ import {
 } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
 import { getErrorMessage } from "@/common/utils/errors";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 
 type APIClient = ReturnType<typeof createClient>;
 
@@ -29,9 +30,12 @@ export type APIState =
   | { status: "connecting"; api: null; error: null }
   | { status: "connected"; api: APIClient; error: null }
   | { status: "degraded"; api: APIClient; error: null } // Connected but the backend answers slowly
-  | { status: "reconnecting"; api: null; error: null; attempt: number }
+  // While reconnecting, and in an error after a lost session, `api` can be the last client: the
+  // App stays mounted, and panes keep what they show. Calls on it then fail fast with
+  // ConnectionLostError (connectionLink.ts). Code that must know "offline" uses useLiveAPI().
+  | { status: "reconnecting"; api: APIClient | null; error: null; attempt: number }
   | { status: "auth_required"; api: null; error: string | null }
-  | { status: "error"; api: null; error: string };
+  | { status: "error"; api: APIClient | null; error: string };
 
 interface APIStateMethods {
   authenticate: (token: string) => void;
@@ -95,6 +99,8 @@ interface APIProviderProps {
   client?: APIClient;
   /** WebSocket factory for testing. Defaults to native WebSocket constructor. */
   createWebSocket?: (url: string) => WebSocket;
+  /** The VS Code webview connects AppConfigStore itself, only while its host has a server. */
+  skipAppConfigStore?: boolean;
 }
 
 const noopConnectionControl = (_token?: string) => undefined;
@@ -175,6 +181,16 @@ async function reloadIfServerBuildChanged(
   } catch {
     // Version discovery must not disturb an already reconnected client.
   }
+}
+
+// Connected here rather than in AppLoader so terminal and desktop popouts get the config store too.
+function useAppConfigStoreClient(api: APIClient | null, skip = false) {
+  useEffect(() => {
+    if (skip) return;
+    const store = getAppConfigStore();
+    store.setClient(api);
+    return () => store.setClient(null);
+  }, [api, skip]);
 }
 
 function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
@@ -663,6 +679,8 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
         return { status: "error", api: null, error: state.error, ...base };
     }
   }, [state, authenticate, retry]);
+  // The store must see "offline" to resubscribe after the reconnect.
+  useAppConfigStoreClient(liveClientOf(value));
 
   // Always render children - consumers handle their own loading/error states
   return (
@@ -675,11 +693,12 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
 }
 
 function InjectedClientAPIProvider(
-  props: Pick<APIProviderProps, "children"> & { client: APIClient }
+  props: Pick<APIProviderProps, "children" | "skipAppConfigStore"> & { client: APIClient }
 ) {
   // User rationale: injected clients are already fully constructed, so wrapping them in the
   // browser liveness/reconnect state machine risks leaking async state updates into tests.
   window.__ORPC_CLIENT__ = props.client;
+  useAppConfigStoreClient(props.client, props.skipAppConfigStore);
 
   return (
     <APIContext.Provider
@@ -699,7 +718,12 @@ function InjectedClientAPIProvider(
 export const APIProvider = (props: APIProviderProps) => {
   if (props.client) {
     return (
-      <InjectedClientAPIProvider client={props.client}>{props.children}</InjectedClientAPIProvider>
+      <InjectedClientAPIProvider
+        client={props.client}
+        skipAppConfigStore={props.skipAppConfigStore}
+      >
+        {props.children}
+      </InjectedClientAPIProvider>
     );
   }
 
@@ -717,6 +741,22 @@ export const useAPI = (): UseAPIResult => {
   }
   return context;
 };
+
+/** The client while the connection is live (connected or degraded), else null. */
+export function liveClientOf(state: APIState): APIClient | null {
+  return state.status === "connected" || state.status === "degraded" ? state.api : null;
+}
+
+/**
+ * The API client only while the connection is live; null while offline.
+ *
+ * `useAPI().api` can stay set while Xum reconnects, so the UI keeps what it shows. Code that must
+ * see "offline" uses this instead: the stores (they resubscribe when it comes back), deferred
+ * writes that must wait for a live server, and handlers that report "API not connected".
+ */
+export function useLiveAPI(): APIClient | null {
+  return liveClientOf(useAPI());
+}
 
 /**
  * Like {@link useAPI} but returns null instead of throwing when there is no APIProvider.

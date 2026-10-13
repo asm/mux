@@ -233,6 +233,8 @@ export class AgentStatusService {
         const id = ws.id ?? ws.name;
         if (typeof id !== "string" || id.length === 0) continue;
         if (isWorkspaceArchived(ws.archivedAt, ws.unarchivedAt)) continue;
+        // Side chats have no sidebar status UI; inherited context must not trigger paid background work.
+        if (ws.sideChatParentWorkspaceId != null) continue;
         const state = this.tracked.get(id);
         if (state?.inFlight) continue;
         const snapshot = snapshots.get(id);
@@ -457,6 +459,15 @@ export class AgentStatusService {
           );
           if (recorded) {
             this.requestAnalyticsIngest?.(workspaceId);
+            // #6118: this spend bypasses the stream, so tell the open chat about it, as the
+            // bash AI proxy does; otherwise the footer total misses it until a reload.
+            this.workspaceService.emitChatEvent(workspaceId, {
+              type: "session-usage-delta",
+              workspaceId,
+              sourceWorkspaceId: workspaceId,
+              byModelDelta: { [recorded.model]: recorded.usage },
+              timestamp: Date.now(),
+            });
           }
         },
       });
@@ -676,7 +687,9 @@ export class AgentStatusService {
     // A turn persists its snapshot prefix before its user row: trailing prefix
     // rows belong to a turn still being written (PREPARING), whose gate has
     // not run yet.
-    while (committedMessages.length > 0 && isTurnSnapshotPrefixRow(committedMessages.at(-1)!)) {
+    for (;;) {
+      const last = committedMessages.at(-1);
+      if (last === undefined || !isTurnSnapshotPrefixRow(last)) break;
       committedMessages = committedMessages.slice(0, -1);
     }
     // The partial is the in-flight reply to the latest user turn: the latest

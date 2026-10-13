@@ -105,7 +105,7 @@ describe("buildFollowUpFromSource", () => {
 
     expect(followUp.text).toBe("Using skill done: finish");
     // parseCommand canonicalizes the "haiku" alias.
-    expect(followUp.model).toBe("anthropic:claude-haiku-4-5");
+    expect(followUp.model).toBe("anthropic:claude-haiku-5-5");
     expect(followUp.skipSkillModelRouting).toBe(true);
     // The raw numeric index rides along even with an explicit model: dispatch
     // resolves it against the model that actually streams (a provider mapping

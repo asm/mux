@@ -5,20 +5,18 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { Profiler } from "react";
 
 import { installDom } from "../../../tests/ui/dom";
-import { readPersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
 import {
-  BASH_COLLAPSED_SUMMARY_MODE_KEY,
-  GLOBAL_SCOPE_ID,
-  getAgentIdKey,
-  getThinkingLevelKey,
-} from "xum/common/constants/storage";
-import { resetAiSelectionIntentForTests } from "xum/browser/utils/aiSelectionIntent";
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+  setWorkspaceAgentPick,
+} from "xum/browser/utils/aiSelectionIntent";
 import { formatModelDisplayName } from "xum/common/utils/ai/modelDisplay";
-import { getAppConfigStore } from "xum/browser/stores/AppConfigStore";
+import { getAppConfigStore, getUserPreferences } from "xum/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "xum/browser/stores/ProvidersConfigStore";
 import { CHAT_VIEW_DATA_READY_TIMEOUT_MS } from "xum/browser/components/ChatPane/useChatViewDataReady";
 import { createMuxMessage, type MuxMetadata } from "xum/common/types/message";
 import { formatAgentMessageEnvelope } from "xum/common/utils/agentMessageEnvelope";
+import { CUSTOM_EVENTS, createCustomEvent } from "xum/common/constants/events";
 import { App } from "./App";
 import type { UiWorkspace, WebviewToExtensionMessage } from "./protocol";
 import type { VscodeBridge } from "./vscodeBridge";
@@ -764,7 +762,11 @@ describe("vscode webview turn status and jump to bottom (#4971)", () => {
     await selectWorkspace(bridge);
     const waiting = "Waiting on background bash monitor...";
     const activity = (workspaceId: string, activeBashMonitorCount: number) =>
-      bridge.emit({ type: "workspaceActivity", workspaceId, activeBashMonitorCount });
+      bridge.emit({
+        type: "workspaceActivity",
+        workspaceId,
+        activity: { [workspaceId]: { activeBashMonitorCount, streaming: false, activeWorkflowRunIds: [] } },
+      });
 
     await activity(WORKSPACE.id, 1);
     expect(view.container.textContent).toContain(waiting);
@@ -1061,8 +1063,7 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
     cleanup();
     // The store is an app-wide singleton; drop what a test loaded so later tests start clean.
     getAppConfigStore().updateOptimistically({
-      bashCollapsedSummaryMode: undefined,
-      transcriptDensity: undefined,
+      userPreferences: undefined,
       agentAiDefaults: undefined,
     });
     cleanupDom?.();
@@ -1071,8 +1072,6 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
 
   test("bash headers follow the user's collapsed-summary mode once config arrives", async () => {
     const script = "ls -la && git log --oneline -3";
-    // Left over from an earlier webview session; it must not apply before this server's config.
-    updatePersistedState(BASH_COLLAPSED_SUMMARY_MODE_KEY, "intent");
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge, [
@@ -1105,6 +1104,12 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
     await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://y" } });
     await emitBackgroundBashes(bridge, WORKSPACE.id);
     expect(view.queryByText(script)).not.toBeNull();
+
+    // A deep-equal config from the new server still restores the mode.
+    await bridge.answer("config.getConfig", {
+      userPreferences: { appearance: { bashCollapsedSummaryMode: "intent" } },
+    });
+    expect(view.queryByText(script)).toBeNull();
   });
 
   test("hyper transcript density collapses a finished turn's work into a work bundle (#4979)", async () => {
@@ -1243,6 +1248,40 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
       options: { agentId: "exec", model: "anthropic:claude-opus-5-5", thinkingLevel: "low" },
     });
   });
+
+  test("shows the saved compaction threshold read-only", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [
+      userMessage("Summarize the repo"),
+      {
+        type: "message",
+        id: "a1",
+        role: "assistant",
+        parts: [{ type: "text", text: "Done." }],
+        metadata: {
+          historySequence: 2,
+          timestamp: 2,
+          model: "anthropic:claude-opus-5-5",
+          contextUsage: { inputTokens: 50_000, outputTokens: 1_000, totalTokens: undefined },
+        },
+      },
+    ]);
+    await bridge.answer("config.getConfig", {
+      userPreferences: {
+        ai: { autoCompactionThresholdByModel: { "anthropic:claude-opus-5-5": 60 } },
+      },
+    });
+
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: /^Context usage/ }));
+      await Promise.resolve();
+    });
+    const dialog = document.body.querySelector('[role="dialog"]');
+    expect(dialog?.textContent).toContain("Auto-compact at 60%");
+    // A drag would call config.updateUserPreferences, which the host blocks.
+    expect(dialog?.querySelector('[style*="ew-resize"]')).toBeNull();
+  });
 });
 
 describe("vscode webview AI settings persistence", () => {
@@ -1250,6 +1289,7 @@ describe("vscode webview AI settings persistence", () => {
 
   beforeEach(() => {
     cleanupDom = installDom();
+    resetAiSelectionIntentForTests();
   });
 
   afterEach(() => {
@@ -1301,7 +1341,7 @@ describe("vscode webview AI settings persistence", () => {
     // not clamp; the backend applies the authoritative floor to the turn.
     // "low" is below the default model's built-in minimum (medium), so a client-side clamp would
     // raise it; it is also not the default, so the test proves the stored choice is what is sent.
-    updatePersistedState(getThinkingLevelKey(WORKSPACE.id), "low");
+    markAiSelectionIntent(WORKSPACE.id, "thinkingLevel", "low");
     const { bridge, view } = await renderSelected();
     const options = await sendMessage(bridge, view);
     expect(options.thinkingLevel).toBe("low");
@@ -1387,7 +1427,7 @@ describe("vscode webview workspace AI settings", () => {
     });
     // A stale local pick must not change the agent a child task runs with.
     await act(async () => {
-      updatePersistedState(getAgentIdKey(WORKSPACE.id), "plan");
+      setWorkspaceAgentPick(WORKSPACE.id, "plan");
       await Promise.resolve();
     });
 
@@ -1419,6 +1459,8 @@ describe("vscode webview workspace AI settings", () => {
       model: "anthropic:claude-opus-5-5",
       thinkingLevel: "low",
     });
+    // Settle the persisting send so this webview session has no unresolved one (#4781).
+    await bridge.answer("workspace.sendMessage", { success: true, data: {} });
   });
 
   test("keeps a model picked for one agent after switching agents and back", async () => {
@@ -1582,7 +1624,7 @@ describe("vscode webview agent lookup", () => {
     });
     // The click must not open the picker: an unscoped pick would write the webview's global agent key.
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
-    expect(readPersistedState(getAgentIdKey(GLOBAL_SCOPE_ID), null)).toBeNull();
+    expect(getUserPreferences().ai?.globalDefaults).toBeUndefined();
   });
 
   test("looks up agents again when the connection recovers from file mode (#4797)", async () => {
@@ -1612,19 +1654,23 @@ describe("vscode webview app and providers config", () => {
 
   beforeEach(() => {
     cleanupDom = installDom();
+    resetAiSelectionIntentForTests();
   });
 
   afterEach(() => {
     cleanup();
-    // The store is an app-wide singleton; drop the floors a test loaded so later tests start clean.
-    getAppConfigStore().updateOptimistically({ minThinkingLevelByModel: undefined });
+    // The store is an app-wide singleton; drop what a test loaded so later tests start clean.
+    getAppConfigStore().updateOptimistically({
+      minThinkingLevelByModel: undefined,
+      defaultModel: undefined,
+    });
     cleanupDom?.();
     cleanupDom = null;
   });
 
   test("shows the thinking level raised to the user's configured minimum", async () => {
     // "low" is below both the built-in minimum (MED) and the configured one (HIGH).
-    updatePersistedState(getThinkingLevelKey(WORKSPACE.id), "low");
+    markAiSelectionIntent(WORKSPACE.id, "thinkingLevel", "low");
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge);
@@ -1661,6 +1707,27 @@ describe("vscode webview app and providers config", () => {
     await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
     expect(bridge.orpcCalls("config.getConfig")).toHaveLength(1);
     expect(bridge.orpcCalls("providers.getConfig")).toHaveLength(1);
+  });
+
+  test("shows and sends the configured default model when the config loads after the composer", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    await bridge.answer("config.getConfig", { defaultModel: "openai:gpt-5.6-terra" });
+    expect(view.getByRole("combobox").textContent).toContain(
+      formatModelDisplayName("gpt-5.6-terra")
+    );
+
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    await typeInto(textarea, "hello");
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Send message" }));
+      await Promise.resolve();
+    });
+    const sends = bridge.orpcCalls("workspace.sendMessage");
+    expect(sends).toHaveLength(1);
+    expect(sends[0].input).toMatchObject({ options: { model: "openai:gpt-5.6-terra" } });
   });
 });
 
@@ -1781,7 +1848,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
     await reply(bridge, OK);
   });
 
-  test("persists an explicit model pick once, at the next send", async () => {
+  test("persists an explicit model pick until the host's metadata holds it", async () => {
     // "low" is below Opus 5.5's built-in minimum (MED): the companion thinking level must be sent
     // (and so persisted) as stored, not raised to a client-side floor.
     const { bridge, view } = await open([
@@ -1789,21 +1856,60 @@ describe("vscode webview explicit AI-setting persistence", () => {
     ]);
     await pickModel(view, "Opus 5.5");
 
-    const first = await send(bridge, view);
-    expect(first).toMatchObject({
+    const picked = {
       agentId: "plan",
       model: "anthropic:claude-opus-5-5",
       thinkingLevel: "low",
       skipAiSettingsPersistence: false,
       aiSelectionIntent: { model: true },
+    };
+    expect(await send(bridge, view)).toMatchObject(picked);
+    await reply(bridge, OK);
+    // The metadata pump has not delivered the saved model yet, so the pick still applies.
+    expect(await send(bridge, view)).toMatchObject(picked);
+    await reply(bridge, OK);
+
+    await bridge.emit({
+      type: "workspaces",
+      workspaces: [mainWorkspace({ model: "anthropic:claude-opus-5-5", thinkingLevel: "low" })],
+    });
+    const saved = await send(bridge, view);
+    expect(saved.model).toBe("anthropic:claude-opus-5-5");
+    expect(saved.skipAiSettingsPersistence).toBe(true);
+    expect(saved.aiSelectionIntent).toBeUndefined();
+    await reply(bridge, OK);
+    expect(bridge.orpcCalls("workspace.updateAgentAISettings")).toHaveLength(0);
+  });
+
+  test("drops an unsent pick on a server switch but keeps it across a reconnect", async () => {
+    // The host posts the server's workspaces, and the chat catches up again, after each connection.
+    async function reconnect(bridge: TestBridge, baseUrl: string) {
+      await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl } });
+      await bridge.emit({ type: "workspaces", workspaces: [mainWorkspace(TERRA_HIGH)] });
+      await bridge.emit({
+        type: "chatEvent",
+        workspaceId: WORKSPACE.id,
+        event: { type: "caught-up" },
+      });
+      await emitBackgroundBashes(bridge, WORKSPACE.id);
+    }
+    const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)]);
+    await pickModel(view, "Opus 5.5");
+
+    await bridge.emit({ type: "connectionStatus", status: { mode: "file" } });
+    await reconnect(bridge, "http://x");
+    expect(await send(bridge, view)).toMatchObject({
+      model: "anthropic:claude-opus-5-5",
+      aiSelectionIntent: { model: true },
     });
     await reply(bridge, OK);
 
-    const second = await send(bridge, view);
-    expect(second.skipAiSettingsPersistence).toBe(true);
-    expect(second.aiSelectionIntent).toBeUndefined();
+    // Another server with a workspace of the same ID saves another model.
+    await reconnect(bridge, "http://y");
+    const options = await send(bridge, view);
+    expect(options.model).toBe(TERRA_HIGH.model);
+    expect(options.aiSelectionIntent).toBeUndefined();
     await reply(bridge, OK);
-    expect(bridge.orpcCalls("workspace.updateAgentAISettings")).toHaveLength(0);
   });
 
   test("persists only the last of several rapid picks", async () => {
@@ -1832,6 +1938,26 @@ describe("vscode webview explicit AI-setting persistence", () => {
       skipAiSettingsPersistence: false,
       aiSelectionIntent: { thinkingLevel: true },
     });
+    await reply(bridge, OK);
+  });
+
+  test("persists an agent-only pick until the host's metadata holds it", async () => {
+    const workspace = mainWorkspace(TERRA_HIGH);
+    const { bridge, view } = await open([workspace]);
+    await bridge.answer("agents.list", AGENT_DESCRIPTORS);
+    await pickAgent(view, "exec");
+
+    const picked = await send(bridge, view);
+    expect(picked).toMatchObject({ agentId: "exec", skipAiSettingsPersistence: false });
+    expect(picked.aiSelectionIntent).toBeUndefined();
+    await reply(bridge, OK);
+
+    await bridge.emit({
+      type: "workspaces",
+      workspaces: [{ ...workspace, ai: { ...workspace.ai, agentId: "exec" } }],
+    });
+    const saved = await send(bridge, view);
+    expect(saved).toMatchObject({ agentId: "exec", skipAiSettingsPersistence: true });
     await reply(bridge, OK);
   });
 
@@ -2266,7 +2392,8 @@ describe("vscode webview retry barrier (#5092)", () => {
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge, failedTurn("network"));
 
-    expect(view.container.textContent).toContain("Stream interrupted");
+    // The barrier title names the error kind (RetryBarrier STREAM_ERROR_TITLES).
+    expect(view.container.textContent).toContain("Network error");
     await click(view.getByRole("button", { name: "Retry" }));
 
     const resumes = bridge.orpcCalls("workspace.resumeStream");
@@ -2318,7 +2445,7 @@ describe("vscode webview retry barrier (#5092)", () => {
       { type: "auto-retry-abandoned", reason: "authentication" },
     ]);
 
-    expect(view.container.textContent).toContain("Stream interrupted");
+    expect(view.container.textContent).toContain("Authentication failed");
     expect(view.container.textContent).toContain("Auto-retry stopped: authentication");
     expect(view.getByRole("button", { name: "Retry" })).toBeTruthy();
     // Read-only: the webview never offers Stop or toggles auto-retry.
@@ -2376,6 +2503,7 @@ describe("vscode webview retry barrier (#5092)", () => {
 
     expect(view.container.textContent).toContain("provider exploded");
     expect(view.container.textContent).not.toContain("Stream interrupted");
+    expect(view.container.textContent).not.toContain("Context limit exceeded");
     expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
   });
 
@@ -2450,7 +2578,7 @@ describe("vscode webview retry barrier (#5092)", () => {
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge, failedTurn("network"), subAgent);
     await act(async () => {
-      updatePersistedState(getAgentIdKey(subAgent.id), "plan");
+      setWorkspaceAgentPick(subAgent.id, "plan");
       await Promise.resolve();
     });
 
@@ -2464,7 +2592,7 @@ describe("vscode webview retry barrier (#5092)", () => {
     await selectWorkspace(bridge, [userRow("u1", 1)], subAgent);
     await stopMidStream(bridge);
     await act(async () => {
-      updatePersistedState(getAgentIdKey(subAgent.id), "plan");
+      setWorkspaceAgentPick(subAgent.id, "plan");
       await Promise.resolve();
     });
 
@@ -2472,6 +2600,150 @@ describe("vscode webview retry barrier (#5092)", () => {
     expect(resumedAgentId(bridge)).toBe("exec");
   });
 
+  const pressShiftR = () =>
+    act(async () => {
+      fireEvent.keyDown(window, { key: "R", shiftKey: true });
+      await Promise.resolve();
+    });
+
+  // #5111: the retry barrier's Retry has the shared Shift+R shortcut, as on desktop.
+  test("Shift+R retries a failed turn from the retry barrier", async () => {
+    const bridge = new TestBridge();
+    render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, failedTurn("network"));
+
+    await pressShiftR();
+    expect(bridge.orpcCalls("workspace.resumeStream")).toHaveLength(1);
+    expect(bridge.orpcCalls("workspace.setAutoRetryEnabled")).toHaveLength(0);
+  });
+
+  // #5116: a forced catch-up (replay buffer overflow) shows a partial transcript whose tail may not
+  // be the backend's latest turn, so neither Retry nor resume is offered, by click or by Shift+R.
+  const overflowingHistory = (count: number) =>
+    Array.from({ length: count }, (_, index) => userRow(`filler-${index}`, index + 1));
+
+  test("a partial transcript after a forced catch-up offers no Retry", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [
+      ...overflowingHistory(500),
+      {
+        type: "message",
+        id: "a-failed",
+        role: "assistant",
+        parts: [],
+        metadata: {
+          historySequence: 501,
+          timestamp: 501,
+          error: "provider exploded",
+          errorType: "network",
+        },
+      },
+    ]);
+
+    expect(view.container.textContent).toContain("did not finish loading");
+    expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
+    await pressShiftR();
+    expect(bridge.orpcCalls("workspace.resumeStream")).toHaveLength(0);
+  });
+
+  test("a partial transcript after a forced catch-up offers no interrupted-divider resume", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, overflowingHistory(501));
+    await chatEvent(bridge, {
+      type: "stream-start",
+      workspaceId: WORKSPACE.id,
+      messageId: "a1",
+      model: "anthropic:claude-sonnet-4-5",
+      historySequence: 502,
+      startTime: 502,
+    });
+    await chatEvent(bridge, {
+      type: "stream-delta",
+      workspaceId: WORKSPACE.id,
+      messageId: "a1",
+      delta: "Half an answer",
+      tokens: 3,
+      timestamp: 503,
+    });
+    await chatEvent(bridge, {
+      type: "stream-abort",
+      workspaceId: WORKSPACE.id,
+      messageId: "a1",
+      abortReason: "user",
+    });
+
+    expect(view.container.textContent).toContain("did not finish loading");
+    expect(view.container.textContent).toContain("Half an answer");
+    expect(view.queryByRole("button", { name: "Continue interrupted response" })).toBeNull();
+    await pressShiftR();
+    expect(bridge.orpcCalls("workspace.resumeStream")).toHaveLength(0);
+  });
+});
+
+describe("vscode webview sub-agent tasks strip (#5109)", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  const parent: UiWorkspace = { ...WORKSPACE, id: "ws-parent", workspaceName: "parent" };
+  const child = (task: UiWorkspace["task"]): UiWorkspace => ({
+    ...WORKSPACE,
+    id: "ws-child",
+    workspaceName: "Explorer",
+    ai: { parentWorkspaceId: parent.id },
+    task,
+  });
+  const idle = { activeBashMonitorCount: 0, streaming: false, activeWorkflowRunIds: [] };
+  const strip = (view: ReturnType<typeof render>) =>
+    view.container.querySelector('[data-component="SubAgentTasksDecoration"]');
+
+  test("follows the host's live list and activity, and a row selects the sub-agent", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], parent);
+    expect(strip(view)).toBeNull();
+
+    await bridge.emit({ type: "workspaces", workspaces: [parent, child({ taskStatus: "running" })] });
+    expect(strip(view)?.textContent).toContain("1 sub-agent · 1 active");
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: /1 sub-agent/ }));
+      await Promise.resolve();
+    });
+    fireEvent.click(view.getByRole("button", { name: /Explorer/ }));
+    expect(bridge.sent.at(-1)).toEqual({ type: "selectWorkspace", workspaceId: "ws-child" });
+
+    // The host re-posts the list when the task reports; an armed monitor keeps it active.
+    await bridge.emit({ type: "workspaces", workspaces: [parent, child({ taskStatus: "reported" })] });
+    expect(strip(view)?.textContent).toContain("1 sub-agent · inactive");
+    const activity = { [parent.id]: idle, "ws-child": { ...idle, activeBashMonitorCount: 1 } };
+    await bridge.emit({ type: "workspaceActivity", workspaceId: parent.id, activity });
+    expect(strip(view)?.textContent).toContain("1 sub-agent · 1 active");
+    expect(view.getByRole("button", { name: /Explorer/ }).textContent).toContain("Monitoring");
+
+    // Removed or archived descendants leave the strip.
+    const archived = child({ taskStatus: "reported", archivedAt: "2026-10-04T00:00:00.000Z" });
+    await bridge.emit({ type: "workspaces", workspaces: [parent, archived] });
+    expect(strip(view)).toBeNull();
+  });
+
+  test("a workflow run between workers still shows as running", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], parent);
+    const activity = { [parent.id]: { ...idle, activeWorkflowRunIds: ["wfr_abcdef123456"] } };
+    await bridge.emit({ type: "workspaceActivity", workspaceId: parent.id, activity });
+    expect(strip(view)?.textContent).toContain("running");
+  });
 });
 
 describe("vscode webview background processes strip (#5092)", () => {
@@ -2521,6 +2793,170 @@ describe("vscode webview background processes strip (#5092)", () => {
     ).toEqual([{ workspaceId: workspaceA.id, processId: "bash-1" }]);
     // Re-renders (history caught up, expanding, terminating) keep the one backend stream.
     expect(bridge.orpcCalls("workspace.backgroundBashes.subscribe")).toHaveLength(1);
+  });
+
+  // The strip's keyboard shortcuts live in the shared banner, so desktop gets the same ones (#5197).
+  const press = async (target: Element, init: KeyboardEventInit): Promise<boolean> => {
+    let notPrevented = true;
+    await act(async () => {
+      notPrevented = fireEvent.keyDown(target, init);
+      await Promise.resolve();
+    });
+    return notPrevented;
+  };
+  const FOCUS_STRIP = { key: "J", ctrlKey: true, shiftKey: true };
+  const stripRows = (view: ReturnType<typeof render>) =>
+    Array.from(view.container.querySelectorAll<HTMLElement>("[data-process-row]"));
+  const focusComposerWithProcesses = async (workspace: UiWorkspace) => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], workspace);
+    await emitBackgroundBashes(bridge, workspace.id, [
+      runningProcess,
+      { ...runningProcess, id: "bash-2", pid: 4343, script: "sleep 700" },
+    ]);
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("the composer is not rendered");
+    textarea.focus();
+    return { bridge, view, textarea };
+  };
+
+  test("the shortcut focuses the strip; arrows move, Backspace terminates, Escape returns focus (#5197)", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys", workspaceName: "bash-keys" };
+    const { bridge, view, textarea } = await focusComposerWithProcesses(workspace);
+    expect(stripRows(view)).toHaveLength(0);
+
+    expect(await press(textarea, FOCUS_STRIP)).toBe(false);
+    const rows = stripRows(view);
+    expect(rows).toHaveLength(2);
+    expect(document.activeElement).toBe(rows[0]);
+
+    await press(rows[0], { key: "ArrowDown" });
+    expect(document.activeElement).toBe(rows[1]);
+    await press(rows[1], { key: "ArrowDown" });
+    expect(document.activeElement).toBe(rows[1]);
+    await press(rows[1], { key: "ArrowUp" });
+    expect(document.activeElement).toBe(rows[0]);
+    await press(rows[0], { key: "ArrowDown" });
+    await press(rows[1], { key: "Backspace" });
+    await settle();
+    expect(
+      bridge.orpcCalls("workspace.backgroundBashes.terminate").map((call) => call.input)
+    ).toEqual([{ workspaceId: workspace.id, processId: "bash-2" }]);
+
+    // Once the terminated process leaves the list, focus moves to the remaining row.
+    await emitBackgroundBashes(bridge, workspace.id, [runningProcess]);
+    const remaining = stripRows(view);
+    expect(remaining).toHaveLength(1);
+    expect(document.activeElement).toBe(remaining[0]);
+
+    await press(remaining[0], { key: "Escape" });
+    expect(stripRows(view)).toHaveLength(0);
+    expect(document.activeElement).toBe(textarea);
+  });
+
+  test("Enter on a focused row opens its output (#5197)", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys-output", workspaceName: "bash-keys-output" };
+    const { bridge, view, textarea } = await focusComposerWithProcesses(workspace);
+    await press(textarea, FOCUS_STRIP);
+    await press(stripRows(view)[0], { key: "Enter" });
+    await settle();
+    expect(getOutputCalls(bridge).map((call) => call.input)).toEqual([
+      { workspaceId: workspace.id, processId: "bash-1", tailBytes: 64_000 },
+    ]);
+
+    // The dialog has no trigger to return focus to; closing it refocuses the row.
+    const closeDialog = async () => {
+      const close = Array.from(
+        document.body.querySelectorAll<HTMLElement>('[role="dialog"] button')
+      ).find((button) => button.textContent === "Close");
+      if (!close) throw new Error("the output dialog has no close button");
+      await click(close);
+      await settle();
+      expect(document.body.querySelector('[role="dialog"]')).toBeNull();
+    };
+    await closeDialog();
+    expect(document.activeElement).toBe(stripRows(view)[0]);
+
+    // When the row's process leaves the list while the dialog is open, a neighbor takes focus.
+    await press(stripRows(view)[0], { key: "ArrowDown" });
+    await press(stripRows(view)[1], { key: "Enter" });
+    await emitBackgroundBashes(bridge, workspace.id, [runningProcess]);
+    await closeDialog();
+    expect(document.activeElement).toBe(stripRows(view)[0]);
+  });
+
+  test("focus moves to a neighbor when the focused process exits on its own (#5197)", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys-exit", workspaceName: "bash-keys-exit" };
+    const { bridge, view, textarea } = await focusComposerWithProcesses(workspace);
+    await press(textarea, FOCUS_STRIP);
+    await press(stripRows(view)[0], { key: "ArrowDown" });
+    expect(document.activeElement).toBe(stripRows(view)[1]);
+
+    await emitBackgroundBashes(bridge, workspace.id, [runningProcess]);
+    const remaining = stripRows(view);
+    expect(remaining).toHaveLength(1);
+    expect(document.activeElement).toBe(remaining[0]);
+  });
+
+  test("opened without a focus origin (command palette), Escape leaves focus on the strip toggle (#5197)", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys-palette", workspaceName: "bash-keys-palette" };
+    const { view, textarea } = await focusComposerWithProcesses(workspace);
+    textarea.blur();
+    const request = createCustomEvent(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, {
+      workspaceId: workspace.id,
+      handled: false,
+    });
+    await act(async () => {
+      window.dispatchEvent(request);
+      await Promise.resolve();
+    });
+    expect(request.detail.handled).toBe(true);
+    expect(document.activeElement).toBe(stripRows(view)[0]);
+
+    await press(stripRows(view)[0], { key: "Escape" });
+    expect(stripRows(view)).toHaveLength(0);
+    expect(document.activeElement).toBe(view.getByRole("button", { name: /2 background bashes/ }));
+  });
+
+  test("the shortcut is ignored inside the command palette or an inert pane (#5197)", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys-cmdk", workspaceName: "bash-keys-cmdk" };
+    const { view } = await focusComposerWithProcesses(workspace);
+    const palette = document.createElement("div");
+    palette.setAttribute("cmdk-root", "");
+    const input = document.createElement("input");
+    palette.appendChild(input);
+    document.body.appendChild(palette);
+    try {
+      input.focus();
+      expect(await press(input, FOCUS_STRIP)).toBe(true);
+      expect(stripRows(view)).toHaveLength(0);
+      expect(document.activeElement).toBe(input);
+    } finally {
+      palette.remove();
+    }
+    // Nor from the terminal, which owns its keystrokes.
+    const terminal = document.createElement("textarea");
+    terminal.setAttribute("data-terminal-container", "");
+    view.container.appendChild(terminal);
+    expect(await press(terminal, FOCUS_STRIP)).toBe(true);
+    // Nor while the chat pane is inert (desktop's immersive review keeps it mounted).
+    view.container.setAttribute("inert", "");
+    expect(await press(document.body, FOCUS_STRIP)).toBe(true);
+    expect(stripRows(view)).toHaveLength(0);
+  });
+
+  test("the shortcut is not consumed when there are no processes (#5197)", async () => {
+    const workspace: UiWorkspace = { ...WORKSPACE, id: "ws-bash-keys-idle", workspaceName: "bash-keys-idle" };
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [], workspace);
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("the composer is not rendered");
+    textarea.focus();
+    // Not prevented, so the key keeps its default meaning for the host.
+    expect(await press(textarea, FOCUS_STRIP)).toBe(true);
+    expect(stripRows(view)).toHaveLength(0);
   });
 
   const getOutputCalls = (bridge: TestBridge) =>

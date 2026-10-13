@@ -559,6 +559,18 @@ describe("ProviderService.getConfig", () => {
       expect(service.getConfig().coder.coderOauthCredentialStored).toBe(false);
     });
   });
+
+  it("exposes Coder canonicalRoutes limited to known origins with instance names", () => {
+    withTempConfig((config, service) => {
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        coder: {
+          deploymentUrl: "https://coder.example.com",
+          canonicalRoutes: { anthropic: "x", bogus: "y", google: "" },
+        },
+      });
+      expect(service.getConfig().coder.canonicalRoutes).toEqual({ anthropic: "x" });
+    });
+  });
 });
 
 describe("ProviderService model normalization", () => {
@@ -1262,7 +1274,6 @@ describe("ProviderService custom provider mutations", () => {
                 modelString: `${provider}:agent-model`,
                 thinkingLevel: "high",
                 enabled: false,
-                advisorEnabled: true,
               },
               plan: { modelString: "openai:gpt-5", thinkingLevel: "medium" },
               review: {
@@ -1309,7 +1320,6 @@ describe("ProviderService custom provider mutations", () => {
       expect(appConfig.agentAiDefaults?.exec).toEqual({
         thinkingLevel: "high",
         enabled: false,
-        advisorEnabled: true,
       });
       expect(appConfig.agentAiDefaults?.plan).toEqual({
         modelString: "openai:gpt-5",

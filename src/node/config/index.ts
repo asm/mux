@@ -6,6 +6,7 @@ import { EventEmitter } from "events";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { isTaskAttemptId } from "@/node/utils/taskAttemptId";
 import { Effect, Semaphore } from "effect";
+import { ORPCError } from "@orpc/server";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
 import { EXPERIMENT_OVERRIDES_FILE_NAME } from "@/node/services/experimentsService";
@@ -41,7 +42,12 @@ import {
   normalizeAutoModelRoutingConfig,
   type AutoModelRoutingConfigInput,
 } from "@/common/types/autoModelRouting";
-import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
+import {
+  normalizeUserPreferences,
+  UserPreferencesSchema,
+  type UserPreferences,
+} from "@/common/config/schemas/userPreferences";
+import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { SettingsBackupSchema } from "@/common/config/schemas/settingsBackup";
 import {
   isLayoutPresetsConfigEmpty,
@@ -80,6 +86,7 @@ import {
 } from "@/common/config/worktreeArchiveBehavior";
 import { PlatformPaths } from "@/common/utils/paths";
 import { sharesPlanDirectory } from "@/common/utils/planStorage";
+import { stableStringify } from "@/common/utils/stableStringify";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import {
   DelegatedCreationMarkSchema,
@@ -112,24 +119,32 @@ import { isProviderAutoRouteEligible } from "@/node/utils/providerRequirements";
 import { getContainerName as getDockerContainerName } from "@/node/runtime/DockerRuntime";
 import { deriveProjectHierarchy } from "@/common/utils/subProjects";
 import { deriveSharedTaskCheckouts } from "./sharedTaskCheckouts";
+import { loadOrCreateInstallationId } from "./installationIdentity";
 import {
   decodeCyberReasoningModesFromDisk,
   encodeCyberReasoningModesForDisk,
+  hasCyberReasoningMode,
 } from "./cyberReasoningModeDisk";
 import {
   type ProjectRegistrationLockHandle,
   tryProjectRegistrationFileLock,
   withProjectRegistrationFileLock,
 } from "@/node/config/projectRegistrationLock";
-import {
-  coerceOpenAIReasoningMode,
-  coerceThinkingLevel,
-  type OpenAIReasoningMode,
-  type ThinkingLevel,
-} from "@/common/types/thinking";
+import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
 
 // Re-export project/provider types from dedicated schema/types files (for preload usage)
 export type { Workspace, ProjectConfig, ProjectsConfig, ProviderConfig };
+
+// Retired advisor settings are inert downgrade data, never part of the current API
+// or agent defaults. Carry them with each snapshot so unrelated saves cannot erase
+// them, and a later disk reload can replace or remove them without stale side caches.
+type LegacyAdvisorProjectsConfig = ProjectsConfig & {
+  legacyAdvisorSettings?: {
+    root: Record<string, unknown>;
+    agentEnabled: Record<string, unknown>;
+  };
+};
+
 export { FileLeaseManager } from "./fileLeaseManager";
 export { ProvidersConfigStore, type ProvidersConfig } from "./providersConfigStore";
 export { SecretsStore } from "./secretsStore";
@@ -644,22 +659,6 @@ function parseOptionalPort(value: unknown): number | undefined {
   return value;
 }
 
-function parseOptionalPositiveInteger(value: unknown): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
-    return undefined;
-  }
-
-  if (value <= 0) {
-    return undefined;
-  }
-
-  return value;
-}
-
-function parseOptionalThinkingLevel(value: unknown): ThinkingLevel | undefined {
-  return coerceThinkingLevel(value);
-}
-
 function parseOptionalHeartbeatIntervalMs(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
     return undefined;
@@ -749,6 +748,33 @@ function delegatedCreationInterruptedField(workspace: Workspace): {
     : {};
 }
 
+/** The notify map gains an entry per auto-notified workspace, so entries of removed ones go. */
+function dropRemovedWorkspaceNotifications(
+  preferences: UserPreferences | undefined,
+  projects: Map<string, ProjectConfig>
+): UserPreferences | undefined {
+  const notifyByWorkspace = preferences?.notifications?.notifyOnResponseByWorkspace;
+  if (!notifyByWorkspace) {
+    return preferences;
+  }
+  const workspaces = [...projects.values()].flatMap((project) => project.workspaces);
+  // A legacy id-less row resolves its ID only after this load; a later load prunes once the ID
+  // migration has persisted it.
+  if (workspaces.some((workspace) => !workspace.id)) {
+    return preferences;
+  }
+  const workspaceIds = new Set(workspaces.map((workspace) => workspace.id));
+  return normalizeUserPreferences({
+    ...preferences,
+    notifications: {
+      ...preferences.notifications,
+      notifyOnResponseByWorkspace: Object.fromEntries(
+        Object.entries(notifyByWorkspace).filter(([workspaceId]) => workspaceIds.has(workspaceId))
+      ),
+    },
+  });
+}
+
 function normalizePersistedWorkspace(
   workspace: ProjectConfig["workspaces"][number]
 ): ProjectConfig["workspaces"][number] {
@@ -758,21 +784,8 @@ function normalizePersistedWorkspace(
     };
   const hasLegacyWorkflowSchedule = Object.hasOwn(persisted, "workflowSchedule");
   const hasBestOf = Object.hasOwn(persisted, "bestOf");
-  // Legacy alias: tasks stamped by builds where "PTC Exclusive Mode" was a
-  // separate experiment may carry only programmaticToolCallingExclusive. The
-  // merged PTC experiment activates exactly that posture, so resumed tasks
-  // must read it as programmaticToolCalling (`true` wins over an explicit
-  // false, matching the schema preprocess and backend feature-flag alias).
-  // This is the runtime path: loadConfigOrDefault does not parse workspaces
-  // through WorkspaceConfigSchema, so the schema-level alias alone never runs
-  // here. The legacy key is retained for downgrade compatibility.
-  const taskExperiments =
-    typeof persisted.taskExperiments === "object" && persisted.taskExperiments !== null
-      ? (persisted.taskExperiments as Record<string, unknown>)
-      : undefined;
-  const hasLegacyPtcExclusive =
-    taskExperiments?.programmaticToolCallingExclusive === true &&
-    taskExperiments.programmaticToolCalling !== true;
+  // Children read experiments from ExperimentsService; a spawn-time snapshot must not linger.
+  const hasLegacyTaskExperiments = Object.hasOwn(persisted, "taskExperiments");
   const hasMalformedTaskAttemptId =
     persisted.taskAttemptId !== undefined && !isTaskAttemptId(persisted.taskAttemptId);
   // A malformed removal marker (hand edit, corruption) is dropped rather than kept: every task
@@ -790,6 +803,10 @@ function normalizePersistedWorkspace(
   const hasMalformedConsentPending =
     Object.hasOwn(persisted, "unrelatedWorkspaceConsentPending") &&
     persisted.unrelatedWorkspaceConsentPending !== true;
+  // The migration flag is monotone: any other value (hand edit, corruption) reads as migrated,
+  // which can only hide a legacy plan Xum never deletes, never bring back a cleared one (#5174).
+  const hasMalformedRemotePlanMigrated =
+    Object.hasOwn(persisted, "remotePlanMigrated") && persisted.remotePlanMigrated !== true;
   // A malformed delegated-creation mark reads as absent: the startup resolver then leaves the row
   // alone, as it does every row without the creator's mark (#4983).
   const hasMalformedDelegatedCreation =
@@ -807,11 +824,12 @@ function normalizePersistedWorkspace(
   if (
     !hasLegacyWorkflowSchedule &&
     !hasBestOf &&
-    !hasLegacyPtcExclusive &&
+    !hasLegacyTaskExperiments &&
     !hasMalformedTaskAttemptId &&
     !hasMalformedPendingRemoval &&
     !hasMalformedPendingArchive &&
     !hasMalformedConsentPending &&
+    !hasMalformedRemotePlanMigrated &&
     !hasMalformedDelegatedCreation &&
     !hasMalformedReservationTombstones
   ) {
@@ -820,10 +838,12 @@ function normalizePersistedWorkspace(
 
   const nextWorkspace = { ...persisted };
   delete nextWorkspace.workflowSchedule;
+  delete nextWorkspace.taskExperiments;
   if (hasMalformedPendingRemoval) delete nextWorkspace.pendingRemoval;
   if (hasMalformedPendingArchive) delete nextWorkspace.pendingArchive;
   if (hasMalformedTaskAttemptId) healMalformedTaskAttemptId(nextWorkspace);
   if (hasMalformedConsentPending) delete nextWorkspace.unrelatedWorkspaceConsentPending;
+  if (hasMalformedRemotePlanMigrated) nextWorkspace.remotePlanMigrated = true;
   if (hasMalformedDelegatedCreation) delete nextWorkspace.delegatedCreation;
   if (hasMalformedReservationTombstones) {
     const ids = Array.isArray(reservationTombstones)
@@ -831,15 +851,6 @@ function normalizePersistedWorkspace(
       : [];
     if (ids.length > 0) nextWorkspace.taskReservationTombstones = ids;
     else delete nextWorkspace.taskReservationTombstones;
-  }
-
-  if (hasLegacyPtcExclusive) {
-    // Spreading the typed field copies ALL persisted keys at runtime —
-    // including the legacy one, which stays for downgrade compatibility.
-    nextWorkspace.taskExperiments = {
-      ...persisted.taskExperiments,
-      programmaticToolCalling: true,
-    };
   }
 
   if (hasBestOf) {
@@ -925,6 +936,98 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
 
   return next;
 }
+
+interface StoredProjectEntry {
+  /** The key exactly as config.json stores it. */
+  storedKey: string;
+  /** The normalized project path the loader uses as the map key. */
+  key: string;
+  config: ProjectConfig;
+}
+
+/**
+ * Merge one group of aliases (stored keys that normalize to the same path), or return null when
+ * a merge would have to choose between two different rows with the same id. Rows with distinct
+ * ids are combined, and a duplicate row is kept once. Rows are compared with their properties in
+ * sorted order: the same row written with another property order is a duplicate, not a conflict
+ * that would drop the earlier aliases' rows (#5929). Project settings come from
+ * the last entry, as the previous `new Map(pairs)` loader did: a setting only an earlier alias
+ * holds may be one the user cleared since. The project is trusted only when every alias was:
+ * the canonical spelling says nothing about which alias the user trusted.
+ */
+function mergeProjectAliases(group: StoredProjectEntry[]): ProjectConfig | null {
+  const workspaces: ProjectConfig["workspaces"] = [];
+  const rowJsonById = new Map<string, string>();
+  // Legacy rows without an id: an identical copy in two aliases is one workspace. Keeping
+  // both would let the id migration give both copies the same stable id.
+  const idlessRowJson = new Set<string>();
+  for (const { config } of group) {
+    if (!Array.isArray(config.workspaces)) return null;
+    for (const workspace of config.workspaces) {
+      const json = stableStringify(workspace);
+      if (!workspace.id) {
+        if (!idlessRowJson.has(json)) workspaces.push(workspace);
+        idlessRowJson.add(json);
+        continue;
+      }
+      const seenJson = rowJsonById.get(workspace.id);
+      if (seenJson === undefined) {
+        rowJsonById.set(workspace.id, json);
+        workspaces.push(workspace);
+      } else if (seenJson !== json) {
+        return null;
+      }
+    }
+  }
+  const merged: ProjectConfig = { ...group[group.length - 1].config, workspaces };
+  delete merged.trusted;
+  if (group.every(({ config }) => config.trusted === true)) {
+    merged.trusted = true;
+  } else if (group.some(({ config }) => config.trusted !== undefined)) {
+    merged.trusted = false;
+  }
+  return merged;
+}
+
+/**
+ * Build the project map from the loaded entries. Stored keys that normalize to the same path
+ * ("/repo" and "/repo/") are aliases of one project. `new Map(pairs)` used to keep only the last
+ * alias, so the next save dropped the other aliases' workspace rows. Group every alias first,
+ * then merge the group's rows. A group with two different rows under one id still keeps only
+ * its last entry, as before (#5929).
+ */
+function buildProjectsFromStoredEntries(entries: StoredProjectEntry[]): Map<string, ProjectConfig> {
+  const groups = new Map<string, StoredProjectEntry[]>();
+  for (const entry of entries) {
+    const group = groups.get(entry.key);
+    if (group) group.push(entry);
+    else groups.set(entry.key, [entry]);
+  }
+  const projects = new Map<string, ProjectConfig>();
+  for (const [key, group] of groups) {
+    if (group.length === 1) {
+      projects.set(key, group[0].config);
+      continue;
+    }
+    const storedKeys = group.map((entry) => entry.storedKey);
+    const merged = mergeProjectAliases(group);
+    if (merged) {
+      log.warn("Merged project config entries with the same path", { path: key, storedKeys });
+      projects.set(key, merged);
+      continue;
+    }
+    // Conflicting aliases keep main's behavior (`new Map(pairs)`): the last entry wins, at the
+    // position of the first. Keeping every conflicting entry under its own key broke trust and
+    // project mutators, which look up the stripped path; a lossless design is #5929.
+    log.error("Project config entries share a path but conflict; keeping the last entry", {
+      path: key,
+      storedKeys,
+    });
+    projects.set(key, group[group.length - 1].config);
+  }
+  return projects;
+}
+
 /**
  * The built-in Chat with Mux workspace (removed in #3123) lived in a hidden
  * `<xumHome>/system/Mux` project. Real upgraded installs still carry that
@@ -1022,6 +1125,10 @@ interface ConfigLoadFailureState {
    * the most recent failed load (re-checked every failed load, never trusted across loads).
    */
   backupSignature: string | null;
+  /** True when no bytes could be read (EACCES, EISDIR, ...), as opposed to bytes that failed to parse. */
+  unreadable: boolean;
+  /** Error from the most recent failed load, reported by getConfigLoadError (#5757). */
+  errorMessage: string;
 }
 
 // Process-scoped, keyed by config file path: production creates short-lived Config
@@ -1037,7 +1144,7 @@ export function configFilePath(rootDir: string): string {
 function configLoadFailureState(configFile: string): ConfigLoadFailureState {
   let state = configLoadFailureStates.get(configFile);
   if (!state) {
-    state = { failureSignature: null, backupSignature: null };
+    state = { failureSignature: null, backupSignature: null, unreadable: false, errorMessage: "" };
     configLoadFailureStates.set(configFile, state);
   }
   return state;
@@ -1049,15 +1156,6 @@ function configLoadFailureState(configFile: string): ConfigLoadFailureState {
  * Encapsulates all config paths and operations, making them dependency-injectable
  * and testable. Pass a custom rootDir for tests to avoid polluting ~/.xum
  */
-
-function normalizeAdvisorPositiveInteger(value: number | null, label: string): number | null {
-  if (value == null) {
-    return null;
-  }
-  assert(Number.isInteger(value), `${label} must be an integer`);
-  assert(value > 0, `${label} must be positive`);
-  return value;
-}
 
 /**
  * What an edit already holds of the project registration lock when it enters the queue:
@@ -1113,19 +1211,31 @@ function projectNameOfEntry(
 }
 
 /**
- * Registered rows that keep their plans in `target`'s plan directory: plans/<projectName>/ on shared
- * plan storage, which same-basename projects share (#5139). A name such a row uses is taken for
- * `target`: its plan file is the same file. Rows default their runtime like the metadata the
- * removal's plan guard reads.
+ * The project path a row's metadata reports (getAllWorkspaceMetadata): its first project for a
+ * multi-project row, which is stored under _multi.
+ */
+function projectPathOfEntry(
+  configProjectPath: string,
+  workspace: Pick<Workspace, "kind" | "path" | "projects">
+): string {
+  if (workspace.kind === "scratch") return workspace.path;
+  return workspace.projects?.[0]?.projectPath ?? configProjectPath;
+}
+
+/**
+ * Registered rows that keep their plans in `target`'s plan directory (sharesPlanDirectory): a
+ * name such a row uses is taken for `target`, since its plan file is the same file. Rows default
+ * their runtime like the metadata the removal's plan guard reads.
  */
 export function* workspacesSharingPlanDirectory(
   projects: ProjectsConfig["projects"],
-  target: { projectName: string; runtimeConfig: RuntimeConfig }
+  target: { projectName: string; projectPath: string; runtimeConfig: RuntimeConfig }
 ): Generator<{ projectPath: string; workspace: Workspace }> {
   for (const [projectPath, project] of projects) {
     for (const workspace of project.workspaces) {
       const row = {
         projectName: projectNameOfEntry(projectPath, workspace),
+        projectPath: projectPathOfEntry(projectPath, workspace),
         runtimeConfig: workspace.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG,
       };
       if (sharesPlanDirectory(row, target)) yield { projectPath, workspace };
@@ -1376,6 +1486,7 @@ export class Config {
 
   private handleConfigLoadFailure(rawBytes: Buffer | undefined, error: unknown): void {
     const state = configLoadFailureState(this.configFile);
+    this.observedLoadFailure = state;
     const errorMessage = error instanceof Error ? error.message : String(error);
     // Backup confirmation is keyed on content alone: the same corrupt bytes need only one
     // sidecar regardless of which error message they produced.
@@ -1459,6 +1570,8 @@ export class Config {
     // Until a sidecar is confirmed for these exact bytes, enqueueConfigEdit refuses to
     // overwrite the corrupt source.
     state.backupSignature = backupConfirmed ? contentSignature : null;
+    state.unreadable = rawBytes === undefined;
+    state.errorMessage = errorMessage;
 
     // Dedupe on content + error + actionable backup detail: repeated loads of the same
     // state stay silent, while any change in remediation (backup gained or lost, sidecar
@@ -1603,6 +1716,8 @@ export class Config {
     return { ids, hasWorkspaceEntriesWithoutIds };
   }
 
+  /** Failure state this instance's last failed load wrote; see getConfigLoadError. */
+  private observedLoadFailure: ConfigLoadFailureState | undefined;
   private configSnapshot?: {
     key: string;
     config: ProjectsConfig;
@@ -1617,7 +1732,7 @@ export class Config {
    * workspace; with thousands of archived entries a heap walk found ten
    * live copies of the same list. Snapshot identity is the natural change
    * signal: loadConfigOrDefault hands out the same object until config.json's
-   * stat key changes, and saveConfig drops the snapshot, so both this
+   * stat key changes, and saveConfig keeps no snapshot of the replaced file, so both this
    * process's edits and other backends' rewrites invalidate the memo. The
    * WeakMap lets a superseded snapshot's memo die with it.
    */
@@ -1638,6 +1753,12 @@ export class Config {
     project: ProjectConfig;
     workspace: Workspace;
   }> = [];
+  /**
+   * The indexed snapshot holds an id-less row or a "" project key. The full build resolves
+   * id-less rows through session files and skips "" keys, so its first row with an id can differ
+   * from the index entry; findWorkspaceMetadata then runs the full build (#5727 F1b).
+   */
+  private workspaceIndexNeedsFullBuild = false;
 
   private configStatKey(stat: fs.Stats): string {
     return [stat.ino, stat.mtimeMs, stat.size].join(":");
@@ -1660,11 +1781,18 @@ export class Config {
     return this.readConfigOrDefault(options, key);
   }
 
-  private readConfigOrDefault(options?: { throwOnError?: boolean }, key?: string): ProjectsConfig {
+  private readConfigOrDefault(
+    options?: { throwOnError?: boolean; keepSnapshot?: boolean },
+    key?: string
+  ): ProjectsConfig {
     // Read as a Buffer and hand the same snapshot to the failure handler: backing up via a
     // second read could preserve a concurrent writer's replacement instead of the bytes that
     // actually failed parsing.
     let rawBytes: Buffer | undefined;
+    // An edit's fresh read stores nothing, so the snapshot of the unchanged file stays valid
+    // for readers until the save's rename; dropping it made every reader during the edit parse
+    // the same bytes again. It is still key-guarded: a miss as soon as the file changes.
+    const kept = options?.keepSnapshot ? this.configSnapshot : undefined;
     this.configSnapshot = undefined;
     try {
       try {
@@ -1699,6 +1827,11 @@ export class Config {
             config,
             writeId: typeof parsed.writeId === "string" ? parsed.writeId : "-",
           };
+        } else if (cacheable && kept !== undefined) {
+          // Give it back only after a successful, cacheable read. A failed read leaves it
+          // cleared: otherwise later gate loads would hit it and never retry the read that
+          // clears a recorded load failure, refusing every edit until a restart.
+          this.configSnapshot = kept;
         }
         configLoadFailureStates.delete(this.configFile);
         return config;
@@ -1756,8 +1889,10 @@ export class Config {
         }
         const projectKey: unknown = pair[0];
         // The lenient normalization below silently drops the WHOLE
-        // project when its key is empty or non-string ("Filtering out
-        // project with invalid path"), and an id-less legacy workspace
+        // project when its key is non-string ("Filtering out project with
+        // invalid path"). An empty key now loads as "/" there (#5917), but
+        // strict mode keeps failing closed on it until a save rewrites the
+        // key; an id-less legacy workspace
         // inside it is raw-invisible too (its stable id lives only in
         // session metadata.json, which only the normalized enumeration
         // resolves). Accepting the pair here would hand destructive
@@ -1829,27 +1964,30 @@ export class Config {
         this.legacyTaskVariantGroups.delete(workspaceId);
       }
     }
-    const normalizedPairs = rawPairs
+    const storedEntries = rawPairs
       .filter(([projectPath]) => {
-        if (!projectPath || typeof projectPath !== "string") {
+        // "" is accepted: earlier saves wrote the root project "/" as "" (#5917). It loads as
+        // "/" below instead of dropping the project and its workspace rows.
+        if (typeof projectPath !== "string") {
           log.warn("Filtering out project with invalid path", { projectPath });
           return false;
         }
         return true;
       })
-      .map(([projectPath, projectConfig]) => {
+      .map(([storedProjectPath, projectConfig]) => {
+        const projectPath = storedProjectPath === "" ? "/" : storedProjectPath;
         if (Array.isArray(projectConfig?.workspaces)) {
           for (const workspace of projectConfig.workspaces) {
             this.rememberLegacyTaskVariantWorkspace(projectPath, workspace);
           }
         }
-        const normalizedProjectConfig = normalizeProjectRuntimeSettings(projectConfig);
-        return [stripTrailingSlashes(projectPath), normalizedProjectConfig] as [
-          string,
-          ProjectConfig,
-        ];
+        return {
+          storedKey: storedProjectPath,
+          key: stripTrailingSlashes(projectPath),
+          config: normalizeProjectRuntimeSettings(projectConfig),
+        };
       });
-    return new Map(normalizedPairs);
+    return buildProjectsFromStoredEntries(storedEntries);
   }
 
   private normalizeParsedConfig(
@@ -2138,17 +2276,6 @@ export class Config {
         : normalizeAutoModelRoutingConfig(parsed.autoModelRouting);
 
     const defaultModel = normalizeOptionalModelString(parsed.defaultModel);
-    const advisorModelString = parseOptionalNonEmptyString(parsed.advisorModelString);
-    const advisorThinkingLevel = parseOptionalThinkingLevel(parsed.advisorThinkingLevel);
-    const advisorReasoningMode = coerceOpenAIReasoningMode(parsed.advisorReasoningMode);
-    const advisorMaxUsesPerTurn =
-      parsed.advisorMaxUsesPerTurn === null
-        ? null
-        : parseOptionalPositiveInteger(parsed.advisorMaxUsesPerTurn);
-    const advisorMaxOutputTokens =
-      parsed.advisorMaxOutputTokens === null
-        ? null
-        : parseOptionalPositiveInteger(parsed.advisorMaxOutputTokens);
     const hiddenMigrations = normalizeConfigMigrations(parsed.migrations);
     const existingHiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
     if (existingHiddenModels === undefined && hiddenMigrations.hiddenModelsInitialized === true) {
@@ -2228,18 +2355,18 @@ export class Config {
     const runtimeEnablement = normalizeRuntimeEnablementOverrides(parsed.runtimeEnablement);
     const defaultRuntime = normalizeRuntimeEnablementId(parsed.defaultRuntime);
 
-    const userPreferences = normalizeUserPreferences(parsed.userPreferences);
+    const userPreferences = dropRemovedWorkspaceNotifications(
+      normalizeUserPreferences(parsed.userPreferences),
+      projectsMap
+    );
     const migrations = normalizeConfigMigrations(parsed.migrations);
-    if (parsed.userPreferences !== undefined) {
-      migrations.userPreferencesInitialized = true;
-    }
 
     const layoutPresetsRaw = normalizeLayoutPresetsConfig(parsed.layoutPresets);
     const layoutPresets = isLayoutPresetsConfigEmpty(layoutPresetsRaw)
       ? undefined
       : layoutPresetsRaw;
 
-    return {
+    const config: LegacyAdvisorProjectsConfig = {
       projects: projectsMap,
       apiServerBindHost: parseOptionalNonEmptyString(parsed.apiServerBindHost),
       apiServerServeWebUi: parseOptionalBoolean(parsed.apiServerServeWebUi) ? true : undefined,
@@ -2260,6 +2387,7 @@ export class Config {
       skillModelClasses,
       keepScreenAwake: parseOptionalBoolean(parsed.keepScreenAwake),
       toolSearchEnabled: parseOptionalBoolean(parsed.toolSearchEnabled),
+      bashAiProxyEnabled: parseOptionalBoolean(parsed.bashAiProxyEnabled),
       agentHeartbeatsEnabled: parseOptionalBoolean(parsed.agentHeartbeatsEnabled),
       heartbeatDefaultPrompt: parseOptionalNonEmptyString(parsed.heartbeatDefaultPrompt),
       heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs(
@@ -2274,11 +2402,6 @@ export class Config {
       modelFallbacks,
       autoModelRouting,
       defaultModel,
-      advisorModelString,
-      advisorThinkingLevel,
-      advisorReasoningMode,
-      advisorMaxUsesPerTurn,
-      advisorMaxOutputTokens,
       hiddenModels,
       agentAiDefaults,
       migrations,
@@ -2297,6 +2420,34 @@ export class Config {
       settingsBackup: SettingsBackupSchema.optional().catch(undefined).parse(parsed.settingsBackup),
       legacyOnePasswordAccountName: parseOptionalNonEmptyString(parsed.onePasswordAccountName),
     };
+    const root = Object.fromEntries(
+      [
+        "advisorModelString",
+        "advisorThinkingLevel",
+        "advisorReasoningMode",
+        "advisorMaxUsesPerTurn",
+        "advisorMaxOutputTokens",
+        "advisorCyberReasoningMode",
+      ]
+        .filter((key) => Object.hasOwn(parsed, key))
+        .map((key) => [key, parsed[key]])
+    );
+    const agentEnabled = Object.fromEntries(
+      Object.entries(parsed.agentAiDefaults ?? {}).flatMap(([agentId, entry]) =>
+        entry &&
+        typeof entry === "object" &&
+        !Array.isArray(entry) &&
+        Object.hasOwn(entry, "advisorEnabled")
+          ? [[agentId, (entry as { advisorEnabled: unknown }).advisorEnabled]]
+          : []
+      )
+    );
+    if (Object.keys(root).length > 0 || Object.keys(agentEnabled).length > 0) {
+      // Preserve raw values, including malformed ones: they must never be validated
+      // as active settings or make an unrelated load/edit fail.
+      config.legacyAdvisorSettings = { root, agentEnabled };
+    }
+    return config;
   }
 
   /**
@@ -2322,7 +2473,7 @@ export class Config {
    * atomic write) happens before the rename, so a failure means the previous bytes are
    * still on disk; nothing after the write can fail.
    */
-  private saveConfigEffect(config: ProjectsConfig): Effect.Effect<void, unknown> {
+  private saveConfigEffect(config: LegacyAdvisorProjectsConfig): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
@@ -2382,6 +2533,11 @@ export class Config {
         data.toolSearchEnabled = false;
       }
 
+      // Default-off flag: only the opt-in is written.
+      if (parseOptionalBoolean(config.bashAiProxyEnabled) === true) {
+        data.bashAiProxyEnabled = true;
+      }
+
       if (parseOptionalBoolean(config.agentHeartbeatsEnabled) === true) {
         data.agentHeartbeatsEnabled = true;
       }
@@ -2415,39 +2571,6 @@ export class Config {
       const defaultModel = normalizeOptionalModelString(config.defaultModel);
       if (defaultModel !== undefined) {
         data.defaultModel = defaultModel;
-      }
-
-      const advisorModelString = parseOptionalNonEmptyString(config.advisorModelString);
-      if (advisorModelString !== undefined) {
-        data.advisorModelString = advisorModelString;
-      }
-
-      const advisorReasoningMode = coerceOpenAIReasoningMode(config.advisorReasoningMode);
-      if (advisorReasoningMode !== undefined) {
-        data.advisorReasoningMode = advisorReasoningMode;
-      }
-
-      const advisorThinkingLevel = parseOptionalThinkingLevel(config.advisorThinkingLevel);
-      if (advisorThinkingLevel !== undefined) {
-        data.advisorThinkingLevel = advisorThinkingLevel;
-      }
-
-      if (config.advisorMaxUsesPerTurn === null) {
-        data.advisorMaxUsesPerTurn = null;
-      } else {
-        const advisorMaxUsesPerTurn = parseOptionalPositiveInteger(config.advisorMaxUsesPerTurn);
-        if (advisorMaxUsesPerTurn !== undefined) {
-          data.advisorMaxUsesPerTurn = advisorMaxUsesPerTurn;
-        }
-      }
-
-      if (config.advisorMaxOutputTokens === null) {
-        data.advisorMaxOutputTokens = null;
-      } else {
-        const advisorMaxOutputTokens = parseOptionalPositiveInteger(config.advisorMaxOutputTokens);
-        if (advisorMaxOutputTokens !== undefined) {
-          data.advisorMaxOutputTokens = advisorMaxOutputTokens;
-        }
       }
 
       const hiddenModels = normalizeOptionalModelStringArray(config.hiddenModels);
@@ -2541,9 +2664,25 @@ export class Config {
       if (config.viewedSplashScreens) {
         data.viewedSplashScreens = config.viewedSplashScreens;
       }
-      if (config.agentAiDefaults && Object.keys(config.agentAiDefaults).length > 0) {
-        const normalizedAgentAiDefaults = normalizeAiDefaultsModelStrings(config.agentAiDefaults);
-        data.agentAiDefaults = normalizedAgentAiDefaults;
+      const legacyAdvisorSettings = config.legacyAdvisorSettings;
+      if (
+        (config.agentAiDefaults && Object.keys(config.agentAiDefaults).length > 0) ||
+        Object.keys(legacyAdvisorSettings?.agentEnabled ?? {}).length > 0
+      ) {
+        const normalizedAgentAiDefaults = normalizeAiDefaultsModelStrings(
+          config.agentAiDefaults ?? {}
+        );
+        // Include advisor-only entries omitted at runtime, without overwriting edits
+        // or bypassing normalization of current, non-advisor defaults.
+        data.agentAiDefaults = Object.fromEntries([
+          ...Object.entries(normalizedAgentAiDefaults),
+          ...Object.entries(legacyAdvisorSettings?.agentEnabled ?? {}).map(
+            ([agentId, advisorEnabled]) => [
+              agentId,
+              { ...normalizedAgentAiDefaults[agentId], advisorEnabled },
+            ]
+          ),
+        ]);
 
         // Downgrade-compatibility projection only: older builds resolve
         // delegated runs from the legacy root map. Never read back at runtime;
@@ -2557,14 +2696,9 @@ export class Config {
       const migrations = normalizeConfigMigrations(config.migrations);
       // Any true flag (known or from a newer version) must persist; the spread
       // below writes them all, so gate only on presence.
-      if (
-        Object.keys(migrations).length > 0 ||
-        config.userPreferences !== undefined ||
-        config.agentAiDefaults?.exec != null
-      ) {
+      if (Object.keys(migrations).length > 0 || config.agentAiDefaults?.exec != null) {
         data.migrations = {
           ...migrations,
-          ...(config.userPreferences !== undefined ? { userPreferencesInitialized: true } : {}),
           // Written for downgrade compatibility so older builds do not re-run
           // their exec split migration against the projected legacy map.
           ...(config.agentAiDefaults?.exec != null ? { execSubagentDefaultsSplit: true } : {}),
@@ -2623,6 +2757,8 @@ export class Config {
         data.onePasswordAccountName = legacyOnePasswordAccountName;
       }
 
+      if (legacyAdvisorSettings) Object.assign(data, legacyAdvisorSettings.root);
+
       const persistedWorkspaceIds = new Set<string>();
       for (const [, project] of data.projects) {
         for (const workspace of project.workspaces) {
@@ -2632,20 +2768,30 @@ export class Config {
           }
         }
       }
-      // Encode a copy: `data` still shares settings objects with runtime state.
-      const diskData = structuredClone(data);
-      encodeCyberReasoningModesForDisk(diskData);
+      // Encode a copy: `data` still shares settings objects with runtime state. Without a Cyber
+      // slot the encode is a no-op, so skip the whole-config clone (about 27 ms per save at
+      // ~4,700 workspaces).
+      let diskData: typeof data = data;
+      if (hasCyberReasoningMode(data)) {
+        diskData = structuredClone(data);
+        encodeCyberReasoningModesForDisk(diskData);
+      }
+      // Serialize in the same synchronous step as the check: without the clone, `diskData` is
+      // live runtime state, and a later fiber yield could let a Cyber value the check missed in.
+      const text = JSON.stringify(diskData, null, 2);
       // writeFileAtomic writes the whole payload and verifies the temp file's size before
       // the rename: a filling disk makes write(2) accept a short count without an error,
       // and the npm write-file-atomic package renamed that truncated file over
       // config.json, which then loaded as an empty registry (coder/xum#4197).
       yield* Effect.tryPromise({
-        try: async () =>
-          writeFileAtomic(self.configFile, JSON.stringify(diskData, null, 2), "utf-8"),
+        try: async () => writeFileAtomic(self.configFile, text, "utf-8"),
         catch: (error) => error,
       });
       // A competing rename may already have replaced our write; only a fresh read can publish it.
-      self.configSnapshot = undefined;
+      // Keep a snapshot only if a reader already parsed the file that is on disk now (it read
+      // real disk bytes, whoever wrote them), so the first reader after the save does not parse
+      // the same bytes again.
+      if (self.configSnapshot?.key !== self.readConfigStatKey()) self.configSnapshot = undefined;
       for (const workspaceId of self.legacyTaskVariantGroups.keys()) {
         if (!persistedWorkspaceIds.has(workspaceId)) {
           // A load-time settings migration can save before getAllWorkspaceMetadata's queued
@@ -2788,7 +2934,6 @@ export class Config {
   getClientConfig() {
     const config = this.loadConfigOrDefault();
     return {
-      userPreferencesInitialized: config.migrations?.userPreferencesInitialized === true,
       userPreferences: config.userPreferences,
       taskSettings: config.taskSettings ?? DEFAULT_TASK_SETTINGS,
       muxGatewayEnabled: config.muxGatewayEnabled,
@@ -2801,11 +2946,6 @@ export class Config {
       skillModelClasses: config.skillModelClasses,
       autoModelRouting: config.autoModelRouting ?? getDefaultAutoModelRoutingConfig(),
       defaultModel: config.defaultModel,
-      advisorModelString: config.advisorModelString ?? null,
-      advisorThinkingLevel: config.advisorThinkingLevel ?? null,
-      advisorReasoningMode: config.advisorReasoningMode ?? null,
-      advisorMaxUsesPerTurn: config.advisorMaxUsesPerTurn,
-      advisorMaxOutputTokens: config.advisorMaxOutputTokens,
       hiddenModels: config.hiddenModels,
       hiddenModelsInitialized: config.migrations?.hiddenModelsInitialized === true,
       coderWorkspaceArchiveBehavior:
@@ -2818,6 +2958,7 @@ export class Config {
       llmDebugLogs: config.llmDebugLogs === true,
       keepScreenAwake: config.keepScreenAwake === true,
       toolSearchEnabled: config.toolSearchEnabled !== false,
+      bashAiProxyEnabled: config.bashAiProxyEnabled === true,
       agentHeartbeatsEnabled: config.agentHeartbeatsEnabled === true,
       heartbeatDefaultPrompt: config.heartbeatDefaultPrompt ?? undefined,
       heartbeatDefaultIntervalMs: config.heartbeatDefaultIntervalMs ?? undefined,
@@ -2868,6 +3009,14 @@ export class Config {
     await this.editConfig((config) => {
       if (enabled) delete config.toolSearchEnabled;
       else config.toolSearchEnabled = false;
+      return config;
+    });
+  }
+
+  async updateBashAiProxyEnabled(enabled: boolean): Promise<void> {
+    await this.editConfig((config) => {
+      if (enabled) config.bashAiProxyEnabled = true;
+      else delete config.bashAiProxyEnabled;
       return config;
     });
   }
@@ -3105,14 +3254,23 @@ export class Config {
     });
   }
 
+  async updateUserPreferences(patches: readonly unknown[]): Promise<void> {
+    await this.editConfig((config) => {
+      const merged = patches.reduce<unknown>(
+        (prefs, patch) => applyMergePatch(prefs, patch),
+        config.userPreferences
+      );
+      // Normalization drops invalid fields, so an invalid patch would silently delete the
+      // stored value; refuse it instead.
+      if (!UserPreferencesSchema.safeParse(merged ?? {}).success) {
+        throw new ORPCError("BAD_REQUEST", { message: "Invalid user preferences patch" });
+      }
+      return { ...config, userPreferences: normalizeUserPreferences(merged) };
+    });
+  }
+
   async saveUserConfig(input: {
     taskSettings?: unknown;
-    userPreferences?: unknown;
-    advisorModelString?: string | null;
-    advisorThinkingLevel?: string | null;
-    advisorReasoningMode?: OpenAIReasoningMode | null;
-    advisorMaxUsesPerTurn?: number | null;
-    advisorMaxOutputTokens?: number | null;
     agentAiDefaults?: unknown;
   }): Promise<void> {
     await this.editConfig((config) => {
@@ -3133,35 +3291,6 @@ export class Config {
         });
       }
 
-      if (input.userPreferences !== undefined) {
-        result.userPreferences = normalizeUserPreferences(input.userPreferences);
-        result.migrations = {
-          ...(result.migrations ?? {}),
-          userPreferencesInitialized: true,
-        };
-      }
-
-      if (input.advisorModelString !== undefined) {
-        result.advisorModelString = parseOptionalNonEmptyString(input.advisorModelString);
-      }
-      if (input.advisorReasoningMode !== undefined) {
-        result.advisorReasoningMode = coerceOpenAIReasoningMode(input.advisorReasoningMode);
-      }
-      if (input.advisorThinkingLevel !== undefined) {
-        result.advisorThinkingLevel = parseOptionalThinkingLevel(input.advisorThinkingLevel);
-      }
-      if (input.advisorMaxUsesPerTurn !== undefined) {
-        result.advisorMaxUsesPerTurn = normalizeAdvisorPositiveInteger(
-          input.advisorMaxUsesPerTurn,
-          "Advisor max uses per turn"
-        );
-      }
-      if (input.advisorMaxOutputTokens !== undefined) {
-        result.advisorMaxOutputTokens = normalizeAdvisorPositiveInteger(
-          input.advisorMaxOutputTokens,
-          "Advisor max output tokens"
-        );
-      }
       if (input.agentAiDefaults !== undefined) {
         const normalized = normalizeAgentAiDefaults(input.agentAiDefaults);
         result.agentAiDefaults = Object.keys(normalized).length > 0 ? normalized : undefined;
@@ -3213,7 +3342,7 @@ export class Config {
      * pure (callers run their own updaters and record results inside it): only after the
      * edit holds the lock it will write under, so no invocation's result is discarded.
      */
-    const transform = (): ProjectsConfig => fn(self.readConfigOrDefault());
+    const transform = (): ProjectsConfig => fn(self.readConfigOrDefault({ keepSnapshot: true }));
     const write = Effect.fn(function* (
       newConfig: ProjectsConfig,
       lock: ProjectRegistrationLockHandle
@@ -3304,6 +3433,10 @@ export class Config {
       log.error(message);
       throw new Error(message);
     };
+    // An unreadable file is not corrupt: telling the user to move it aside would be wrong (#5757).
+    if (failureState.unreadable) {
+      rejectEdit(this.describeConfigLoadFailure(failureState));
+    }
     if (failureState.backupSignature === null) {
       rejectEdit(
         "the existing corrupt config has no confirmed backup yet. Fix the reported backup failure or move the corrupt file aside, then retry."
@@ -3325,6 +3458,32 @@ export class Config {
         "the file changed after this edit loaded it and the new content has no confirmed backup. Retry the settings change."
       );
     }
+  }
+
+  private describeConfigLoadFailure(state: ConfigLoadFailureState): string {
+    if (state.unreadable) {
+      return `config.json could not be read (${state.errorMessage}). Check that ${this.configFile} is a regular file readable by this user, then retry.`;
+    }
+    const parseError = `config.json could not be parsed (${state.errorMessage}).`;
+    return state.backupSignature === null
+      ? `${parseError} Xum could not back it up yet, so fix ${this.configFile} by hand and see the log for the backup failure.`
+      : `${parseError} Fix ${this.configFile} or restore it from its .corrupt- backup, then retry.`;
+  }
+
+  /**
+   * Why the most recent load of config.json failed, or null when it succeeded. Callers that
+   * found no workspace report this instead of "not found": the defaults view a failed load
+   * returns has no workspaces, but they are still registered on disk (#5757). A map lookup
+   * with no I/O, so hot paths can call it.
+   */
+  getConfigLoadError(): string | null {
+    const state = configLoadFailureStates.get(this.configFile);
+    // The map is shared by every Config for this path, and a successful load deletes its
+    // entry. Report it only if this instance's own last load created or refreshed it: another
+    // instance's failure says nothing about the snapshot this one serves.
+    return state !== undefined && state === this.observedLoadFailure
+      ? this.describeConfigLoadFailure(state)
+      : null;
   }
 
   getUpdateChannel(): UpdateChannel {
@@ -3539,16 +3698,52 @@ export class Config {
     this.workspaceIndexConfig = config;
     this.workspaceIndex = new Map();
     this.legacyWorkspaceEntries = [];
+    this.workspaceIndexNeedsFullBuild = false;
     for (const [projectPath, project] of config.projects) {
+      if (!projectPath) this.workspaceIndexNeedsFullBuild = true;
       for (const workspace of project.workspaces) {
         const entry = { projectPath, project, workspace };
         if (!workspace.id) {
+          this.workspaceIndexNeedsFullBuild = true;
           this.legacyWorkspaceEntries.push(entry);
         } else if (!this.workspaceIndex.has(workspace.id)) {
           this.workspaceIndex.set(workspace.id, entry);
         }
       }
     }
+  }
+
+  /**
+   * This installation's identity (installationIdentity.ts), created on first use under this
+   * config's root. Rejects with InstallationIdentityError when the file is unusable.
+   */
+  getInstallationId(): Promise<string> {
+    return loadOrCreateInstallationId(this.rootDir);
+  }
+
+  /**
+   * Whether a workspace's one-shot SSH plan migration (#5174, planLocation.ts) is done, read fresh
+   * from config: a clear in this or a sibling backend may have marked it since the caller looked.
+   * No row means migrated: there is no workspace left to migrate, and an unreadable config errs
+   * the same way (a legacy plan is only ever left unimported, never a cleared plan revived).
+   */
+  isRemotePlanMigrated(workspaceId: string): boolean {
+    for (const project of this.loadConfigOrDefault().projects.values()) {
+      const row = project.workspaces.find((workspace) => workspace.id === workspaceId);
+      if (row) return row.remotePlanMigrated === true;
+    }
+    return true;
+  }
+
+  /** Record a workspace's SSH plan migration as done, for good (monotone; see the schema field). */
+  async markRemotePlanMigrated(workspaceId: string): Promise<void> {
+    await this.editConfig((config) => {
+      for (const project of config.projects.values()) {
+        const row = project.workspaces.find((workspace) => workspace.id === workspaceId);
+        if (row) row.remotePlanMigrated = true;
+      }
+      return config;
+    });
   }
 
   /**
@@ -3802,6 +3997,26 @@ export class Config {
     return metadata.slice();
   }
 
+  /**
+   * The row `(await getAllWorkspaceMetadata()).find((m) => m.id === workspaceId)` gives, built
+   * from that one row (one checkout probe) unless the snapshot needs the full build (see
+   * workspaceIndexNeedsFullBuild). No await before the build, so both paths read one snapshot.
+   * Other rows' read-time migrations wait for their next full build (#5727 F1b).
+   */
+  async findWorkspaceMetadata(workspaceId: string): Promise<FrontendWorkspaceMetadata | null> {
+    const config = this.loadConfigOrDefault();
+    this.ensureWorkspaceIndex(config);
+    let projects: Iterable<[string, ProjectConfig]> = config.projects;
+    if (!this.workspaceIndexNeedsFullBuild) {
+      const entry = this.workspaceIndex.get(workspaceId);
+      if (!entry) return null;
+      assert(entry.workspace.id === workspaceId, "index entry must match its key");
+      projects = [[entry.projectPath, { ...entry.project, workspaces: [entry.workspace] }]];
+    }
+    const metadata = await this.buildWorkspaceMetadata(config, projects);
+    return metadata.find((candidate) => candidate.id === workspaceId) ?? null;
+  }
+
   async getWorkspaceMetadataById(
     workspaceId: string,
     options?: Pick<WorkspaceMetadataOptions, "persistMigrations" | "probeCheckouts">
@@ -3957,6 +4172,7 @@ export class Config {
               taskPrompt: workspace.taskPrompt,
               taskTrunkBranch: workspace.taskTrunkBranch,
               taskIsolation: workspace.taskIsolation,
+              sideChatParentWorkspaceId: workspace.sideChatParentWorkspaceId,
               taskDesktopOwnerWorkspaceId: workspace.taskDesktopOwnerWorkspaceId,
               taskSticky: workspace.taskSticky,
               taskExecutionId: workspace.taskExecutionId,
@@ -4264,6 +4480,7 @@ export class Config {
               taskPrompt: workspace.taskPrompt,
               taskTrunkBranch: workspace.taskTrunkBranch,
               taskIsolation: workspace.taskIsolation,
+              sideChatParentWorkspaceId: workspace.sideChatParentWorkspaceId,
               taskDesktopOwnerWorkspaceId: workspace.taskDesktopOwnerWorkspaceId,
               taskSticky: workspace.taskSticky,
               taskExecutionId: workspace.taskExecutionId,
@@ -4347,6 +4564,7 @@ export class Config {
             taskPrompt: workspace.taskPrompt,
             taskTrunkBranch: workspace.taskTrunkBranch,
             taskIsolation: workspace.taskIsolation,
+            sideChatParentWorkspaceId: workspace.sideChatParentWorkspaceId,
             taskDesktopOwnerWorkspaceId: workspace.taskDesktopOwnerWorkspaceId,
             taskSticky: workspace.taskSticky,
             taskExecutionId: workspace.taskExecutionId,
@@ -4393,24 +4611,6 @@ export class Config {
       }
     }
 
-    // Filtered rows still inherit family identity from archived ancestors in the registry.
-    this.ensureWorkspaceIndex(config);
-    const parentById = new Map(workspaceMetadata.map((meta) => [meta.id, meta.parentWorkspaceId]));
-    const parentOf = (id: string) =>
-      parentById.has(id)
-        ? parentById.get(id)
-        : this.workspaceIndex.get(id)?.workspace.parentWorkspaceId;
-    for (const metadata of workspaceMetadata) {
-      const chain: string[] = [];
-      let root = metadata.id;
-      while (parentOf(root) && !chain.includes(root)) {
-        chain.push(root);
-        root = parentOf(root)!;
-      }
-      // A malformed cycle gets one representative, even for descendants entering it.
-      const cycle = chain.indexOf(root);
-      metadata.rootWorkspaceId = cycle < 0 ? root : chain.slice(cycle).sort()[0];
-    }
     const filtered = workspaceMetadata.filter((metadata) => {
       if (options?.archived == null || options.archived === "all") return true;
       return (
@@ -4469,6 +4669,12 @@ export class Config {
        */
       refuseTakenName?: true;
       /**
+       * Revalidate a shared-checkout parent's identity/path and lifecycle state inside this
+       * registration write. Local task-tree locks cannot fence a different backend's archive
+       * or removal, so a side chat must not be registered using a stale parent snapshot.
+       */
+      requireActiveParent?: { workspaceId: string; workspacePath: string };
+      /**
        * Also set this other workspace's runtimeConfig in the same write, so both land or neither
        * does. A Coder fork marks its source as sharing the Coder workspace this way (#5114).
        * Rejects, writing nothing, when that workspace is gone.
@@ -4480,6 +4686,23 @@ export class Config {
     } = {}
   ): Promise<void> {
     await this.editConfig((config) => {
+      const requiredParent = options.requireActiveParent;
+      if (requiredParent != null) {
+        const parent = config.projects
+          .get(projectPath)
+          ?.workspaces.find((workspace) => workspace.id === requiredParent.workspaceId);
+        if (
+          parent == null ||
+          parent.path !== requiredParent.workspacePath ||
+          parent.pendingRemoval != null ||
+          parent.pendingArchive != null ||
+          isWorkspaceArchived(parent.archivedAt, parent.unarchivedAt)
+        ) {
+          throw new Error(
+            `Parent workspace ${requiredParent.workspaceId} changed or is being archived/removed; retry from an active workspace.`
+          );
+        }
+      }
       const sourceUpdate = options.sourceRuntimeConfigUpdate;
       if (sourceUpdate != null) {
         const source = [...config.projects.values()]
@@ -4510,6 +4733,7 @@ export class Config {
         }
         const planTarget = {
           projectName: metadata.projectName,
+          projectPath: metadata.projectPath,
           runtimeConfig: metadata.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG,
         };
         for (const other of workspacesSharingPlanDirectory(config.projects, planTarget)) {
@@ -4565,6 +4789,7 @@ export class Config {
         taskPrompt: metadata.taskPrompt,
         taskTrunkBranch: metadata.taskTrunkBranch,
         taskIsolation: metadata.taskIsolation,
+        sideChatParentWorkspaceId: metadata.sideChatParentWorkspaceId,
         taskDesktopOwnerWorkspaceId: metadata.taskDesktopOwnerWorkspaceId,
         taskSticky: metadata.taskSticky,
         taskExecutionId: metadata.taskExecutionId,
@@ -4585,6 +4810,8 @@ export class Config {
           ...workspaceEntry,
           taskAttemptId: existing.taskAttemptId,
           taskAttemptUnproven: existing.taskAttemptUnproven,
+          // Server-owned, not part of WorkspaceMetadata (see TaskLaunchStart in taskService).
+          taskPromptSendId: existing.taskPromptSendId,
           taskAttemptRetiredBy: existing.taskAttemptRetiredBy,
           taskTerminalFailure: existing.taskTerminalFailure,
           taskReservationTombstones: existing.taskReservationTombstones,
@@ -4592,11 +4819,15 @@ export class Config {
           pendingArchive: existing.pendingArchive,
           unrelatedWorkspaceConsentPending: existing.unrelatedWorkspaceConsentPending,
           delegatedCreation: existing.delegatedCreation,
+          // Monotone (#5174): a metadata round trip never un-marks a migrated plan.
+          remotePlanMigrated: existing.remotePlanMigrated,
         };
       } else {
         // Add new workspace
         project.workspaces.push({
           ...workspaceEntry,
+          // A new workspace has no legacy plan to migrate (#5174).
+          remotePlanMigrated: true,
           ...(options.unrelatedWorkspaceConsentPending === true
             ? { unrelatedWorkspaceConsentPending: true as const }
             : {}),

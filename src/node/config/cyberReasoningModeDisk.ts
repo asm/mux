@@ -18,9 +18,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function collectReasoningModeSlots(doc: Record<string, unknown>): ReasoningModeSlot[] {
-  const slots: ReasoningModeSlot[] = [
-    { owner: doc, modeKey: "advisorReasoningMode", markerKey: "advisorCyberReasoningMode" },
-  ];
+  const slots: ReasoningModeSlot[] = [];
   const addSettings = (value: unknown) => {
     if (isRecord(value)) {
       slots.push({ owner: value, modeKey: "reasoningMode", markerKey: "cyberReasoningMode" });
@@ -48,6 +46,11 @@ function collectReasoningModeSlots(doc: Record<string, unknown>): ReasoningModeS
     }
   }
   return slots;
+}
+
+/** The encoder's precondition: when false, encodeCyberReasoningModesForDisk is a no-op. */
+export function hasCyberReasoningMode(doc: Record<string, unknown>): boolean {
+  return collectReasoningModeSlots(doc).some((slot) => slot.owner[slot.modeKey] === "cyber");
 }
 
 /** Rewrites Cyber modes into their disk form in place; pass a copy of runtime state. */

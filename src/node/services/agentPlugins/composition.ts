@@ -10,6 +10,7 @@ import { discoverAgentDefinitions } from "@/node/services/agentDefinitions/agent
 import {
   discoverAgentSkills,
   getDefaultAgentSkillsRoots,
+  requireReachableSkills,
 } from "@/node/services/agentSkills/agentSkillsService";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
@@ -170,6 +171,7 @@ export async function buildWorkspaceComposition(
             ...defaultSkillRoots,
             projectPluginRoots: [
               ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
+                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
                 args.runtime.normalizePath(relativePath, args.hostCheckoutRoot!)
               ),
               args.runtime.normalizePath(".agents/plugins", args.hostCheckoutRoot),
@@ -182,10 +184,14 @@ export async function buildWorkspaceComposition(
         }
       : undefined;
 
-  const skillDescriptors = await discoverAgentSkills(args.runtime, args.workspacePath, {
-    dedupeByName: false,
-    ...(checkoutSkillRoots ?? {}),
-  });
+  // Like the turn's skill index, the inspector must not report a composition
+  // that silently lost a project root to an unreachable host.
+  const skillDescriptors = requireReachableSkills(
+    await discoverAgentSkills(args.runtime, args.workspacePath, {
+      dedupeByName: false,
+      ...(checkoutSkillRoots ?? {}),
+    })
+  );
   const skills = markShadowed(
     skillDescriptors.map((skill) => ({
       name: skill.name,

@@ -52,6 +52,11 @@ export async function summarizeContinuousCompaction(args: {
   aiService: AgentSessionAIService;
   sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   head: MuxMessage[];
+  /**
+   * Rows searched for the thinking-repair receipt: the whole segment, head included. Required
+   * so a caller cannot silently fall back to the head alone (#5996).
+   */
+  receiptRows: MuxMessage[];
   signal: AbortSignal;
   context: ContinuousCompactionContext;
   baseOptions: SendMessageOptions;
@@ -99,6 +104,7 @@ export async function summarizeContinuousCompaction(args: {
     journal: sharedDurableEventJournal(sessionDir),
     xumHome: args.config.rootDir,
     projectRoot: pluginContext?.projectRoot,
+    projectKey: pluginContext?.projectKey,
     projectTrusted: isWorkspaceProjectTrusted(args.config, metadata.data),
   });
   args.signal.throwIfAborted();
@@ -159,6 +165,7 @@ export async function summarizeContinuousCompaction(args: {
     );
     const messages = await prepareMessagesForProvider({
       messagesWithSentinel: addInterruptedSentinel(prepared.providerRequestMessages),
+      replayReceiptMessages: args.receiptRows,
       effectiveAgentId: "compact",
       toolNamesForSentinel: [],
       postCompactionAttachments: null,

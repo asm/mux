@@ -1,6 +1,7 @@
 import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import { wrapAsyncIterator } from "@orpc/shared";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { CLAUDE_DESIGN_URL } from "@/common/constants/claudeDesign";
 import type { ClaudeDesignStatus } from "@/common/orpc/schemas/claudeDesign";
 import { useEffect, useRef } from "react";
@@ -10,7 +11,6 @@ import { expect, fn, userEvent, waitFor, within } from "@storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
@@ -59,6 +59,7 @@ interface MCPSectionStoryOptions {
   testResults?: Record<string, string[]>;
   secrets?: Secret[];
   preCacheTools?: boolean;
+  experiments?: Partial<Record<ExperimentId, boolean>>;
 }
 
 function setupMCPSettingsSectionStory(options: MCPSectionStoryOptions = {}): APIClient {
@@ -97,6 +98,7 @@ function setupMCPSettingsSectionStory(options: MCPSectionStoryOptions = {}): API
     globalSecrets: options.secrets ?? [],
     mcpTestResults,
     mcpOauthAuthStatus: options.mcpOauthAuthStatus,
+    experiments: options.experiments,
   });
 }
 
@@ -109,14 +111,13 @@ const MCPSettingsSectionStoryShell: FC<{ setup: () => APIClient; children: React
   if (clientRef.current === null || setupRef.current !== setup) {
     setupRef.current = setup;
     clientRef.current = setup();
+    getAppConfigStore().setClient(clientRef.current);
   }
 
   return (
     <ThemeProvider>
       <TooltipProvider>
-        <APIProvider client={clientRef.current}>
-          <ExperimentsProvider>{children}</ExperimentsProvider>
-        </APIProvider>
+        <APIProvider client={clientRef.current}>{children}</APIProvider>
       </TooltipProvider>
     </ThemeProvider>
   );
@@ -550,13 +551,20 @@ export const ProjectSettingsOAuthLoggedIn: Story = {
 function setupDesignStory(
   enabled = true,
   reuseEnabled = false,
-  sibling?: { disconnect: () => void }
+  sibling?: { disconnect: () => void },
+  pendingDisable?: { finish: () => void }
 ): APIClient {
-  const updates = createAsyncMessageQueue<{ enabled: boolean; revision: number }>();
+  // One stream per subscription, like the backend: the section and its card both subscribe.
+  const subscribers: Array<(update: { enabled: boolean; revision: number }) => void> = [];
   let revision = 0;
-  updates.push({ enabled, revision });
-  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP), enabled);
+  let streamEnabled = enabled;
+  const publish = () => {
+    revision++;
+    for (const push of subscribers) push({ enabled: streamEnabled, revision });
+  };
   const client = setupMCPSettingsSectionStory({
+    // A pending disable: the config snapshot already reads off while the stream still reports on.
+    experiments: { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: enabled && !pendingDisable },
     servers: enabled
       ? {
           claude_design: {
@@ -580,11 +588,23 @@ function setupDesignStory(
   };
   client.experiments = {
     onDesignChange: (_input, { signal } = {}) => {
+      const updates = createAsyncMessageQueue<{ enabled: boolean; revision: number }>();
+      updates.push({ enabled: streamEnabled, revision });
+      subscribers.push(updates.push);
       signal?.addEventListener("abort", updates.end, { once: true });
       return Promise.resolve(wrapAsyncIterator(updates.iterate(), {}));
     },
-    getOverrides: () => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: enabled }),
-    setOverride: () => Promise.resolve(),
+    set: () => Promise.resolve(),
+    // The flight recorder status stream: off, like a fresh profile.
+    onPerfFlightRecorderChange: () =>
+      Promise.resolve(
+        wrapAsyncIterator(
+          (async function* () {
+            yield await Promise.resolve({ enabled: false, state: "off" as const });
+          })(),
+          {}
+        )
+      ),
   };
   client.mcp.designStatus = () => Promise.resolve(status);
   client.mcp.configureDesign = (settings) => {
@@ -593,7 +613,7 @@ function setupDesignStory(
       settings: { ...status.settings, ...settings },
       state: settings.reuseEnabled ? "not_configured" : "disabled",
     };
-    updates.push({ enabled, revision: ++revision });
+    publish();
     return Promise.resolve(status);
   };
   if (sibling) {
@@ -612,7 +632,15 @@ function setupDesignStory(
         state: "disabled",
         settings: { ...status.settings, reuseEnabled: false, serverEnabled: false },
       };
-      updates.push({ enabled, revision: ++revision });
+      publish();
+    };
+  }
+  if (pendingDisable) {
+    pendingDisable.finish = () => {
+      streamEnabled = false;
+      publish();
+      // An update from before the disable that arrives late.
+      for (const push of subscribers) push({ enabled: true, revision: revision - 1 });
     };
   }
   client.mcp.test = () => {
@@ -720,5 +748,28 @@ export const ClaudeDesignSiblingDisconnect: Story = {
     await expect(
       canvas.getByRole("switch", { name: "Toggle claude_design enabled" })
     ).not.toBeChecked();
+  },
+};
+
+const pendingDesignDisable: { finish: () => void } = { finish: () => undefined };
+
+export const ClaudeDesignHidesAfterRetirement: Story = {
+  tags: ["claude-design"],
+  parameters: { pixel: { exclude: true } },
+  render: () => (
+    <MCPSettingsSectionStoryShell
+      setup={() => setupDesignStory(true, false, undefined, pendingDesignDisable)}
+    >
+      <MCPSettingsSection />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    // The Design stream reports a disable only after the backend retired affected clients.
+    await canvas.findByRole("region", { name: "Claude Design" });
+    // A direct call, not a click, so React renders the disable and the late older update
+    // together: the card hides only if the older update is ignored.
+    pendingDesignDisable.finish();
+    await waitFor(() => expect(canvas.queryByRole("region", { name: "Claude Design" })).toBeNull());
   },
 };

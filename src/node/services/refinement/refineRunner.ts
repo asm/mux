@@ -352,7 +352,8 @@ export async function runRefinePass(args: {
       args.beforeDispatch === undefined
         ? undefined
         : async () => {
-            if (!stale && !(await args.beforeDispatch!())) {
+            const beforeDispatch = args.beforeDispatch;
+            if (beforeDispatch !== undefined && !stale && !(await beforeDispatch())) {
               stale = true;
               gate.abort(new Error(REFINE_INPUT_STALE_MESSAGE));
             }

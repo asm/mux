@@ -63,6 +63,8 @@ export const SendMessageErrorSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("history-changed") }),
   /** A direct edit targeted authentic plan-review feedback; nothing was changed. */
   z.object({ type: z.literal("plan_review_feedback_edit_blocked"), message: z.string() }),
+  // Session tape replay mode (XUM_REPLAY_TAPES) refuses turns and model creation; deterministic
+  z.object({ type: z.literal("session_tape_replay"), message: z.string() }),
   z.object({ type: z.literal("unknown"), raw: z.string() }),
 ]);
 
@@ -108,6 +110,7 @@ export const StreamErrorTypeSchema = z.enum([
   "model_refusal", // Provider declined to answer (refusal/content-filter); retrying the same request will refuse again
   "agent_resolution", // Strict explicit-agent contract failure (agent missing/hidden/disabled/provenance changed); deterministic, retrying reproduces it
   "reasoning_rejected", // Provider rejected replayed reasoning (OpenAI rs_ item / encrypted_content, Anthropic thinking signature) after the in-stream repair; deterministic
+  "session_tape_replay", // Perf harness (XUM_REPLAY_TAPES) refused to replay this workspace's tape; renderer-only, no model involved
   "unknown", // Catch-all
 ]);
 

@@ -54,6 +54,7 @@ export class SummarizeStrategy {
         agentInitiated: streamContext.agentInitiated,
         goalKind: streamContext.goalKind,
         goalId: streamContext.goalId,
+        taskTurnKind: streamContext.taskTurnKind,
         modelForStream: streamContext.modelString,
         muxMetadata: streamContext.workspaceTurnMetadata,
         // The post-compaction "Continue" streams on the routed options and can

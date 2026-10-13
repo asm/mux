@@ -20,6 +20,8 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
  */
 import { ORPCError, os, type ProcedureConfig } from "@orpc/server";
 import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
+import { PerfCaptureRefusedError } from "@/node/services/perf/perfCaptureService";
+import { PerfReportRefusedError } from "@/node/services/perf/perfReportService";
 import * as schemas from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
 import {
@@ -31,6 +33,43 @@ import {
 } from "@/node/services/agentPlugins/workspacePluginOperations";
 import { handlerGen } from "@orpc/experimental-effect";
 import { Effect } from "effect";
+import {
+  getArtifactsCapabilities,
+  listArtifacts,
+  MAX_ARTIFACT_READ_BYTES,
+  readArtifact,
+} from "@/node/services/artifactsOperations";
+import {
+  listShelfRoute,
+  pinToShelfRoute,
+  readShelfRoute,
+  unpinShelfRoute,
+} from "@/node/services/artifactShelfOperations";
+import {
+  getStateRoute,
+  sendInteractionRoute,
+  setStateRoute,
+} from "@/node/services/artifactInteractions";
+import {
+  callMcpAppTool,
+  getMcpAppView,
+  getMcpAppViewRecords,
+  readMcpAppServerResource,
+  updateMcpAppModelContext,
+  approveMcpAppViewDomains,
+  listMcpAppViewDomains,
+  revokeMcpAppViewDomains,
+} from "@/node/services/mcpAppsOperations";
+import {
+  listArtifactVersions,
+  readArtifactVersion,
+} from "@/node/services/artifactVersionsOperations";
+import {
+  listPinnedFiles,
+  pinFile,
+  readPinnedFile,
+  unpinFile,
+} from "@/node/services/pinnedArtifactFiles";
 import {
   assertMemoryEnabled,
   consolidateMemoryEffect,
@@ -62,6 +101,7 @@ import {
   clearWorkspaceGoal,
   createMultiProjectWorkspace,
   createScratchWorkspace,
+  createSideChat,
   createWorkspace,
   forkWorkspace,
   getBackgroundBashOutput,
@@ -106,6 +146,8 @@ import {
   subscribeMetadata,
   subscribeOpenSettings,
   subscribeDesignExperiment,
+  subscribePerfFlightRecorderStatus,
+  subscribeComputerUseStatus,
   subscribeProviderConfig,
   subscribeSshPrompts,
   subscribeTerminalActivity,
@@ -121,11 +163,7 @@ import {
 import { checkRuntimeAvailability } from "@/node/runtime/runtimeFactory";
 import { DEFAULT_LAYOUT_PRESETS_CONFIG } from "@/common/types/uiLayouts";
 
-import {
-  getAgentSkill,
-  listAgentSkillDiagnostics,
-  listAgentSkills,
-} from "@/node/services/agentSkills/agentSkillsService";
+import { getAgentSkill, listAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import {
   getAgentDefinition,
   listAgentDefinitions,
@@ -147,6 +185,13 @@ import {
 } from "@/node/services/workflows/WorkflowService";
 import { throwWorkflowOrpcError } from "./formatOrpcError";
 import { isDraftTooLargeError } from "@/common/utils/drafts";
+import { resolveDraftSends } from "@/node/services/draftSendResolution";
+import type { SendAcceptance } from "@/node/services/draftService";
+import {
+  boundMCPSettingsError,
+  MCP_SETTINGS_READ_TIMEOUT_MS,
+  type MCPSettingsSnapshot,
+} from "@/common/utils/mcpSettings";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 
 /**
@@ -158,6 +203,86 @@ function rethrowDraftTooLarge(error: unknown): never {
     throw new ORPCError("BAD_REQUEST", { message: (error as Error).message });
   }
   throw error;
+}
+
+/**
+ * Transports mask plain errors as "Internal Server Error". Computer use refusals (unsupported
+ * machine, remote workspace) must reach the picker as themselves so the user learns why.
+ */
+async function passComputerUseRefusal<T>(request: Promise<T>): Promise<T> {
+  try {
+    return await request;
+  } catch (error) {
+    throw new ORPCError("PRECONDITION_FAILED", { message: getErrorMessage(error) });
+  }
+}
+
+/** The draft merge's passive acceptance check (DraftService.update/beginSend). */
+/** Settings routes start the workspace's servers first, like MCP Apps views do. */
+async function runMcpSettingsRoute<T>(
+  context: ORPCContext,
+  workspaceId: string,
+  signal: AbortSignal | undefined,
+  run: () => Promise<T>
+): Promise<{ success: true; data: T } | { success: false; error: string }> {
+  try {
+    if (!context.mcpServerManager.hasWorkspaceRequestOptions(workspaceId))
+      await listWorkspaceMcpPrompts(context, workspaceId, signal);
+    return { success: true, data: await run() };
+  } catch (error) {
+    // Server error text is untrusted and unbounded: bound it before it crosses IPC.
+    return { success: false, error: boundMCPSettingsError(getErrorMessage(error)) };
+  }
+}
+
+type McpSettingsReadResult =
+  | { success: true; data: MCPSettingsSnapshot | { notConnected: true } | null }
+  | { success: false; error: string };
+
+/**
+ * `mcp.settings.read` for several servers in one call (concurrently). With `ifConnected`, a
+ * server the workspace does not run reads as `{ notConnected: true }`, and a running one is
+ * read with `noStart`: neither runMcpSettingsRoute's warm-up nor the manager's startup path
+ * runs, so the read never starts or restarts a server (an instance that closed meanwhile
+ * fails the read instead).
+ */
+async function readMcpSettingsRoute(
+  context: ORPCContext,
+  input: { workspaceId: string; serverNames: string[]; ifConnected?: boolean },
+  signal: AbortSignal | undefined
+): Promise<Record<string, McpSettingsReadResult>> {
+  const manager = context.mcpServerManager;
+  // Per server: a hung server times out with its own error and does not hold back the others.
+  const timeoutMs = MCP_SETTINGS_READ_TIMEOUT_MS;
+  const readOne = async (serverName: string): Promise<McpSettingsReadResult> => {
+    if (input.ifConnected !== true)
+      return runMcpSettingsRoute(context, input.workspaceId, signal, () =>
+        manager.readSettings(input.workspaceId, serverName, { signal, timeoutMs })
+      );
+    if (!manager.isWorkspaceServerConnected(input.workspaceId, serverName))
+      return { success: true, data: { notConnected: true } };
+    try {
+      const data = await manager.readSettings(input.workspaceId, serverName, {
+        signal,
+        timeoutMs,
+        noStart: true,
+      });
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: boundMCPSettingsError(getErrorMessage(error)) };
+    }
+  };
+  const entries = await Promise.all(
+    [...new Set(input.serverNames)].map(async (name) => [name, await readOne(name)] as const)
+  );
+  return Object.fromEntries(entries);
+}
+
+function sendAcceptanceOf(context: ORPCContext): SendAcceptance {
+  return {
+    acceptedSendIds: (workspaceId, sendIds) =>
+      context.workspaceService.acceptedSendIds(workspaceId, sendIds),
+  };
 }
 
 function handleWorkflowRequest<T>(request: () => Promise<T>): Promise<T> {
@@ -191,6 +316,15 @@ async function getCurrentServerAuthSessionId(context: ORPCContext): Promise<stri
 // abort defers the handler fiber's exit until the write settles instead of detaching the write,
 // so the in-flight procedure count that gates server restarts covers the write itself.
 const atomicPromise = <A>(thunk: () => Promise<A>) => Effect.uninterruptible(Effect.promise(thunk));
+
+/** Keeps the perf flight recorder in step with the backend's adopted experiment state. */
+function syncPerfFlightRecorder(context: ORPCContext): void {
+  const enabled = context.experimentsService.isExperimentEnabled(
+    EXPERIMENT_IDS.PERF_FLIGHT_RECORDER
+  );
+  context.perfFlightRecorder.setEnabled(enabled);
+  context.perfCaptures.setEnabled(enabled);
+}
 
 export const router = (authToken?: string) => {
   const auth = createAuthMiddleware(authToken);
@@ -304,7 +438,14 @@ export const router = (authToken?: string) => {
         .output(schemas.config.getConfig.output)
         .handler(
           handlerGen(function* ({ context }) {
-            return yield* Effect.sync(() => context.config.getClientConfig());
+            const experiments = yield* Effect.promise(() =>
+              context.experimentsService.getEnabledStates()
+            );
+            return yield* Effect.sync(() => {
+              // The disk reread can adopt another backend's recorder toggle.
+              syncPerfFlightRecorder(context);
+              return { ...context.config.getClientConfig(), experiments };
+            });
           })
         ),
       // Event-iterator subscription: stays on the plain handler until the Effect
@@ -483,6 +624,15 @@ export const router = (authToken?: string) => {
           })
         ),
 
+      updateUserPreferences: t
+        .input(schemas.config.updateUserPreferences.input)
+        .output(schemas.config.updateUserPreferences.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* atomicPromise(async () => context.config.updateUserPreferences(input.patches));
+          })
+        ),
+
       updateChatTranscriptFullWidth: t
         .input(schemas.config.updateChatTranscriptFullWidth.input)
         .output(schemas.config.updateChatTranscriptFullWidth.output)
@@ -515,6 +665,16 @@ export const router = (authToken?: string) => {
         .handler(
           handlerGen(function* ({ context }, input) {
             yield* atomicPromise(async () => context.config.updateToolSearchEnabled(input.enabled));
+          })
+        ),
+      updateBashAiProxyEnabled: t
+        .input(schemas.config.updateBashAiProxyEnabled.input)
+        .output(schemas.config.updateBashAiProxyEnabled.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* atomicPromise(async () =>
+              context.config.updateBashAiProxyEnabled(input.enabled)
+            );
           })
         ),
       updateAgentHeartbeatsEnabled: t
@@ -632,7 +792,7 @@ export const router = (authToken?: string) => {
         .input(schemas.drafts.update.input)
         .output(schemas.drafts.update.output)
         .handler(({ context, input }) =>
-          context.draftService.update(input).catch(rethrowDraftTooLarge)
+          context.draftService.update(input, sendAcceptanceOf(context)).catch(rethrowDraftTooLarge)
         ),
       delete: t
         .input(schemas.drafts.delete.input)
@@ -644,6 +804,22 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.draftService.importLegacy(input).catch(rethrowDraftTooLarge)
         ),
+      beginSend: t
+        .input(schemas.drafts.beginSend.input)
+        .output(schemas.drafts.beginSend.output)
+        .handler(({ context, input }) =>
+          context.draftService
+            .beginSend(input, sendAcceptanceOf(context))
+            .catch(rethrowDraftTooLarge)
+        ),
+      setSendReceiver: t
+        .input(schemas.drafts.setSendReceiver.input)
+        .output(schemas.drafts.setSendReceiver.output)
+        .handler(({ context, input }) => context.draftService.setSendReceiver(input)),
+      resolveSends: t
+        .input(schemas.drafts.resolveSends.input)
+        .output(schemas.drafts.resolveSends.output)
+        .handler(({ context, input }) => resolveDraftSends(context, input)),
       getList: t
         .input(schemas.drafts.getList.input)
         .output(schemas.drafts.getList.output)
@@ -697,10 +873,6 @@ export const router = (authToken?: string) => {
         .input(schemas.agentSkills.list.input)
         .output(schemas.agentSkills.list.output)
         .handler(({ context, input }) => listAgentSkills(context, input)),
-      listDiagnostics: t
-        .input(schemas.agentSkills.listDiagnostics.input)
-        .output(schemas.agentSkills.listDiagnostics.output)
-        .handler(({ context, input }) => listAgentSkillDiagnostics(context, input)),
       get: t
         .input(schemas.agentSkills.get.input)
         .output(schemas.agentSkills.get.output)
@@ -1011,6 +1183,14 @@ export const router = (authToken?: string) => {
             return yield* context.coderOauthService.refreshModelsEffect();
           })
         ),
+      refreshProviders: t
+        .input(schemas.coderOauth.refreshProviders.input)
+        .output(schemas.coderOauth.refreshProviders.output)
+        .handler(
+          handlerGen(function* ({ context }) {
+            return yield* context.coderOauthService.refreshProvidersEffect();
+          })
+        ),
     },
     general: {
       listDirectory: t
@@ -1117,6 +1297,33 @@ export const router = (authToken?: string) => {
         }),
     },
     mcp: {
+      settings: {
+        read: t
+          .input(schemas.mcp.settings.read.input)
+          .output(schemas.mcp.settings.read.output)
+          .handler(({ context, input, signal }) => readMcpSettingsRoute(context, input, signal)),
+        update: t
+          .input(schemas.mcp.settings.update.input)
+          .output(schemas.mcp.settings.update.output)
+          .handler(({ context, input, signal }) =>
+            // Validate against a fresh read: the renderer's schema can be stale.
+            runMcpSettingsRoute(context, input.workspaceId, signal, async () => {
+              const snapshot = await context.mcpServerManager.readSettings(
+                input.workspaceId,
+                input.serverName,
+                { signal }
+              );
+              if (snapshot === null)
+                throw new Error(`MCP server '${input.serverName}' has no settings`);
+              return context.mcpServerManager.updateSettings(
+                input.workspaceId,
+                input.serverName,
+                input.set,
+                snapshot
+              );
+            })
+          ),
+      },
       designStatus: t
         .input(schemas.mcp.designStatus.input)
         .output(schemas.mcp.designStatus.output)
@@ -1263,7 +1470,7 @@ export const router = (authToken?: string) => {
       getAuthStatus: t
         .input(schemas.mcpOauth.getAuthStatus.input)
         .output(schemas.mcpOauth.getAuthStatus.output)
-        .handler(({ context, input }) => context.mcpOauthService.getAuthStatus(input)),
+        .handler(({ context, input }) => context.mcpOauthService.getAuthStatusForApi(input)),
       logout: t
         .input(schemas.mcpOauth.logout.input)
         .output(schemas.mcpOauth.logout.output)
@@ -1518,6 +1725,110 @@ export const router = (authToken?: string) => {
         .output(schemas.coder.listWorkspaces.output)
         .handler(async ({ context }) => context.coderService.listWorkspaces()),
     },
+    artifacts: {
+      list: t
+        .input(schemas.artifacts.list.input)
+        .output(schemas.artifacts.list.output)
+        .handler(({ context, input, signal }) => listArtifacts(context, input, signal)),
+      read: t
+        .input(schemas.artifacts.read.input)
+        .output(schemas.artifacts.read.output)
+        .handler(({ context, input, signal }) => readArtifact(context, input, signal)),
+      capabilities: t
+        .input(schemas.artifacts.capabilities.input)
+        .output(schemas.artifacts.capabilities.output)
+        .handler(({ context, input }) => getArtifactsCapabilities(context, input)),
+      listVersions: t
+        .input(schemas.artifacts.listVersions.input)
+        .output(schemas.artifacts.listVersions.output)
+        .handler(({ context, input }) => listArtifactVersions(context, input)),
+      readVersion: t
+        .input(schemas.artifacts.readVersion.input)
+        .output(schemas.artifacts.readVersion.output)
+        .handler(({ context, input }) => readArtifactVersion(context, input)),
+      listPinned: t
+        .input(schemas.artifacts.listPinned.input)
+        .output(schemas.artifacts.listPinned.output)
+        .handler(({ context, input }) => listPinnedFiles(context, input)),
+      pinFile: t
+        .input(schemas.artifacts.pinFile.input)
+        .output(schemas.artifacts.pinFile.output)
+        .handler(({ context, input }) => pinFile(context, input)),
+      unpinFile: t
+        .input(schemas.artifacts.unpinFile.input)
+        .output(schemas.artifacts.unpinFile.output)
+        .handler(({ context, input }) => unpinFile(context, input)),
+      readPinned: t
+        .input(schemas.artifacts.readPinned.input)
+        .output(schemas.artifacts.readPinned.output)
+        .handler(({ context, input }) => readPinnedFile(context, input)),
+      listShelf: t
+        .input(schemas.artifacts.listShelf.input)
+        .output(schemas.artifacts.listShelf.output)
+        .handler(({ context, input }) => listShelfRoute(context, input)),
+      readShelf: t
+        .input(schemas.artifacts.readShelf.input)
+        .output(schemas.artifacts.readShelf.output)
+        .handler(({ context, input }) => readShelfRoute(context, input, MAX_ARTIFACT_READ_BYTES)),
+      pinToShelf: t
+        .input(schemas.artifacts.pinToShelf.input)
+        .output(schemas.artifacts.pinToShelf.output)
+        .handler(({ context, input }) => pinToShelfRoute(context, input)),
+      unpinShelf: t
+        .input(schemas.artifacts.unpinShelf.input)
+        .output(schemas.artifacts.unpinShelf.output)
+        .handler(({ context, input }) => unpinShelfRoute(context, input)),
+      sendInteraction: t
+        .input(schemas.artifacts.sendInteraction.input)
+        .output(schemas.artifacts.sendInteraction.output)
+        .handler(({ context, input }) => sendInteractionRoute(context, input)),
+      getState: t
+        .input(schemas.artifacts.getState.input)
+        .output(schemas.artifacts.getState.output)
+        .handler(({ context, input }) => getStateRoute(context, input)),
+      setState: t
+        .input(schemas.artifacts.setState.input)
+        .output(schemas.artifacts.setState.output)
+        .handler(({ context, input }) => setStateRoute(context, input)),
+    },
+    mcpApps: {
+      getView: t
+        .input(schemas.mcpApps.getView.input)
+        .output(schemas.mcpApps.getView.output)
+        .handler(({ context, input, signal }) =>
+          getMcpAppView(context, input, signal, (workspaceId, warmSignal) =>
+            listWorkspaceMcpPrompts(context, workspaceId, warmSignal)
+          )
+        ),
+      getViewRecords: t
+        .input(schemas.mcpApps.getViewRecords.input)
+        .output(schemas.mcpApps.getViewRecords.output)
+        .handler(({ context, input }) => getMcpAppViewRecords(context, input)),
+      callTool: t
+        .input(schemas.mcpApps.callTool.input)
+        .output(schemas.mcpApps.callTool.output)
+        .handler(({ context, input, signal }) => callMcpAppTool(context, input, signal)),
+      readResource: t
+        .input(schemas.mcpApps.readResource.input)
+        .output(schemas.mcpApps.readResource.output)
+        .handler(({ context, input, signal }) => readMcpAppServerResource(context, input, signal)),
+      updateModelContext: t
+        .input(schemas.mcpApps.updateModelContext.input)
+        .output(schemas.mcpApps.updateModelContext.output)
+        .handler(({ context, input }) => updateMcpAppModelContext(context, input)),
+      approveViewDomains: t
+        .input(schemas.mcpApps.approveViewDomains.input)
+        .output(schemas.mcpApps.approveViewDomains.output)
+        .handler(({ context, input }) => approveMcpAppViewDomains(context, input)),
+      listViewDomains: t
+        .input(schemas.mcpApps.listViewDomains.input)
+        .output(schemas.mcpApps.listViewDomains.output)
+        .handler(({ context }) => listMcpAppViewDomains(context)),
+      revokeViewDomains: t
+        .input(schemas.mcpApps.revokeViewDomains.input)
+        .output(schemas.mcpApps.revokeViewDomains.output)
+        .handler(({ context, input }) => revokeMcpAppViewDomains(context, input)),
+    },
     // Memory handlers run Effect generators via handlerGen (client aborts
     // interrupt the fiber); the wire contracts are unchanged.
     memory: {
@@ -1596,20 +1907,14 @@ export const router = (authToken?: string) => {
       run: t
         .input(schemas.refinements.run.input)
         .output(schemas.refinements.run.output)
-        .handler(({ context, input }) =>
-          context.refineService.run(input.workspaceId, input.experiments)
-        ),
+        .handler(({ context, input }) => context.refineService.run(input.workspaceId)),
       // Explicit approval step: applies the staged edits from the last run
       // through the same journaled tool paths (rollback keeps working).
       apply: t
         .input(schemas.refinements.apply.input)
         .output(schemas.refinements.apply.output)
         .handler(({ context, input }) =>
-          context.refineService.apply(
-            input.workspaceId,
-            input.approvedProposalHash,
-            input.experiments
-          )
+          context.refineService.apply(input.workspaceId, input.approvedProposalHash)
         ),
     },
     workspace: {
@@ -1668,7 +1973,10 @@ export const router = (authToken?: string) => {
           .input(schemas.workspace.heartbeat.get.input)
           .output(schemas.workspace.heartbeat.get.output)
           .handler(({ context, input }) =>
-            context.workspaceService.getHeartbeatSettings(input.workspaceId)
+            context.workspaceService.getHeartbeatSettings(input.workspaceId, {
+              // The dialog needs the saved shape to tell an override from the default (#5692).
+              resolveDefaultInterval: false,
+            })
           ),
         set: t
           .input(schemas.workspace.heartbeat.set.input)
@@ -1732,6 +2040,12 @@ export const router = (authToken?: string) => {
             input.workspaceId,
             input.thinkingLevel
           )
+        ),
+      setActiveTurnServiceTier: t
+        .input(schemas.workspace.setActiveTurnServiceTier.input)
+        .output(schemas.workspace.setActiveTurnServiceTier.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.setActiveTurnServiceTier(input.workspaceId, input.serviceTier)
         ),
       updateTitle: t
         .input(schemas.workspace.updateTitle.input)
@@ -1824,6 +2138,10 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.fork.input)
         .output(schemas.workspace.fork.output)
         .handler(({ context, input }) => forkWorkspace(context, input)),
+      createSideChat: t
+        .input(schemas.workspace.createSideChat.input)
+        .output(schemas.workspace.createSideChat.output)
+        .handler(({ context, input }) => createSideChat(context, input)),
       stageAttachment: t
         .input(schemas.workspace.stageAttachment.input)
         .output(schemas.workspace.stageAttachment.output)
@@ -1882,6 +2200,12 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.clearQueue.input)
         .output(schemas.workspace.clearQueue.output)
         .handler(({ context, input }) => context.workspaceService.clearQueue(input.workspaceId)),
+      getSendStatus: t
+        .input(schemas.workspace.getSendStatus.input)
+        .output(schemas.workspace.getSendStatus.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.getSendStatus(input.workspaceId, input.sendIds, input.receiverId)
+        ),
       sendHeldInput: t
         .input(schemas.workspace.sendHeldInput.input)
         .output(schemas.workspace.sendHeldInput.output)
@@ -1974,7 +2298,16 @@ export const router = (authToken?: string) => {
       getInfo: t
         .input(schemas.workspace.getInfo.input)
         .output(schemas.workspace.getInfo.output)
-        .handler(async ({ context, input }) => context.workspaceService.getInfo(input.workspaceId)),
+        .handler(async ({ context, input }) => {
+          const info = await context.workspaceService.getInfo(input.workspaceId);
+          // A failed config load hides every workspace. Report why instead of a null that
+          // reads as "workspace removed" (#5757).
+          const loadError = info === null ? context.config.getConfigLoadError() : null;
+          if (loadError !== null) {
+            throw new ORPCError("SERVICE_UNAVAILABLE", { message: loadError });
+          }
+          return info;
+        }),
       getLastLlmRequest: t
         .input(schemas.workspace.getLastLlmRequest.input)
         .output(schemas.workspace.getLastLlmRequest.output)
@@ -2087,6 +2420,18 @@ export const router = (authToken?: string) => {
         .output(schemas.workspace.getPostCompactionState.output)
         .handler(({ context, input }) =>
           context.workspaceService.getPostCompactionState(input.workspaceId)
+        ),
+      getImportableLegacyPlan: t
+        .input(schemas.workspace.getImportableLegacyPlan.input)
+        .output(schemas.workspace.getImportableLegacyPlan.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.getImportableLegacyPlan(input.workspaceId)
+        ),
+      importLegacyPlan: t
+        .input(schemas.workspace.importLegacyPlan.input)
+        .output(schemas.workspace.importLegacyPlan.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.importLegacyPlan(input.workspaceId)
         ),
       setPostCompactionExclusion: t
         .input(schemas.workspace.setPostCompactionExclusion.input)
@@ -2313,7 +2658,9 @@ export const router = (authToken?: string) => {
       attach: t
         .input(schemas.terminal.attach.input)
         .output(schemas.terminal.attach.output)
-        .handler(({ context, input, signal }) => attachTerminal(context, input.sessionId, signal)),
+        .handler(({ context, input, signal }) =>
+          attachTerminal(context, input.sessionId, signal, input.popout === true)
+        ),
       onExit: t
         .input(schemas.terminal.onExit.input)
         .output(schemas.terminal.onExit.output)
@@ -2330,7 +2677,9 @@ export const router = (authToken?: string) => {
       closeWindow: t
         .input(schemas.terminal.closeWindow.input)
         .output(schemas.terminal.closeWindow.output)
-        .handler(({ context, input }) => context.terminalService.closeWindow(input.workspaceId)),
+        .handler(({ context, input }) =>
+          context.terminalService.closeWindow(input.workspaceId, input.sessionId ?? undefined)
+        ),
       listSessions: t
         .input(schemas.terminal.listSessions.input)
         .output(schemas.terminal.listSessions.output)
@@ -2465,17 +2814,121 @@ export const router = (authToken?: string) => {
         .input(schemas.experiments.onDesignChange.input)
         .output(schemas.experiments.onDesignChange.output)
         .handler(({ context, signal }) => subscribeDesignExperiment(context, signal)),
-      getOverrides: t
-        .input(schemas.experiments.getOverrides.input)
-        .output(schemas.experiments.getOverrides.output)
-        .handler(async ({ context }) => await context.experimentsService.getOverrides()),
-      setOverride: t
-        .input(schemas.experiments.setOverride.input)
-        .output(schemas.experiments.setOverride.output)
+      onPerfFlightRecorderChange: t
+        .input(schemas.experiments.onPerfFlightRecorderChange.input)
+        .output(schemas.experiments.onPerfFlightRecorderChange.output)
+        .handler(({ context, signal }) => subscribePerfFlightRecorderStatus(context, signal)),
+      set: t
+        .input(schemas.experiments.set.input)
+        .output(schemas.experiments.set.output)
         .handler(async ({ context, input }) => {
           await context.experimentsService.setOverride(input.experimentId, input.enabled);
+          // Any override write adopts the merged disk state, which can flip this flag too.
+          syncPerfFlightRecorder(context);
           if (input.experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP) {
             await context.mcpConfigService.claudeDesign.getStatus();
+          }
+        }),
+    },
+    computerUse: {
+      getStatus: t
+        .input(schemas.computerUse.getStatus.input)
+        .output(schemas.computerUse.getStatus.output)
+        .handler(({ context }) => context.computerUseService.getStatus()),
+      setEnabled: t
+        .input(schemas.computerUse.setEnabled.input)
+        .output(schemas.computerUse.setEnabled.output)
+        .handler(({ context, input }) =>
+          passComputerUseRefusal(
+            context.computerUseService.setEnabled(input.workspaceId, input.enabled)
+          )
+        ),
+      toggle: t
+        .input(schemas.computerUse.toggle.input)
+        .output(schemas.computerUse.toggle.output)
+        .handler(({ context, input }) =>
+          passComputerUseRefusal(context.computerUseService.toggle(input.workspaceId))
+        ),
+      requestPermission: t
+        .input(schemas.computerUse.requestPermission.input)
+        .output(schemas.computerUse.requestPermission.output)
+        .handler(({ context, input }) =>
+          passComputerUseRefusal(context.computerUseService.requestPermission(input.kind))
+        ),
+      subscribe: t
+        .input(schemas.computerUse.subscribe.input)
+        .output(schemas.computerUse.subscribe.output)
+        .handler(({ context, signal }) => subscribeComputerUseStatus(context, signal)),
+    },
+    perf: {
+      getFlightRecorderSnapshot: t
+        .input(schemas.perf.getFlightRecorderSnapshot.input)
+        .output(schemas.perf.getFlightRecorderSnapshot.output)
+        .handler(({ context }) => context.perfFlightRecorder.getSnapshot()),
+      pushRendererFlightRecorderBatch: t
+        .input(schemas.perf.pushRendererFlightRecorderBatch.input)
+        .output(schemas.perf.pushRendererFlightRecorderBatch.output)
+        .handler(({ context, input }) => context.perfFlightRecorder.ingestRendererBatch(input)),
+    },
+    perfCaptures: {
+      list: t
+        .input(schemas.perfCaptures.list.input)
+        .output(schemas.perfCaptures.list.output)
+        .handler(({ context }) => context.perfCaptures.listCaptures()),
+      captureNow: t
+        .input(schemas.perfCaptures.captureNow.input)
+        .output(schemas.perfCaptures.captureNow.output)
+        .handler(async ({ context, input }) => {
+          try {
+            return await context.perfCaptures.captureNow(input);
+          } catch (error) {
+            // Transports mask plain errors as "Internal Server Error". Pass refusals on with
+            // a code, so callers can tell "enable the experiment" from "retry later".
+            if (error instanceof PerfCaptureRefusedError) {
+              throw new ORPCError(
+                error.refusal === "experiment-off" ? "PRECONDITION_FAILED" : "CONFLICT",
+                { message: error.message }
+              );
+            }
+            throw error;
+          }
+        }),
+    },
+    perfReports: {
+      create: t
+        .input(schemas.perfReports.create.input)
+        .output(schemas.perfReports.create.output)
+        .handler(async ({ context }) => {
+          try {
+            return await context.perfReports.createReport();
+          } catch (error) {
+            // Same mapping as perfCaptures.captureNow: "enable the experiment" vs "retry later".
+            if (error instanceof PerfReportRefusedError) {
+              throw new ORPCError(
+                error.refusal === "experiment-off" ? "PRECONDITION_FAILED" : "CONFLICT",
+                { message: error.message }
+              );
+            }
+            throw error;
+          }
+        }),
+    },
+    sessionTapes: {
+      saveOpen: t
+        .input(schemas.sessionTapes.saveOpen.input)
+        .output(schemas.sessionTapes.saveOpen.output)
+        .handler(({ context }) => context.sessionTapes.saveOpen()),
+      revealFolder: t
+        .input(schemas.sessionTapes.revealFolder.input)
+        .output(schemas.sessionTapes.revealFolder.output)
+        .handler(async ({ context }) => {
+          try {
+            return await context.sessionTapes.revealFolder();
+          } catch (error) {
+            // Transports mask plain errors as "Internal Server Error"; keep the reason visible.
+            throw new ORPCError("INTERNAL_SERVER_ERROR", {
+              message: `Could not open the session tapes folder: ${getErrorMessage(error)}`,
+            });
           }
         }),
     },

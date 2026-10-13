@@ -267,7 +267,8 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
       // and shift snippet offsets. Escape the query so matching stays literal.
       const search =
         args.action === "search"
-          ? new RegExp(args.query!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "iu")
+          ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+            new RegExp(args.query!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "iu")
           : null;
       const timeout = (): SessionHistoryResult => ({
         success: false,
@@ -289,7 +290,9 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           items: [],
           windows: [],
         };
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const items = result.items!;
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const windows = result.windows!;
         const warnings = new Set<Warning>();
         // Context windows in which a row carrying project skill content was already visited

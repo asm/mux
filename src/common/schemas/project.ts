@@ -17,6 +17,7 @@ import {
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "@/common/types/thinking";
 import { BackgroundWorkAttentionPolicySchema } from "@/common/types/backgroundWorkAttention";
 import { z } from "zod";
+import { ServiceTierSchema } from "../config/schemas/providersConfig";
 
 import { RuntimeEnablementIdSchema } from "./ids";
 import { RuntimeEnablementOverridesSchema } from "./runtimeEnablement";
@@ -144,6 +145,10 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "Set in the same write that registers a new root workspace that gets default unrelated-messaging consent once its setup completes. The grant runs only while this is set and consumes it; an explicit consent toggle (from any backend sharing this root) clears it, so the default can never reverse a choice already made (#4446).",
   }),
+  remotePlanMigrated: z.literal(true).optional().meta({
+    description:
+      "Monotone: set once this SSH workspace's one-shot plan migration (#5174) is done, after which it reads and writes only its installation-scoped plan path, never a legacy one. Set on every new row; set by the migration after the workspace's plans/<id>.md plan (if any) is durably copied into that path; set before a full clear or a removal deletes the plan. Never cleared. Legacy files are never moved or deleted.",
+  }),
   delegatedCreation: DelegatedCreationMarkSchema.optional().meta({
     description:
       "Set by a delegated task(kind: workspace, mode: new) in the same write that registers this target, and dropped once the creating handle's record persists. Binds the row to its handle and owner: the public create API cannot write it (#4983). interruptedAt is added by the startup resolver when the creator died before the record persisted.",
@@ -154,6 +159,10 @@ export const WorkspaceConfigSchema = z.object({
   parentWorkspaceId: z.string().optional().meta({
     description:
       "If set, this workspace is a child workspace spawned from the parent workspaceId (enables nesting in UI and backend orchestration).",
+  }),
+  sideChatParentWorkspaceId: z.string().optional().meta({
+    description:
+      'If set, this workspace is an ephemeral /side chat forked from the given workspace: its `path` points at that workspace\'s checkout (with taskIsolation "none"), and it is discarded when the user leaves it or the backend restarts.',
   }),
   memoryOwnerWorkspaceId: z.string().optional().meta({
     description:
@@ -215,6 +224,10 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "Completion-tool recovery prompts sent to this agent task since it last completed successfully. Persisted (not in-memory) so crash/restart recovery loops stay bounded; cleared on a successful report, on plan-to-exec handoff, and on user-initiated resume.",
   }),
+  taskGoalPauseOwed: z.string().optional().meta({
+    description:
+      "Goal id ('*' when unreadable) whose explicit pause a terminated sub-agent attempt still owes. Written with the termination and cleared once the pause is durable; while set, no automatic goal turn is admitted for the task.",
+  }),
   reportedAt: z.string().optional().meta({
     description: "ISO 8601 timestamp for when an agent task reported completion (optional).",
   }),
@@ -229,6 +242,7 @@ export const WorkspaceConfigSchema = z.object({
       model: z.string().optional(),
       thinkingLevel: ThinkingLevelSchema.optional(),
       reasoningMode: OpenAIReasoningModeSchema.optional(),
+      serviceTier: ServiceTierSchema.optional(),
     })
     .optional()
     .meta({
@@ -247,38 +261,10 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "The agent task's prompt or title was authored from a context carrying project skill content: a queued launch stamps its opening row with it, and task_list withholds or stamps the title.",
   }),
-  taskExperiments: z
-    .preprocess(
-      // Legacy alias: tasks stamped by builds where "PTC Exclusive Mode" was a
-      // separate experiment may carry only programmaticToolCallingExclusive.
-      // The merged PTC experiment activates exactly that posture, so the flag
-      // must map onto programmaticToolCalling on resumption instead of being
-      // stripped (which would silently drop PTC and make rlm inert). `true`
-      // wins over an explicit programmaticToolCalling: false because the old
-      // exclusive flag activated the posture regardless of the supplement flag.
-      (value) =>
-        typeof value === "object" &&
-        value !== null &&
-        (value as Record<string, unknown>).programmaticToolCallingExclusive === true
-          ? { ...value, programmaticToolCalling: true }
-          : value,
-      z.object({
-        programmaticToolCalling: z.boolean().optional(),
-        // Downgrade-compat mirror (see toPersistedTaskExperiments): retained
-        // through parsing and stamped alongside programmaticToolCalling so a
-        // downgraded build resumes the task in its exclusive posture instead
-        // of reading bare PTC as the removed (~2x cost) supplement mode.
-        programmaticToolCallingExclusive: z.boolean().optional(),
-        // RLM mode is stamped at spawn so child sessions keep RLM-gated features
-        // (persistent sandbox kernel, family messaging tools) across app restarts
-        // without depending on live frontend experiment state.
-        rlm: z.boolean().optional(),
-      })
-    )
-    .optional()
-    .meta({
-      description: "Experiments inherited from parent for restart-safe resumptions.",
-    }),
+  taskPromptSendId: z.string().optional().meta({
+    description:
+      "Send id of the launch send that carries taskPrompt, written before that send. The history row that accepts the prompt carries the same id, so a reawakening sends a kept taskPrompt again only while no row does. Meaningful only while taskPrompt is set; absent on entries written before brief send ids.",
+  }),
   taskBaseCommitSha: z.string().optional().meta({
     description:
       "Git commit SHA this agent task workspace started from (used for generating git-format-patch artifacts).",
@@ -443,6 +429,10 @@ export const ProjectConfigSchema = z.object({
   customInstructions: z.string().optional().meta({
     description:
       "Custom system prompt appended for every workspace in this project (Settings → Instructions)",
+  }),
+  mcpAppViewDomains: z.record(z.string(), z.array(z.string())).optional().meta({
+    description:
+      "MCP Apps: https origins the user allowed each MCP server's views to reach (server key -> origins), for every workspace of this project",
   }),
   codeWorkspaceSyncPath: z.string().optional().meta({
     description:

@@ -11,13 +11,9 @@ import * as path from "path";
 import * as fs from "fs";
 import { execFileSync } from "child_process";
 import { TestTempDir, createTestToolConfig, getTestDeps, mockToolCallOptions } from "./testHelpers";
-import type { createRuntime as CreateRuntimeFn } from "@/node/runtime/runtimeFactory";
-
-/* eslint-disable @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment */
-const {
-  createRuntime,
-}: { createRuntime: typeof CreateRuntimeFn } = require("@/node/runtime/runtimeFactory?real=1");
-/* eslint-enable @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment */
+// A static import, not a require("...?real=1") copy: Bun's LCOV keeps only the last-loaded copy of
+// a file, so a copy would replace runtimeFactory.test.ts's coverage of runtimeFactory.ts.
+import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { sshConnectionPool } from "@/node/runtime/sshConnectionPool";
 
 // Type guard to narrow foreground success result (has note, no backgroundProcessId)
@@ -2165,6 +2161,31 @@ describe("bash tool - background execution", () => {
     if (!result.success) {
       expect(result.error).toContain("Background execution is only available for AI tool calls");
     }
+  });
+
+  // B2: an archive or removal stops the stream before it stops the workspace's background
+  // processes; a tool call of that stream must not start a new one afterwards.
+  it("does not start a background process once the tool call was aborted", async () => {
+    const tempDir = new TestTempDir("test-bash-bg-aborted");
+    const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg-root"));
+    const workspaceId = path.basename(tempDir.path);
+    const config = createTestToolConfig(tempDir.path, { workspaceId });
+    config.backgroundProcessManager = manager;
+    // Trusted: untrusted repos run an abortable git-automation probe that would fail first.
+    config.trusted = true;
+    const spawn = spyOn(manager, "spawn");
+    const abortController = new AbortController();
+    abortController.abort();
+
+    const result = (await createBashTool(config).execute!(
+      { script: "sleep 30", timeout_secs: 60, run_in_background: true, display_name: "late" },
+      { ...mockToolCallOptions, abortSignal: abortController.signal }
+    )) as BashToolResult;
+
+    expect(result).toMatchObject({ success: false, error: "Command execution was aborted" });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(await manager.list(workspaceId)).toEqual([]);
+    tempDir[Symbol.dispose]();
   });
 
   it("should accept timeout with background mode for auto-termination", async () => {

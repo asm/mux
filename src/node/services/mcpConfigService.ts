@@ -1,4 +1,5 @@
 import { ClaudeDesignService } from "./claudeDesignService";
+import { getOwn } from "@/common/utils/getOwn";
 import { CLAUDE_DESIGN_SERVER_NAME } from "@/common/constants/claudeDesign";
 import * as fs from "fs";
 import * as path from "path";
@@ -38,6 +39,7 @@ import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpC
 import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { roundToBase2 } from "@/common/telemetry/utils";
 import { isSecretReferenceValue } from "@/common/types/secrets";
+import { getMcpServerUrlError } from "@/common/utils/mcp/serverUrl";
 
 /**
  * Canonical `plugin:<16-hex>:<server>` keys are RESERVED for Agent Plugin
@@ -203,7 +205,7 @@ export class MCPConfigService {
   }
 
   async removeForApi(name: string): Promise<Result<void>> {
-    const server = (await this.listServers())[name];
+    const server = getOwn(await this.listServers(), name);
     const result = await this.removeServer(name);
     if (result.success && server) {
       this.captureConfigChange(
@@ -216,7 +218,7 @@ export class MCPConfigService {
   }
 
   async setEnabledForApi(name: string, enabled: boolean): Promise<Result<void>> {
-    const server = (await this.listServers())[name];
+    const server = getOwn(await this.listServers(), name);
     const result = await this.setServerEnabled(name, enabled);
     if (result.success && server) {
       this.captureConfigChange(
@@ -229,7 +231,7 @@ export class MCPConfigService {
   }
 
   async setToolAllowlistForApi(name: string, toolAllowlist: string[]): Promise<Result<void>> {
-    const server = (await this.listServers())[name];
+    const server = getOwn(await this.listServers(), name);
     const result = await this.setToolAllowlist(name, toolAllowlist);
     if (result.success && server) {
       this.captureConfigChange(
@@ -743,6 +745,8 @@ export class MCPConfigService {
     try {
       return await this.runExclusive(async () => {
         if (!name.trim()) return Err("Server name is required");
+        // A plain-object key cannot hold "__proto__": the entry would vanish on save (#5740).
+        if (name.trim() === "__proto__") return Err('"__proto__" cannot be used as a server name');
         if (isCanonicalPluginServerKey(name.trim())) {
           // See omitReservedPluginKeys: user definitions must not occupy plugin keys.
           return Err(
@@ -752,20 +756,24 @@ export class MCPConfigService {
         const transport: MCPServerTransport = input.transport ?? "stdio";
         if (transport === "stdio") {
           if (!input.command?.trim()) return Err("Command is required");
-        } else if (!input.url?.trim()) {
-          return Err("URL is required");
+        } else {
+          if (!input.url?.trim()) return Err("URL is required");
+          const urlError = getMcpServerUrlError(input.url);
+          if (urlError !== null) return Err(urlError);
         }
 
         const cfg = await this.getGlobalConfig();
-        const existing = cfg.servers[name];
+        const existing = getOwn(cfg.servers, name);
         const base = {
           disabled: existing?.disabled ?? false,
           toolAllowlist: existing?.toolAllowlist,
         };
         cfg.servers[name] =
           transport === "stdio"
-            ? { transport: "stdio", command: input.command!, ...base }
-            : { transport, url: input.url!, headers: input.headers, ...base };
+            ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+              { transport: "stdio", command: input.command!, ...base }
+            : // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+              { transport, url: input.url!, headers: input.headers, ...base };
         await this.saveGlobalConfig(cfg);
         return Ok(undefined);
       });
@@ -778,7 +786,7 @@ export class MCPConfigService {
   async setServerEnabled(name: string, enabled: boolean): Promise<Result<void>> {
     try {
       return await this.runExclusive(async () => {
-        const managed = (await this.listServers())[name];
+        const managed = getOwn(await this.listServers(), name);
         if (managed?.plugin) {
           assert(isCanonicalPluginServerKey(name), "Plugin server must have a canonical key");
           if (managed.plugin.sourceScope !== "global") {
@@ -794,7 +802,7 @@ export class MCPConfigService {
           return Ok(undefined);
         }
         const cfg = await this.getGlobalConfig();
-        const entry = cfg.servers[name];
+        const entry = getOwn(cfg.servers, name);
         if (!entry || isCanonicalPluginServerKey(name)) return Err(`Server ${name} not found`);
         cfg.servers[name] = { ...entry, disabled: !enabled };
         await this.saveGlobalConfig(cfg);
@@ -811,7 +819,7 @@ export class MCPConfigService {
       return await this.runExclusive(async () => {
         if (isCanonicalPluginServerKey(name)) return Err("Agent Plugin definitions are read-only");
         const cfg = await this.getGlobalConfig();
-        if (!cfg.servers[name]) return Err(`Server ${name} not found`);
+        if (!getOwn(cfg.servers, name)) return Err(`Server ${name} not found`);
         delete cfg.servers[name];
         await this.saveGlobalConfig(cfg);
         return Ok(undefined);
@@ -826,13 +834,13 @@ export class MCPConfigService {
     try {
       return await this.runExclusive(async () => {
         if (isCanonicalPluginServerKey(name)) return Err("Agent Plugin definitions are read-only");
-        const managed = (await this.listServers())[name];
+        const managed = getOwn(await this.listServers(), name);
         if (managed?.transport !== "stdio" && managed?.managed === "claude-design") {
           await this.claudeDesign.configure({ toolAllowlist });
           return Ok(undefined);
         }
         const cfg = await this.getGlobalConfig();
-        const entry = cfg.servers[name];
+        const entry = getOwn(cfg.servers, name);
         if (!entry) return Err(`Server ${name} not found`);
         // [] = no tools allowed, [...tools] = those tools allowed
         cfg.servers[name] = { ...entry, toolAllowlist };

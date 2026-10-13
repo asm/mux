@@ -540,6 +540,91 @@ const localPlugin = {
         };
       },
     },
+    "no-module-query-copy": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            'Disallow loading a second copy of a repo module with a query specifier (`require("./x?real=1")`)',
+        },
+        schema: [
+          {
+            type: "object",
+            properties: {
+              // Repo-relative test path -> query specifiers it may still load.
+              allow: {
+                type: "object",
+                additionalProperties: { type: "array", items: { type: "string" } },
+              },
+            },
+            additionalProperties: false,
+          },
+        ],
+        messages: {
+          copy: '"{{specifier}}" loads a second copy of a repo module. Bun\'s LCOV keeps only the last-loaded copy of a file, so in a shared CI shard this copy can replace the coverage that the module\'s own tests recorded (#6339). To get the real exports past a module mock, snapshot `{ ...RealModule }` from a static `import * as RealModule` at file scope, before the mock.module call.',
+        },
+      },
+      create(context) {
+        const allowed = new Set(
+          context.options[0]?.allow?.[
+            path.relative(context.cwd, context.filename).split(path.sep).join("/")
+          ] ?? []
+        );
+        // Package specifiers (react-dnd?real=1) stay allowed: their coverage is not reported.
+        // Asset loader queries (logo.svg?react) are the module's only specifier, not a copy.
+        const isRepoQueryCopy = (specifier) => {
+          const queryStart = specifier.indexOf("?");
+          return (
+            (specifier.startsWith("@/") ||
+              specifier.startsWith("@shared/") ||
+              specifier.startsWith(".")) &&
+            queryStart !== -1 &&
+            !/\.(svg|png|jpe?g|gif|webp|avif|ico|css|json|txt|md|html|wasm|woff2?|ttf)$/.test(
+              specifier.slice(0, queryStart)
+            )
+          );
+        };
+        const check = (node, source) => {
+          if (
+            source?.type === "Literal" &&
+            typeof source.value === "string" &&
+            isRepoQueryCopy(source.value) &&
+            !allowed.has(source.value)
+          ) {
+            context.report({ node, messageId: "copy", data: { specifier: source.value } });
+          }
+        };
+        return {
+          CallExpression(node) {
+            if (node.callee.type === "Identifier" && node.callee.name === "require") {
+              check(node, node.arguments[0]);
+            }
+          },
+          ImportExpression(node) {
+            check(node, node.source);
+          },
+          // Type-only imports and exports load nothing at runtime, whether the declaration
+          // (`import type`) or every specifier (`import { type A, type B }`) is type-only.
+          ImportDeclaration(node) {
+            const typeOnly =
+              node.importKind === "type" ||
+              (node.specifiers.length > 0 &&
+                node.specifiers.every((specifier) => specifier.importKind === "type"));
+            if (!typeOnly) check(node, node.source);
+          },
+          ExportNamedDeclaration(node) {
+            const typeOnly =
+              node.exportKind === "type" ||
+              (node.specifiers.length > 0 &&
+                node.specifiers.every((specifier) => specifier.exportKind === "type"));
+            if (!typeOnly) check(node, node.source);
+          },
+          ExportAllDeclaration(node) {
+            if (node.exportKind !== "type") check(node, node.source);
+          },
+        };
+      },
+    },
     "no-clear-dom-global": {
       meta: {
         type: "problem",
@@ -2055,6 +2140,32 @@ const localPlugin = {
   },
 };
 
+// Shared by the two no-restricted-imports blocks for src/** (a later block replaces an earlier
+// block's options for the files it matches, so each block must restate these).
+const AI_TOKENIZER_ENCODING_RESTRICTION = {
+  name: "ai-tokenizer/encoding",
+  allowTypeImports: true,
+  message:
+    "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts.",
+};
+const SHIKI_RESTRICTION = {
+  group: ["shiki"],
+  importNamePattern: "^(?!type\\s)",
+  allowTypeImports: true,
+  message:
+    "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead.",
+};
+// Browser and common code must not value-import the @/common/orpc/schemas barrel (#5971).
+// Matches "@/common/orpc/schemas" and relative forms such as "../orpc/schemas", but not leaf
+// modules such as "@/common/orpc/schemas/runtime". Every later no-restricted-imports block that
+// matches browser or common files must include it, because that block replaces this one's options.
+const ORPC_SCHEMAS_BARREL_RESTRICTION = {
+  regex: "(^|/)orpc/schemas$",
+  allowTypeImports: true,
+  message:
+    "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine.",
+};
+
 export default defineConfig([
   {
     ignores: [
@@ -2437,23 +2548,26 @@ export default defineConfig([
         {
           // Lives here, not in the src/** block above: this later block replaces that block's
           // no-restricted-imports options for every file it matches.
-          paths: [
-            {
-              name: "ai-tokenizer/encoding",
-              allowTypeImports: true,
-              message:
-                "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts.",
-            },
-          ],
-          patterns: [
-            {
-              group: ["shiki"],
-              importNamePattern: "^(?!type\\s)",
-              allowTypeImports: true,
-              message:
-                "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead.",
-            },
-          ],
+          paths: [AI_TOKENIZER_ENCODING_RESTRICTION],
+          patterns: [SHIKI_RESTRICTION],
+        },
+      ],
+    },
+  },
+  {
+    // Browser and common code import schemas from their leaf modules, never the
+    // @/common/orpc/schemas barrel: one value import of the barrel puts every schema, including
+    // the api.ts router schemas, on the browser's first load (#5971). Type-only imports are
+    // erased at compile time, so they stay allowed. Restates the block above, because this block
+    // replaces its no-restricted-imports options for the files it matches.
+    files: ["src/browser/**/*.{ts,tsx}", "src/common/**/*.{ts,tsx}"],
+    ignores: ["src/browser/workers/highlightWorker.ts", "src/**/*.test.{ts,tsx}"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [AI_TOKENIZER_ENCODING_RESTRICTION],
+          patterns: [SHIKI_RESTRICTION, ORPC_SCHEMAS_BARREL_RESTRICTION],
         },
       ],
     },
@@ -2477,6 +2591,11 @@ export default defineConfig([
                 "Import config schemas via direct file paths (e.g., @/common/config/schemas/appConfigOnDisk), not the barrel.",
             },
           ],
+          patterns: [
+            ORPC_SCHEMAS_BARREL_RESTRICTION,
+            // Inside src/common/orpc, "./schemas" and "../schemas" are the barrel too.
+            { ...ORPC_SCHEMAS_BARREL_RESTRICTION, regex: "^\\.\\.?/schemas$" },
+          ],
         },
       ],
     },
@@ -2494,9 +2613,34 @@ export default defineConfig([
               message:
                 "Config schemas must not import from ORPC; use @/common/schemas/* or @/common/config/schemas/* instead.",
             },
+            ORPC_SCHEMAS_BARREL_RESTRICTION,
           ],
         },
       ],
+    },
+  },
+  {
+    // Production code must not add non-null assertions: `x!` hides a missing
+    // check, and the CRAP gate (.xum/skills/crap-gate) forbids trading `?.`/`??`
+    // for `!` to lower complexity. Each site from before the ban carries an
+    // inline disable comment; reportUnusedDisableDirectives flags a stale one.
+    files: ["src/**/*.{ts,tsx}"],
+    // These globs must match isProductionSource() in
+    // scripts/check-test-seam-comments.ts, the repo's one definition of
+    // production code (the CRAP gate uses it too), plus benchmarks. Change both
+    // together; do not add conventions that isProductionSource() does not have.
+    ignores: [
+      "src/**/{__tests__,__mocks__,test,tests,testing,mocks,stories}/**",
+      "src/**/*.@(test|spec)*([a-zA-Z0-9_-]).{ts,tsx}",
+      "src/**/*.@(stories|generated).{ts,tsx}",
+      "src/**/test[A-Z_.-]*",
+      "src/**/*Test@(Helper|Helpers|Harness|Utils|Fixture|Fixtures|Overlay|Child)[!a-zA-Z0-9_]*",
+      "src/**/*.*([a-zA-Z0-9_])[fF]ixture?(s).{ts,tsx}",
+      "src/version.ts",
+      "src/**/*.bench.{ts,tsx}",
+    ],
+    rules: {
+      "@typescript-eslint/no-non-null-assertion": "error",
     },
   },
   {
@@ -2620,8 +2764,10 @@ export default defineConfig([
     // Test/story/mock files and shared test support (harnesses/utils named
     // per repo convention: *.testHarness.ts, test[A-Z]*.ts): casting partial
     // doubles through `unknown` is the standard mocking idiom, so the
-    // chained-assertion ban is production-only.
+    // chained-assertion ban is production-only. Microbenchmarks (*.bench.ts)
+    // never ship either and stub services the same way.
     files: [
+      "**/*.bench.ts",
       "**/*.test.ts",
       "**/*.test.tsx",
       "**/*.stories.ts",
@@ -2717,6 +2863,65 @@ export default defineConfig([
         beforeAll: "readonly",
         afterAll: "readonly",
       },
+    },
+  },
+  {
+    // Test files and the support code they load run in the same covered bun process.
+    files: [
+      "**/*.test.ts",
+      "**/*.test.tsx",
+      "tests/**/*.{ts,tsx}",
+      "src/**/*.testHarness.{ts,tsx}",
+      "src/**/*.testUtils.{ts,tsx}",
+      "src/**/test[A-Z]*.{ts,tsx}",
+    ],
+    rules: {
+      "local/no-module-query-copy": [
+        "error",
+        {
+          // Existing copies. Each one can still lose coverage of its module in a shared shard;
+          // replace it with a file-scope snapshot or a static import, then drop it from here.
+          allow: {
+            "src/browser/AppEarlyPageImport.test.tsx": [
+              "@/browser/components/AIView/AIView?real=1",
+              "@/browser/App?earlyImport=root",
+              "@/browser/App?earlyImport=workspace",
+              "@/browser/App?prefetch=browser",
+              "@/browser/App?prefetch=desktop",
+            ],
+            "src/browser/components/AgentListItem/AgentListItem.test.tsx": [
+              "./AgentListItem?agent-list-item-test=1",
+            ],
+            "src/browser/components/ChatPane/WorkspaceFooterBar.test.tsx": [
+              "./WorkspaceFooterBar?workspace-footer-bar-test=1",
+              "./WorkspaceFooterBar?workspace-footer-bar-test=2",
+            ],
+            "src/browser/components/Dialog/Dialog.test.tsx": ["./Dialog?real=1"],
+            "src/browser/components/LoadingScreen/LoadingScreen.test.tsx": [
+              "../LoadingScreen/LoadingScreen?real=1",
+            ],
+            "src/browser/components/ProjectSidebar/ProjectSidebar.test.tsx": [
+              "../AgentListItem/AgentListItem?project-sidebar-real-row=1",
+              "./ProjectSidebar?project-sidebar-test=1",
+              "./ProjectSidebar?project-sidebar-scratch-test=1",
+              "./ProjectSidebar?project-sidebar-flat-test=1",
+            ],
+            "src/browser/components/WorkspaceMenuBar/WorkspaceMenuBar.test.tsx": [
+              "../Dialog/Dialog?real=1",
+              "./WorkspaceMenuBar?workspace-menu-bar-test=1",
+            ],
+            "src/browser/contexts/API.test.tsx": ["./API?real=1"],
+            "src/browser/features/Analytics/SavedQuerySqlDialog.test.tsx": [
+              "./SavedQuerySqlDialog?real=1",
+            ],
+            "src/browser/features/RightSidebar/BrowserTab/useBrowserBridgeConnection.test.tsx": [
+              "./useBrowserBridgeConnection.ts?test-isolation=static",
+            ],
+            "src/browser/utils/feedbackToast.test.tsx": ["../components/Dialog/Dialog?real=1"],
+            "src/browser/utils/perf/appShellReady.test.ts": ["./appShellReady?fresh=1"],
+          },
+        },
+      ],
     },
   },
   {

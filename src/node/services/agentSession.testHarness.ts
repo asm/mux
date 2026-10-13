@@ -128,11 +128,6 @@ export function createAgentSessionAIServiceFake(
   const getClosingSignal = options.getClosingSignal;
   const aiService: AgentSessionAIService & EventEmitter = Object.assign(aiEmitter, {
     // Real implementations report failures as Err results, never rejections.
-    createModelWithPinnedMetadata: mock(() =>
-      Promise.resolve(
-        Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
-      )
-    ),
     createModelWithPinnedOptions: mock(() =>
       Promise.resolve(
         Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
@@ -190,6 +185,7 @@ export interface AgentSessionHarnessOptions extends Pick<
   | "sessionUsageService"
   | "autoModelRouter"
   | "hasExternalSendPreflight"
+  | "hasExternalManualSendPreflight"
 > {
   workspaceId: string;
   contextManagement?: ContextManagementService;
@@ -233,19 +229,9 @@ export async function seedAutoCompactionThreshold(
   model: string,
   percent: number
 ): Promise<void> {
-  const current = config.loadConfigOrDefault().userPreferences;
-  await config.saveUserConfig({
-    userPreferences: {
-      ...current,
-      ai: {
-        ...current?.ai,
-        autoCompactionThresholdByModel: {
-          ...current?.ai?.autoCompactionThresholdByModel,
-          [model]: percent,
-        },
-      },
-    },
-  });
+  await config.updateUserPreferences([
+    { ai: { autoCompactionThresholdByModel: { [model]: percent } } },
+  ]);
 }
 
 export async function createAgentSessionHarness(
@@ -310,6 +296,7 @@ export async function createAgentSessionHarness(
     sessionUsageService: options.sessionUsageService,
     autoModelRouter: options.autoModelRouter,
     hasExternalSendPreflight: options.hasExternalSendPreflight,
+    hasExternalManualSendPreflight: options.hasExternalManualSendPreflight,
   });
 
   const events: WorkspaceChatMessage[] = [];

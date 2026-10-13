@@ -81,6 +81,10 @@ export interface ReplayFixtureTurnSpec {
   postCompactionAttachments?: PostCompactionAttachment[];
   /** Refusal-fallback partial continuation (envelope-only, never in chat.jsonl). */
   partialContinuation?: MuxMessage;
+  /** MCP Apps model context message (request-only, never in chat.jsonl). */
+  mcpAppModelContext?: MuxMessage;
+  /** Simulate an envelope written without the model context it sent. */
+  envelopeOmitsMcpAppModelContext?: boolean;
   anthropicCacheTtl?: AnthropicCacheTtl;
   /** Volatile system tail length (production splits it into its own block). */
   systemVolatileSuffixLength?: number;
@@ -91,6 +95,8 @@ export interface ReplayFixtureTurnSpec {
    * before the final one — simulates retried attempts whose streams failed.
    */
   extraEnvelopeAttempts?: number;
+  /** A trimmed compaction request: the budget production recorded in its DevTools run. */
+  compactionInputBudgetTokens?: number;
 }
 
 /** Mutable state threaded through appendReplayFixtureTurn calls. */
@@ -180,6 +186,8 @@ export async function appendReplayFixtureTurn(
       planFilePath: spec.planFilePath,
       postCompactionAttachments: spec.postCompactionAttachments,
       partialContinuationMessage: spec.partialContinuation,
+      mcpAppModelContextMessage:
+        spec.envelopeOmitsMcpAppModelContext === true ? undefined : spec.mcpAppModelContext,
     });
   }
 
@@ -198,8 +206,10 @@ export async function appendReplayFixtureTurn(
       planFilePath: spec.planFilePath,
       postCompactionAttachments: spec.postCompactionAttachments,
       partialContinuation: spec.partialContinuation,
+      mcpAppModelContext: spec.mcpAppModelContext,
       // Production derives these from the request tools (assemblePromptPayload).
       deferLoadingToolNames: collectDeferLoadingToolNames(spec.tools),
+      compactionInputBudgetTokens: spec.compactionInputBudgetTokens,
       workspaceId: ctx.workspaceId,
     });
     // Wire tool definitions use the same cache treatment as the prompt assembler.
@@ -222,6 +232,8 @@ export async function appendReplayFixtureTurn(
         workspaceId: ctx.workspaceId,
         startedAt: new Date(baseTimestamp + 1_000).toISOString(),
         requestHistorySequence,
+        // JSON drops the key when the turn has no budget.
+        compactionInputBudgetTokens: spec.compactionInputBudgetTokens,
       },
     };
     const stepEntry: DevToolsLogEntry = {
@@ -247,6 +259,7 @@ export async function appendReplayFixtureTurn(
         responseHeaders: null,
         rawResponse: null,
         rawChunks: null,
+        inputTransformations: null,
       },
     };
     ctx.devtoolsLines.push(JSON.stringify(runEntry), JSON.stringify(stepEntry));

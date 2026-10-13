@@ -490,7 +490,6 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           ...(contextCarriesProjectSkillContent ? { carriesProjectSkillContent: true } : {}),
           // Agent mode for the launched turn (e.g. "plan"); createWorkspaceTurn defaults to exec.
           ...(agentId != null ? { agentId } : {}),
-          experiments: config.experiments,
           ...(aiOverrides.modelString != null ? { modelString: aiOverrides.modelString } : {}),
           ...(aiOverrides.thinkingLevel != null
             ? { thinkingLevel: aiOverrides.thinkingLevel }
@@ -663,7 +662,6 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           prompt: launch.prompt,
           title,
           ...(contextCarriesProjectSkillContent ? { carriesProjectSkillContent: true } : {}),
-          experiments: config.experiments,
           ...(aiOverrides.modelString != null ? { modelString: aiOverrides.modelString } : {}),
           ...(aiOverrides.thinkingLevel != null
             ? { thinkingLevel: aiOverrides.thinkingLevel }

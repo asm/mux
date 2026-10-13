@@ -4,7 +4,6 @@ import {
 } from "@/node/services/agentPlugins/registry";
 import { readPersistedExperimentEnabled } from "@/node/services/experimentsService";
 import { ClaudeDesignService } from "@/node/services/claudeDesignService";
-import * as os from "os";
 import * as path from "path";
 import { Context, Effect, Layer } from "effect";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -22,6 +21,7 @@ import {
 import { AIService } from "@/node/services/aiService";
 import { AutoModelRouter } from "@/node/services/autoModelRouter";
 import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
+import { localBgRecordsRoot } from "@/node/services/backgroundProcessExecutor";
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { CoreOptions, CoreServices, CoreServicesOptions } from "@/node/services/coreServices";
 import { AppFiberScopeLive, AppFiberScopeTag } from "@/node/services/di/appFiberScope";
@@ -69,11 +69,13 @@ import { InitStateManager } from "@/node/services/initStateManager";
 import { log } from "@/node/services/log";
 import { MCPConfigService } from "@/node/services/mcpConfigService";
 import { MCPServerManager } from "@/node/services/mcpServerManager";
+import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
 import { MemoryConsolidationService } from "@/node/services/memoryConsolidationService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { MemoryService } from "@/node/services/memoryService";
 import { ProviderService } from "@/node/services/providerService";
 import { SessionUsageService } from "@/node/services/sessionUsageService";
+import { McpAppResultStore } from "@/node/services/mcpAppResultStore";
 import { StreamManager } from "@/node/services/streamManager";
 import { ToolCallDisplayRegistry } from "@/node/services/toolCallDisplayRegistry";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
@@ -200,7 +202,9 @@ export const AutoModelRouterLive = Layer.effect(
 
 export const BackgroundProcessManagerLive = Layer.sync(
   BackgroundProcessManagerTag,
-  () => new BackgroundProcessManager(path.join(os.tmpdir(), "mux-bashes"))
+  // Same root as local spawns, their name lock, and every gate (localBgRecordsRoot), not
+  // os.tmpdir(): on macOS that is /var/folders/..., where other backends never looked.
+  () => new BackgroundProcessManager(localBgRecordsRoot())
 );
 
 // Headless evaluation (workflow `evaluate()`): no dependencies — the caller
@@ -602,6 +606,19 @@ export const CoreWiringLive: Layer.Layer<
 
     turnRequestBuilderBindings.mcpServerManager = mcpServerManager;
     streamManager.setMCPServerManager(mcpServerManager);
+    // Plugin hooks read their own MCP servers' structured settings. Core wiring, not desktop:
+    // the headless roots (`xum run`, `xum workflow`) build only CoreLive.
+    agentPluginHookService.setSettingsProvider((workspaceId, keyPrefix, timeoutMs) =>
+      mcpServerManager.getSettingsForPluginHooks(workspaceId, keyPrefix, timeoutMs)
+    );
+    // MCP Apps views (artifacts experiment): host-only raw results live in the session dir.
+    mcpServerManager.setMcpApps({
+      isEnabled: () => aiService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS),
+      store: new McpAppResultStore(
+        (workspaceId) => path.join(config.sessionsDir, workspaceId),
+        config.rootDir
+      ),
+    });
     // Recorded prompt options can hold stale secret snapshots, so prompt refreshes
     // resolve credentials from current configuration.
     mcpServerManager.setSecretsResolver(async (workspaceId, projectPath) => {
@@ -653,6 +670,16 @@ export const CoreWiringLive: Layer.Layer<
     workspaceGoalService.setOnActivityChange((workspaceId, snapshot) => {
       workspaceService.emitWorkspaceActivity(workspaceId, snapshot);
     });
+    // TaskService owns sub-agent turns: it gates and continues a child goal's user resume.
+    workspaceGoalService.setChildGoalResumeHooks({
+      getResumeRefusal: (workspaceId) => taskService.getChildGoalResumeRefusal(workspaceId),
+      captureActivationAttempt: (workspaceId) =>
+        taskService.captureChildGoalActivationAttempt(workspaceId),
+      isActivationAllowed: (workspaceId, attemptId) =>
+        taskService.isChildGoalActivationAllowed(workspaceId, attemptId),
+      getTurnModel: (workspaceId) => taskService.getChildGoalTurnModel(workspaceId),
+      onGoalResumed: (workspaceId) => taskService.continueResumedChildGoal(workspaceId),
+    });
     // Wire user-initiated `promoteUpcomingGoal` through `interruptStream`
     // so promoting mid-stream cleanly aborts the in-flight turn before
     // the new active goal lands. Without this, the goal service would
@@ -683,6 +710,10 @@ export const CoreWiringLive: Layer.Layer<
       executeGoalContinuation: (input) => workspaceService.executeGoalContinuation(input),
       getKickoffSendOptions: (workspaceId) =>
         workspaceService.getGoalContinuationKickoffSendOptions(workspaceId),
+      refuseUnavailableAgent: (workspaceId, options, isCurrent) =>
+        workspaceService.refuseUnavailableGoalTurnAgent(workspaceId, options, isCurrent),
+      abandonGoalAutoRetry: (workspaceId, goalId) =>
+        workspaceService.abandonGoalAutoRetry(workspaceId, goalId),
     });
   })
 );

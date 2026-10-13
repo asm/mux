@@ -9,6 +9,7 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 
+import { useMinThinkingLevels } from "./useMinThinkingLevels";
 import { useRouting } from "./useRouting";
 import { createTestApiClient, createTestConfig, type TestClientConfig } from "@/browser/testUtils";
 
@@ -114,6 +115,37 @@ describe("useRouting", () => {
     });
   });
 
+  test.each([
+    { canonicalRoutes: { google: "agents-google" }, expected: "coder" },
+    { canonicalRoutes: undefined, expected: "direct" },
+  ])("routes Google through Coder only when canonicalRoutes maps it: %j", async (testCase) => {
+    const model = "google:gemini-3.8-flash";
+    providersConfig = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "agents-google", type: "google" }],
+        canonicalRoutes: testCase.canonicalRoutes,
+      },
+    };
+    routePriority = ["coder", "direct"];
+    getProvidersConfigStore().setClient(stubClient);
+    getAppConfigStore().setClient(stubClient);
+    const { result } = renderHook(() => useRouting(), { wrapper });
+    // Anthropic's default-named instance proves the Coder config has loaded.
+    await waitFor(() =>
+      expect(result.current.resolveRoute(KNOWN_MODELS.OPUS.id).route).toBe("coder")
+    );
+
+    expect(result.current.availableRoutes(model).some((route) => route.route === "coder")).toBe(
+      testCase.expected === "coder"
+    );
+    expect(result.current.resolveRoute(model).route).toBe(testCase.expected);
+    expect(result.current.resolveAutoRoute(model).route).toBe(testCase.expected);
+    expect(result.current.resolveEffectiveRoute(model)).toBe(testCase.expected);
+  });
+
   const coderFallbackCases: Array<{
     availability: Partial<NonNullable<ProvidersConfigMap["coder"]>>;
     override?: string;
@@ -201,5 +233,28 @@ describe("useRouting", () => {
     expect(result.current.routePriority).toEqual(["mux-gateway", "direct"]);
 
     await waitFor(() => expect(result.current.routePriority).toEqual(["direct"]));
+  });
+
+  test("a preferences-only update does not re-render routing or thinking-floor consumers", async () => {
+    getProvidersConfigStore().setClient(stubClient);
+    let renders = 0;
+    const { result } = renderHook(
+      () => {
+        renders++;
+        return [useRouting(), useMinThinkingLevels()] as const;
+      },
+      { wrapper }
+    );
+    await waitFor(() => expect(getAppConfigStore().getSnapshot()).not.toBeNull());
+    await waitFor(() => expect(result.current[0].routePriority).toEqual(["direct"]));
+    const rendersBefore = renders;
+
+    act(() => {
+      getAppConfigStore().updateOptimistically({
+        userPreferences: { appearance: { theme: "light" } },
+      });
+    });
+
+    expect(renders).toBe(rendersBefore);
   });
 });

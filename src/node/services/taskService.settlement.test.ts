@@ -1,5 +1,6 @@
 import * as path from "path";
 import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import * as fsPromises from "fs/promises";
 import {
   TASK_CREATE_WAIT_WARNING_MS,
@@ -722,6 +723,8 @@ describe("TaskService", () => {
       expect(internal).toMatchObject({
         queueDedupeKey: taskRecoveryPromptDedupeKey(t.childId, "timeout-finalization"),
         removableQueueDedupeKey: true,
+        // An automatic report prompt: it cannot create or replace the child's goal.
+        taskTurnKind: "required_report",
       });
     });
 
@@ -852,6 +855,9 @@ describe("TaskService", () => {
             );
           }),
           buildMemorySessionContext: mock(() => Promise.resolve(null)),
+          isExperimentEnabled: mock(
+            (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
+          ),
         },
       });
       const { session } = sessionHarness;
@@ -907,7 +913,6 @@ describe("TaskService", () => {
             await session.sendMessage("Research the topic and report.", {
               model: childModel,
               agentId: "exec",
-              experiments: { tokenBudget: true, memory: true },
             })
           ).success
         ).toBe(true);

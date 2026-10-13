@@ -109,7 +109,6 @@ interface CreationControlsProps {
   defaultRuntimeMode: RuntimeChoice;
   /** Set the currently selected runtime (discriminated union) */
   onSelectedRuntimeChange: (runtime: ParsedRuntime) => void;
-  onSetDefaultRuntime: (mode: RuntimeChoice) => void;
   disabled: boolean;
   /** Owning project path used for runtime/settings scoping (always the parent). */
   projectPath: string;
@@ -146,7 +145,6 @@ export interface RuntimeButtonGroupProps {
   value: RuntimeChoice;
   onChange: (mode: RuntimeChoice) => void;
   defaultMode: RuntimeChoice;
-  onSetDefault: (mode: RuntimeChoice) => void;
   disabled?: boolean;
   runtimeAvailabilityState?: RuntimeAvailabilityState;
   runtimeEnablement?: RuntimeEnablement;
@@ -796,7 +794,6 @@ function CreationControlsContent(props: CreationControlsProps) {
                   }
                 }}
                 defaultMode={props.defaultRuntimeMode}
-                onSetDefault={props.onSetDefaultRuntime}
                 disabled={props.disabled}
                 runtimeAvailabilityState={runtimeAvailabilityState}
                 runtimeEnablement={props.runtimeEnablement}
@@ -1034,9 +1031,11 @@ export function CreationControls(props: CreationControlsProps) {
     ? undefined
     : {
         enabled: coderEnabled ?? false,
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         onEnabledChange: coderOnEnabledChange!,
         coderInfo: coderInfo ?? null,
         coderConfig: coderConfig ?? null,
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         onCoderConfigChange: coderOnConfigChange!,
         templates: coderTemplates ?? [],
         templatesError: coderTemplatesError ?? null,
@@ -1086,7 +1085,6 @@ export function CreationControls(props: CreationControlsProps) {
       sshHostFallback={props.sshHostFallback}
       defaultRuntimeMode={props.defaultRuntimeMode}
       onSelectedRuntimeChange={props.onSelectedRuntimeChange}
-      onSetDefaultRuntime={props.onSetDefaultRuntime}
       disabled={props.disabled}
       projectPath={props.projectPath}
       selectedProjectPath={props.selectedProjectPath}

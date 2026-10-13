@@ -14,7 +14,6 @@ import { useAboutDialog } from "@/browser/contexts/AboutDialogContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useRouting } from "@/browser/hooks/useRouting";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
   formatMuxGatewayBalance,
@@ -26,7 +25,8 @@ import {
   DESKTOP_TITLEBAR_HEIGHT_CLASS,
 } from "@/browser/hooks/useDesktopTitlebar";
 
-import { DEFAULT_MODEL_KEY, getModelKey } from "@/common/constants/storage";
+import { useWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
+import { useAppConfig } from "@/browser/stores/AppConfigStore";
 import { PROVIDER_DISPLAY_NAMES } from "@/common/constants/providers";
 import {
   getExplicitGatewayPrefix,
@@ -75,20 +75,9 @@ export function TitleBar(props: TitleBarProps) {
   const { isAnalyticsOpen, navigateToAnalytics, navigateFromAnalytics, currentWorkspaceId } =
     useRouter();
   const routing = useRouting();
-  const [defaultModel] = usePersistedState<string>(DEFAULT_MODEL_KEY, WORKSPACE_DEFAULTS.model, {
-    listener: true,
-  });
-  const workspaceModelKey = getModelKey(currentWorkspaceId ?? "__titlebar__");
-  const [workspaceModelOverride] = usePersistedState<string | null>(workspaceModelKey, null, {
-    listener: true,
-  });
-  const rawActiveModel =
-    currentWorkspaceId &&
-    typeof workspaceModelOverride === "string" &&
-    workspaceModelOverride.trim().length > 0
-      ? workspaceModelOverride.trim()
-      : defaultModel;
-  const activeModel = normalizeSelectedModel(rawActiveModel);
+  const defaultModel = useAppConfig((config) => config.defaultModel) ?? WORKSPACE_DEFAULTS.model;
+  const workspaceModel = useWorkspaceAiSelection(currentWorkspaceId ?? "").model;
+  const activeModel = normalizeSelectedModel(currentWorkspaceId ? workspaceModel : defaultModel);
   const explicitGateway = getExplicitGatewayPrefix(activeModel);
   const canonicalActiveModel = normalizeToCanonical(activeModel);
   // Explicit gateway selections short-circuit route resolution: the user
@@ -220,14 +209,16 @@ export function TitleBar(props: TitleBarProps) {
               className={cn(
                 // Keep the version row shrinkable so long git-describe values ellipsize
                 // instead of overlapping the gateway/settings controls.
-                "flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-left text-inherit transition-opacity hover:opacity-70",
+                "flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-left text-inherit transition-opacity",
                 isDesktop && "titlebar-no-drag"
               )}
               onClick={handleOpenAboutDialog}
             >
+              {/* text-content-secondary, not the bar's text-muted: the light theme's muted token is
+                  3.5:1 on the sidebar color, below WCAG AA (#5950). */}
               <div
                 className={cn(
-                  "min-w-0 flex-1 truncate font-normal tracking-wider",
+                  "text-content-secondary min-w-0 flex-1 truncate font-normal tracking-wider",
                   leftInset > 0 ? "text-[10px]" : "text-xs"
                 )}
               >

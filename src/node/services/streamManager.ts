@@ -5,6 +5,7 @@ import {
   checkAssembledRequestBudgetForModel,
   createContextBudgetAnchor,
   estimateAnchoredRequestTokensForModel,
+  isExactAppend,
   type ContextBudgetAnchorRequest,
   estimateToolResultTokensForModel,
 } from "./contextBudgetCounting";
@@ -107,11 +108,14 @@ import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { stripInternalToolResultFields } from "@/common/utils/tools/internalToolResultFields";
 import { summarizeInvalidToolInputErrors } from "@/node/utils/messages/summarizeInvalidToolInputErrors";
 import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
 import {
   collectDeferLoadingToolNames,
   computeActiveToolNames,
   computeContextLoadedToolNames,
+  dedupeNativeToolReferences,
   computeLoadedToolNames,
+  unprojectNativeToolReferences,
   type ToolSearchStreamState,
 } from "@/common/utils/tools/toolCatalog";
 import { StreamingTokenTracker } from "@/node/utils/main/StreamingTokenTracker";
@@ -124,6 +128,7 @@ import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
 import { neutralizeAgentEnvelopeLookalikesInModelToolParts } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
 import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
+import { countAnthropicInputTransformations } from "@/node/utils/messages/anthropicInputTransformations";
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
 import { stripAnthropicReasoning } from "@/browser/utils/messages/modelMessageTransform";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
@@ -293,6 +298,10 @@ export interface SettledStepBudget {
    * preflight will compute it. Absent when no context budget applies.
    */
   nextRequestTokens?: number;
+  /** The appended-message part of `nextRequestTokens`; absent when it was a full count. */
+  nextRequestDeltaTokens?: number;
+  /** True only while every budget count since the turn's first step 0 was an exact append. */
+  exactAppendChain?: boolean;
   sessionHistoryAvailable: boolean;
   /** The step's request advertised `new_context`, so the final prompt can be acted on. */
   newContextAvailable: boolean;
@@ -438,12 +447,14 @@ function publishLiveRouting(streamInfo: WorkspaceStreamInfo): void {
 
 /**
  * Same-turn message transforms applied before every provider step: strip workflow run records
- * from same-turn tool results (history-level redaction in applyToolOutputRedaction can't see
- * these), neutralize protocol-envelope lookalikes in same-turn tool inputs/results
+ * and redact binary-like strings in same-turn tool results (history-level redaction in
+ * applyToolOutputRedaction can't see these), neutralize protocol-envelope lookalikes in same-turn tool inputs/results
  * (messagePipeline's neutralizer only sees persisted history), then extract supported
  * attachments out of tool-result JSON so providers don't treat them as text. Idempotent on an
  * already-transformed prefix. The settled-step budget floor reuses it so it measures exactly the
- * request the next step's preflight will check.
+ * request the next step's preflight will check. Native tool_reference dedupe is NOT part of
+ * this transform: it must run after a prefix swap (see prepareStep), which replaces the prefix
+ * the projection is decided against.
  */
 function transformStepMessages(messages: ModelMessage[]): Promise<ModelMessage[]> {
   return extractToolMediaAsUserMessagesFromModelMessages(
@@ -481,8 +492,18 @@ interface StepMessageTracker {
    * reuse the tracker, so their step 0 is not the turn's first request (#5279).
    */
   providerRequestPrepared?: boolean;
+  /** A full count after the turn's first request, or a thinking rebuild, ran (never reset). */
+  exactAppendChainBroken?: boolean;
   /** Present only when Auto set this turn's thinking level; shared across fallback hops. */
   autoThinkingEscalation?: AutoThinkingEscalationState;
+  /**
+   * Set when an in-turn prefix change made prepareStep strip earlier Anthropic thinking.
+   * The finish-step handler then writes the replay receipt, so the next turn does not
+   * put the removed blocks back (preserved thinking).
+   */
+  anthropicThinkingStripped?: boolean;
+  /** True once this turn holds the Anthropic thinking-repair receipt (reads initialMetadata). */
+  hasAnthropicReplayReceipt?: () => boolean;
 }
 interface StreamRequestConfig {
   stopCause?: StreamStopCause;
@@ -585,8 +606,8 @@ interface PreparedModelFallback {
    */
   onStreamConstructed?: () => Promise<void>;
   /**
-   * Pinned providers-config snapshot the fallback request was built from
-   * (see TurnRequestBuilder's pinCoderInstanceProvidersConfig). The swap's request-config
+   * Providers-config snapshot the fallback request was built from (the
+   * factory's creation-time read, see TurnRequestBuilder). The swap's request-config
    * rebuild and metadata resolution must read THIS snapshot, not the live
    * config: a catalog refresh between prepare() and the swap could retag the
    * instance and hand the prepared SDK model another wire's output limits or
@@ -708,6 +729,33 @@ const OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN =
 // (Coder gateway, custom providers) otherwise fail every retry identically.
 const ANTHROPIC_THINKING_SIGNATURE_INVALID_PATTERN = /Invalid `signature` in `thinking` block/;
 
+/**
+ * The provider's Retry-After in ms from a failed request's response headers, or null when it
+ * sent none (or an unusable value). Parsed like the AI SDK's own retry loop
+ * (`getRetryDelayInMs` in `ai`): `retry-after-ms` first, then `retry-after` as seconds or an
+ * HTTP date. A RetryError (the SDK exhausted its retries) reports its last attempt's headers.
+ */
+function getProviderRetryAfterMs(error: unknown): number | null {
+  const apiError = RetryError.isInstance(error) ? error.lastError : error;
+  if (!APICallError.isInstance(apiError)) return null;
+  // Header names are lowercase: the SDK collects them from a fetch Headers object.
+  const headers = apiError.responseHeaders;
+  if (!headers) return null;
+  const parse = (): number => {
+    const retryAfterMs = headers["retry-after-ms"];
+    if (retryAfterMs) {
+      const ms = Number.parseFloat(retryAfterMs);
+      if (!Number.isNaN(ms)) return ms;
+    }
+    const retryAfter = headers["retry-after"];
+    if (!retryAfter) return Number.NaN;
+    const seconds = Number.parseFloat(retryAfter);
+    return Number.isNaN(seconds) ? Date.parse(retryAfter) - Date.now() : seconds * 1000;
+  };
+  const ms = parse();
+  return Number.isFinite(ms) && ms >= 0 ? ms : null;
+}
+
 // Use the resolved SDK model, not the requested prefix: OpenAI Responses can
 // arrive through direct, custom, Coder, or Vercel gateway routes. xAI Responses
 // and OpenRouter chat-completions models must not enter this recovery path.
@@ -727,6 +775,15 @@ function isAnthropicMessagesModel(model: LanguageModel): boolean {
     model.provider === "anthropic.messages" ||
     (model.provider === "gateway" && model.modelId.startsWith("anthropic/"))
   );
+}
+
+// Claude through Bedrock Converse (@ai-sdk/amazon-bedrock), whose converter replays
+// in-turn thinking from the `bedrock` namespace. Same id test as the SDK's own
+// isAnthropicModel, plus the metadata model for opaque ids that map to Claude
+// (application inference profile ARNs with mappedToModel).
+function isBedrockClaudeModel(model: LanguageModel, metadataModel: string | undefined): boolean {
+  if (typeof model === "string" || model.provider !== "amazon-bedrock") return false;
+  return model.modelId.includes("anthropic") || metadataModel?.includes("claude-") === true;
 }
 
 // Stream state enum for exhaustive checking
@@ -904,6 +961,11 @@ interface WorkspaceStreamInfo {
   // original start timestamp even after they gain output.
   toolCompletionTimestamps: Map<string, number>;
 
+  // Anthropic server tools (web_search, ...) called in this row (#5887). Xum stores them as
+  // client tool calls without their encrypted results, so history replays them as a
+  // tool_use/tool_result pair: thinking after one is bound to a prefix never sent again.
+  anthropicServerToolCallIds?: Set<string>;
+
   // Workflow tools can create the durable run before their stream part is stored. Keep the exact
   // attachment and apply it as soon as the matching dynamic-tool part lands.
   pendingWorkflowRunAttachments: Map<string, WorkflowRunToolAttachment>;
@@ -966,6 +1028,11 @@ interface WorkspaceStreamInfo {
   historySequence: number;
   // Track accumulated parts for partial message (includes reasoning, text, and tools)
   parts: CompletedMessagePart[];
+  // The reasoning block opened by the latest reasoning-start, and the last part
+  // created for it (undefined until the block has a part). Anthropic replays each
+  // thinking block with its own signature, so a metadata-only signature delta may
+  // only attach to a part of the SAME block; otherwise it is its own (empty) block.
+  currentReasoningBlock?: { lastPart?: CompletedMessagePart };
   // Reasoning parts before this index belong to refused fallback attempts whose
   // usage was already attributed separately; stream-end backfill must not bill
   // them again under the answering model.
@@ -1082,7 +1149,7 @@ export interface ActiveStreamInfo {
   parts: CompletedMessagePart[];
   currentStepStartIndex: number;
   stepStartIndices: number[];
-  initialMetadata?: { systemMessageTokens?: number };
+  initialMetadata?: { systemMessageTokens?: number; anthropicThinkingReplay?: "off" };
   toolCompletionTimestamps: Map<string, number>;
   muxMetadata?: unknown;
 }
@@ -2118,6 +2185,7 @@ export class StreamManager {
         }
       }
       streamInfo.parts.push(partToPersist);
+      if (part.type === "reasoning") this.turnReplayOffAfterServerTool(streamInfo);
       if (pendingExecutionStart !== undefined && part.type === "dynamic-tool") {
         this.emitTurnEvent({
           type: "tool-call-execution-start",
@@ -2156,6 +2224,36 @@ export class StreamManager {
         void this.schedulePartialWrite(workspaceId, streamInfo);
       }
     }
+  }
+
+  /**
+   * #5887 containment: thinking that follows an Anthropic server tool in this row cannot
+   * replay as the API returned it (see anthropicServerToolCallIds). Write the same receipt
+   * as the signature repair, so later requests in the context segment send no thinking
+   * (removing every thinking block is valid; a gap or a put-back block is not). It rides
+   * on the partial write that stores this reasoning part (every reasoning append schedules
+   * one).
+   */
+  private turnReplayOffAfterServerTool(streamInfo: WorkspaceStreamInfo): void {
+    const serverToolIds = streamInfo.anthropicServerToolCallIds;
+    if (serverToolIds == null || streamInfo.initialMetadata?.anthropicThinkingReplay === "off") {
+      return;
+    }
+    // Only Anthropic reasoning is bound to the native prefix: a refusal fallback to another
+    // provider keeps the parts (and the IDs) but its reasoning replays nothing Anthropic.
+    if (!isAnthropicMessagesModel(streamInfo.request.model)) return;
+    // Read the parts, not only the ID set: a retry that drops parts drops the server tool too.
+    const followsServerTool = streamInfo.parts.some(
+      (part) => part.type === "dynamic-tool" && serverToolIds.has(part.toolCallId)
+    );
+    if (!followsServerTool) {
+      // Every recorded server tool's part is gone. The tool-call case records an ID and
+      // stores its part before any later reasoning, so the IDs are stale: drop them, or
+      // every later reasoning delta would scan all parts again (perf).
+      streamInfo.anthropicServerToolCallIds = undefined;
+      return;
+    }
+    streamInfo.initialMetadata = { ...streamInfo.initialMetadata, anthropicThinkingReplay: "off" };
   }
 
   private async cancelStreamSafely(
@@ -2335,6 +2433,11 @@ export class StreamManager {
         contextProviderMetadata,
         model: streamInfo.model,
         metadataModel: streamInfo.metadataModel,
+        // Same tool-model usage the committed partial gets below, so the renderer's
+        // per-turn cost views match history replay without a reload.
+        ...(streamInfo.toolModelUsages.length > 0
+          ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
+          : {}),
       },
       abortReason,
       abandonPartial,
@@ -2740,37 +2843,42 @@ export class StreamManager {
           const nextMessages =
             request.contextBudgetLimit == null
               ? undefined
-              : await transformStepMessages([
-                  ...(stepTracker?.latestMessages ?? [
-                    ...request.messages,
-                    ...steps.slice(0, -1).flatMap((prior) => prior.response.messages),
-                  ]),
-                  ...step.response.messages,
-                ]);
-          const nextRequestTokens =
+              : dedupeNativeToolReferences(
+                  await transformStepMessages([
+                    ...(stepTracker?.latestMessages ?? [
+                      ...request.messages,
+                      ...steps.slice(0, -1).flatMap((prior) => prior.response.messages),
+                    ]),
+                    ...step.response.messages,
+                  ])
+                );
+          const nextRequest =
             nextMessages == null
               ? undefined
-              : (
-                  await estimateAnchoredRequestTokensForModel(
-                    {
-                      system: request.system,
-                      messages: nextMessages,
-                      tools: request.tools,
-                    },
-                    {
-                      model: request.modelString,
-                      metadataModel: request.budgetMetadataModel,
-                      modelContextLimit: request.contextBudgetLimit,
-                      activeTools: computeContextLoadedToolNames(
-                        request.toolSearchState,
-                        nextMessages
-                      ),
-                    },
-                    // prepareStep anchors the next step on this same request and usage, so both
-                    // measures take the same anchored-or-full branch and the invariant holds.
-                    createContextBudgetAnchor(stepTracker?.contextBudgetRequest, step)
-                  )
-                )?.estimate;
+              : await estimateAnchoredRequestTokensForModel(
+                  {
+                    system: request.system,
+                    messages: nextMessages,
+                    tools: isAgentToolsDisabled() ? undefined : request.tools,
+                  },
+                  {
+                    model: request.modelString,
+                    metadataModel: request.budgetMetadataModel,
+                    modelContextLimit: request.contextBudgetLimit,
+                    activeTools: computeContextLoadedToolNames(
+                      request.toolSearchState,
+                      nextMessages
+                    ),
+                  },
+                  // prepareStep anchors the next step on this same request and usage, so both
+                  // measures take the same anchored-or-full branch and the invariant holds.
+                  createContextBudgetAnchor(stepTracker?.contextBudgetRequest, step)
+                );
+          const nextRequestTokens = nextRequest?.estimate;
+          const nextRequestDeltaTokens = nextRequest?.delta;
+          if (nextRequestDeltaTokens == null && stepTracker) {
+            stepTracker.exactAppendChainBroken = true;
+          }
           const { decision, continuationEntryId } = await request.onStepSettled({
             model: request.modelString,
             usage: normalizeUsage(step.usage),
@@ -2778,6 +2886,9 @@ export class StreamManager {
             ...size,
             toolResultTokens,
             ...(nextRequestTokens != null ? { nextRequestTokens } : {}),
+            ...(nextRequestDeltaTokens != null ? { nextRequestDeltaTokens } : {}),
+            exactAppendChain:
+              nextRequestDeltaTokens != null && stepTracker?.exactAppendChainBroken !== true,
             sessionHistoryAvailable: request.tools?.session_history != null,
             newContextAvailable: request.tools?.new_context != null,
             newContextRequested: step.toolResults.some(
@@ -2947,7 +3058,14 @@ export class StreamManager {
       log.warn("[continuous-compaction] prefix locator missing; retaining full context");
       return null;
     }
-    return [...swap.prefix, ...stripMessageCacheControl(messages.slice(index))];
+    // The retained tail may hold a projected repeated search whose first
+    // occurrence the swapped-out prefix carried; restore the raw references so
+    // the caller's dedupe re-decides against the swapped transcript. Done here
+    // so every swap site (per-step and fallback rebuild) inverts identically.
+    return [
+      ...swap.prefix,
+      ...stripMessageCacheControl(unprojectNativeToolReferences(messages.slice(index))),
+    ];
   }
 
   private createStreamResult(
@@ -2963,8 +3081,12 @@ export class StreamManager {
     // #5086: see the `between_tools` replay guard in prepareStep.
     let previousToolSetKey: string | undefined;
     let seenPrefixSwap: ContinuousPrefixSwap | undefined;
+
     // Outgoing rows before this index predate the latest in-turn prefix change.
     let reasoningReplayBoundary = 0;
+    // XUM_DISABLE_AGENT_TOOLS=1 sends no tools at all (see isAgentToolsDisabled). Every chat
+    // turn, sub-agent and workflow agent streams through here.
+    const agentToolsDisabled = isAgentToolsDisabled();
     return (this.streamTextOverride ?? streamText)<ToolSet>({
       model: request.model,
       messages: request.messages,
@@ -3046,6 +3168,11 @@ export class StreamManager {
           }
           if (stepTracker.pendingPrefixSwap === swap) stepTracker.pendingPrefixSwap = undefined;
         }
+        // Dedupe after the swap, never before: the swap replaces the prefix this
+        // projection is decided against, and the SDK accumulates the next step's
+        // input from these returned messages, so a reference dropped against a
+        // swapped-out prefix would stay lost for the rest of the turn.
+        effectiveMessages = dedupeNativeToolReferences(effectiveMessages);
         if (stepTracker) {
           stepTracker.latestMessages = effectiveMessages;
         }
@@ -3056,20 +3183,25 @@ export class StreamManager {
         // undefined when the feature is inactive, keeping the return value
         // byte-identical to the pre-feature behavior, and in native mode, which
         // keeps the tools block stable (#5262).
-        const searchedActiveTools = computeActiveToolNames(request.toolSearchState);
+        const searchedActiveTools = agentToolsDisabled
+          ? undefined
+          : computeActiveToolNames(request.toolSearchState);
         const forceFirstStepTools =
-          stepNumber === 0 && request.forcedFirstStepToolNames?.length
+          !agentToolsDisabled && stepNumber === 0 && request.forcedFirstStepToolNames?.length
             ? request.forcedFirstStepToolNames
             : undefined;
         const activeTools = forceFirstStepTools ?? searchedActiveTools;
         // Mid-turn thinking-level change: consume a pending override before
         // this step's provider request is built. Before the turn's first request it
         // resolves as at turn start (#5279); without a tracker, assume a step ran.
-        const thinkingOverride = this.applyPendingThinkingOverride(
-          request,
-          stepTracker != null && stepNumber === 0 && !stepTracker.providerRequestPrepared
-        );
-        if (stepTracker) stepTracker.providerRequestPrepared = true;
+        const firstTurnRequest =
+          stepTracker != null && stepNumber === 0 && !stepTracker.providerRequestPrepared;
+        const thinkingOverride = this.applyPendingThinkingOverride(request, firstTurnRequest);
+        if (stepTracker) {
+          stepTracker.providerRequestPrepared = true;
+          // A thinking change rebuilds the request (mid-turn, or step 0's first-step rebuild).
+          if (thinkingOverride !== undefined) stepTracker.exactAppendChainBroken = true;
+        }
         if (escalation && escalationState) {
           // The rebuild clamps to the model's ladder and reports a no-op as "not applicable";
           // only a level that actually changed is provenance, at the level it changed to (a
@@ -3110,13 +3242,21 @@ export class StreamManager {
               appliedLevel,
               thinkingOverride
             );
+            // #5886: the rebuild reads history, which does not hold this turn's
+            // thinking-repair receipt yet. Keep the removed thinking out.
+            const receiptApplied =
+              stepTracker?.hasAnthropicReplayReceipt?.() === true
+                ? stripReasoningReplay(rebuilt, "anthropic")
+                : rebuilt;
             // Same per-step transforms the construction-time messages receive.
-            rebuiltFirstStepMessages = await transformStepMessages(rebuilt);
+            rebuiltFirstStepMessages = dedupeNativeToolReferences(
+              await transformStepMessages(receiptApplied)
+            );
             if (stepTracker) {
               stepTracker.latestMessages = rebuiltFirstStepMessages;
             }
             // onStepMessages fired above with the pre-rebuild transcript;
-            // re-notify so consumers (advisor transcript ref) track the
+            // re-notify so consumers track the
             // messages this step actually sends.
             request.onStepMessages?.(rebuiltFirstStepMessages);
           } catch (error) {
@@ -3151,11 +3291,14 @@ export class StreamManager {
             throw new Error(formatSendMessageError(consentError).message);
           }
         }
-        // #5086: `between_tools` cannot carry blockBinding, so a replayed in-turn
-        // thinking block stays valid only while everything before it is unchanged.
-        // A consumed prefix swap or a change to the advertised tool set edits that
-        // prefix, so rows sent up to that step never replay reasoning again. Blocks
-        // produced after it are bound to the new prefix and keep replaying (#5279).
+        // #5086, preserved thinking: a replayed in-turn thinking block stays valid only
+        // while everything before it is unchanged. A consumed prefix swap or a change to
+        // the advertised tool set edits that prefix, so rows sent up to that step never
+        // replay reasoning again. Blocks produced after it are bound to the new prefix and
+        // keep replaying (#5279). This applies to every Anthropic Messages thinking mode,
+        // not only `between_tools` (which cannot carry blockBinding): only the direct API
+        // route sends `drop_block`, so adaptive/enabled thinking on other routes would 400.
+        // Claude on Bedrock gets the same strip (#5841): Bedrock cannot take drop_block.
         const toolSetKey = activeTools === undefined ? "" : [...activeTools].sort().join("\n");
         const consumedSwap = stepTracker?.consumedPrefixSwap;
         const outgoing = rebuiltFirstStepMessages ?? effectiveMessages;
@@ -3170,7 +3313,9 @@ export class StreamManager {
         seenPrefixSwap = consumedSwap;
         previousToolSetKey = toolSetKey;
         if (
-          sendsBetweenToolsThinking(request.providerOptions) &&
+          (sendsBetweenToolsThinking(request.providerOptions) ||
+            isAnthropicMessagesModel(request.model) ||
+            isBedrockClaudeModel(request.model, request.budgetMetadataModel)) &&
           outgoing.some(
             (message, index) =>
               index < reasoningReplayBoundary &&
@@ -3188,6 +3333,13 @@ export class StreamManager {
           } else {
             effectiveMessages = stripped;
           }
+          // No receipt for Bedrock: Xum never replays Bedrock thinking across turns
+          // (sanitizeReasoningReplayMetadata keeps no `bedrock` namespace), so the
+          // stripped blocks cannot come back, and a receipt would strip later
+          // Anthropic-route thinking in the same segment for nothing.
+          if (stepTracker && isAnthropicMessagesModel(request.model)) {
+            stepTracker.anthropicThinkingStripped = true;
+          }
         }
         // Taken before this step records its own request; step zero has no settled step.
         const previousRequest = stepNumber > 0 ? stepTracker?.contextBudgetRequest : undefined;
@@ -3195,7 +3347,7 @@ export class StreamManager {
           model: request.modelString,
           metadataModel: request.budgetMetadataModel,
           system: request.system,
-          tools: request.tools,
+          tools: agentToolsDisabled ? undefined : request.tools,
           // Native tool search sends deferred tools without loading them into context.
           activeTools:
             forceFirstStepTools ??
@@ -3207,10 +3359,21 @@ export class StreamManager {
         };
         if (stepTracker) stepTracker.contextBudgetRequest = budgetRequest;
         if (request.contextBudgetLimit != null) {
+          const budgetOptions = { ...budgetRequest, modelContextLimit: request.contextBudgetLimit };
+          const anchor = createContextBudgetAnchor(previousRequest, steps.at(-1));
+          // Any full count after the turn's first request breaks the chain; a fallback or retry
+          // hop's step 0 has no anchor.
+          if (
+            stepTracker &&
+            !firstTurnRequest &&
+            (anchor == null || !isExactAppend(budgetRequest, budgetOptions, anchor))
+          ) {
+            stepTracker.exactAppendChainBroken = true;
+          }
           const exceeded = await checkAssembledRequestBudgetForModel(
             budgetRequest,
-            { ...budgetRequest, modelContextLimit: request.contextBudgetLimit },
-            createContextBudgetAnchor(previousRequest, steps.at(-1))
+            budgetOptions,
+            anchor
           );
           // Step zero can follow executed tools on a fallback. This late hard stop
           // preserves settled results; it must not reset/replay the activated catalog.
@@ -3252,7 +3415,7 @@ export class StreamManager {
         };
       },
       onChunk: request.onChunk,
-      tools: request.tools,
+      tools: agentToolsDisabled ? undefined : request.tools,
       experimental_transform: summarizeInvalidToolInputErrors(),
       stopWhen: this.createStopWhenCondition(request, stepTracker),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment
@@ -3374,6 +3537,9 @@ export class StreamManager {
       cumulativeUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
       cumulativeProviderMetadata: undefined,
     };
+    // Single source for same-turn rebuilds: the receipt lives on initialMetadata (#5886).
+    stepTracker.hasAnthropicReplayReceipt = () =>
+      streamInfo.initialMetadata?.anthropicThinkingReplay === "off";
 
     // Mid-turn thinking override: route applied levels into this stream's
     // metadata (partials, stream-end, final assistant message). Wired before
@@ -3689,6 +3855,7 @@ export class StreamManager {
         toolName: event.toolName,
         result: event.result ?? (event.error ? { error: event.error } : undefined),
         ...(mcpServer ? { mcpServer } : {}),
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         timestamp: event.endTime!,
         parentToolCallId: event.parentToolCallId,
       });
@@ -4132,7 +4299,11 @@ export class StreamManager {
     const nextRequest = this.buildStreamRequestConfig({
       model: prepared.data.model,
       modelString: prepared.data.modelString,
-      messages: prepared.data.messages,
+      // #5886: prepare() rebuilds from history, which does not hold this turn's
+      // thinking-repair receipt yet. Keep the removed thinking out.
+      messages: streamInfo.stepTracker.hasAnthropicReplayReceipt?.()
+        ? stripReasoningReplay(prepared.data.messages, "anthropic")
+        : prepared.data.messages,
       system: prepared.data.system,
       tools: prepared.data.tools,
       providerOptions: prepared.data.providerOptions,
@@ -4509,7 +4680,20 @@ export class StreamManager {
                 const startOptions = reasoningProviderOptionsFromMetadata(
                   lifecyclePart.providerMetadata
                 );
-                if (startOptions) {
+                const block: { lastPart?: CompletedMessagePart } = {};
+                streamInfo.currentReasoningBlock = block;
+                if (startOptions?.anthropic?.redactedData != null) {
+                  // An Anthropic redacted_thinking block is complete at start and
+                  // replays as its own block: never merge it into earlier reasoning.
+                  const redactedPart = {
+                    type: "reasoning" as const,
+                    text: "",
+                    timestamp: nextPartTimestamp(streamInfo),
+                    providerOptions: startOptions,
+                  };
+                  await this.appendPartAndEmit(workspaceId, streamInfo, redactedPart, true);
+                  block.lastPart = redactedPart;
+                } else if (startOptions) {
                   const lastPart = streamInfo.parts.at(-1);
                   if (lastPart?.type === "reasoning") {
                     lastPart.providerOptions = mergeReasoningProviderOptions(
@@ -4530,6 +4714,7 @@ export class StreamManager {
                       true
                     );
                   }
+                  block.lastPart = streamInfo.parts.at(-1);
                 }
                 break;
               }
@@ -4547,6 +4732,26 @@ export class StreamManager {
                 // the latest reasoning part without creating a new empty text part.
                 if (!delta && (signature || deltaOptions)) {
                   const lastPart = streamInfo.parts.at(-1);
+                  const block = streamInfo.currentReasoningBlock;
+                  // Without a reasoning-start (some normalized streams) the last
+                  // reasoning part is the only block we know of.
+                  const lastPartInBlock = block == null || block.lastPart === lastPart;
+                  if (signature && !(lastPart?.type === "reasoning" && lastPartInBlock)) {
+                    // The block has no part yet (empty thinking, only a signature) or
+                    // the last part belongs to an earlier block: the signature is a
+                    // block of its own. Attaching it elsewhere would drop this block
+                    // and overwrite the earlier block's signature.
+                    const signedPart = {
+                      type: "reasoning" as const,
+                      text: "",
+                      timestamp: nextPartTimestamp(streamInfo),
+                      signature,
+                      providerOptions: deltaOptions,
+                    };
+                    await this.appendPartAndEmit(workspaceId, streamInfo, signedPart, true);
+                    if (block) block.lastPart = signedPart;
+                    break;
+                  }
                   if (lastPart?.type === "reasoning") {
                     if (signature) {
                       lastPart.signature = signature;
@@ -4582,6 +4787,9 @@ export class StreamManager {
                   providerOptions: deltaOptions,
                 };
                 await this.appendPartAndEmit(workspaceId, streamInfo, newPart, true);
+                if (streamInfo.currentReasoningBlock) {
+                  streamInfo.currentReasoningBlock.lastPart = newPart;
+                }
                 break;
               }
 
@@ -4627,6 +4835,12 @@ export class StreamManager {
                   toolName: part.toolName,
                   input: part.input,
                 });
+                if (
+                  part.providerExecuted === true &&
+                  isAnthropicMessagesModel(streamInfo.request.model)
+                ) {
+                  (streamInfo.anthropicServerToolCallIds ??= new Set()).add(part.toolCallId);
+                }
 
                 // Note: Tool availability is handled by the SDK, which emits tool-error events
                 // for unavailable tools. No need to check here.
@@ -4874,6 +5088,41 @@ export class StreamManager {
                   finishStepPart.usage
                 );
 
+                // Preserved thinking: report thinking blocks Anthropic dropped for this
+                // step. A prefix-binding drop means Xum edited the prompt prefix, which is
+                // worth seeing at info; model/account drops and older-account
+                // "mismatch allowed" flags are expected noise.
+                const inputTransformations =
+                  countAnthropicInputTransformations(stepProviderMetadata);
+                if (inputTransformations != null) {
+                  const fields = {
+                    messageId: streamInfo.messageId,
+                    model: streamInfo.model,
+                    ...inputTransformations,
+                  };
+                  const message = "Anthropic dropped or flagged replayed thinking blocks";
+                  if (inputTransformations.dropped.prefix_binding_mismatch > 0) {
+                    workspaceLog.info(message, fields);
+                  } else {
+                    workspaceLog.debug(message, fields);
+                  }
+                }
+
+                // Preserved thinking: prepareStep stripped earlier Anthropic thinking after
+                // an in-turn prefix change. Write the same receipt as the signature repair,
+                // or the next turn replays the removed blocks and gets a 400. Persisted with
+                // the next partial write; a crash before it only costs one repair (fail-safe).
+                if (
+                  streamInfo.stepTracker.anthropicThinkingStripped === true &&
+                  streamInfo.initialMetadata?.anthropicThinkingReplay !== "off"
+                ) {
+                  streamInfo.initialMetadata = {
+                    ...streamInfo.initialMetadata,
+                    anthropicThinkingReplay: "off",
+                  };
+                  await this.schedulePartialWrite(workspaceId, streamInfo);
+                }
+
                 // Update cumulative totals for this stream.
                 //
                 // Effect migration Phase 10: usage accounting stays in plain
@@ -5117,7 +5366,7 @@ export class StreamManager {
               } else {
                 // On successful completion, partial.json becomes stale and must be removed.
                 // Only this stream's own partial: the row just written covers nothing else
-                // (the order formal/history-crash/HistoryPartial.tla checks as crash-safe).
+                // (row first, then the partial delete: the crash-safe order).
                 const deleteResult = await this.historyService.deletePartialIfMessageIdMatches(
                   workspaceId,
                   streamInfo.messageId
@@ -5412,12 +5661,16 @@ export class StreamManager {
     }
 
     errorType = coerceStreamErrorTypeForMessage(errorType, errorMessage);
+    // The AI SDK honors Retry-After only for its own short in-request retries; once they are
+    // exhausted, Xum's auto-retry must not come back sooner than the provider asked.
+    const retryAfterMs = errorType === "rate_limit" ? getProviderRetryAfterMs(actualError) : null;
 
     return {
       messageId: streamInfo.messageId,
       error: errorMessage,
       errorType,
       acpPromptId: streamInfo.initialMetadata?.acpPromptId,
+      ...(retryAfterMs != null ? { retryAfterMs } : {}),
     };
   }
 
@@ -5592,6 +5845,8 @@ export class StreamManager {
     if (!preserveParts) {
       streamInfo.reasoningBackfillStartIndex = undefined;
     }
+    // A retried attempt starts with no open reasoning block.
+    streamInfo.currentReasoningBlock = undefined;
     this.recordStepStart(streamInfo);
     streamInfo.receivedTerminalEvent = false;
     streamInfo.terminalFinishReason = undefined;
@@ -5825,6 +6080,20 @@ export class StreamManager {
       preserveUsage: hasParts,
       workspaceLog,
     });
+
+    if (rejectedNamespace === "anthropic") {
+      // Preserved thinking: once thinking is removed, putting it back invalidates every
+      // later block, so the next turns must keep it out (messagePipeline reads this
+      // receipt). initialMetadata feeds the partial, error partial and final row alike
+      // (as the model-fallback record does). Persist before the retry request goes out so
+      // a crash mid-retry cannot forget the strip. A step-0 repair has no parts yet:
+      // commitPartial keeps the receipt on the empty row (#5886).
+      streamInfo.initialMetadata = {
+        ...streamInfo.initialMetadata,
+        anthropicThinkingReplay: "off",
+      };
+      await this.flushPartialWrite(workspaceId, streamInfo);
+    }
 
     streamInfo.request = { ...streamInfo.request, messages };
     streamInfo.streamResult = this.createStreamResult(
@@ -6632,7 +6901,11 @@ export class StreamManager {
         parts: streamInfo.parts,
         currentStepStartIndex: streamInfo.currentStepStartIndex,
         stepStartIndices: streamInfo.stepStartIndices.slice(),
-        initialMetadata: { systemMessageTokens: streamInfo.initialMetadata?.systemMessageTokens },
+        initialMetadata: {
+          systemMessageTokens: streamInfo.initialMetadata?.systemMessageTokens,
+          // Continuous compaction reads the running turn's receipt from here (#5996).
+          anthropicThinkingReplay: streamInfo.initialMetadata?.anthropicThinkingReplay,
+        },
         // Correlation metadata for delegated work (e.g. workspace-turn
         // continuations); lets TaskService match a live continuation stream
         // to its still-open workspace-turn handle.

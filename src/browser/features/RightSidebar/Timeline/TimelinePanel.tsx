@@ -40,6 +40,7 @@ import {
   getTimelineEventKind,
   getAgentEventIcon,
   getAgentEventTint,
+  getPromptCacheBreakView,
   getTimelineEventTitle,
   getTimelinePresentation,
   isMachineryKind,
@@ -397,6 +398,21 @@ function TimelineRuleRow(props: {
   );
 }
 
+function PromptCacheBreakDetails(props: { event: TimelineEvent }) {
+  const view = getPromptCacheBreakView(props.event);
+  if (view == null) return null;
+  return (
+    <span className="text-muted counter-nums mt-1 grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-[11px]">
+      {/* Wrap instead of truncating: the tool name and size at the end are what a reader needs. */}
+      <span className="col-span-2 min-w-0 break-words">{view.position}</span>
+      <span>Before</span>
+      <span className="text-content-secondary min-w-0 break-words">{view.before}</span>
+      <span>After</span>
+      <span className="text-content-secondary min-w-0 break-words">{view.after}</span>
+    </span>
+  );
+}
+
 function TimelineEventRow(props: {
   event: TimelineEvent;
   selected: boolean;
@@ -413,7 +429,6 @@ function TimelineEventRow(props: {
     presentation.icon;
   const failed = props.event.status === "failed";
   const interrupted = props.event.status === "interrupted";
-
   return (
     <button
       type="button"
@@ -462,6 +477,7 @@ function TimelineEventRow(props: {
             ) : null}
           </span>
         ) : null}
+        <PromptCacheBreakDetails event={props.event} />
       </span>
       <time
         dateTime={new Date(props.event.ts).toISOString()}
@@ -780,8 +796,7 @@ interface TimelinePanelViewProps extends TimelinePanelProps {
 export function TimelinePanelView(props: TimelinePanelViewProps) {
   const timeline = props.timeline;
   const workspaceStore = props.workspaceStore;
-  // listener keeps duplicate mounts in sync: a CSS-hidden sidebar tab and the mobile
-  // timeline dialog can both be mounted, sharing this persisted filter.
+  // listener keeps every mount of this panel in sync: they share this persisted filter.
   const [storedFilter, setStoredFilter] = usePersistedState<string>(
     getTimelineFilterKey(props.workspaceId),
     "all",
@@ -813,7 +828,7 @@ export function TimelinePanelView(props: TimelinePanelViewProps) {
       }}
     >
       <div className="border-border shrink-0 border-b px-3 py-2.5">
-        <div className="scrollbar-none flex min-w-0 gap-1.5 overflow-x-auto">
+        <div className="scrollbar-none scroll-fade-x flex min-w-0 gap-1.5 overflow-x-auto">
           {FILTERS.map((item) => (
             <button
               key={item.value}

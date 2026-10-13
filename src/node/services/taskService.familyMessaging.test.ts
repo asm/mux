@@ -1018,7 +1018,6 @@ describe("TaskService", () => {
           parentWorkspaceId,
           title: "Schema researcher",
           taskStatus: "running",
-          taskExperiments: { rlm: true },
         }),
       ],
       testTaskSettings()
@@ -1069,7 +1068,6 @@ describe("TaskService", () => {
           parentWorkspaceId,
           title: "Schema researcher",
           taskStatus: "running",
-          taskExperiments: { rlm: true },
         }),
       ],
       testTaskSettings()
@@ -1155,7 +1153,6 @@ describe("TaskService", () => {
         projectWorkspace(projectPath, "child", childTaskId, {
           parentWorkspaceId,
           taskStatus: "running",
-          taskExperiments: { rlm: true },
         }),
       ],
       testTaskSettings()
@@ -1200,12 +1197,10 @@ describe("TaskService", () => {
         projectWorkspace(projectPath, "child-a", childA, {
           parentWorkspaceId,
           taskStatus: "running",
-          taskExperiments: { rlm: true },
         }),
         projectWorkspace(projectPath, "child-b", childB, {
           parentWorkspaceId,
           taskStatus: "running",
-          taskExperiments: { rlm: true },
         }),
       ],
       testTaskSettings()

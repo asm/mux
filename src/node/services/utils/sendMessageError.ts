@@ -180,6 +180,8 @@ export const formatSendMessageError = (
       return { message: EDIT_HISTORY_CHANGED_MESSAGE, errorType: "unknown" };
     case "plan_review_feedback_edit_blocked":
       return { message: error.message, errorType: "unknown" };
+    case "session_tape_replay":
+      return { message: error.message, errorType: "session_tape_replay" };
   }
 };
 
@@ -193,6 +195,11 @@ export interface StreamErrorPayload {
   error: string;
   errorType?: StreamErrorType;
   acpPromptId?: string;
+  /**
+   * Internal: the provider's Retry-After for a `rate_limit` error, in ms. Feeds auto-retry
+   * scheduling only; not persisted and not part of the renderer wire payload.
+   */
+  retryAfterMs?: number;
 }
 
 export const createErrorEvent = (workspaceId: string, payload: StreamErrorPayload): ErrorEvent => ({
