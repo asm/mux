@@ -27,6 +27,7 @@ import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
+  markMcpAppViewHosted,
   mcpAppViewRefFor,
   openMcpAppViewTab,
   type McpAppViewRef,
@@ -100,11 +101,18 @@ const McpAppToolDetails: React.FC<{
   // A failed call's error is in the raw output: show it without a click.
   const [showRaw, setShowRaw] = React.useState(props.view.failed);
   const inTab = useMcpAppViewInTab(props.workspaceId, props.view.toolCallId, ["tab"]);
-  if (!useMcpAppViewsSupported()) return <ToolDetails>{props.raw}</ToolDetails>;
+  const supported = useMcpAppViewsSupported();
+  const { workspaceId, view } = props;
+  // An expanded card is where the view goes back to on inline (ui/request-display-mode).
+  React.useEffect(() => {
+    if (!supported) return;
+    return markMcpAppViewHosted(workspaceId, view.toolCallId, "card");
+  }, [supported, workspaceId, view.toolCallId]);
+  if (!supported) return <ToolDetails>{props.raw}</ToolDetails>;
   return (
     <ToolDetails>
       {inTab ? (
-        // One live instance per view: while its tab (or the sheet) has it, the card shows this
+        // One live instance per view: while its tab has it, the card shows this
         // instead of a second frame. Closing the tab brings the view back here.
         <AppViewInTabNotice workspaceId={props.workspaceId} view={props.view} />
       ) : (

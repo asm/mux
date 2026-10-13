@@ -381,10 +381,11 @@ export function openMcpAppViewTab(workspaceId: string, view: McpAppViewRef) {
 
 /**
  * Where a view is mounted outside its tool card: its app tab (also on phones, where the sidebar
- * shows full-screen). Counted per workspace and tool call, so every place that can show a view
- * yields to it and at most one live instance runs.
+ * shows full-screen). Counted per workspace, tool call and host, so every place that can show a
+ * view yields to it and at most one live instance runs. "card" is an expanded tool card, which
+ * shows the view (inline) whenever no tab has it.
  */
-export type McpAppViewHost = "tab";
+export type McpAppViewHost = "tab" | "card";
 const hostedViews = new Map<string, number>();
 const hostedKey = (workspaceId: string, toolCallId: string, host: McpAppViewHost) =>
   `${workspaceId}\u0000${toolCallId}\u0000${host}`;
@@ -406,12 +407,20 @@ export function markMcpAppViewHosted(
   };
 }
 
+export function isMcpAppViewHosted(
+  workspaceId: string,
+  toolCallId: string,
+  host: McpAppViewHost
+): boolean {
+  return hostedViews.has(hostedKey(workspaceId, toolCallId, host));
+}
+
 export function useMcpAppViewHostedBy(
   workspaceId: string,
   toolCallId: string,
   hosts: readonly McpAppViewHost[]
 ): boolean {
   return useSyncExternalStore(subscribe, () =>
-    hosts.some((host) => hostedViews.has(hostedKey(workspaceId, toolCallId, host)))
+    hosts.some((host) => isMcpAppViewHosted(workspaceId, toolCallId, host))
   );
 }
