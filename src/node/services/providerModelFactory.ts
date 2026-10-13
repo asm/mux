@@ -7,6 +7,7 @@ export {
   normalizeOpenAICompatibleBaseURL,
 } from "@/common/utils/providers/baseUrl";
 import assert from "node:assert";
+import { createHash } from "node:crypto";
 import { Effect } from "effect";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type {
@@ -848,11 +849,11 @@ export function wrapFetchWithAnthropicCacheControl(
   options?: {
     injectCacheControl?: boolean;
     /**
-     * Sees the final JSON body once the request was dispatched (prompt-cache
-     * prefix detection). Not called when cache markers are stripped: with
-     * prompt caching off there is no cache to break.
+     * Sees the final JSON body and its request URL once the request was
+     * dispatched (prompt-cache prefix detection). Not called when cache
+     * markers are stripped: with prompt caching off there is no cache to break.
      */
-    observeFinalBody?: (body: Record<string, unknown>) => void;
+    observeFinalBody?: (body: Record<string, unknown>, requestUrl: string) => void;
   }
 ): typeof fetch {
   const injectCacheControl = options?.injectCacheControl ?? true;
@@ -941,7 +942,7 @@ export function wrapFetchWithAnthropicCacheControl(
     // it must not move the baseline or record a break.
     if (injectCacheControl && response.ok) {
       try {
-        options?.observeFinalBody?.(json);
+        options?.observeFinalBody?.(json, requestUrlOf(input));
       } catch {
         // Observation is diagnostic only and must never affect the request.
       }
@@ -1013,6 +1014,44 @@ function wrapFetchStrippingEmptyAuthHeaders(baseFetch: typeof fetch): typeof fet
     return baseFetch(input, { ...init, headers });
   };
   return Object.assign(wrappedFetch, baseFetch) as typeof fetch;
+}
+
+function requestUrlOf(input: Parameters<typeof fetch>[0]): string {
+  return input instanceof Request ? input.url : String(input);
+}
+
+/** First 16 hex chars of sha256: tells values apart without revealing them. */
+function shortHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+/** `?sha256:<hash>` for a non-empty query string, else "". */
+function hashedQuery(search: string): string {
+  return search.length > 0 ? `?sha256:${shortHash(search)}` : "";
+}
+
+/**
+ * The prompt-cache route of a mux-gateway account. Signing in as another account keeps the
+ * base URL but reaches another cache, so the account joins the baseline key, as a short
+ * hash: the credential never reaches keys, logs or events.
+ */
+export function muxGatewayPromptCacheRoute(couponCode: string): string {
+  return `mux-gateway:${shortHash(couponCode)}`;
+}
+
+/**
+ * The cache endpoint of a request URL: origin and path, plus a short hash of the query.
+ * normalizeAnthropicBaseURL keeps base-URL query parameters, and a proxy can pick an account
+ * or cache by them (`?token=...`), so another query is another cache. The query can hold
+ * credentials, so only its hash reaches baseline keys, logs and DevTools records.
+ */
+export function requestEndpoint(requestUrl: string): string {
+  try {
+    const url = new URL(requestUrl);
+    return `${url.origin}${url.pathname}${hashedQuery(url.search)}`;
+  } catch {
+    return `unparsed:sha256:${shortHash(requestUrl)}`;
+  }
 }
 
 /**
@@ -1576,16 +1615,25 @@ export class ProviderModelFactory {
     return this.promptCachePrefixMonitor.createTurnScope(workspaceId, recorder);
   }
 
-  /** Final-body observer for an Anthropic wire, or undefined for requests outside a chat turn. */
+  /**
+   * Final-body observer for an Anthropic wire, or undefined for requests outside a chat turn.
+   * The request's endpoint joins the route identity: a changed base URL reaches another cache
+   * (another proxy or account), so its first request must not compare with the old baseline.
+   */
   private promptCacheObserver(
     opts: CreateModelOptions | undefined,
-    identity: PromptCacheRouteIdentity
-  ): ((body: Record<string, unknown>) => void) | undefined {
+    identity: Omit<PromptCacheRouteIdentity, "endpoint">
+  ): ((body: Record<string, unknown>, requestUrl: string) => void) | undefined {
     const scope = opts?.promptCacheScope;
     if (scope == null) {
       return undefined;
     }
-    return (body) => this.promptCachePrefixMonitor.observe(scope, identity, body);
+    return (body, requestUrl) =>
+      this.promptCachePrefixMonitor.observe(
+        scope,
+        { ...identity, endpoint: requestEndpoint(requestUrl) },
+        body
+      );
   }
 
   private isProviderAvailableForRouting(
@@ -2594,21 +2642,24 @@ export class ProviderModelFactory {
           // The gateway server still expects spec-v3 string-encoded file parts;
           // rewrite the v4 `{ type: "data" | "url" }` objects the 4.x SDK emits
           // so image attachments are not rejected as "invalid request".
-          const baseFetch = wrapFetchWithGatewayFilePartNormalization(
-            getProviderFetch(providerConfig)
-          );
+          const baseFetch = getProviderFetch(providerConfig);
           const isAnthropicModel = modelId.startsWith("anthropic/");
           const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
           // For Anthropic models via gateway, wrap for cache_control normalization;
-          // skip injection when beta features are off.
+          // skip injection when beta features are off. It sits inside the file-part
+          // normalization, so its prefix observer sees the body the gateway receives
+          // (normalization does not touch cache markers, so the order is otherwise neutral).
           const fetchWithCacheControl = isAnthropicModel
             ? wrapFetchWithAnthropicCacheControl(baseFetch, effectiveAnthropicCacheTtl, {
-                // No prefix observer: the inner file-part normalization rewrites the body after this wrapper.
                 injectCacheControl: !disableBeta,
+                observeFinalBody: self.promptCacheObserver(opts, {
+                  route: muxGatewayPromptCacheRoute(couponCode),
+                  modelString,
+                }),
               })
             : baseFetch;
           const fetchWithAutoLogout = wrapFetchWithMuxGatewayAutoLogout(
-            fetchWithCacheControl,
+            wrapFetchWithGatewayFilePartNormalization(fetchWithCacheControl),
             self.providerService
           );
           const providerFetch = fetchWithAutoLogout;
