@@ -726,6 +726,235 @@ describe("MCPServerManager", () => {
     expect(manager.isWorkspaceServerConnected("settings-connected-ws", "other")).toBe(false);
   });
 
+  test("settings for plugin hooks: cache first, one read on a miss, {} on failure", async () => {
+    using tmp = new DisposableTempDir("mcp-hook-settings");
+    const pluginServer = (command: string, serverName: string) => ({
+      ...stdioConfig(command),
+      env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: path.join(tmp.path, "data") },
+      plugin: {
+        pluginName: "cad",
+        serverName,
+        sourceScope: "global" as const,
+        sourceLocation: "x",
+      },
+    });
+    configService.listServers.mockResolvedValue({
+      "plugin:abc:cached": pluginServer("hooks-cached", "cached"),
+      "plugin:abc:broken": pluginServer("hooks-broken", "broken"),
+      "plugin:other:foreign": pluginServer("hooks-foreign", "foreign"),
+    });
+    let reads = 0;
+    const settingsServer = (fail: boolean) => ({
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () => {
+          reads++;
+          if (fail) return Promise.reject(new Error("server down"));
+          return Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: { units: { type: "string", title: "Units" } } },
+              values: { units: "mm" },
+            },
+          });
+        },
+      },
+    });
+    servers.serve("hooks-cached", settingsServer(false));
+    servers.serve("hooks-broken", settingsServer(true));
+    servers.serve("hooks-foreign", settingsServer(false));
+    await manager.getToolsForWorkspace(workspaceRequest("hooks-ws"));
+
+    // The UI read fills the cache; the hook path then makes no call for it.
+    await manager.readSettings("hooks-ws", "plugin:abc:cached");
+    expect(reads).toBe(1);
+    const first = await manager.getSettingsForPluginHooks("hooks-ws", "plugin:abc:", 100);
+    // Keyed by the plugin's own server names; the other plugin's server is left out.
+    expect(first).toEqual({ cached: { units: "mm" }, broken: {} });
+    expect(reads).toBe(2);
+    // A failed server is not read again on every hook call.
+    expect(await manager.getSettingsForPluginHooks("hooks-ws", "plugin:abc:", 100)).toEqual(first);
+    expect(reads).toBe(2);
+  });
+
+  test("settings for plugin hooks: concurrent calls join one read; misses read concurrently; __proto__ stays a key", async () => {
+    using tmp = new DisposableTempDir("mcp-hook-settings-join");
+    const pluginServer = (command: string, serverName: string) => ({
+      ...stdioConfig(command),
+      env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: path.join(tmp.path, "data") },
+      plugin: {
+        pluginName: "cad",
+        serverName,
+        sourceScope: "global" as const,
+        sourceLocation: "x",
+      },
+    });
+    configService.listServers.mockResolvedValue({
+      "plugin:abc:a": pluginServer("hooks-join-a", "a"),
+      // A valid JSON key; it must stay an own key of the hook settings.
+      "plugin:abc:__proto__": pluginServer("hooks-join-proto", "__proto__"),
+    });
+    const pending: Array<() => void> = [];
+    let reads = 0;
+    let fail = true;
+    const settingsServer = () => ({
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () => {
+          reads++;
+          return new Promise<mcpSdk.MCPRawCallToolResult>((resolve, reject) =>
+            pending.push(() =>
+              fail
+                ? reject(new Error("server down"))
+                : resolve({
+                    content: [],
+                    structuredContent: {
+                      schema: {
+                        type: "object",
+                        properties: { on: { type: "boolean", title: "On" } },
+                      },
+                      values: { on: true },
+                    },
+                  })
+            )
+          );
+        },
+      },
+    });
+    servers.serve("hooks-join-a", settingsServer());
+    servers.serve("hooks-join-proto", settingsServer());
+    await manager.getToolsForWorkspace(workspaceRequest("hooks-join-ws"));
+
+    fail = false;
+    const first = manager.getSettingsForPluginHooks("hooks-join-ws", "plugin:abc:", 100);
+    const second = manager.getSettingsForPluginHooks("hooks-join-ws", "plugin:abc:", 100);
+    // Both servers' reads started before either settled, and the second call started none.
+    expect(reads).toBe(2);
+    for (const settle of pending.splice(0)) settle();
+    const expected = { a: { on: true }, ["__proto__"]: { on: true } };
+    expect(Object.keys(await first)).toEqual(Object.keys(expected));
+    expect(Object.keys(await second)).toEqual(Object.keys(expected));
+    expect(JSON.parse(JSON.stringify(await second))).toEqual(JSON.parse(JSON.stringify(expected)));
+    expect(reads).toBe(2);
+  });
+
+  test("settings for plugin hooks: a recycled plugin server is read again after a failed read", async () => {
+    using tmp = new DisposableTempDir("mcp-hook-settings-recycle");
+    configService.listServers.mockResolvedValue({
+      "plugin:abc:a": {
+        ...stdioConfig("hooks-recycle"),
+        env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: path.join(tmp.path, "data") },
+        plugin: {
+          pluginName: "cad",
+          serverName: "a",
+          sourceScope: "global" as const,
+          sourceLocation: "x",
+        },
+      },
+    });
+    let fail = true;
+    servers.serve("hooks-recycle", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          fail
+            ? Promise.reject(new Error("server down"))
+            : Promise.resolve({
+                content: [],
+                structuredContent: {
+                  schema: { type: "object", properties: { on: { type: "boolean", title: "On" } } },
+                  values: { on: true },
+                },
+              }),
+      },
+    });
+    const request = workspaceRequest("hooks-recycle-ws");
+    await manager.getToolsForWorkspace(request);
+    expect(await manager.getSettingsForPluginHooks("hooks-recycle-ws", "plugin:abc:", 100)).toEqual(
+      {
+        a: {},
+      }
+    );
+    // A plugin update recycles its servers; the new instance's settings are read again.
+    fail = false;
+    await manager.stopServersWithKeyPrefix("plugin:abc:");
+    await manager.getToolsForWorkspace(request);
+    expect(await manager.getSettingsForPluginHooks("hooks-recycle-ws", "plugin:abc:", 100)).toEqual(
+      {
+        a: { on: true },
+      }
+    );
+  });
+
+  test("settings for plugin hooks: a save during a slow hook read wins; a server disabled meanwhile is left out", async () => {
+    using tmp = new DisposableTempDir("mcp-hook-settings-race");
+    const pluginServer = (command: string, serverName: string) => ({
+      ...stdioConfig(command),
+      env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: path.join(tmp.path, "data") },
+      plugin: {
+        pluginName: "cad",
+        serverName,
+        sourceScope: "global" as const,
+        sourceLocation: "x",
+      },
+    });
+    configService.listServers.mockResolvedValue({
+      "plugin:abc:saved": pluginServer("hooks-race-saved", "saved"),
+      "plugin:abc:gone": pluginServer("hooks-race-gone", "gone"),
+    });
+    const pendingReads: Array<() => void> = [];
+    const settingsServer = () => ({
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({
+          readTool: "s.read",
+          updateTool: "s.update",
+        }),
+        callSettingsTool: (name: string) => {
+          const result = (units: string): mcpSdk.MCPRawCallToolResult => ({
+            content: [],
+            structuredContent: {
+              schema: {
+                type: "object",
+                properties: { units: { type: "string", title: "Units" } },
+              },
+              values: { units },
+            },
+          });
+          if (name === "s.update") return Promise.resolve(result("in"));
+          return new Promise<mcpSdk.MCPRawCallToolResult>((resolve) =>
+            pendingReads.push(() => resolve(result("mm")))
+          );
+        },
+      },
+    });
+    servers.serve("hooks-race-saved", settingsServer());
+    servers.serve("hooks-race-gone", settingsServer());
+    const request = workspaceRequest("hooks-race-ws");
+    await manager.getToolsForWorkspace(request);
+
+    const hookSettings = manager.getSettingsForPluginHooks("hooks-race-ws", "plugin:abc:", 1000);
+    expect(pendingReads).toHaveLength(2);
+    // While both reads are in flight, the user saves one server and disables the other.
+    await manager.updateSettings(
+      "hooks-race-ws",
+      "plugin:abc:saved",
+      { units: "in" },
+      { properties: { units: { type: "string", title: "Units" } }, values: { units: "mm" } }
+    );
+    await manager.applyWorkspaceOverrides("hooks-race-ws", {
+      disabledServers: ["plugin:abc:gone"],
+    });
+    for (const settle of pendingReads.splice(0)) settle();
+
+    // The older read neither replaces the saved values nor reaches the hook.
+    expect(await hookSettings).toEqual({ saved: { units: "in" } });
+    expect(manager.getCachedSettings("hooks-race-ws", "plugin:abc:saved")).toEqual({ units: "in" });
+  });
+
   test("settings: a noStart read never starts or restarts the server", async () => {
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-nostart") });
     servers.serve("settings-nostart", {
