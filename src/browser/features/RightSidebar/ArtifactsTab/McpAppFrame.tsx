@@ -100,6 +100,8 @@ function consentText(request: McpAppConsentRequest): [string, string, string] {
       return [`Open a link to ${request.host}?`, "Open", "Cancel"];
     case "message":
       return ["Insert into message?", "Insert", "Dismiss"];
+    case "context":
+      return ["Share this view's context with the model in your next messages?", "Allow", "Deny"];
   }
 }
 
@@ -287,6 +289,18 @@ export function McpAppFrame(props: {
         if (!result.success) throw new Error(result.error);
         return result.data;
       },
+      // Bound like callTool: the backend attributes the context to the view's result record.
+      updateModelContext: async (text) => {
+        const client = apiRef.current;
+        if (client == null) throw new Error("Xum is reconnecting. Try again once it is back.");
+        const result = await client.mcpApps.updateModelContext({
+          workspaceId,
+          toolCallId,
+          serverName: boundServerName,
+          text,
+        });
+        if (!result.success) throw new Error(result.error);
+      },
       requestConsent: (request) =>
         new Promise<boolean>((resolve) => {
           // One strip at a time, and a shown strip is never replaced: a frame could otherwise
@@ -406,7 +420,9 @@ export function McpAppFrame(props: {
             {consent.request.kind === "tool" && (
               <ConsentArgs json={consentArgsJson(consent.request.args)} />
             )}
-            {consent.request.kind === "message" && <ConsentArgs json={consent.request.text} />}
+            {(consent.request.kind === "message" || consent.request.kind === "context") && (
+              <ConsentArgs json={consent.request.text} />
+            )}
             {consent.request.kind === "link" && <ConsentArgs json={consent.request.url} />}
           </div>
           <button

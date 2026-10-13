@@ -76,6 +76,7 @@ import { ResultSchema } from "./result";
 import {
   McpAppToolCallRequestSchema,
   McpAppToolCallResultSchema,
+  McpAppModelContextRequestSchema,
   McpAppResourceReadRequestSchema,
   McpAppViewRequestSchema,
   McpAppViewSchema,
@@ -1514,6 +1515,11 @@ export const mcpApps = {
   readResource: {
     input: McpAppResourceReadRequestSchema,
     output: ResultSchema(z.unknown(), z.string()),
+  },
+  /** ui/update-model-context of a view; used by the workspace's next requests. */
+  updateModelContext: {
+    input: McpAppModelContextRequestSchema,
+    output: ResultSchema(z.object({}), z.string()),
   },
 };
 

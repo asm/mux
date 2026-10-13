@@ -1,5 +1,8 @@
 import { z } from "zod";
-import { MCP_APP_READ_URI_MAX_CHARS } from "@/common/utils/mcpApps";
+import {
+  MCP_APP_MODEL_CONTEXT_MAX_BYTES,
+  MCP_APP_READ_URI_MAX_CHARS,
+} from "@/common/utils/mcpApps";
 import type { McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
 import { createBridgeRateLimiter } from "./artifactBridge";
 import type { GrantedMcpAppCsp } from "./mcpAppCsp";
@@ -12,8 +15,9 @@ import type { GrantedMcpAppCsp } from "./mcpAppCsp";
  * Implemented view -> host methods: ui/initialize, ui/notifications/initialized, ping,
  * ui/notifications/size-changed, notifications/message, tools/call (own server only, visibility
  * and consent rules enforced by the backend), resources/read (own server only), ui/open-link
- * (https, after a confirm), ui/message (inserted into the composer after a confirm, never sent).
- * Every other request gets -32601.
+ * (https, after a confirm), ui/message (inserted into the composer after a confirm, never sent)
+ * and ui/update-model-context (stored per view for the workspace's next requests). Every other
+ * request gets -32601.
  */
 
 export const MCP_APP_PROTOCOL_VERSION = "2026-01-26";
@@ -89,7 +93,14 @@ const MessageParams = z.object({
 
 /** The message text, or null when a block is not text or the text is too long. */
 function messageText(content: z.infer<typeof MessageParams>["content"]): string | null {
-  const blocks = Array.isArray(content) ? content : [content];
+  return joinTextBlocks(Array.isArray(content) ? content : [content], MESSAGE_TEXT_MAX_CHARS);
+}
+
+/**
+ * Text blocks joined by newlines, or null when any block is not text or the joined text would
+ * be longer than `maxChars` (UTF-16 code units).
+ */
+function joinTextBlocks(blocks: readonly unknown[], maxChars: number): string | null {
   const texts: string[] = [];
   // Enforce the limit while iterating, counting the "\n" join() adds: a view can send 64
   // blocks, so joining first would build an arbitrarily large string before rejecting it.
@@ -98,10 +109,39 @@ function messageText(content: z.infer<typeof MessageParams>["content"]): string 
     const parsed = TextBlock.safeParse(block);
     if (!parsed.success) return null;
     length += parsed.data.text.length + (texts.length > 0 ? 1 : 0);
-    if (length > MESSAGE_TEXT_MAX_CHARS) return null;
+    if (length > maxChars) return null;
     texts.push(parsed.data.text);
   }
   return texts.join("\n");
+}
+
+const ModelContextParams = z.object({
+  content: z.array(z.unknown()).max(64).optional(),
+  structuredContent: z.record(z.string(), z.unknown()).optional(),
+});
+
+/**
+ * The text stored for a ui/update-model-context: its text blocks, then its structuredContent as
+ * JSON. Empty when the update has neither (it clears the view's context). Null when a block is
+ * not text or the text exceeds the cap.
+ */
+function modelContextText(params: z.infer<typeof ModelContextParams>): string | null {
+  // A UTF-16 code unit is at least one UTF-8 byte, so the byte cap also bounds the code units.
+  const text = joinTextBlocks(params.content ?? [], MCP_APP_MODEL_CONTEXT_MAX_BYTES);
+  if (text === null) return null;
+  let structured = "";
+  if (params.structuredContent !== undefined) {
+    try {
+      structured = JSON.stringify(params.structuredContent);
+    } catch {
+      // postMessage's structured clone carries cyclic objects and BigInt; JSON cannot.
+      return null;
+    }
+  }
+  const combined = [text, structured].filter((part) => part !== "").join("\n\n");
+  return new TextEncoder().encode(combined).length <= MCP_APP_MODEL_CONTEXT_MAX_BYTES
+    ? combined
+    : null;
 }
 
 export type McpAppConsentRequest =
@@ -110,7 +150,9 @@ export type McpAppConsentRequest =
   /** `host` is the parsed host the link opens, shown in the strip ahead of the full URL. */
   | { kind: "link"; url: string; host: string }
   /** `text` is exactly what is added to the composer once accepted, shown in the strip. */
-  | { kind: "message"; text: string };
+  | { kind: "message"; text: string }
+  /** `text` is exactly what the model sees with later requests once allowed. */
+  | { kind: "context"; text: string };
 
 export interface McpAppHostContext {
   theme: "dark" | "light";
@@ -137,6 +179,8 @@ export interface McpAppHostOptions {
   ) => Promise<McpAppToolCallResult>;
   /** Backend resources/read, bound to the view's own server like callTool. */
   readResource: (uri: string) => Promise<unknown>;
+  /** Store the view's model context; it replaces the previous one ("" clears it). */
+  updateModelContext: (text: string) => Promise<void>;
   requestConsent: (request: McpAppConsentRequest) => Promise<boolean>;
   insertIntoComposer: (text: string) => void;
   openExternalLink: (url: string) => void;
@@ -154,6 +198,8 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   const pendingHostRequests = new Map<string, (ok: boolean) => void>();
   let nextHostRequestId = 1;
   let initialized = false;
+  /** Whether the user allowed this mounted view's model context (ui/update-model-context). */
+  let modelContextAllowed = false;
 
   const respond = (id: string | number, result: unknown) =>
     options.postToView({ jsonrpc: "2.0", id, result });
@@ -174,6 +220,9 @@ export function createMcpAppHost(options: McpAppHostOptions) {
             serverResources: {},
             logging: {},
             openLinks: {},
+            // The modalities ui/update-model-context accepts (McpUiSupportedContentBlockModalities):
+            // text blocks and structuredContent. Other blocks get -32602.
+            updateModelContext: { text: {}, structuredContent: {} },
             sandbox: { csp: options.grantedCsp },
           },
           hostContext: options.getHostContext(),
@@ -226,6 +275,30 @@ export function createMcpAppHost(options: McpAppHostOptions) {
           // The request names only a URI: options.readResource is bound to this view's server,
           // so a view cannot read another server's resources.
           return respond(id, await options.readResource(parsed.data.uri));
+        } catch (error) {
+          return fail(id, REQUEST_FAILED, error instanceof Error ? error.message : String(error));
+        }
+      }
+      case "ui/update-model-context": {
+        const parsed = ModelContextParams.safeParse(params);
+        const text = parsed.success ? modelContextText(parsed.data) : null;
+        if (text === null) {
+          return fail(id, INVALID_PARAMS, "Only text model context up to 16 KB is supported");
+        }
+        // The context reaches the model with every later request, so the user allows it once
+        // per mounted view (this host lives as long as the view's document; a remount asks
+        // again, and nothing is persisted). After Allow, the view can change its context until
+        // it unmounts. Its server can already put any text in front of the model through tool
+        // results; this keeps context the user never agreed to out. Clearing needs no consent.
+        if (text !== "" && !modelContextAllowed) {
+          if (!(await options.requestConsent({ kind: "context", text }))) {
+            return fail(id, REQUEST_FAILED, "Context update denied");
+          }
+          modelContextAllowed = true;
+        }
+        try {
+          await options.updateModelContext(text);
+          return respond(id, {});
         } catch (error) {
           return fail(id, REQUEST_FAILED, error instanceof Error ? error.message : String(error));
         }

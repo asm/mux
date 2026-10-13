@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
+import { MCP_APP_MODEL_CONTEXT_MAX_BYTES } from "@/common/utils/mcpApps";
 import { passesFrameGate } from "./artifactBridge";
 import {
   createMcpAppHost,
@@ -13,6 +14,7 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
   const sent: Array<Record<string, unknown>> = [];
   const calls: Array<{ toolName: string; consented: boolean }> = [];
   const reads: string[] = [];
+  const modelContexts: string[] = [];
   const consents: McpAppConsentRequest[] = [];
   const composer: string[] = [];
   const opened: string[] = [];
@@ -46,6 +48,10 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
       if (uri === "ui://missing") return Promise.reject(new Error("Resource not found"));
       return Promise.resolve({ contents: [{ uri, mimeType: "text/plain", text: "data" }] });
     },
+    updateModelContext: (text) => {
+      modelContexts.push(text);
+      return Promise.resolve();
+    },
     requestConsent: (request) => {
       consents.push(request);
       return Promise.resolve(true);
@@ -65,6 +71,7 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
     sent,
     calls,
     reads,
+    modelContexts,
     consents,
     composer,
     opened,
@@ -105,6 +112,7 @@ describe("MCP Apps host router", () => {
       "sandbox",
       "serverResources",
       "serverTools",
+      "updateModelContext",
     ]);
     await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
     await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
@@ -115,7 +123,7 @@ describe("MCP Apps host router", () => {
     const t = setup();
     for (const [id, method] of [
       [2, "resources/subscribe"],
-      [3, "ui/update-model-context"],
+      [3, "ui/request-teardown"],
       [4, "ui/request-display-mode"],
       [5, "sampling/createMessage"],
     ] as const) {
@@ -298,9 +306,86 @@ describe("MCP Apps host router", () => {
     expect(t.composer).toEqual([]);
   });
 
-  test("ui/message stops reading blocks once the text limit is passed", async () => {
+  test("a view that checks the host capability before updating model context sends it", async () => {
     const t = setup();
-    // Counts reads of the block after the one that crosses the limit (32,000 + "\n" + "y").
+    await t.request(1, "ui/initialize", { appInfo: { name: "v" }, protocolVersion: "2026-01-26" });
+    // Gates like an ext-apps view: it sends only the modalities the host advertises.
+    const { hostCapabilities } = t.reply(1)?.result as {
+      hostCapabilities: { updateModelContext?: { text?: object; structuredContent?: object } };
+    };
+    const supported = hostCapabilities.updateModelContext;
+    if (supported !== undefined) {
+      await t.request(2, "ui/update-model-context", {
+        ...(supported.text !== undefined ? { content: [{ type: "text", text: "3 dice" }] } : {}),
+        ...(supported.structuredContent !== undefined
+          ? { structuredContent: { dice: [1, 2, 3] } }
+          : {}),
+      });
+    }
+    expect(t.modelContexts).toEqual(['3 dice\n\n{"dice":[1,2,3]}']);
+  });
+
+  test("model context is stored only after the user allows it, once per mounted view", async () => {
+    const declined = setup({ requestConsent: () => Promise.resolve(false) });
+    await declined.request(1, "ui/update-model-context", {
+      content: [{ type: "text", text: "3 dice" }],
+    });
+    expect(declined.reply(1)?.error).toEqual({ code: -32000, message: "Context update denied" });
+    expect(declined.modelContexts).toEqual([]);
+    // Clearing needs no consent.
+    await declined.request(2, "ui/update-model-context", {});
+    expect(declined.reply(2)?.result).toEqual({});
+    expect(declined.modelContexts).toEqual([""]);
+
+    const t = setup();
+    await t.request(1, "ui/update-model-context", { content: [{ type: "text", text: "3 dice" }] });
+    await t.request(2, "ui/update-model-context", { content: [{ type: "text", text: "2 dice" }] });
+    expect(t.consents).toEqual([{ kind: "context", text: "3 dice" }]);
+    expect(t.modelContexts).toEqual(["3 dice", "2 dice"]);
+    // A remounted view gets a new host, which asks again.
+    const remounted = setup();
+    await remounted.request(1, "ui/update-model-context", {
+      content: [{ type: "text", text: "2 dice" }],
+    });
+    expect(remounted.consents).toEqual([{ kind: "context", text: "2 dice" }]);
+  });
+
+  test("update-model-context replaces the view's context with the latest update", async () => {
+    const t = setup();
+    await t.request(1, "ui/update-model-context", {
+      content: [{ type: "text", text: "3 dice" }],
+      structuredContent: { dice: [1, 2, 3] },
+    });
+    await t.request(2, "ui/update-model-context", { content: [{ type: "text", text: "2 dice" }] });
+    // An empty update clears the context.
+    await t.request(3, "ui/update-model-context", {});
+    expect(t.modelContexts).toEqual(['3 dice\n\n{"dice":[1,2,3]}', "2 dice", ""]);
+    for (const id of [1, 2, 3]) expect(t.reply(id)?.result).toEqual({});
+  });
+
+  test("update-model-context rejects non-text content and text over 16 KB", async () => {
+    const t = setup();
+    await t.request(1, "ui/update-model-context", {
+      content: [{ type: "image", data: "AAAA", mimeType: "image/png" }],
+    });
+    await t.request(2, "ui/update-model-context", {
+      content: [{ type: "text", text: "x".repeat(MCP_APP_MODEL_CONTEXT_MAX_BYTES + 1) }],
+    });
+    // Multi-byte text counts in UTF-8 bytes.
+    await t.request(3, "ui/update-model-context", {
+      content: [{ type: "text", text: "é".repeat(MCP_APP_MODEL_CONTEXT_MAX_BYTES / 2 + 1) }],
+    });
+    for (const id of [1, 2, 3]) expect((t.reply(id)?.error as { code: number }).code).toBe(-32602);
+    await t.request(4, "ui/update-model-context", {
+      content: [{ type: "text", text: "x".repeat(MCP_APP_MODEL_CONTEXT_MAX_BYTES) }],
+    });
+    expect(t.reply(4)?.result).toEqual({});
+    expect(t.modelContexts).toHaveLength(1);
+  });
+
+  test("text blocks are not read past the length limit", async () => {
+    const t = setup();
+    // Counts reads of each block after the one that crosses the limit.
     let laterBlockReads = 0;
     const laterBlock = {
       type: "text",
@@ -317,8 +402,26 @@ describe("MCP Apps host router", () => {
         laterBlock,
       ],
     });
-    expect((t.reply(1)?.error as { code: number }).code).toBe(-32602);
+    await t.request(2, "ui/update-model-context", {
+      content: [
+        { type: "text", text: "x".repeat(MCP_APP_MODEL_CONTEXT_MAX_BYTES) },
+        { type: "text", text: "y" },
+        laterBlock,
+      ],
+    });
+    for (const id of [1, 2]) expect((t.reply(id)?.error as { code: number }).code).toBe(-32602);
     expect(laterBlockReads).toBe(0);
     expect(t.consents).toEqual([]);
+    expect(t.modelContexts).toEqual([]);
+  });
+
+  test("update-model-context answers -32602 for structured content JSON cannot encode", async () => {
+    const t = setup();
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    await t.request(1, "ui/update-model-context", { structuredContent: cyclic });
+    await t.request(2, "ui/update-model-context", { structuredContent: { count: BigInt(3) } });
+    for (const id of [1, 2]) expect((t.reply(id)?.error as { code: number }).code).toBe(-32602);
+    expect(t.modelContexts).toEqual([]);
   });
 });
