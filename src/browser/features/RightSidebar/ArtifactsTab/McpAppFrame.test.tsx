@@ -7,7 +7,6 @@ import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
@@ -29,6 +28,11 @@ const VIEW: McpAppViewRef = {
 
 let invocation: McpAppView["invocation"] = null;
 let viewCsp: McpAppView["csp"] = {};
+let approvals: Array<{ serverName: string; origins: string[] }> = [];
+let approveFails: Error | null = null;
+let approvalProjectPath: string | null = "/repo";
+// When set, each approve call waits for the test to resolve it with the list it returns.
+let approveDeferred: Array<(approvedDomains: string[]) => void> | null = null;
 let toolCalls: Array<{
   serverName: string;
   toolName: string;
@@ -49,7 +53,24 @@ function Wrapper(props: { children: ReactNode }) {
             resultAvailable: true,
             result: { content: [] },
             invocation,
+            approvalProjectPath,
           },
+        });
+      },
+      approveViewDomains: (input: { serverName: string; origins: string[] }) => {
+        approvals.push({ serverName: input.serverName, origins: input.origins });
+        if (approveFails) return Promise.reject(approveFails);
+        const deferred = approveDeferred;
+        if (deferred) {
+          return new Promise((resolve) =>
+            deferred.push((approvedDomains) =>
+              resolve({ success: true as const, data: { approvedDomains } })
+            )
+          );
+        }
+        return Promise.resolve({
+          success: true as const,
+          data: { approvedDomains: input.origins },
         });
       },
       callTool: (input: {
@@ -117,6 +138,15 @@ function captureReplies(frame: HTMLIFrameElement) {
   return replies;
 }
 
+/** Press the strip's Allow once its arming delay is over (confirmArming.ts). */
+async function pressAllow(button: HTMLElement) {
+  await waitFor(() => expect(button.hasAttribute("disabled")).toBe(false), {
+    timeout: CONFIRM_ARM_DELAY_MS * 4,
+  });
+  fireEvent.pointerDown(button);
+  fireEvent.click(button);
+}
+
 async function renderFrame() {
   const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
   const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
@@ -131,6 +161,10 @@ describe("McpAppFrame", () => {
     window.localStorage.clear();
     invocation = null;
     viewCsp = {};
+    approvals = [];
+    approveFails = null;
+    approvalProjectPath = "/repo";
+    approveDeferred = null;
     toolCalls = [];
     // Desktop mode by default: the preload bridge exists (isDesktopMode). Browser tests delete it.
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
@@ -142,11 +176,123 @@ describe("McpAppFrame", () => {
     cleanupDom = null;
   });
 
-  test("grants no CDN source until the saved preferences load", async () => {
-    getAppConfigStore().clearCachedState();
-    viewCsp = { resourceDomains: ["https://cdn.tailwindcss.com"] };
-    const { frame } = await renderFrame();
-    expect(frame.getAttribute("srcdoc")).not.toContain("https://cdn.tailwindcss.com");
+  test("declared domains run under the base policy until the user allows them", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = {
+      connectDomains: ["https://api.example.com", "http://insecure.example.com"],
+      frameDomains: ["https://frame.example.com"],
+    };
+    const { view, frame } = await renderFrame();
+    expect(frame.getAttribute("srcdoc")).not.toContain("api.example.com");
+    expect(view.getByRole("alert").textContent).toContain(
+      "This view wants to reach: api.example.com"
+    );
+    // Not now keeps the base policy and hides the strip.
+    fireEvent.click(view.getByRole("button", { name: "Not now" }));
+    expect(view.queryByRole("alert")).toBeNull();
+    expect(approvals).toEqual([]);
+    cleanup();
+
+    const again = await renderFrame();
+    await pressAllow(again.view.getByRole("button", { name: "Allow" }));
+    // Approved for the record's raw server key, then the view reloads under the wider policy.
+    await waitFor(() =>
+      expect(approvals).toEqual([
+        { serverName: "charts-raw", origins: ["https://api.example.com"] },
+      ])
+    );
+    await waitFor(() => {
+      const csp = again.view.getByTestId("mcp-app-frame").getAttribute("srcdoc") ?? "";
+      expect(csp).toContain("connect-src https://api.example.com");
+      expect(csp).not.toContain("insecure.example.com");
+      expect(csp).toContain("frame-src 'none'");
+    });
+    expect(again.view.queryByText(/wants to reach/)).toBeNull();
+  });
+
+  test("an approval applies at once to every mounted view of the same server", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    const view = render(
+      <>
+        <McpAppFrame workspaceId="ws" view={VIEW} />
+        <McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />
+      </>,
+      { wrapper: Wrapper }
+    );
+    await waitFor(() => expect(view.getAllByTestId("mcp-app-frame")).toHaveLength(2));
+    await pressAllow(view.getAllByRole("button", { name: "Allow" })[0]);
+    await waitFor(() => {
+      for (const frame of view.getAllByTestId("mcp-app-frame")) {
+        expect(frame.getAttribute("srcdoc")).toContain("connect-src https://api.example.com");
+      }
+    });
+    expect(view.queryAllByRole("button", { name: "Allow" })).toHaveLength(0);
+  });
+
+  test("an older approval response never replaces a newer one", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://a.example.com", "https://b.example.com"] };
+    const responders: Array<(approvedDomains: string[]) => void> = [];
+    approveDeferred = responders;
+    const view = render(
+      <>
+        <McpAppFrame workspaceId="ws" view={VIEW} />
+        <McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />
+      </>,
+      { wrapper: Wrapper }
+    );
+    await waitFor(() => expect(view.getAllByRole("button", { name: "Allow" })).toHaveLength(2));
+    const [first, second] = view.getAllByRole("button", { name: "Allow" });
+    await pressAllow(first);
+    await pressAllow(second);
+    await waitFor(() => expect(responders).toHaveLength(2));
+    // The backend wrote both; the second request's (complete) answer arrives first.
+    const both = ["https://a.example.com", "https://b.example.com"];
+    await act(async () => {
+      responders[1](both);
+      await Promise.resolve();
+    });
+    await act(async () => {
+      responders[0](["https://a.example.com"]);
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      for (const frame of view.getAllByTestId("mcp-app-frame")) {
+        expect(frame.getAttribute("srcdoc")).toContain("https://b.example.com");
+      }
+    });
+    expect(view.queryAllByRole("button", { name: "Allow" })).toHaveLength(0);
+  });
+
+  test("a view without its result record names its blocked domains and offers no Allow", async () => {
+    invocation = null;
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    const { view, frame } = await renderFrame();
+    expect(view.getByText(/api\.example\.com/)).toBeTruthy();
+    expect(view.queryByRole("button", { name: "Allow" })).toBeNull();
+    expect(frame.getAttribute("srcdoc")).not.toContain("https://api.example.com");
+  });
+
+  test("a view whose server no project owns names its blocked domains and offers no Allow", async () => {
+    // A scratch chat, or a global server in a multi-project workspace: approving always fails.
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    approvalProjectPath = null;
+    const { view } = await renderFrame();
+    expect(view.getByText(/api\.example\.com/)).toBeTruthy();
+    expect(view.queryByRole("button", { name: "Allow" })).toBeNull();
+  });
+
+  test("a failed approval request shows its error instead of a silently armed strip", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    approveFails = new Error("config write failed");
+    const { view, frame } = await renderFrame();
+    await pressAllow(view.getByRole("button", { name: "Allow" }));
+    await view.findByText(/config write failed/);
+    expect(view.queryByRole("button", { name: "Allow" })).toBeNull();
+    expect(frame.getAttribute("srcdoc")).not.toContain("api.example.com");
   });
 
   test("the view is bound to the recorded tool call, not the card", async () => {

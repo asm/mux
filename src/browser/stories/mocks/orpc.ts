@@ -2410,6 +2410,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             : { success: false as const, error: `No view for ${input.toolCallId}` }
         );
       },
+      approveViewDomains: (input: { origins: string[] }) =>
+        Promise.resolve({ success: true as const, data: { approvedDomains: input.origins } }),
       // Story views are always in the story transcript, so no record lookup finds one.
       getViewRecords: (input: { toolCallIds: string[] }) =>
         Promise.resolve({

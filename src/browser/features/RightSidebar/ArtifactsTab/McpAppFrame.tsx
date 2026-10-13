@@ -21,10 +21,16 @@ import {
   type McpAppHostContext,
 } from "./mcpAppHost";
 import { isMcpAppViewHosted, openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
+import {
+  beginMcpAppViewDomainsRequest,
+  currentMcpAppViewDomainsSeq,
+  publishMcpAppViewDomains,
+  useMcpAppViewDomains,
+} from "./mcpAppViewDomainsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
-import { ARTIFACT_IFRAME_SANDBOX, useArtifactsAllowCdnScripts } from "./SandboxedArtifactFrame";
+import { ARTIFACT_IFRAME_SANDBOX } from "./SandboxedArtifactFrame";
 import { Notice, NoteBar } from "./SourceText";
 
 // Spec style variable -> the app's CSS variable it is read from (globals.css). Values are
@@ -76,6 +82,8 @@ interface Loaded {
   toolCallId: string;
   view: McpAppView | null;
   error: string | null;
+  /** currentMcpAppViewDomainsSeq() when the fetch started: newer approval changes win. */
+  domainsSeq: number;
 }
 
 interface PendingConsent {
@@ -166,7 +174,11 @@ export function McpAppFrame(props: {
 }) {
   const inline = props.variant === "inline";
   const { api } = useAPI();
-  const allowCdn = useArtifactsAllowCdnScripts();
+  // Whether the user chose "Not now" for this call, or the approval failed.
+  const [domainsDismissed, setDomainsDismissed] = useState<{
+    toolCallId: string;
+    error?: string;
+  }>();
   const { theme: themeMode } = useTheme();
   const theme: "light" | "dark" = isLightThemeMode(themeMode) ? "light" : "dark";
   // The window.openai globals start with this host context. Fixed at mount: a theme change or
@@ -204,26 +216,84 @@ export function McpAppFrame(props: {
   useEffect(() => {
     if (!api || viewLoaded) return;
     const controller = new AbortController();
+    const domainsSeq = currentMcpAppViewDomainsSeq();
     api.mcpApps
       .getView({ workspaceId, toolCallId, serverName, resourceUri }, { signal: controller.signal })
       .then((result) => {
         if (controller.signal.aborted) return;
         setLoaded(
           result.success
-            ? { toolCallId, view: result.data, error: null }
-            : { toolCallId, view: null, error: result.error }
+            ? { toolCallId, view: result.data, error: null, domainsSeq }
+            : { toolCallId, view: null, error: result.error, domainsSeq }
         );
       })
       .catch((error: unknown) => {
         if (!controller.signal.aborted) {
-          setLoaded({ toolCallId, view: null, error: getErrorMessage(error) });
+          setLoaded({ toolCallId, view: null, error: getErrorMessage(error), domainsSeq });
         }
       });
     return () => controller.abort();
   }, [api, workspaceId, toolCallId, serverName, resourceUri, viewLoaded]);
 
   const current = loaded?.toolCallId === toolCallId ? loaded : null;
-  const grant = current?.view ? grantMcpAppCsp(current.view.csp, { allowCdn }) : null;
+  // The result record binds the view to the call that produced it (server, server-local tool
+  // name, sanitized arguments); the card's display values are only a fallback without one.
+  const boundServerName = current?.view?.invocation?.serverName ?? serverName;
+  const approvalProjectPath = current?.view?.approvalProjectPath ?? null;
+  // An approval made in another frame of this server after this view loaded applies here too.
+  const published = useMcpAppViewDomains(approvalProjectPath, boundServerName);
+  const approved =
+    published != null && current != null && published.seq > current.domainsSeq
+      ? published.origins
+      : (current?.view?.approvedDomains ?? []);
+  const grant = current?.view ? grantMcpAppCsp(current.view.csp, approved) : null;
+  // Only a view with a result record can be approved (the record binds its server), and only
+  // when a user project can own the approval (approvalProjectPathOf in mcpAppsOperations.ts):
+  // not in a scratch chat, nor for a global server of a multi-project workspace. Otherwise
+  // every Allow would fail.
+  const unapprovable =
+    current?.view == null
+      ? null
+      : current.view.invocation == null
+        ? "the tool result record of this view is gone"
+        : approvalProjectPath == null
+          ? "no project of this workspace owns this server"
+          : null;
+  const domainsPrompt =
+    grant != null &&
+    grant.pending.length > 0 &&
+    unapprovable == null &&
+    domainsDismissed?.toolCallId !== toolCallId
+      ? grant.pending
+      : null;
+  const [domainsPromptId] = useState(newConfirmPromptId);
+  const domainsArming = useConfirmArmed(domainsPrompt != null ? domainsPromptId : null);
+  const allowDomains = async (origins: string[]) => {
+    if (!api) return;
+    try {
+      const requestSeq = beginMcpAppViewDomainsRequest();
+      const result = await api.mcpApps.approveViewDomains({
+        workspaceId,
+        toolCallId,
+        serverName: boundServerName,
+        origins,
+      });
+      if (!result.success) {
+        setDomainsDismissed({ toolCallId, error: result.error });
+      } else if (approvalProjectPath != null) {
+        // The new grant changes every such view's document: they reload under the wider policy.
+        publishMcpAppViewDomains(
+          approvalProjectPath,
+          boundServerName,
+          result.data.approvedDomains,
+          requestSeq
+        );
+      }
+    } catch (error) {
+      // A failed write or a lost connection: the same visible failure as a refusal.
+      setDomainsDismissed({ toolCallId, error: getErrorMessage(error) });
+    }
+  };
   const srcDoc =
     current?.view && grant
       ? finalizeSandboxedDocument(parseArtifactHtml(current.view.html), {
@@ -233,9 +303,6 @@ export function McpAppFrame(props: {
       : null;
   const guard = useFrameNavigationGuard(srcDoc);
   const { navigatedRef } = guard;
-  // The result record binds the view to the call that produced it (server, server-local tool
-  // name, sanitized arguments); the card's display values are only a fallback without one.
-  const boundServerName = current?.view?.invocation?.serverName ?? serverName;
 
   // Values the long-lived host reads at message time.
   const latest = useRef({ theme, view, result: current?.view ?? null, onClose: props.onClose });
@@ -433,6 +500,46 @@ export function McpAppFrame(props: {
       )}
       {grant.notGranted.length > 0 && (
         <NoteBar>Not granted to this view: {grant.notGranted.join(", ")}</NoteBar>
+      )}
+      {grant.pending.length > 0 && unapprovable != null && (
+        <NoteBar>
+          Blocked, and cannot be allowed because {unapprovable}:{" "}
+          {grant.pending.map((origin) => new URL(origin).host).join(", ")}
+        </NoteBar>
+      )}
+      {domainsDismissed?.toolCallId === toolCallId && domainsDismissed.error != null && (
+        <NoteBar>Could not allow the domains: {domainsDismissed.error}</NoteBar>
+      )}
+      {domainsPrompt != null && (
+        <div
+          role="alert"
+          className="border-border-light bg-background-secondary flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-xs"
+        >
+          <div className="text-foreground min-w-0 flex-1 break-words">
+            This view wants to reach:{" "}
+            {domainsPrompt.map((origin) => new URL(origin).host).join(", ")}
+          </div>
+          <button
+            type="button"
+            // Disabled briefly after the strip appears (confirmArming.ts), like the consent strip.
+            disabled={!domainsArming.armed}
+            onPointerDown={domainsArming.onPointerDown}
+            onClick={(event) =>
+              domainsArming.guardClick(event, () => void allowDomains(domainsPrompt))
+            }
+            className="bg-accent text-accent-foreground focus-visible:ring-accent focus-visible:ring-offset-background rounded px-2 py-0.5 focus-visible:ring-1 focus-visible:ring-offset-1 disabled:opacity-50"
+          >
+            Allow
+          </button>
+          <button
+            type="button"
+            // The view keeps running under the base policy.
+            onClick={() => setDomainsDismissed({ toolCallId })}
+            className="border-border-light focus-visible:ring-accent rounded border px-2 py-0.5 focus-visible:ring-1"
+          >
+            Not now
+          </button>
+        </div>
       )}
       {consent != null && (
         <div
