@@ -696,6 +696,7 @@ describe("MCPServerManager", () => {
     await manager.getToolsForWorkspace(request);
 
     const snapshot = await manager.readSettings("settings-ws", "cad");
+    if (snapshot === null) throw new Error("expected settings");
     expect(manager.getCachedSettings("settings-ws", "cad")).toEqual({ units: "in", grid: false });
     // An invalid value is refused before anything reaches the server.
     const refused = await manager
@@ -714,6 +715,46 @@ describe("MCPServerManager", () => {
       },
     ]);
     expect(manager.getCachedSettings("settings-ws", "cad")).toEqual(values);
+  });
+
+  test("settings: a server counts as connected only once the workspace started it", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-connected") });
+    servers.serve("settings-connected", { tools: { draw: testTool() } });
+    expect(manager.isWorkspaceServerConnected("settings-connected-ws", "cad")).toBe(false);
+    await manager.getToolsForWorkspace(workspaceRequest("settings-connected-ws"));
+    expect(manager.isWorkspaceServerConnected("settings-connected-ws", "cad")).toBe(true);
+    expect(manager.isWorkspaceServerConnected("settings-connected-ws", "other")).toBe(false);
+  });
+
+  test("settings: a noStart read never starts or restarts the server", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-nostart") });
+    servers.serve("settings-nostart", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: { schema: { type: "object", properties: {} }, values: {} },
+          }),
+      },
+    });
+    await manager.getToolsForWorkspace(workspaceRequest("settings-nostart-ws"));
+    expect(servers.connectCount("settings-nostart")).toBe(1);
+    // The instance goes away, but the restart options stay (as after a config change).
+    await manager.stopServers("settings-nostart-ws", { retainRestartOptions: true });
+    const error = await manager
+      .readSettings("settings-nostart-ws", "cad", { noStart: true })
+      .catch((caught: unknown) => caught);
+    expect(String(error)).toContain("not connected");
+    expect(servers.connectCount("settings-nostart")).toBe(1);
+  });
+
+  test("settings: a server without the capability reads as null", async () => {
+    configService.listServers.mockResolvedValue({ plain: stdioConfig("settings-none") });
+    servers.serve("settings-none", { tools: { draw: testTool() } });
+    await manager.getToolsForWorkspace(workspaceRequest("settings-none-ws"));
+    expect(await manager.readSettings("settings-none-ws", "plain")).toBeNull();
   });
 
   test("settings: an older read never overwrites a newer update in the cache; an update keeps omitted values", async () => {
@@ -751,6 +792,7 @@ describe("MCPServerManager", () => {
     const slowRead = manager.readSettings("settings-latest-ws", "cad");
     await waitFor(() => releaseRead !== undefined);
     const prior = await manager.readSettings("settings-latest-ws", "cad");
+    if (prior === null) throw new Error("expected settings");
     const values = await manager.updateSettings(
       "settings-latest-ws",
       "cad",

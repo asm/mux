@@ -4675,28 +4675,52 @@ export class MCPServerManager {
     return result.structuredContent;
   }
 
-  /** Read and validate a server's structured settings for one workspace (cached on success). */
+  /**
+   * Read and validate a server's structured settings for one workspace
+   * (cached on success). Null when the server has no `openai/settings`.
+   */
+  /**
+   * Whether this workspace runs the server now (enabled, connected). The
+   * workspace MCP dialog reads settings on open only then, so opening it never
+   * starts a server; Fetch Tools does.
+   */
+  isWorkspaceServerConnected(workspaceId: string, serverName: string): boolean {
+    const entry = this.workspaceServers.get(workspaceId);
+    const instance = entry?.instances.get(serverName);
+    return (
+      entry?.enabledServerNames.has(serverName) === true &&
+      instance !== undefined &&
+      !instance.isClosed
+    );
+  }
+
   async readSettings(
     workspaceId: string,
     serverName: string,
-    options?: { signal?: AbortSignal; timeoutMs?: number }
-  ): Promise<MCPSettingsSnapshot> {
+    /** `noStart`: read only a running instance; never start or restart the server. */
+    options?: { signal?: AbortSignal; timeoutMs?: number; noStart?: boolean }
+  ): Promise<MCPSettingsSnapshot | null> {
+    const noSettings = Symbol("no settings");
     let source: { instance: MCPServerInstance; requestId: number } | undefined;
     const snapshot = await this.invokeServerOperation(
       workspaceId,
       serverName,
       `MCP settings read for '${serverName}'`,
       (instance) => {
+        if (instance.settings?.settingsCapability() === undefined)
+          return Promise.resolve(noSettings);
         source = { instance, requestId: this.takeSettingsRequestId(instance, workspaceId) };
         return this.callSettingsTool(instance, workspaceId, "readTool", {}, options);
       },
       (content) => {
+        if (content === noSettings) return null;
         const parsed = parseMCPSettingsReadResult(content);
         if ("error" in parsed) throw new Error(`MCP server '${serverName}': ${parsed.error}`);
         return parsed;
       },
       options
     );
+    if (snapshot === null) return null;
     for (const warning of snapshot.warnings)
       log.warn(`[MCP] Settings of '${serverName}': ${warning}`, { workspaceId });
     if (source !== undefined)
@@ -4829,9 +4853,11 @@ export class MCPServerManager {
     label: string,
     operation: (instance: MCPServerInstance) => Promise<R>,
     finalize: (result: R) => T,
-    options?: { signal?: AbortSignal }
+    /** `noStart`: skip the startup path, so only an already running instance is used. */
+    options?: { signal?: AbortSignal; noStart?: boolean }
   ): Promise<T> {
-    const lastOptions = this.lastWorkspaceRequestOptions.get(workspaceId);
+    const lastOptions =
+      options?.noStart === true ? undefined : this.lastWorkspaceRequestOptions.get(workspaceId);
     let stableSecrets: Record<string, string> | undefined;
     if (lastOptions !== undefined) {
       // First stabilize cached startup state against settings/trust/secret
