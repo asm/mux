@@ -76,6 +76,7 @@ import { ResultSchema } from "./result";
 import {
   McpAppToolCallRequestSchema,
   McpAppToolCallResultSchema,
+  McpAppResourceReadRequestSchema,
   McpAppViewRequestSchema,
   McpAppViewSchema,
 } from "./mcpApps";
@@ -1498,7 +1499,7 @@ export const artifacts = {
 
 /**
  * MCP Apps views in the Artifacts tab (artifacts experiment): the view resource plus the
- * host-only tool result, and tools/call issued by a view.
+ * host-only tool result, and tools/call and resources/read issued by a view.
  */
 export const mcpApps = {
   getView: {
@@ -1508,6 +1509,11 @@ export const mcpApps = {
   callTool: {
     input: McpAppToolCallRequestSchema,
     output: ResultSchema(McpAppToolCallResultSchema, z.string()),
+  },
+  /** resources/read issued by a view; returns the server's raw ReadResourceResult. */
+  readResource: {
+    input: McpAppResourceReadRequestSchema,
+    output: ResultSchema(z.unknown(), z.string()),
   },
 };
 
