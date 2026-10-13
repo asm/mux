@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
+import { refocusFallenFocus } from "@/browser/utils/ui/refocusFallenFocus";
 import {
   Download,
   Maximize2,
@@ -665,14 +666,7 @@ export function ArtifactsPanel(props: {
     // The dialog's focus scope also caught focus that fell out with a removed node: a poll that
     // swaps the viewer for a new version, or a closing comment box. Focus then sat on <body>, so
     // J/K and Escape missed the panel (Escape could even reach Escape-to-interrupt). Do the same.
-    // Watch all of <body>, not just the panel: a portaled menu outside it can take focus away
-    // too, and watching only the panel restored focus at its next change (#5715).
-    const observer = new MutationObserver(() => {
-      if (document.activeElement == null || document.activeElement === document.body) {
-        panel.focus();
-      }
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
+    const stopRefocus = refocusFallenFocus(panel);
     // A hidden ancestor hides the pinned panel too (the phone sidebar, hidden again after its
     // full-screen view closed on a rotation), which would leave the rest of the app inert
     // behind nothing. Leave fullscreen once the panel has no box.
@@ -685,7 +679,7 @@ export function ArtifactsPanel(props: {
     sizeObserver.observe(panel);
     return () => {
       sizeObserver.disconnect();
-      observer.disconnect();
+      stopRefocus();
       restore();
       // Back to the opener when it is still a control of this panel, else to the panel, so J/K
       // keep working without another click: keys from the panel's controls bubble to it. Not to
