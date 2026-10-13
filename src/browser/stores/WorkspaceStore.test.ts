@@ -41,7 +41,11 @@ import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMe
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import type { StreamStartEvent, ToolCallStartEvent } from "@/common/types/stream";
-import type { WorkspaceActivitySnapshot, WorkspaceChatMessage } from "@/common/orpc/types";
+import type {
+  WorkspaceActivitySnapshot,
+  WorkspaceChatMessage,
+  WorkspaceStatsSnapshot,
+} from "@/common/orpc/types";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
   getAutoRetryKey,
@@ -56,6 +60,7 @@ import type {
   TimelinePage,
   TimelineSubscriptionEvent,
 } from "@/common/orpc/schemas/timeline";
+import type { APIClient } from "@/browser/contexts/API";
 import { computeProvidersConfigFingerprint } from "@/common/utils/providers/configFingerprint";
 import {
   findRenderedRefineProposalHash,
@@ -67,6 +72,7 @@ import {
 import {
   createControllableAsyncIterable,
   type ControllableAsyncIterable,
+  type TestApiOverrides,
 } from "@/browser/testUtils";
 import {
   shouldNotifyOnResponseComplete,
@@ -7404,6 +7410,165 @@ describe("WorkspaceStore", () => {
 
       // Should be same reference (cached)
       expect(recency1).toBe(recency2);
+    });
+  });
+
+  // Timing stats stream from one refcounted backend subscription per workspace, opened only
+  // while the UI shows them.
+  describe("workspace timing stats", () => {
+    const snapshot = (generatedAt: number): WorkspaceStatsSnapshot => ({
+      workspaceId: "stats",
+      generatedAt,
+    });
+
+    // One feed per backend subscription, so a test can tell a replacement stream from the old one.
+    let feeds: Array<ControllableAsyncIterable<WorkspaceStatsSnapshot>>;
+    let subscribeSignals: AbortSignal[];
+    const mockStatsSubscribe = mock(
+      (_input: { workspaceId: string }, options?: { signal?: AbortSignal }) => {
+        if (options?.signal) subscribeSignals.push(options.signal);
+        const feed = createControllableAsyncIterable<WorkspaceStatsSnapshot>();
+        feeds.push(feed);
+        return Promise.resolve(feed.iterable);
+      }
+    );
+    // Typed against the real `workspace.stats.subscribe` procedure: a change to its input or
+    // snapshot schema fails the typecheck here.
+    const statsOverride: TestApiOverrides<APIClient> = {
+      workspace: { stats: { subscribe: mockStatsSubscribe } },
+    };
+    const statsClient = () =>
+      ({
+        ...mockClient,
+        workspace: { ...mockClient.workspace, ...statsOverride.workspace },
+      }) as unknown as Parameters<WorkspaceStore["setClient"]>[0];
+
+    beforeEach(() => {
+      feeds = [];
+      subscribeSignals = [];
+      mockStatsSubscribe.mockClear();
+      resetStore();
+      store.setClient(statsClient());
+    });
+
+    const generatedAt = (workspaceId: string) =>
+      store.getWorkspaceStatsSnapshot(workspaceId)?.generatedAt;
+
+    it("shares one backend subscription between listeners and shows its snapshots", async () => {
+      const workspaceId = "stats-shared";
+      const listener = mock(() => undefined);
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      // Registration alone does not subscribe: no UI shows the stats yet.
+      expect(mockStatsSubscribe).not.toHaveBeenCalled();
+
+      store.subscribeStats(workspaceId, listener);
+      store.subscribeStats(workspaceId, () => undefined);
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(1);
+      expect(mockStatsSubscribe.mock.calls[0][0]).toEqual({ workspaceId });
+      expect(store.getWorkspaceStatsSnapshot(workspaceId)).toBeNull();
+
+      feeds[0].push(snapshot(1));
+      feeds[0].push(snapshot(2));
+
+      expect(await waitUntil(() => generatedAt(workspaceId) === 2)).toBe(true);
+      expect(listener).toHaveBeenCalledTimes(2);
+    });
+
+    it("closes the backend subscription and drops the snapshot after the last listener", async () => {
+      const workspaceId = "stats-refcount";
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      const unsubscribeFirst = store.subscribeStats(workspaceId, () => undefined);
+      const unsubscribeSecond = store.subscribeStats(workspaceId, () => undefined);
+      feeds[0].push(snapshot(1));
+      expect(await waitUntil(() => generatedAt(workspaceId) === 1)).toBe(true);
+
+      unsubscribeFirst();
+      expect(subscribeSignals[0].aborted).toBe(false);
+      expect(generatedAt(workspaceId)).toBe(1);
+
+      unsubscribeSecond();
+      expect(subscribeSignals[0].aborted).toBe(true);
+      expect(store.getWorkspaceStatsSnapshot(workspaceId)).toBeNull();
+
+      // A later listener opens a fresh subscription, and its stream delivers.
+      store.subscribeStats(workspaceId, () => undefined);
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(2);
+      feeds[1].push(snapshot(2));
+      expect(await waitUntil(() => generatedAt(workspaceId) === 2)).toBe(true);
+    });
+
+    it("ignores an extra unsubscribe call once every listener is gone", () => {
+      const workspaceId = "stats-underflow";
+      const warn = spyOn(console, "warn").mockImplementation(() => undefined);
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      const unsubscribe = store.subscribeStats(workspaceId, () => undefined);
+      unsubscribe();
+
+      unsubscribe();
+      expect(warn).toHaveBeenCalledTimes(1);
+      warn.mockRestore();
+
+      // The count did not go negative: the next listener subscribes again.
+      store.subscribeStats(workspaceId, () => undefined);
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it("subscribes a listener that came before the workspace was registered", () => {
+      store.subscribeStats("stats-unregistered", () => undefined);
+      expect(mockStatsSubscribe).not.toHaveBeenCalled();
+
+      createAndAddWorkspace(store, "stats-unregistered", {}, false);
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it("subscribes a listener that came before the client", () => {
+      store.setClient(null);
+      store.subscribeStats("stats-early", () => undefined);
+      createAndAddWorkspace(store, "stats-early", {}, false);
+      expect(mockStatsSubscribe).not.toHaveBeenCalled();
+
+      store.setClient(statsClient());
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(1);
+      expect(mockStatsSubscribe.mock.calls[0][0]).toEqual({ workspaceId: "stats-early" });
+    });
+
+    it("closes the subscription when the client changes or the workspace is removed", async () => {
+      createAndAddWorkspace(store, "stats-reconnect", {}, false);
+      createAndAddWorkspace(store, "stats-removed", {}, false);
+      store.subscribeStats("stats-reconnect", () => undefined);
+      store.subscribeStats("stats-removed", () => undefined);
+      expect(subscribeSignals).toHaveLength(2);
+
+      // A reconnect resubscribes the workspaces that still have listeners.
+      store.setClient(statsClient());
+      expect(subscribeSignals.map((signal) => signal.aborted)).toEqual([true, true, false, false]);
+      const reconnectFeed =
+        feeds[
+          mockStatsSubscribe.mock.calls.findLastIndex(
+            ([input]) => input.workspaceId === "stats-reconnect"
+          )
+        ];
+      reconnectFeed.push(snapshot(3));
+      expect(await waitUntil(() => generatedAt("stats-reconnect") === 3)).toBe(true);
+
+      store.removeWorkspace("stats-removed");
+      expect(subscribeSignals[3].aborted).toBe(true);
+      expect(subscribeSignals[2].aborted).toBe(false);
+    });
+
+    it("logs a failed subscription and keeps showing no snapshot", async () => {
+      const workspaceId = "stats-error";
+      const warn = spyOn(console, "warn").mockImplementation(() => undefined);
+      const failure = new Error("stats gone");
+      mockStatsSubscribe.mockImplementationOnce(() => Promise.reject(failure));
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.subscribeStats(workspaceId, () => undefined);
+
+      expect(await waitUntil(() => warn.mock.calls.length > 0)).toBe(true);
+      // The log carries the error itself, not just a message.
+      expect(warn.mock.calls[0]).toContain(failure);
+      warn.mockRestore();
+      expect(store.getWorkspaceStatsSnapshot(workspaceId)).toBeNull();
     });
   });
 
