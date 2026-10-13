@@ -40,6 +40,32 @@ import {
   openArtifactsTab,
   pinAndOpenArtifact,
 } from "@/browser/features/RightSidebar/ArtifactsTab/openArtifact";
+import {
+  appViewPickerDetails,
+  getMcpAppViews,
+  openMcpAppViewTab,
+  transcriptViews,
+  type McpAppViewRef,
+} from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
+import { mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
+
+/**
+ * The workspace's MCP App views (the loaded transcript's, then ones opened this session), each
+ * with its detail (appViewPickerDetails, as the Artifacts picker shows it).
+ */
+function appViewEntries(
+  workspaceId: string,
+  messages: Parameters<typeof transcriptViews>[1]
+): Array<{ view: McpAppViewRef; detail: string }> {
+  const fromTranscript = transcriptViews(workspaceId, messages);
+  const known = new Set(fromTranscript.map((view) => view.toolCallId));
+  const views = [
+    ...fromTranscript,
+    ...getMcpAppViews(workspaceId).filter((view) => !known.has(view.toolCallId)),
+  ];
+  const details = appViewPickerDetails(views);
+  return views.map((view, i) => ({ view, detail: details[i] }));
+}
 import { isTabType, type TabType } from "@/browser/types/rightSidebar";
 import {
   getOrderedBaseTabIds,
@@ -894,6 +920,22 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 keywords: ["artifacts", "preview", "versions"],
                 run: () => openArtifactsTab(wsId),
               },
+              // One per MCP App view of the workspace (transcript or opened this session): opens
+              // its tab or focuses the one it has, the keyboard path to "Open in tab".
+              // The subtitle carries each call's detail, so several calls of one tool differ.
+              ...appViewEntries(wsId, p.selectedWorkspaceState?.messages ?? []).map(
+                ({ view, detail }) => ({
+                  id: CommandIds.navOpenAppView(view.toolCallId),
+                  title: `Open App View: ${view.label}`,
+                  subtitle:
+                    detail === ""
+                      ? mcpServerDisplayName(view.serverName)
+                      : `${mcpServerDisplayName(view.serverName)} · ${detail}`,
+                  section: section.navigation,
+                  keywords: ["app", "view", "mcp", "tab", view.serverName],
+                  run: () => openMcpAppViewTab(wsId, view),
+                })
+              ),
               {
                 id: CommandIds.navOpenFileAsArtifact(),
                 title: "Open File as Artifact…",
