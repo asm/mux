@@ -16,8 +16,8 @@ type RestartRule =
   | "effect-deps"
   /** A store fed through setClient(): it drops the client while offline and resubscribes. */
   | "store-live-feed"
-  /** The terminal router: today the provider builds a new router per client. */
-  | "router-per-client"
+  /** The terminal router: setClient() restarts its streams on each new client. */
+  | "router-setClient"
   /** A long-lived holder with its own capped backoff. */
   | "holder-backoff"
   /** One operation's progress stream (a clone): it is not restarted, the operation fails. */
@@ -56,7 +56,7 @@ const RESTART_RULES: Record<string, RestartRule> = {
   "src/browser/stores/ProvidersConfigStore.ts": "store-live-feed",
   "src/browser/stores/ReviewStateStore.ts": "store-live-feed",
   "src/browser/stores/WorkspaceStore.ts": "store-live-feed",
-  "src/browser/terminal/TerminalSessionRouter.ts": "router-per-client",
+  "src/browser/terminal/TerminalSessionRouter.ts": "router-setClient",
 };
 
 /**
@@ -72,10 +72,11 @@ const RULE_SHAPES: Record<RestartRule, { describe: string; matches: (text: strin
     describe: "a setClient(client) method that the app feeds with the live client",
     matches: (text) => /\bsetClient\s*\(\s*\w+\s*:/.test(text),
   },
-  "router-per-client": {
-    describe: "a router bound to one client (the provider builds one per client)",
-    matches: (text) => /constructor\(api: APIClient\b/.test(text),
+  "router-setClient": {
+    describe: "a setClient(api) method that restarts the streams",
+    matches: (text) => /\bsetClient\s*\(\s*api\s*:/.test(text),
   },
+
   "holder-backoff": {
     describe: "a retry with a delay",
     matches: (text) => text.includes("setTimeout(") && /backoff|retry/i.test(text),
