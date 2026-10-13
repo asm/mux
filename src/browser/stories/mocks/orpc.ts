@@ -438,6 +438,10 @@ type MockMcpTestResult =
  * ```
  */
 export function createMockORPCClient(options: MockORPCClientOptions = {}): APIClient {
+  const mockViewDomains = new Map<
+    string,
+    { projectPath: string; serverName: string; origins: string[] }
+  >();
   const {
     projects: providedProjects = new Map<string, ProjectConfig>(),
     workspaces = [],
@@ -2410,8 +2414,34 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             : { success: false as const, error: `No view for ${input.toolCallId}` }
         );
       },
-      approveViewDomains: (input: { origins: string[] }) =>
-        Promise.resolve({ success: true as const, data: { approvedDomains: input.origins } }),
+      // Kept like the backend's project config, so listViewDomains (Settings' list) reports
+      // what the story approved.
+      approveViewDomains: (input: {
+        toolCallId: string;
+        serverName: string;
+        origins: string[];
+      }) => {
+        const view = mcpApps?.views[input.toolCallId];
+        const entry = {
+          projectPath: view?.approvalProjectPath ?? "",
+          serverName: view?.invocation?.serverName ?? input.serverName,
+          origins: [] as string[],
+        };
+        const key = JSON.stringify([entry.projectPath, entry.serverName]);
+        entry.origins = [
+          ...new Set([...(mockViewDomains.get(key)?.origins ?? []), ...input.origins]),
+        ];
+        mockViewDomains.set(key, entry);
+        return Promise.resolve({
+          success: true as const,
+          data: { approvedDomains: entry.origins },
+        });
+      },
+      listViewDomains: () => Promise.resolve([...mockViewDomains.values()]),
+      revokeViewDomains: (input: { projectPath: string; serverName: string }) => {
+        mockViewDomains.delete(JSON.stringify([input.projectPath, input.serverName]));
+        return Promise.resolve();
+      },
       // Story views are always in the story transcript, so no record lookup finds one.
       getViewRecords: (input: { toolCallIds: string[] }) =>
         Promise.resolve({

@@ -1,4 +1,6 @@
+import { z } from "zod";
 import {
+  MCP_APP_CSP_DOMAINS_MAX,
   MCP_APP_MIME_TYPE,
   MCP_APP_RESOURCE_MAX_BYTES,
   MCP_APP_SKYBRIDGE_MIME_TYPE,
@@ -12,6 +14,36 @@ export interface McpAppResource {
   html: string;
   csp: McpAppCspDeclaration;
   prefersBorder: boolean | null;
+}
+
+/**
+ * ChatGPT's legacy `_meta["openai/widgetCSP"]` (snake_case), read next to `_meta.ui.csp`.
+ * `redirect_domains` is ignored: it lists window.openai.openExternal redirect targets, not
+ * origins the view fetches from or loads, so it maps to no CSP directive.
+ */
+const DomainList = z.array(z.string().max(256)).max(MCP_APP_CSP_DOMAINS_MAX).optional();
+const McpAppWidgetCspSchema = z.object({
+  connect_domains: DomainList,
+  resource_domains: DomainList,
+  frame_domains: DomainList,
+});
+
+function mergeCsp(
+  ui: McpAppCspDeclaration,
+  alias: z.infer<typeof McpAppWidgetCspSchema>
+): McpAppCspDeclaration {
+  // Capped like each source list, so the merged view still fits McpAppCspDeclarationSchema.
+  const union = (a: string[] | undefined, b: string[] | undefined) =>
+    a === undefined && b === undefined
+      ? undefined
+      : [...new Set([...(a ?? []), ...(b ?? [])])].slice(0, MCP_APP_CSP_DOMAINS_MAX);
+  const merged: McpAppCspDeclaration = {
+    ...ui,
+    connectDomains: union(ui.connectDomains, alias.connect_domains),
+    resourceDomains: union(ui.resourceDomains, alias.resource_domains),
+    frameDomains: union(ui.frameDomains, alias.frame_domains),
+  };
+  return Object.fromEntries(Object.entries(merged).filter(([, v]) => v !== undefined));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -29,8 +61,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * `openai/outputTemplate`: the alias is resolved into a plain resourceUri at tool discovery, so
  * this reader cannot tell which key named the view, and carrying that through would add a field
  * to tool metadata, display snapshots and result records. Both types are HTML rendered in the
- * same sandbox, so accepting either grants nothing extra. A skybridge template's
- * `openai/widgetCSP` is not mapped: only `_meta.ui.csp` grants domains.
+ * same sandbox, so accepting either grants nothing extra. The declared CSP is `_meta.ui.csp`
+ * merged with ChatGPT's `openai/widgetCSP` alias (mergeCsp). Either way a declared domain is
+ * granted only after the user approves it for the server (mcpAppCsp.ts).
  */
 export function extractMcpAppResource(result: unknown, uri: string): McpAppResource {
   const contents = isRecord(result) && Array.isArray(result.contents) ? result.contents : [];
@@ -63,10 +96,13 @@ export function extractMcpAppResource(result: unknown, uri: string): McpAppResou
   }
   const ui = isRecord(content._meta) && isRecord(content._meta.ui) ? content._meta.ui : {};
   const csp = McpAppCspDeclarationSchema.safeParse(ui.csp ?? {});
+  const alias = McpAppWidgetCspSchema.safeParse(
+    (isRecord(content._meta) ? content._meta["openai/widgetCSP"] : undefined) ?? {}
+  );
   return {
     html: bytes.toString("utf8"),
     // A malformed declaration grants nothing rather than failing the whole view.
-    csp: csp.success ? csp.data : {},
+    csp: mergeCsp(csp.success ? csp.data : {}, alias.success ? alias.data : {}),
     prefersBorder: typeof ui.prefersBorder === "boolean" ? ui.prefersBorder : null,
   };
 }

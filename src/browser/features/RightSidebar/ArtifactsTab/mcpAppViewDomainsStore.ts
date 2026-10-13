@@ -63,3 +63,8 @@ export function useMcpAppViewDomains(
     projectPath == null ? undefined : entries.get(keyOf(projectPath, serverName))
   );
 }
+
+// A revoke in this renderer publishes here directly, so its mounted views narrow at once. A revoke
+// made in another window or on another device takes effect when the view next mounts (its getView
+// reads the stored approvals): cross-process config events are missed (#6179), and a live
+// cross-window follow is deferred to #6181.

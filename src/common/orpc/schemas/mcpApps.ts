@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   isMcpAppResourceUri,
+  MCP_APP_CSP_DOMAINS_MAX,
   MCP_APP_MODEL_CONTEXT_MAX_BYTES,
   MCP_APP_READ_URI_MAX_CHARS,
   MCP_APP_VIEW_DOMAINS_MAX,
@@ -13,7 +14,7 @@ import {
  * chat history.
  */
 
-const DomainListSchema = z.array(z.string().max(256)).max(32);
+const DomainListSchema = z.array(z.string().max(256)).max(MCP_APP_CSP_DOMAINS_MAX);
 
 /** `_meta.ui.csp` as declared by the view resource (not what the host grants). */
 export const McpAppCspDeclarationSchema = z.object({
@@ -105,6 +106,14 @@ export const McpAppApproveDomainsRequestSchema = z.object({
   // One strip asks for a view's resource and connect domains together (up to 32 each).
   origins: z.array(z.string().max(256)).min(1).max(MCP_APP_VIEW_DOMAINS_MAX),
 });
+
+/** One server's approved view origins in one project (Settings → MCP). */
+export const McpAppViewDomainsSchema = z.object({
+  projectPath: z.string(),
+  serverName: z.string(),
+  origins: z.array(z.string()),
+});
+export type McpAppViewDomains = z.infer<typeof McpAppViewDomainsSchema>;
 
 /** resources/read issued by a view; the server is the view's own (bound) server. */
 export const McpAppResourceReadRequestSchema = z.object({
