@@ -12,11 +12,15 @@ import type {
   McpAppToolCallRequestSchema,
   McpAppToolCallResult,
   McpAppView,
+  McpAppViewRecord,
+  McpAppViewRecordsRequestSchema,
   McpAppViewRequestSchema,
 } from "@/common/orpc/schemas/mcpApps";
 import type { Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { ORPCContext } from "@/node/orpc/context";
+import { buildMcpToolName } from "@/common/utils/tools/mcpToolName";
+import type { McpAppResultRecord } from "./mcpAppResultStore";
 import { displayConnectionKey } from "./mcpServerIdentity";
 
 type McpAppsContext = Pick<ORPCContext, "experimentsService" | "mcpServerManager">;
@@ -94,6 +98,46 @@ export async function getMcpAppView(
   } catch (error) {
     return { success: false, error: getErrorMessage(error) };
   }
+}
+
+/**
+ * The views of tool calls by their result records alone, one entry per distinct requested ID. A restored
+ * app tab knows only the tool call ID; when that call is outside the loaded transcript (before a
+ * compaction boundary, or older than the first history page) this is how the tab still finds its
+ * view. One request covers every tab restored at once. Records are read from the asking
+ * workspace only, and each view is then opened with getView, which checks the same record.
+ */
+export async function getMcpAppViewRecords(
+  context: McpAppsContext,
+  input: z.infer<typeof McpAppViewRecordsRequestSchema>
+): Promise<Result<Array<{ toolCallId: string; view: McpAppViewRecord }>, string>> {
+  assertMcpAppsEnabled(context);
+  // One entry per distinct ID: a repeated ID is answered once (the schema caps the list and
+  // refuses an empty one).
+  const data = await Promise.all(
+    [...new Set(input.toolCallIds)].map(async (toolCallId) => {
+      const record = await context.mcpServerManager.getMcpAppResult(input.workspaceId, toolCallId);
+      return { toolCallId, view: record === null ? null : viewOfRecord(record) };
+    })
+  );
+  return { success: true, data };
+}
+
+/** Only the view's binding, never the stored tool result. */
+function viewOfRecord(record: McpAppResultRecord): NonNullable<McpAppViewRecord> {
+  // The record keeps the server-local tool name; cards show the model-facing one. Without the
+  // catalog the collision suffix is unknown, so this is the unsuffixed name.
+  const modelFacing = buildMcpToolName({
+    serverName: record.serverName,
+    toolName: record.toolName,
+    usedNames: new Set(),
+  });
+  return {
+    serverName: displayConnectionKey(record.serverName),
+    toolName: modelFacing?.toolName ?? record.toolName,
+    resourceUri: record.resourceUri,
+    arguments: record.arguments,
+  };
 }
 
 export async function callMcpAppTool(

@@ -3,6 +3,7 @@ import {
   isMcpAppResourceUri,
   MCP_APP_MODEL_CONTEXT_MAX_BYTES,
   MCP_APP_READ_URI_MAX_CHARS,
+  MCP_APP_VIEW_RECORDS_MAX_IDS,
 } from "@/common/utils/mcpApps";
 
 /**
@@ -52,6 +53,32 @@ export const McpAppViewRequestSchema = z.object({
   serverName: z.string().min(1),
   resourceUri: z.string().refine(isMcpAppResourceUri, "resourceUri must be a ui:// URI"),
 });
+
+/** Tool calls' views, looked up by their result records alone (getViewRecords). */
+export const McpAppViewRecordsRequestSchema = z.object({
+  workspaceId: z.string().min(1),
+  toolCallIds: z.array(z.string().min(1)).min(1).max(MCP_APP_VIEW_RECORDS_MAX_IDS),
+});
+
+/**
+ * What a restored app tab needs to show a view whose tool call is outside the loaded
+ * transcript: the record's server (display form, as cards carry it), the model-facing tool
+ * name, the view resource and the arguments. Null when the workspace has no record.
+ */
+export const McpAppViewRecordSchema = z
+  .object({
+    serverName: z.string().min(1),
+    toolName: z.string().min(1),
+    resourceUri: z.string().refine(isMcpAppResourceUri, "resourceUri must be a ui:// URI"),
+    arguments: z.unknown(),
+  })
+  .nullable();
+export type McpAppViewRecord = z.infer<typeof McpAppViewRecordSchema>;
+
+/** One entry per requested tool call, in request order. */
+export const McpAppViewRecordsSchema = z.array(
+  z.object({ toolCallId: z.string(), view: McpAppViewRecordSchema })
+);
 
 export const McpAppToolCallRequestSchema = z.object({
   workspaceId: z.string().min(1),

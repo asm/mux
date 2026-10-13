@@ -57,7 +57,15 @@ import { useArtifactInteractions } from "./useArtifactInteractions";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { createCappedMemory, useCappedMemory } from "./cappedMemory";
 import { McpAppFrame } from "./McpAppFrame";
-import { appViewPickerDetails, mcpAppSelectionKey, useMcpAppViews } from "./mcpAppViewsStore";
+import {
+  appViewPickerDetails,
+  markMcpAppViewHosted,
+  mcpAppSelectionKey,
+  useMcpAppViews,
+  type McpAppViewRef,
+} from "./mcpAppViewsStore";
+import { AppViewInTabNotice } from "../AppViewTab/AppViewTab";
+import { useMcpAppViewInTab } from "../AppViewTab/appViewTabs";
 import {
   type ArtifactSelection,
   type ArtifactSelectionScope,
@@ -285,6 +293,28 @@ const SELECTION_EXTENDING_KEYS = new Set([
  * Artifacts tab (experiment: "artifacts"): files the agent writes to
  * $XUM_SCRATCH_DIR/artifacts, listed newest first with a preview of the selected one.
  */
+/**
+ * An app view selected in the Artifacts picker. While the view is open in its app tab, this
+ * shows the "Open in tab" placeholder and mounts no frame, so one view never runs twice.
+ */
+function ArtifactsAppView(props: { workspaceId: string; view: McpAppViewRef }) {
+  const { workspaceId } = props;
+  const { toolCallId } = props.view;
+  const inTab = useMcpAppViewInTab(workspaceId, toolCallId, ["tab"]);
+  useEffect(() => {
+    if (inTab) return;
+    return markMcpAppViewHosted(workspaceId, toolCallId, "artifacts");
+  }, [inTab, workspaceId, toolCallId]);
+  if (inTab) {
+    return (
+      <div className="p-3">
+        <AppViewInTabNotice workspaceId={workspaceId} view={props.view} />
+      </div>
+    );
+  }
+  return <McpAppFrame workspaceId={workspaceId} view={props.view} />;
+}
+
 export function ArtifactsPanel(props: {
   workspaceId: string;
   /** Take focus once rendered (the tab was opened by shortcut), then report it consumed. */
@@ -978,7 +1008,7 @@ export function ArtifactsPanel(props: {
 
   const viewerBody =
     selectedApp != null ? (
-      <McpAppFrame
+      <ArtifactsAppView
         // Reload remounts the view, so it re-fetches its resource and result.
         key={`${selectedApp.toolCallId}\u0000${reloadTick}`}
         workspaceId={props.workspaceId}

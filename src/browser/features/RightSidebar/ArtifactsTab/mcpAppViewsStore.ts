@@ -1,9 +1,11 @@
-import { useSyncExternalStore } from "react";
+import { useEffect, useSyncExternalStore } from "react";
+import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { DisplayedMessage } from "@/common/types/message";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { mcpToolDisplayName } from "@/common/utils/mcp/mcpToolDisplayName";
+import { MCP_APP_VIEW_RECORDS_MAX_IDS } from "@/common/utils/mcpApps";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
 import { getNestedToolStatus } from "@/browser/features/Tools/Shared/toolUtils";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
@@ -80,6 +82,13 @@ export function mcpAppSelectionKey(toolCallId: string): string {
   return `${MCP_APP_SELECTION_PREFIX}${toolCallId}`;
 }
 
+/** The tool call of a view key, or null for anything else. */
+export function toolCallIdFromMcpAppKey(key: string): string | null {
+  return key.startsWith(MCP_APP_SELECTION_PREFIX) && key.length > MCP_APP_SELECTION_PREFIX.length
+    ? key.slice(MCP_APP_SELECTION_PREFIX.length)
+    : null;
+}
+
 const EMPTY: readonly McpAppViewRef[] = [];
 const viewsByWorkspace = new Map<string, readonly McpAppViewRef[]>();
 const listeners = new Set<() => void>();
@@ -153,7 +162,7 @@ function sameViews(a: readonly McpAppViewRef[], b: readonly McpAppViewRef[]): bo
 const viewsByMessages = new WeakMap<readonly DisplayedMessage[], readonly McpAppViewRef[]>();
 const lastTranscriptViews = new Map<string, readonly McpAppViewRef[]>();
 
-function transcriptViews(
+export function transcriptViews(
   workspaceId: string,
   messages: readonly DisplayedMessage[]
 ): readonly McpAppViewRef[] {
@@ -249,4 +258,177 @@ export function closeMcpAppView(workspaceId: string, toolCallId: string) {
   if (readArtifactSelection(workspaceId).path === mcpAppSelectionKey(toolCallId)) {
     writeArtifactSelection(workspaceId, { scope: "artifact", path: null, version: null });
   }
+}
+
+/**
+ * Lookups of views the loaded transcript lacks, by workspace and tool call: "pending" while the
+ * backend is asked, "missing" when it answered that it has no result record, "failed" when the
+ * request failed. Only "missing" is final: a failed lookup runs again the next time a tab asks
+ * (it remounts, or the API client reconnects). A found view joins the session list
+ * (viewsByWorkspace) and its entry is dropped.
+ */
+const recordLookups = new Map<string, "pending" | "missing" | "failed">();
+const lookupKey = (workspaceId: string, toolCallId: string) => `${workspaceId}\u0000${toolCallId}`;
+
+/**
+ * Lookups asked for in the current task, per workspace, sent as one getViewRecords request each
+ * at the next microtask: every tab of a restored layout mounts in one render, so one request
+ * covers all of them (one IPC call, not one per tab).
+ */
+const queuedLookups = new Map<string, { api: APIClient; toolCallIds: Set<string> }>();
+
+function lookUpViewRecord(api: APIClient, workspaceId: string, toolCallId: string) {
+  const state = recordLookups.get(lookupKey(workspaceId, toolCallId));
+  if (state === "pending" || state === "missing") return;
+  recordLookups.set(lookupKey(workspaceId, toolCallId), "pending");
+  emit();
+  if (queuedLookups.size === 0) queueMicrotask(flushViewRecordLookups);
+  const queued = queuedLookups.get(workspaceId) ?? { api, toolCallIds: new Set<string>() };
+  queued.toolCallIds.add(toolCallId);
+  queuedLookups.set(workspaceId, queued);
+}
+
+function flushViewRecordLookups() {
+  const batches = [...queuedLookups];
+  queuedLookups.clear();
+  for (const [workspaceId, { api, toolCallIds }] of batches) {
+    const ids = [...toolCallIds];
+    for (let i = 0; i < ids.length; i += MCP_APP_VIEW_RECORDS_MAX_IDS) {
+      requestViewRecords(api, workspaceId, ids.slice(i, i + MCP_APP_VIEW_RECORDS_MAX_IDS));
+    }
+  }
+}
+
+function requestViewRecords(api: APIClient, workspaceId: string, toolCallIds: string[]) {
+  const fail = () => {
+    for (const id of toolCallIds) recordLookups.set(lookupKey(workspaceId, id), "failed");
+    emit();
+  };
+  // Through a resolved promise, so a client that throws synchronously also counts as failed.
+  Promise.resolve()
+    .then(() => api.mcpApps.getViewRecords({ workspaceId, toolCallIds }))
+    .then((result) => {
+      if (!result.success) return fail();
+      const found: McpAppViewRef[] = [];
+      for (const { toolCallId, view } of result.data) {
+        if (!toolCallIds.includes(toolCallId)) continue;
+        if (view === null) {
+          recordLookups.set(lookupKey(workspaceId, toolCallId), "missing");
+          continue;
+        }
+        recordLookups.delete(lookupKey(workspaceId, toolCallId));
+        found.push({
+          toolCallId,
+          serverName: view.serverName,
+          resourceUri: view.resourceUri,
+          toolName: view.toolName,
+          label: mcpToolDisplayName(view.toolName, { key: view.serverName }),
+          arguments: view.arguments ?? {},
+          // The record does not say how the call ended: a call without a result opens with
+          // "Result no longer available" instead of tool-cancelled.
+          cancelled: false,
+          failed: false,
+        });
+      }
+      // An ID the answer left out was not looked up: it can be asked again.
+      for (const id of toolCallIds) {
+        if (recordLookups.get(lookupKey(workspaceId, id)) === "pending") {
+          recordLookups.set(lookupKey(workspaceId, id), "failed");
+        }
+      }
+      if (found.length > 0) {
+        const ids = new Set(found.map((v) => v.toolCallId));
+        const current = getMcpAppViews(workspaceId).filter((v) => !ids.has(v.toolCallId));
+        viewsByWorkspace.set(workspaceId, [...current, ...found]);
+      }
+      emit();
+    })
+    .catch(fail);
+}
+
+/**
+ * One view of the workspace: the ref, null when the workspace has no such view (any more), or
+ * "loading" while that is not known yet. A tab restored after a reload can name a call outside
+ * the loaded transcript (before a compaction boundary, or older than the first history page):
+ * once the transcript is loaded without it, the backend's result record decides.
+ */
+export function useMcpAppView(
+  workspaceId: string,
+  toolCallId: string
+): McpAppViewRef | null | "loading" {
+  const store = useWorkspaceStoreRaw();
+  const { api } = useAPI();
+  const views = useMcpAppViews(workspaceId);
+  const loading = useSyncExternalStore(
+    (listener) => store.subscribeKey(workspaceId, listener),
+    () =>
+      !store.hasRegisteredWorkspace(workspaceId) ||
+      store.getWorkspaceState(workspaceId).loading ||
+      store.getWorkspaceState(workspaceId).isHydratingTranscript
+  );
+  const view = views.find((v) => v.toolCallId === toolCallId) ?? null;
+  const lookup = useSyncExternalStore(subscribe, () =>
+    recordLookups.get(lookupKey(workspaceId, toolCallId))
+  );
+  const lookUp = view === null && !loading && toolCallId !== "" && api != null;
+  // Fetching from the backend is an external side effect, so an effect, not render.
+  useEffect(() => {
+    if (lookUp) lookUpViewRecord(api, workspaceId, toolCallId);
+  }, [lookUp, api, workspaceId, toolCallId]);
+  if (view !== null) return view;
+  // A failed lookup shows as unavailable until it is retried.
+  return loading || (lookUp && lookup !== "missing" && lookup !== "failed") ? "loading" : null;
+}
+
+/**
+ * Open a view in its own right-sidebar tab, or focus the tab it already has (RightSidebar handles
+ * OPEN_MCP_APP_VIEW, and on small viewports WorkspaceMenuBar shows that tab in the full-screen
+ * sidebar). The ref is kept for the session so a view from outside the loaded transcript window
+ * still resolves.
+ */
+export function openMcpAppViewTab(workspaceId: string, view: McpAppViewRef) {
+  const current = getMcpAppViews(workspaceId).filter((v) => v.toolCallId !== view.toolCallId);
+  viewsByWorkspace.set(workspaceId, [view, ...current]);
+  emit();
+  window.dispatchEvent(
+    createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId, toolCallId: view.toolCallId })
+  );
+}
+
+/**
+ * Where a view is mounted outside its tool card: its app tab (also on phones, where the sidebar
+ * shows full-screen), or the Artifacts tab (which still lists app views). Counted per workspace,
+ * tool call and host, so every place that can show a view yields to the others and at most one
+ * live instance runs.
+ */
+export type McpAppViewHost = "tab" | "artifacts";
+const hostedViews = new Map<string, number>();
+const hostedKey = (workspaceId: string, toolCallId: string, host: McpAppViewHost) =>
+  `${workspaceId}\u0000${toolCallId}\u0000${host}`;
+
+/** Mark a view hosted while that host's frame is mounted; returns the unmark. */
+export function markMcpAppViewHosted(
+  workspaceId: string,
+  toolCallId: string,
+  host: McpAppViewHost
+): () => void {
+  const key = hostedKey(workspaceId, toolCallId, host);
+  hostedViews.set(key, (hostedViews.get(key) ?? 0) + 1);
+  emit();
+  return () => {
+    const left = (hostedViews.get(key) ?? 1) - 1;
+    if (left > 0) hostedViews.set(key, left);
+    else hostedViews.delete(key);
+    emit();
+  };
+}
+
+export function useMcpAppViewHostedBy(
+  workspaceId: string,
+  toolCallId: string,
+  hosts: readonly McpAppViewHost[]
+): boolean {
+  return useSyncExternalStore(subscribe, () =>
+    hosts.some((host) => hostedViews.has(hostedKey(workspaceId, toolCallId, host)))
+  );
 }

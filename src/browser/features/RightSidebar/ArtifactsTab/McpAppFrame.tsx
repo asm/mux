@@ -160,6 +160,8 @@ export function McpAppFrame(props: {
   workspaceId: string;
   view: McpAppViewRef;
   variant?: McpAppFrameVariant;
+  /** Panel only: closes the panel's host (an app tab). Without it, Close leaves Artifacts. */
+  onClose?: () => void;
 }) {
   const inline = props.variant === "inline";
   const { api } = useAPI();
@@ -376,7 +378,8 @@ export function McpAppFrame(props: {
 
   const close = async () => {
     await hostRef.current?.teardown("closed");
-    closeMcpAppView(workspaceId, toolCallId);
+    if (props.onClose) props.onClose();
+    else closeMcpAppView(workspaceId, toolCallId);
   };
 
   const header = inline ? null : (
@@ -389,6 +392,7 @@ export function McpAppFrame(props: {
       <div className="flex min-h-0 flex-col">
         {header}
         <div className="text-danger p-4 text-xs">
+          {inline ? null : "This view is no longer available. "}
           {current.error ?? "The view could not be loaded."}
         </div>
       </div>
