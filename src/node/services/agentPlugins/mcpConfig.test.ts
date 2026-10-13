@@ -10,6 +10,7 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import { Config } from "@/node/config";
 import { MCPConfigService } from "@/node/services/mcpConfigService";
 import { MCPServerManager } from "@/node/services/mcpServerManager";
+import { log } from "@/node/services/log";
 import { readPluginMcpPolicy } from "./registry";
 import { createTestPluginInstallEntry } from "./testFixtures";
 import type { AgentPluginInfo } from "./discovery";
@@ -29,12 +30,12 @@ async function makePlugin(
   baseDir: string,
   name: string,
   mcpJson: unknown,
-  options?: { scope?: "project" | "global" }
+  options?: { scope?: "project" | "global"; fileName?: string }
 ): Promise<AgentPluginInfo> {
   const pluginDir = path.join(baseDir, name);
   await fs.mkdir(pluginDir, { recursive: true });
   const rootPath = await fs.realpath(pluginDir);
-  const mcpConfigPath = path.join(rootPath, "mcp.json");
+  const mcpConfigPath = path.join(rootPath, options?.fileName ?? "mcp.json");
   await fs.writeFile(
     mcpConfigPath,
     typeof mcpJson === "string" ? mcpJson : JSON.stringify(mcpJson),
@@ -48,6 +49,7 @@ async function makePlugin(
     dirName: name,
     manifest: { schemaId: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name },
     mcpConfigPath,
+    ...(options?.fileName === ".mcp.json" ? { mcpConfigDialect: "codex" as const } : {}),
   };
 }
 
@@ -124,6 +126,160 @@ describe("loadPluginMcpServers", () => {
     expect(diagnostics).toEqual([]);
     const values = Object.values(servers);
     expect(values.map((s) => s.transport).sort()).toEqual(["http", "sse"]);
+  });
+
+  test("accepts entry extensions; OAuth settings Xum cannot use yet load with one warning", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const plugin = await makePlugin(
+      tmp.path,
+      "openai-auth",
+      mcpDoc({
+        local: { ...STDIO_ENTRY, extensions: { "com.example": { anything: true } } },
+        discovery: {
+          type: "streamable-http",
+          url: "https://a.example.com/mcp",
+          extensions: { "com.openai": { auth: { type: "oauth", client: { mode: "dcr" } } } },
+        },
+        provided: {
+          type: "streamable-http",
+          url: "https://b.example.com/mcp",
+          extensions: {
+            "com.openai": {
+              auth: {
+                type: "oauth",
+                client: { mode: "provided", clientId: "docs-client" },
+                tokenUrl: "https://b.example.com/token",
+                authorizationUrl: "http://b.example.com/authorize",
+                baseScopes: ["docs:read"],
+              },
+            },
+          },
+        },
+      })
+    );
+
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+
+    expect(Object.keys(servers)).toHaveLength(3);
+    expect(diagnostics.every((d) => d.severity === "warning")).toBe(true);
+    // The non-https endpoint is dropped; the valid unused settings are named once.
+    const messages = diagnostics.map((d) => d.message);
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toMatch(
+      /'provided'.*authorizationUrl' must be an https \(or loopback http\) URL/
+    );
+    expect(messages[1]).toMatch(
+      /'provided'.*ignores: client\.mode: provided, client\.clientId, tokenUrl, baseScopes$/
+    );
+  });
+
+  test("maps the Codex .mcp.json dialect and never echoes the client secret", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const secret = "824c9cd33b8de28213447789c7517ad720138be5";
+    // Shapes copied from openai/plugins (notion, github): no $schema, type "http".
+    const plugin = await makePlugin(
+      tmp.path,
+      "codex",
+      {
+        mcpServers: {
+          notion: {
+            type: "http",
+            url: "https://mcp.notion.com/mcp",
+            oauth_resource: "https://mcp.notion.com",
+          },
+          github: {
+            type: "http",
+            url: "https://api.githubcopilot.com/mcp/",
+            oauth: { client_id: "Iv23li", client_secret: secret, callback_port: 12799 },
+          },
+        },
+      },
+      { fileName: ".mcp.json" }
+    );
+    const warn = spyOn(log, "warn");
+    try {
+      const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+
+      expect(Object.values(servers).map((s) => s.transport)).toEqual(["http", "http"]);
+      const messages = diagnostics.map((d) => d.message);
+      expect(messages).toHaveLength(2);
+      // Messages name the real file, not mcp.json.
+      expect(messages.every((message) => message.startsWith(".mcp.json server '"))).toBe(true);
+      expect(messages[0]).toMatch(/'notion'.*ignores: resource$/);
+      expect(messages[1]).toMatch(
+        /'github'.*ignores: oauth\.client_secret, oauth\.callback_port, client\.mode: provided, client\.clientId$/
+      );
+      const everything = JSON.stringify([servers, diagnostics, warn.mock.calls]);
+      expect(everything).not.toContain(secret);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("the Codex dialect infers stdio from a command and accepts a flat server map", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const plugin = await makePlugin(
+      tmp.path,
+      "flat",
+      { local: { command: "node", args: ["server.js"] } },
+      { fileName: ".mcp.json" }
+    );
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+    expect(diagnostics).toEqual([]);
+    expect(Object.values(servers).map((s) => [s.plugin?.serverName, s.transport])).toEqual([
+      ["local", "stdio"],
+    ]);
+  });
+
+  test("the Codex dialect maps streamable_http spellings and resolves a relative cwd", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    // `cwd: "."` is openai/plugins openai-developers/.mcp.json verbatim.
+    const plugin = await makePlugin(
+      tmp.path,
+      "codex-forms",
+      {
+        mcpServers: {
+          local: { cwd: ".", command: "node", args: ["./mcp/server.mjs"] },
+          nested: { cwd: "sub", command: "node" },
+          escape: { cwd: "../outside", command: "node" },
+          underscore: { type: "streamable_http", url: "https://a.example.com/mcp" },
+          dash: { type: "streamable-http", url: "https://b.example.com/mcp" },
+        },
+      },
+      { fileName: ".mcp.json" }
+    );
+    await fs.mkdir(path.join(plugin.rootPath, "sub"));
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+    const byName = new Map(Object.values(servers).map((s) => [s.plugin?.serverName, s]));
+    expect((byName.get("local") as MCPStdioServerInfo).cwd).toBe(plugin.rootPath);
+    expect((byName.get("nested") as MCPStdioServerInfo).cwd).toBe(
+      path.join(plugin.rootPath, "sub")
+    );
+    expect(byName.get("underscore")?.transport).toBe("http");
+    expect(byName.get("dash")?.transport).toBe("http");
+    // The containment check still applies to a rewritten cwd.
+    expect(byName.has("escape")).toBe(false);
+    expect(diagnostics.map((d) => d.message).join("\n")).toContain("escapes its containment root");
+  });
+
+  test("a root mcp.json stays strict: no Codex dialect", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const missingSchema = await makePlugin(tmp.path, "no-schema", {
+      mcpServers: { a: { type: "streamable-http", url: "https://a.example.com" } },
+    });
+    expect((await loadPluginMcpServers(missingSchema, { xumHome: tmp.path })).servers).toEqual({});
+
+    const dialect = await makePlugin(
+      tmp.path,
+      "dialect",
+      mcpDoc({
+        http: { type: "http", url: "https://a.example.com" },
+        oauth: { type: "streamable-http", url: "https://a.example.com", oauth: {} },
+      })
+    );
+    const { servers, diagnostics } = await loadPluginMcpServers(dialect, { xumHome: tmp.path });
+    expect(servers).toEqual({});
+    expect(diagnostics.map((d) => d.severity)).toEqual(["error", "error"]);
   });
 
   test("skips remote entries with configured headers (redirect conformance) with a warning", async () => {
