@@ -16,6 +16,12 @@ import {
 import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useSettings } from "@/browser/contexts/SettingsContext";
+import { FIRST_RUN_VIEW_ID } from "@/common/constants/firstRunView";
+
+/** Removes the static first-run view. Callers do it whenever the live wizard will not replace it. */
+export function removeFirstRunView(): void {
+  document.getElementById(FIRST_RUN_VIEW_ID)?.remove();
+}
 
 const SplashScreenActiveContext = createContext(false);
 
