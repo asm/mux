@@ -4,11 +4,15 @@ import {
   beforeEach,
   describe,
   expect,
+  jest,
   mock,
   setSystemTime,
   spyOn,
   test,
 } from "bun:test";
+
+// bun-types lags the pinned runtime (bun@1.4.3), which implements advanceTimersByTime.
+const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 import { createServer } from "http";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -28,6 +32,7 @@ import { createTestPluginInstallEntry } from "./agentPlugins/testFixtures";
 import type { MCPServerInfo } from "@/common/types/mcp";
 import * as mcpSdk from "@/node/services/mcpClient";
 import {
+  MCP_APP_CATALOG_REFRESH_TIMEOUT_MS,
   MCPServerManager,
   effectiveToolAllowlist,
   flattenMcpPrompt,
@@ -64,6 +69,7 @@ import {
 import { FakeMcpServers, MCP_STARTUP_TIMEOUT_MS } from "./mcpServerManager.testHarness";
 import { readMcpToolOrigin } from "./agentPlugins/codexToolNames";
 import type { McpOauthService } from "./mcpOauthService";
+import { MCP_APP_TOOL_CALLS_PER_WINDOW } from "@/common/utils/mcpApps";
 
 const PROJECT_PATH = "/tmp/project";
 const WORKSPACE_PATH = "/tmp/workspace";
@@ -1289,6 +1295,399 @@ describe("MCPServerManager", () => {
       );
     expect(refused).toBeInstanceOf(Error);
     expect(reads).toEqual(["apps-read ui://x/a"]);
+  });
+
+  test("entry points: listed per enabled server, opened with {} on their own server only", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entrypoints");
+    const store = new McpAppResultStore((id) => path.join(tmp.path, id));
+    manager.setMcpApps({ isEnabled: () => true, store });
+    configService.listServers.mockResolvedValue({
+      apps: stdioConfig("apps-entry"),
+      // A plugin server: its label names the plugin, never the internal instance key.
+      other: {
+        ...stdioConfig("apps-entry-other"),
+        env: { PLUGIN_DATA: path.join(tmp.path, "data") },
+        plugin: {
+          pluginName: "bits-and-bolts",
+          serverName: "tray",
+          sourceScope: "global" as const,
+          sourceLocation: "~/.xum/plugins/bits-and-bolts",
+        },
+      },
+      off: stdioConfig("apps-entry-off", true),
+    });
+    const calls: string[] = [];
+    const serveEntrypoints = (command: string, toolName: string) =>
+      servers.serve(command, {
+        tools: { show: testTool() },
+        apps: {
+          hasTool: () => true,
+          toolUi: () => undefined,
+          appEntrypoints: () => [
+            { toolName, title: `${toolName} view`, resourceUri: "ui://x/view", types: ["global"] },
+          ],
+          callToolForApp: (name: string, args: Record<string, unknown>) => {
+            calls.push(`${command} ${name} ${JSON.stringify(args)}`);
+            return Promise.resolve({ content: [{ type: "text", text: command }] });
+          },
+        },
+      });
+    serveEntrypoints("apps-entry", "board");
+    serveEntrypoints("apps-entry-other", "tray");
+    serveEntrypoints("apps-entry-off", "hidden");
+    const request = workspaceRequest("apps-entry");
+    await manager.getToolsForWorkspace(request);
+
+    // Disabled servers contribute none.
+    expect(await manager.listMcpAppEntrypoints(request.workspaceId)).toEqual([
+      {
+        serverName: "apps",
+        serverLabel: "apps",
+        toolName: "board",
+        title: "board view",
+        resourceUri: "ui://x/view",
+        type: "global",
+        viewKey: "entrypoint:apps:board:global",
+      },
+      {
+        serverName: "other",
+        serverLabel: "bits-and-bolts · tray",
+        toolName: "tray",
+        title: "tray view",
+        resourceUri: "ui://x/view",
+        type: "global",
+        viewKey: "entrypoint:other:tray:global",
+      },
+    ]);
+
+    const opened = await manager.openMcpAppEntrypoint(
+      request.workspaceId,
+      "apps",
+      "board",
+      "global"
+    );
+    expect(opened.viewKey).toBe("entrypoint:apps:board:global");
+    expect(calls).toEqual(["apps-entry board {}"]);
+    // The view record binds the view to its server: getMcpAppView mounts it after a reload.
+    expect(await store.get(request.workspaceId, opened.viewKey)).toMatchObject({
+      serverName: "apps",
+      toolName: "board",
+      resourceUri: "ui://x/view",
+      arguments: {},
+      result: { content: [{ type: "text", text: "apps-entry" }] },
+    });
+
+    // Another server's tool, or a type the tool does not declare, is refused before any call.
+    for (const [server, tool, type] of [
+      ["apps", "tray", "global"],
+      ["apps", "board", "thread"],
+    ] as const) {
+      const refused = await manager
+        .openMcpAppEntrypoint(request.workspaceId, server, tool, type)
+        .then(
+          () => null,
+          (error: unknown) => error
+        );
+      expect(refused).toBeInstanceOf(Error);
+    }
+    expect(calls).toHaveLength(1);
+
+    // The workspace tool allowlist applies: opening calls the tool. An excluded tool's entry
+    // point is not listed, and opening it is refused before any call.
+    await manager.applyWorkspaceOverrides(request.workspaceId, {
+      toolAllowlist: { apps: ["other"] },
+    });
+    expect(
+      (await manager.listMcpAppEntrypoints(request.workspaceId)).map((entry) => entry.serverName)
+    ).toEqual(["other"]);
+    const excluded = await manager
+      .openMcpAppEntrypoint(request.workspaceId, "apps", "board", "global")
+      .then(
+        () => null,
+        (error: unknown) => error
+      );
+    expect(excluded).toBeInstanceOf(Error);
+    expect(calls).toHaveLength(1);
+  });
+
+  test("a plugin server's label is cleaned of bidi and control characters", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entry-label");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    const plugin = (pluginName: string, serverName: string, command: string) => ({
+      ...stdioConfig(command),
+      env: { PLUGIN_DATA: path.join(tmp.path, command) },
+      plugin: {
+        pluginName,
+        serverName,
+        sourceScope: "global" as const,
+        sourceLocation: "~/.xum/plugins/p",
+      },
+    });
+    configService.listServers.mockResolvedValue({
+      // A plugin mcp.json key with RLO and a newline: it must not reorder or wrap the label.
+      reordered: plugin("bits\u202eand\nbolts", "tr\u202eay\n", "apps-entry-label"),
+      // A part that cleans to nothing: the server key's display form instead.
+      blank: plugin("\u202e\n", "tray", "apps-entry-label-blank"),
+    });
+    for (const command of ["apps-entry-label", "apps-entry-label-blank"]) {
+      servers.serve(command, {
+        tools: { show: testTool() },
+        apps: {
+          hasTool: () => true,
+          toolUi: () => undefined,
+          appEntrypoints: () => [
+            { toolName: "board", title: "Board", resourceUri: "ui://x/view", types: ["global"] },
+          ],
+        },
+      });
+    }
+    const request = workspaceRequest("apps-entry-label");
+    await manager.getToolsForWorkspace(request);
+    expect(
+      (await manager.listMcpAppEntrypoints(request.workspaceId)).map((entry) => entry.serverLabel)
+    ).toEqual(["bits and bolts · tr ay", "blank"]);
+  });
+
+  test("entry point opens share the view tool-call budget per server", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entry-limit");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({
+      apps: stdioConfig("apps-entry-limit"),
+      other: stdioConfig("apps-entry-limit-other"),
+    });
+    let calls = 0;
+    for (const command of ["apps-entry-limit", "apps-entry-limit-other"]) {
+      servers.serve(command, {
+        tools: { show: testTool() },
+        apps: {
+          hasTool: () => true,
+          toolUi: () => undefined,
+          appEntrypoints: () => [
+            { toolName: "board", title: "Board", resourceUri: "ui://x/view", types: ["global"] },
+          ],
+          callToolForApp: () => {
+            calls++;
+            return Promise.resolve({ content: [] });
+          },
+        },
+      });
+    }
+    const request = workspaceRequest("apps-entry-limit");
+    await manager.getToolsForWorkspace(request);
+    const open = (server: string) =>
+      manager.openMcpAppEntrypoint(request.workspaceId, server, "board", "global").then(
+        () => true,
+        () => false
+      );
+    const results: boolean[] = [];
+    for (let i = 0; i <= MCP_APP_TOOL_CALLS_PER_WINDOW; i++) results.push(await open("apps"));
+    expect(results.filter(Boolean)).toHaveLength(MCP_APP_TOOL_CALLS_PER_WINDOW);
+    expect(results.at(-1)).toBe(false);
+    expect(calls).toBe(MCP_APP_TOOL_CALLS_PER_WINDOW);
+    // Another server of the workspace has its own budget.
+    expect(await open("other")).toBe(true);
+  });
+
+  test("invalid entry point opens spend no budget; stopping the servers drops the budget", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entry-limit-invalid");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-entry-invalid") });
+    let calls = 0;
+    servers.serve("apps-entry-invalid", {
+      tools: { show: testTool() },
+      apps: {
+        hasTool: () => true,
+        toolUi: () => undefined,
+        appEntrypoints: () => [
+          { toolName: "board", title: "Board", resourceUri: "ui://x/view", types: ["global"] },
+        ],
+        callToolForApp: () => {
+          calls++;
+          return Promise.resolve({ content: [] });
+        },
+      },
+    });
+    const request = workspaceRequest("apps-entry-invalid");
+    await manager.getToolsForWorkspace(request);
+    const open = (server: string, tool: string) =>
+      manager.openMcpAppEntrypoint(request.workspaceId, server, tool, "global").then(
+        () => true,
+        () => false
+      );
+    // Unknown tools and servers are refused before the budget is checked.
+    for (let i = 0; i <= MCP_APP_TOOL_CALLS_PER_WINDOW; i++) {
+      expect(await open("apps", `missing-${i}`)).toBe(false);
+      expect(await open(`missing-${i}`, "board")).toBe(false);
+    }
+    for (let i = 0; i < MCP_APP_TOOL_CALLS_PER_WINDOW; i++)
+      expect(await open("apps", "board")).toBe(true);
+    expect(await open("apps", "board")).toBe(false);
+    expect(calls).toBe(MCP_APP_TOOL_CALLS_PER_WINDOW);
+    // A stop forgets the workspace's budgets (they would otherwise outlive it).
+    await manager.stopServers(request.workspaceId);
+    await manager.getToolsForWorkspace(request);
+    expect(await open("apps", "board")).toBe(true);
+  });
+
+  test("listing entry points refreshes the tool catalog first (tools/list_changed)", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entry-refresh");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-entry-refresh") });
+    const board = {
+      toolName: "board",
+      title: "Board",
+      resourceUri: "ui://x/view",
+      types: ["global"] as const,
+    };
+    const tray = { ...board, toolName: "tray", title: "Tray" };
+    // Like the real client: appEntrypoints() reflects the latest tools/list.
+    let served = [board];
+    let listed: typeof served = [];
+    servers.serve("apps-entry-refresh", {
+      era: "modern",
+      listTools: () => {
+        listed = served;
+        return Promise.resolve({ show: testTool() });
+      },
+      apps: {
+        hasTool: () => true,
+        toolUi: () => undefined,
+        appEntrypoints: () => listed.map((tool) => ({ ...tool, types: [...tool.types] })),
+      },
+    });
+    const request = workspaceRequest("apps-entry-refresh");
+    await manager.getToolsForWorkspace(request);
+    // The server changed its tools (tools/list_changed); no send ran since.
+    served = [board, tray];
+    expect(
+      (await manager.listMcpAppEntrypoints(request.workspaceId)).map((entry) => entry.toolName)
+    ).toEqual(["board", "tray"]);
+  });
+
+  test("a stalled tools/list refresh does not hold back listing or opening entry points", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entry-stall");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-entry-stall") });
+    const board = {
+      toolName: "board",
+      title: "Board",
+      resourceUri: "ui://x/view",
+      types: ["global"],
+    };
+    let listings = 0;
+    let calls = 0;
+    servers.serve("apps-entry-stall", {
+      era: "modern",
+      // The startup listing answers; every refresh after it never does.
+      listTools: () =>
+        listings++ === 0
+          ? Promise.resolve({ show: testTool() })
+          : new Promise<never>(() => undefined),
+      apps: {
+        hasTool: () => true,
+        toolUi: () => undefined,
+        appEntrypoints: () => [{ ...board, types: ["global" as const] }],
+        callToolForApp: () => {
+          calls++;
+          return Promise.resolve({ content: [] });
+        },
+      },
+    });
+    const request = workspaceRequest("apps-entry-stall");
+    await manager.getToolsForWorkspace(request);
+    const flush = async () => {
+      for (let turn = 0; turn < 20; turn++) await new Promise((resolve) => setImmediate(resolve));
+    };
+    const startedAt = Date.now();
+    fakeTimers.useFakeTimers();
+    setSystemTime(new Date(startedAt));
+    try {
+      // The route's signal ends the wait at once (no timer fires): the held snapshot is listed.
+      const aborted = new AbortController();
+      const seen: { listed: string[] | null } = { listed: null };
+      void manager.listMcpAppEntrypoints(request.workspaceId, aborted.signal).then((list) => {
+        seen.listed = list.map((entry) => entry.toolName);
+      });
+      await flush();
+      expect(seen.listed).toBeNull();
+      aborted.abort();
+      await flush();
+      expect(seen.listed).toEqual(["board"]);
+      // Without a signal, the refresh timeout ends it.
+      const timed = manager.listMcpAppEntrypoints(request.workspaceId);
+      const opened = manager.openMcpAppEntrypoint(request.workspaceId, "apps", "board", "global");
+      await flush();
+      fakeTimers.advanceTimersByTime(MCP_APP_CATALOG_REFRESH_TIMEOUT_MS);
+      expect((await timed).map((entry) => entry.toolName)).toEqual(["board"]);
+      expect((await opened).toolName).toBe("board");
+    } finally {
+      const now = Date.now();
+      fakeTimers.useRealTimers();
+      setSystemTime(new Date(now));
+    }
+    expect(calls).toBe(1);
+  });
+
+  test("opening an entry point the refreshed catalog no longer has is refused", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entry-gone");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-entry-gone") });
+    const board = {
+      toolName: "board",
+      title: "Board",
+      resourceUri: "ui://x/view",
+      types: ["global"],
+    };
+    // Like the real client: appEntrypoints() reflects the latest tools/list.
+    let served = [board];
+    let listed: typeof served = [];
+    let calls = 0;
+    servers.serve("apps-entry-gone", {
+      era: "modern",
+      listTools: () => {
+        listed = served;
+        return Promise.resolve({ show: testTool() });
+      },
+      apps: {
+        hasTool: () => true,
+        toolUi: () => undefined,
+        appEntrypoints: () => listed.map((tool) => ({ ...tool, types: ["global" as const] })),
+        callToolForApp: () => {
+          calls++;
+          return Promise.resolve({ content: [] });
+        },
+      },
+    });
+    const request = workspaceRequest("apps-entry-gone");
+    await manager.getToolsForWorkspace(request);
+    // tools/list_changed: the server dropped the tool; no send or listing ran since.
+    served = [];
+    const refused = await manager
+      .openMcpAppEntrypoint(request.workspaceId, "apps", "board", "global")
+      .then(
+        () => null,
+        (error: unknown) => error
+      );
+    expect(refused).toBeInstanceOf(Error);
+    expect(calls).toBe(0);
   });
 
   test("idle cleanup retries retired-only failures without another MCP request", async () => {
