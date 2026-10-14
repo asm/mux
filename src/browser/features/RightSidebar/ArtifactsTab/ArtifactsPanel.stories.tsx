@@ -1163,6 +1163,27 @@ export const McpAppViewPhone: Story = {
   play: ({ canvasElement }) => playMcpAppView(canvasElement),
 };
 
+/**
+ * #6165: Maximize pins the app tab over the whole window (the spec's fullscreen), with the same
+ * frame (no reload), and Restore returns it to the sidebar. Play only (shared Pixel cap).
+ */
+export const McpAppViewMaximized: Story = {
+  ...LAPTOP,
+  render: () => renderMcpAppView(),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const frame = await canvas.findByTestId("mcp-app-frame");
+    const panel = canvas.getByTestId("app-view-tab-panel");
+    const sidebarWidth = panel.getBoundingClientRect().width;
+    await userEvent.click(canvas.getByRole("button", { name: "Maximize view" }));
+    await waitFor(() => expect(panel.getBoundingClientRect().width).toBe(window.innerWidth));
+    await expect(canvas.getByTestId("mcp-app-frame")).toBe(frame);
+    await userEvent.click(canvas.getByRole("button", { name: "Restore view" }));
+    await waitFor(() => expect(panel.getBoundingClientRect().width).toBe(sidebarWidth));
+    await expect(canvas.getByTestId("mcp-app-frame")).toBe(frame);
+  },
+};
+
 // A tab whose view failed to load offers Reload. The mock has no view for the call at first (the
 // load fails); the play adds it and presses Reload, which remounts the frame.
 const RELOAD_TOOL_CALL_ID = "call-weather-reload";

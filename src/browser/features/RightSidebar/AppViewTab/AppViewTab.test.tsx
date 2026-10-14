@@ -23,7 +23,9 @@ import { AppViewTabLabel, AppViewTabPanel, AppViewTabTooltip } from "./AppViewTa
  */
 function bootViewDocument(
   frame: HTMLIFrameElement,
-  onMessage: (message: { method?: string; params?: unknown }) => void
+  onMessage: (message: { method?: string; params?: unknown }) => void,
+  /** Gets the document's window listeners (keydown, pagehide), by event type. */
+  listeners = new Map<string, (event: unknown) => void>()
 ): { postMessage: (message: unknown, targetOrigin: string) => void } {
   const doc = new window.DOMParser().parseFromString(frame.getAttribute("srcdoc")!, "text/html");
   const preamble = doc.querySelector("script")?.textContent ?? "";
@@ -49,7 +51,9 @@ function bootViewDocument(
       onMessage(event.init.data);
       return true;
     },
-    addEventListener: () => undefined,
+    addEventListener: (type: string, listener: (event: unknown) => void) =>
+      listeners.set(type, listener),
+    setTimeout: (callback: () => void, ms: number) => setTimeout(callback, ms),
   };
   // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
   (new Function("window", preamble) as (window: unknown) => void)(documentWindow);
@@ -315,6 +319,93 @@ describe("AppViewTabPanel", () => {
       registered.mockRestore();
       state.mockRestore();
     }
+  });
+
+  // #6165: fullscreen display mode as the spec means it, over the whole window. The panel is
+  // pinned in place (no portal), so the view's frame never reloads.
+  test("Maximize pins the app tab over the window until Restore or Escape", async () => {
+    openMcpAppViewTab("ws-max", {
+      toolCallId: "call-max",
+      serverName: "dice",
+      resourceUri: "ui://dice/board.html",
+      toolName: "show",
+      label: "Board",
+      arguments: {},
+      cancelled: false,
+      failed: false,
+    });
+    const client = createTestApiClient({
+      mcpApps: {
+        getView: () =>
+          Promise.resolve({
+            success: true as const,
+            data: {
+              html: "<p>view</p>",
+              csp: {},
+              prefersBorder: null,
+              resultAvailable: true,
+              result: { content: [] },
+              invocation: null,
+            },
+          }),
+      },
+    });
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <div data-testid="outside">chat</div>
+        <APIProvider client={client}>
+          <AppViewTabPanel workspaceId="ws-max" toolCallId="call-max" onClose={() => undefined} />
+        </APIProvider>
+      </ThemeProvider>
+    );
+    const frame = await view.findByTestId("mcp-app-frame");
+    const panel = () => view.getByTestId("app-view-tab-panel");
+    fireEvent.click(view.getByRole("button", { name: "Maximize view" }));
+    expect(panel().className).toContain("fixed");
+    // The rest of the window is inert: the panel is a modal dialog.
+    expect(panel().getAttribute("role")).toBe("dialog");
+    expect(panel().getAttribute("aria-modal")).toBe("true");
+    expect(view.getByTestId("outside").inert).toBe(true);
+    // The same frame, not a remounted one.
+    expect(view.getByTestId("mcp-app-frame")).toBe(frame);
+
+    fireEvent.click(view.getByRole("button", { name: "Restore view" }));
+    expect(panel().className).not.toContain("fixed");
+    expect(view.getByTestId("outside").inert).toBe(false);
+
+    // The keyboard path: the Artifacts fullscreen shortcut toggles it, Escape restores it.
+    fireEvent.keyDown(panel(), { key: "F", shiftKey: true });
+    expect(panel().className).toContain("fixed");
+    // Escape restores the panel only: it must not reach window handlers (Escape-to-interrupt).
+    let windowEscapes = 0;
+    const onWindowKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") windowEscapes++;
+    };
+    window.addEventListener("keydown", onWindowKey);
+    try {
+      fireEvent.keyDown(panel(), { key: "Escape" });
+    } finally {
+      window.removeEventListener("keydown", onWindowKey);
+    }
+    expect(panel().className).not.toContain("fixed");
+    expect(windowEscapes).toBe(0);
+    expect(view.getByTestId("mcp-app-frame")).toBe(frame);
+
+    // Focus inside the view's frame: its keys never reach the panel, so the frame forwards an
+    // Escape the view did not handle.
+    const documentListeners = new Map<string, (event: unknown) => void>();
+    bootViewDocument(frame as HTMLIFrameElement, () => undefined, documentListeners);
+    fireEvent.click(view.getByRole("button", { name: "Maximize view" }));
+    expect(panel().className).toContain("fixed");
+    await act(async () => {
+      documentListeners.get("keydown")?.({
+        key: "Escape",
+        shiftKey: false,
+        defaultPrevented: false,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(panel().className).not.toContain("fixed");
   });
 
   test("tabs of two plugin installs with one server name show their instance markers", () => {

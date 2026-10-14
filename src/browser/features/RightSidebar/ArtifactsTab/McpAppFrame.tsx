@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { X } from "lucide-react";
+import { Maximize2, Minimize2, X } from "lucide-react";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
 import { useAPI, useLiveAPI, type APIClient } from "@/browser/contexts/API";
@@ -141,7 +141,40 @@ function viewServerLabel(view: McpAppViewRef): string {
   return view.serverLabel ?? mcpServerDisplayName(view.serverName);
 }
 
-function McpAppViewHeader(props: { serverName: string; serverLabel: string; onClose: () => void }) {
+/** Calls `callback` when the host passed one (an optional panel prop). */
+function runIfSet(callback: (() => void) | undefined): void {
+  callback?.();
+}
+
+/** Maximizes the app tab over the window, or restores it (#6165). None without a toggle. */
+function MaximizeViewButton(props: { maximized?: boolean; onToggle?: () => void }) {
+  if (props.onToggle == null) return null;
+  const maximized = props.maximized === true;
+  const label = maximized ? "Restore view" : "Maximize view";
+  const Icon = maximized ? Minimize2 : Maximize2;
+  return (
+    <TooltipIfPresent tooltip={label}>
+      <button
+        type="button"
+        aria-label={label}
+        aria-pressed={maximized}
+        onClick={props.onToggle}
+        className="text-muted hover:text-foreground focus-visible:ring-accent flex h-5 w-5 items-center justify-center rounded focus-visible:ring-1"
+      >
+        <Icon className="h-3.5 w-3.5" />
+      </button>
+    </TooltipIfPresent>
+  );
+}
+
+function McpAppViewHeader(props: {
+  serverName: string;
+  serverLabel: string;
+  onClose: () => void;
+  /** Whether the tab is maximized over the window; undefined when the host offers no maximize. */
+  maximized?: boolean;
+  onToggleMaximized?: () => void;
+}) {
   return (
     <div className="border-border-light flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-[11px]">
       <span className="text-muted min-w-0 flex-1 truncate">
@@ -150,6 +183,7 @@ function McpAppViewHeader(props: { serverName: string; serverLabel: string; onCl
           <span className="text-foreground">{props.serverLabel}</span>
         </TooltipIfPresent>
       </span>
+      <MaximizeViewButton maximized={props.maximized} onToggle={props.onToggleMaximized} />
       <TooltipIfPresent tooltip="Close view">
         <button
           type="button"
@@ -512,6 +546,11 @@ export function McpAppFrame(props: {
   variant?: McpAppFrameVariant;
   /** Panel only: closes the panel's host (its app tab). */
   onClose?: () => void;
+  /** Panel only: Escape or Shift+F inside the view (mcpAppDocumentChannel.ts): restore only. */
+  onExitKey?: () => void;
+  /** Panel only: whether its tab is maximized over the window (#6165), and the toggle. */
+  maximized?: boolean;
+  onToggleMaximized?: () => void;
   /** Panel only: loads the view again (its tab remounts the frame), offered when loading failed. */
   onReload?: () => void;
   /**
@@ -645,11 +684,23 @@ export function McpAppFrame(props: {
   const srcDoc = buildMcpAppViewSrcDoc(current, grant, viewDocument);
 
   // Values the long-lived host reads at message time.
-  const latest = useRef({ theme, view, result: current?.view ?? null, onClose: props.onClose });
+  const latest = useRef({
+    theme,
+    view,
+    result: current?.view ?? null,
+    onClose: props.onClose,
+    onExitKey: props.onExitKey,
+  });
   // A layout effect ahead of the host's: a view that initializes at once must get this render's
   // result (onInitialized reads it).
   useLayoutEffect(() => {
-    latest.current = { theme, view, result: current?.view ?? null, onClose: props.onClose };
+    latest.current = {
+      theme,
+      view,
+      result: current?.view ?? null,
+      onClose: props.onClose,
+      onExitKey: props.onExitKey,
+    };
   });
 
   // A layout effect: the listener must be in place before the frame's preamble announces its
@@ -799,6 +850,7 @@ export function McpAppFrame(props: {
         if (!navigatedRef.current) void host.handleMessage(data);
       },
       leave: leaveDocument,
+      exit: () => runIfSet(latest.current.onExitKey),
     });
     const handler = (event: MessageEvent) => {
       const frameWindow = navigatedRef.current ? null : frameRef.current?.contentWindow;
@@ -843,6 +895,8 @@ export function McpAppFrame(props: {
       serverName={serverName}
       serverLabel={viewServerLabel(view)}
       onClose={() => void close()}
+      maximized={props.maximized}
+      onToggleMaximized={props.onToggleMaximized}
     />
   );
 
