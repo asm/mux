@@ -283,11 +283,11 @@ export async function spawnProcess(
     cwd: options.cwd,
     cwdEnvVar: BACKGROUND_CWD_ENV,
     env: wrapperEnv,
-    script,
   });
 
   const spawnCommand = buildSpawnCommand({
     wrapperScript,
+    script,
     outputPath,
     quotePath,
   });
