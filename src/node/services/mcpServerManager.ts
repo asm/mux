@@ -1696,6 +1696,8 @@ export class MCPServerManager {
   private readonly pendingEnablementRepairs = new Map<string, Promise<void>>();
   private readonly latestProjectTrust = new Map<string, boolean>();
   private readonly workspaceRestartLocks = new MutexMap<string>();
+  /** Instances whose prompts/list settled at least once; see awaitFirstPromptLists. */
+  private readonly promptListSettledInstances = new WeakSet<MCPServerInstance>();
   /** Orders racing prompt refresh completions per instance; see refreshInstancePrompts. */
   private readonly promptRefreshSequences = new WeakMap<
     MCPServerInstance,
@@ -1716,7 +1718,12 @@ export class MCPServerManager {
    */
   private readonly idleStoppedPromptCatalogs = new Map<
     string,
-    { configSignature: string; prompts: Map<string, MCPPrompt[]> }
+    {
+      configSignature: string;
+      prompts: Map<string, MCPPrompt[]>;
+      /** Servers whose catalog had settled a prompts/list (see awaitFirstPromptLists). */
+      listedServerNames: Set<string>;
+    }
   >();
   // Bumped by removal-style stops (stopServers without retainRestartOptions).
   // Startups run outside any lock shared with removal, so an abort-abandoned
@@ -2606,7 +2613,12 @@ export class MCPServerManager {
     if (saved.configSignature !== configSignature) return;
     for (const [serverName, instance] of instances) {
       const prompts = saved.prompts.get(serverName);
-      if (prompts !== undefined && instance.prompts.length === 0) instance.prompts = prompts;
+      if (prompts !== undefined && instance.prompts.length === 0) {
+        instance.prompts = prompts;
+        // A restored catalog is a stale value: serve it while revalidating. A catalog that was
+        // never listed (warmed, then stopped idle) stays unlisted.
+        this.restorePromptListSettled(instance, saved.listedServerNames.has(serverName));
+      }
     }
   }
 
@@ -2647,9 +2659,60 @@ export class MCPServerManager {
             name: instance.name,
             error: getErrorMessage(error),
           });
+        } finally {
+          this.markPromptListSettled(instance, signal);
         }
       })
     );
+  }
+
+  private markPromptListSettled(instance: MCPServerInstance, signal: AbortSignal | undefined) {
+    // A canceled list says nothing about the server: the next send still waits for one.
+    if (signal?.aborted !== true) this.promptListSettledInstances.add(instance);
+  }
+
+  private restorePromptListSettled(instance: MCPServerInstance, listed: boolean): void {
+    if (listed) this.promptListSettledInstances.add(instance);
+  }
+
+  /** Whether a served instance of the workspace never settled a prompts/list. */
+  private hasUnlistedPromptInstances(workspaceId: string): boolean {
+    const entry = this.workspaceServers.get(workspaceId);
+    return (
+      entry !== undefined &&
+      [...this.promptEligibleInstances(entry).values()].some(
+        (instance) => !this.promptListSettledInstances.has(instance)
+      )
+    );
+  }
+
+  /**
+   * Wait for the first prompts/list of the workspace's served instances. Returns true when the
+   * serve that just ran used a catalog that was never listed (`unlistedAtServe`, or found now),
+   * so the caller must serve again.
+   *
+   * Sends serve a cached entry's prompts stale-while-revalidate. An entry started without a
+   * prompt list (an MCP App entry point warm-up, a prompt dispatch) has an empty catalog, which
+   * is no value rather than a stale one. The first send after a Xum restart then had no
+   * mcp_prompt_get and the next one had it, and that tools change made Anthropic reject the
+   * replayed thinking blocks. A server whose list failed is not waited for again.
+   */
+  private async awaitFirstPromptLists(
+    workspaceId: string,
+    unlistedAtServe: boolean
+  ): Promise<boolean> {
+    // The serve's own background refresh can settle before this check runs.
+    if (!unlistedAtServe && !this.hasUnlistedPromptInstances(workspaceId)) return false;
+    // Share the entry's deduped background refresh with every concurrent send. A refresh that
+    // was already in flight covers only the instances it started with, so a second round lists
+    // an instance added since then.
+    for (let round = 0; round < 2 && this.hasUnlistedPromptInstances(workspaceId); round++) {
+      const entry = this.workspaceServers.get(workspaceId);
+      if (entry === undefined) break;
+      this.refreshInstancePromptsInBackground(entry);
+      await entry.promptRefreshInFlight;
+    }
+    return true;
   }
 
   /**
@@ -2726,6 +2789,11 @@ export class MCPServerManager {
           configSignature: entry.configSignature,
           prompts: new Map(
             [...entry.instances].map(([serverName, instance]) => [serverName, instance.prompts])
+          ),
+          listedServerNames: new Set(
+            [...entry.instances]
+              .filter(([, instance]) => this.promptListSettledInstances.has(instance))
+              .map(([serverName]) => serverName)
           ),
         });
         void this.stopServers(workspaceId, { retainRestartOptions: true });
@@ -3123,9 +3191,25 @@ export class MCPServerManager {
     options: MCPWorkspaceRequestOptions,
     readSignal?: AbortSignal
   ): Promise<MCPToolsForWorkspaceResult> {
-    return this.runWithStablePluginEpoch(() =>
-      this.ensureWorkspaceServers(options, true, readSignal)
+    return this.serveWithFirstPromptLists(options.workspaceId, () =>
+      this.runWithStablePluginEpoch(() => this.ensureWorkspaceServers(options, true, readSignal))
     );
+  }
+
+  /** Run `serve`, and again after awaitFirstPromptLists waited, so the result has the catalog. */
+  private async serveWithFirstPromptLists(
+    workspaceId: string,
+    serve: () => Promise<MCPToolsForWorkspaceResult>
+  ): Promise<MCPToolsForWorkspaceResult> {
+    const unlistedAtServe = this.hasUnlistedPromptInstances(workspaceId);
+    const stopEpoch = this.workspaceStopEpochs.get(workspaceId) ?? 0;
+    const result = await serve();
+    if (!(await this.awaitFirstPromptLists(workspaceId, unlistedAtServe))) return result;
+    // A removal-style stop since the first serve began owns the workspace: never start its
+    // servers again. Return what the first serve returned, as before the wait existed.
+    if ((this.workspaceStopEpochs.get(workspaceId) ?? 0) !== stopEpoch) return result;
+    // The second serve also picks up the current entry and enablement.
+    return serve();
   }
 
   /**

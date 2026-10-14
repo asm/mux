@@ -1521,6 +1521,201 @@ describe("MCPServerManager", () => {
     ).toEqual(["board"]);
   });
 
+  // Opening a workspace lists its entry points, which warms the servers without prompts/list.
+  // The first send after a Xum restart then served no prompts, so mcp_prompt_get was missing
+  // from that turn's tools and back on the next: the changed tools list made Anthropic reject
+  // the replayed thinking blocks.
+  test("the first send after an entry point warm-up serves the prompt catalog", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entry-warm-prompts");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-entry-warm-prompts") });
+    servers.serve("apps-entry-warm-prompts", {
+      tools: { show: testTool() },
+      listPrompts: () => Promise.resolve([{ name: "review" }]),
+    });
+    const request = workspaceRequest("apps-entry-warm-prompts");
+
+    await manager.warmWorkspaceServers(request);
+    const served = await manager.getToolsForWorkspace(request);
+
+    expect(served.promptDescriptors.map((prompt) => prompt.promptName)).toEqual(["review"]);
+  });
+
+  test("a send never waits again for a server whose prompts/list already failed", async () => {
+    configService.listServers.mockResolvedValue({ cmd: stdioConfig("cmd-failed-prompts") });
+    // The first list fails (a 10 s timeout live). Later lists never settle: if the send
+    // waited for one, this test would time out.
+    let attempts = 0;
+    servers.serve("cmd-failed-prompts", {
+      listPrompts: () => {
+        attempts += 1;
+        return attempts === 1
+          ? Promise.reject(new Error("timed out"))
+          : new Promise<Array<{ name: string }>>(() => undefined);
+      },
+    });
+    const request = workspaceRequest("ws-failed-prompts");
+
+    expect((await manager.getToolsForWorkspace(request)).promptDescriptors).toEqual([]);
+    expect((await manager.getToolsForWorkspace(request)).promptDescriptors).toEqual([]);
+  });
+
+  test("a canceled prompt discovery leaves the next send waiting for the first list", async () => {
+    configService.listServers.mockResolvedValue({ cmd: stdioConfig("cmd-canceled-prompts") });
+    let canceled = false;
+    servers.serve("cmd-canceled-prompts", {
+      listPrompts: (options) => {
+        if (canceled) return Promise.resolve([{ name: "review" }]);
+        return new Promise((_resolve, reject) =>
+          options?.signal?.addEventListener("abort", () => reject(new Error("aborted")))
+        );
+      },
+    });
+    const request = workspaceRequest("ws-canceled-prompts");
+    const controller = new AbortController();
+
+    const discovery = manager.getPromptsForWorkspace(request, { signal: controller.signal });
+    // The composer's discovery started the servers; cancel its prompts/list.
+    while (!manager.hasWorkspaceRequestOptions(request.workspaceId)) await Bun.sleep(1);
+    canceled = true;
+    controller.abort();
+    await discovery.catch(() => undefined);
+
+    const served = await manager.getToolsForWorkspace(request);
+    expect(served.promptDescriptors.map((prompt) => prompt.promptName)).toEqual(["review"]);
+  });
+
+  test("a catalog restored after an idle stop is served without waiting for prompts/list", async () => {
+    const workspaceId = "ws-idle-warm-prompts";
+    const sweepIdleServers = useManagerWithIdleSweep();
+    configService.listServers = mock(() => Promise.resolve({ cmd: stdioConfig("cmd-idle-warm") }));
+    // First connection lists REVIEW. After the idle restart prompts/list never settles: if the
+    // send waited for it, this test would time out.
+    servers.serve("cmd-idle-warm", (attempt) => ({
+      listPrompts: () =>
+        attempt === 1
+          ? Promise.resolve([{ name: "review" }])
+          : new Promise<Array<{ name: string }>>(() => undefined),
+    }));
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    setSystemTime(new Date(Date.now() + MCP_IDLE_TIMEOUT_MS + 60_000));
+    sweepIdleServers();
+    await manager.warmWorkspaceServers(workspaceRequest(workspaceId));
+    const served = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    expect(servers.connectCount("cmd-idle-warm")).toBe(2);
+    expect(served.promptDescriptors.map((prompt) => prompt.promptName)).toEqual(["review"]);
+  });
+
+  test("an empty catalog saved by an idle stop of a never-listed server is listed again", async () => {
+    const workspaceId = "ws-idle-unlisted-prompts";
+    const sweepIdleServers = useManagerWithIdleSweep();
+    configService.listServers = mock(() =>
+      Promise.resolve({ cmd: stdioConfig("cmd-idle-unlisted") })
+    );
+    servers.serve("cmd-idle-unlisted", {
+      listPrompts: () => Promise.resolve([{ name: "review" }]),
+    });
+    // Warmed, never sent to, then stopped idle: the saved catalog is the unlisted [].
+    await manager.warmWorkspaceServers(workspaceRequest(workspaceId));
+    setSystemTime(new Date(Date.now() + MCP_IDLE_TIMEOUT_MS + 60_000));
+    sweepIdleServers();
+    await manager.warmWorkspaceServers(workspaceRequest(workspaceId));
+
+    const served = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(servers.connectCount("cmd-idle-unlisted")).toBe(2);
+    expect(served.promptDescriptors.map((prompt) => prompt.promptName)).toEqual(["review"]);
+  });
+
+  test("a server that listed no prompts is not waited for after an idle restart", async () => {
+    const workspaceId = "ws-idle-listed-empty";
+    const sweepIdleServers = useManagerWithIdleSweep();
+    configService.listServers = mock(() => Promise.resolve({ cmd: stdioConfig("cmd-idle-empty") }));
+    // The first connection lists no prompts. After the idle restart prompts/list never
+    // settles: if the send waited for it, this test would time out.
+    servers.serve("cmd-idle-empty", (attempt) => ({
+      listPrompts: () =>
+        attempt === 1 ? Promise.resolve([]) : new Promise<Array<{ name: string }>>(() => undefined),
+    }));
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    setSystemTime(new Date(Date.now() + MCP_IDLE_TIMEOUT_MS + 60_000));
+    sweepIdleServers();
+    await manager.warmWorkspaceServers(workspaceRequest(workspaceId));
+    const served = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    expect(servers.connectCount("cmd-idle-empty")).toBe(2);
+    expect(served.promptDescriptors).toEqual([]);
+  });
+
+  test("a workspace removed while the send waits for prompts/list is not started again", async () => {
+    const request = workspaceRequest("ws-removed-during-prompts");
+    configService.listServers.mockResolvedValue({ cmd: stdioConfig("cmd-removed-prompts") });
+    const listing = Promise.withResolvers<void>();
+    const held = Promise.withResolvers<void>();
+    servers.serve("cmd-removed-prompts", {
+      listPrompts: async () => {
+        listing.resolve();
+        await held.promise;
+        return [{ name: "review" }];
+      },
+    });
+    await manager.warmWorkspaceServers(request);
+
+    const sending = manager.getToolsForWorkspace(request);
+    await listing.promise;
+    await manager.stopServers(request.workspaceId);
+    held.resolve();
+    const served = await sending;
+
+    expect(servers.connectCount("cmd-removed-prompts")).toBe(1);
+    expect(served.promptDescriptors).toEqual([]);
+    expect(manager.hasWorkspaceRequestOptions(request.workspaceId)).toBe(false);
+  });
+
+  test("a server added by a warm-up while an older prompt refresh runs is listed for the send", async () => {
+    const request = workspaceRequest("ws-warm-added-prompts");
+    configService.listServers.mockResolvedValue({ a: stdioConfig("cmd-added-a") });
+    const held = Promise.withResolvers<void>();
+    let releaseA: (() => void) | undefined;
+    let listsOfA = 0;
+    servers.serve("cmd-added-a", {
+      listPrompts: async () => {
+        listsOfA += 1;
+        // The second list of A (the second send's background refresh) waits for the test.
+        if (listsOfA === 2) {
+          releaseA = held.resolve;
+          await held.promise;
+        }
+        return [{ name: "a-prompt" }];
+      },
+    });
+    servers.serve("cmd-added-b", { listPrompts: () => Promise.resolve([{ name: "b-prompt" }]) });
+    await manager.getToolsForWorkspace(request);
+    // This send's background refresh of A stays in flight.
+    await manager.getToolsForWorkspace(request);
+    expect(releaseA).toBeDefined();
+
+    configService.listServers.mockResolvedValue({
+      a: stdioConfig("cmd-added-a"),
+      b: stdioConfig("cmd-added-b"),
+    });
+    await manager.warmWorkspaceServers(request);
+    const sending = manager.getToolsForWorkspace(request);
+    await Bun.sleep(1);
+    releaseA?.();
+    const served = await sending;
+
+    expect(served.promptDescriptors.map((prompt) => prompt.promptName).sort()).toEqual([
+      "a-prompt",
+      "b-prompt",
+    ]);
+  });
+
   test("overlapping opens of one entry point keep the newest open's result", async () => {
     using tmp = new DisposableTempDir("mcp-apps-entry-order");
     const store = new McpAppResultStore((id) => path.join(tmp.path, id));
