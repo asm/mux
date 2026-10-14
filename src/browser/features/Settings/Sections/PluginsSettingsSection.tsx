@@ -680,7 +680,12 @@ const AddPluginPanel: React.FC<{
                 <span className="text-foreground font-mono break-all">
                   {preview.agents.join(", ")}
                 </span>{" "}
-                <span className="text-muted">— become selectable agent definitions.</span>
+                <span className="text-muted">
+                  — become agent definitions. An agent in Claude Code or Cursor format (no Xum-only
+                  field such as base or tools) becomes a hidden sub-agent with Exec&apos;s tools. It
+                  can run shell commands, which can change any file. readonly: true removes only the
+                  file edit and task tools.
+                </span>
               </p>
             </div>
           )}

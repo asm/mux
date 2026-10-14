@@ -2217,7 +2217,11 @@ export class AgentPluginInstallService {
         const content = await fsPromises.readFile(filePath, "utf8");
         // Throws on malformed frontmatter or oversized content — exactly the
         // definitions runtime discovery would skip.
-        frontmatter = parseAgentDefinitionMarkdown({ content, byteSize: stat.size }).frontmatter;
+        frontmatter = parseAgentDefinitionMarkdown({
+          content,
+          byteSize: stat.size,
+          plugin: { agentId: agentIdParse.data },
+        }).frontmatter;
       } catch {
         continue;
       }
