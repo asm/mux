@@ -684,6 +684,129 @@ describe("MCPServerManager", () => {
     });
   });
 
+  test("plugin hook calls reach only a running server that is enabled in the workspace", async () => {
+    configService.listServers.mockResolvedValue({
+      "plugin:aaaaaaaaaaaaaaaa:guard": stdioConfig("hook-guard"),
+      "plugin:aaaaaaaaaaaaaaaa:off": stdioConfig("hook-off", true),
+    });
+    const calls: unknown[] = [];
+    servers.serve("hook-guard", {
+      tools: { check: testTool() },
+      callToolForHook: (name, args) => {
+        calls.push({ name, args });
+        return Promise.resolve({ content: [{ type: "text", text: "{}" }] });
+      },
+    });
+    const signal = new AbortController().signal;
+    const call = (workspaceId: string, key: string) =>
+      manager.callToolForPluginHook(workspaceId, key, "check", { a: 1 }, { signal });
+    const failure = (workspaceId: string, key: string) =>
+      call(workspaceId, key).then(
+        () => "resolved",
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
+
+    // Never starts a server: before any request the workspace has none running.
+    expect(await failure("hook-ws", "plugin:aaaaaaaaaaaaaaaa:guard")).toContain("not enabled");
+    await manager.getToolsForWorkspace(workspaceRequest("hook-ws"));
+
+    expect(await call("hook-ws", "plugin:aaaaaaaaaaaaaaaa:guard")).toEqual({
+      content: [{ type: "text", text: "{}" }],
+    });
+    expect(await failure("hook-ws", "plugin:aaaaaaaaaaaaaaaa:off")).toContain("not enabled");
+    expect(await failure("other-ws", "plugin:aaaaaaaaaaaaaaaa:guard")).toContain("not enabled");
+    expect(calls).toEqual([{ name: "check", args: { a: 1 } }]);
+  });
+
+  test("a plugin hook call honors the live tool allowlist", async () => {
+    const key = "plugin:aaaaaaaaaaaaaaaa:guard";
+    configService.listServers.mockResolvedValue({ [key]: stdioConfig("hook-guard") });
+    servers.serve("hook-guard", {
+      tools: { check: testTool() },
+      callToolForHook: () => Promise.resolve({ content: [] }),
+    });
+    const workspaceId = "ws-hook-allowlist";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const signal = new AbortController().signal;
+    const call = (tool: string) =>
+      manager.callToolForPluginHook(workspaceId, key, tool, {}, { signal });
+    const canCall = (tool: string) => manager.canCallToolForPluginHook(workspaceId, key, tool);
+    expect(await call("check")).toEqual({ content: [] });
+    expect(canCall("check")).toBe(true);
+
+    // The workspace allowlist narrows the hook's server: its tool is refused at the call.
+    await manager.applyWorkspaceOverrides(workspaceId, { toolAllowlist: { [key]: ["other"] } });
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(call("check")).rejects.toThrow("disabled");
+    expect(await call("other")).toEqual({ content: [] });
+    expect([canCall("check"), canCall("other")]).toEqual([false, true]);
+
+    // The user turns the server off: no tool of it can be called.
+    await manager.applyWorkspaceOverrides(workspaceId, { disabledServers: [key] });
+    expect(canCall("other")).toBe(false);
+  });
+
+  test("an allowlist that excludes a hook tool named after an Object member refuses it", async () => {
+    // Codex PRRT_kwDOPxxmWM6rb5ps: `"constructor" in {}` is true through the prototype.
+    const key = "plugin:aaaaaaaaaaaaaaaa:guard";
+    configService.listServers.mockResolvedValue({ [key]: stdioConfig("hook-guard") });
+    servers.serve("hook-guard", {
+      tools: { constructor: testTool(), check: testTool() },
+      callToolForHook: () => Promise.resolve({ content: [] }),
+    });
+    const workspaceId = "ws-hook-proto-name";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    await manager.applyWorkspaceOverrides(workspaceId, { toolAllowlist: { [key]: ["check"] } });
+    const signal = new AbortController().signal;
+
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(
+      manager.callToolForPluginHook(workspaceId, key, "constructor", {}, { signal })
+    ).rejects.toThrow("disabled");
+    expect(await manager.callToolForPluginHook(workspaceId, key, "check", {}, { signal })).toEqual({
+      content: [],
+    });
+  });
+
+  test("a plugin hook call re-checks enablement at dispatch: a server disabled after the serve is refused", async () => {
+    // A direct edit of the override document (or another backend's save) disables the hook's
+    // server after the serve that started it; the cached enabled set still lists it.
+    manager.dispose();
+    let diskOverrides: Record<string, unknown> = {};
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: {
+        keyPrefix: "plugin:",
+        readToken: () => Promise.resolve("epoch-1"),
+        readWorkspaceOverrides: () => Promise.resolve(diskOverrides),
+      },
+    });
+    const key = "plugin:aaaaaaaaaaaaaaaa:guard";
+    configService.listServers = mock(() => Promise.resolve({ [key]: stdioConfig("hook-guard") }));
+    const callToolForHook = mock(() =>
+      Promise.resolve({ content: [{ type: "text" as const, text: "{}" }] })
+    );
+    servers.serve("hook-guard", { tools: { check: testTool() }, callToolForHook });
+    const workspaceId = "ws-hook-revoked";
+    await manager.getToolsForWorkspace(
+      workspaceRequest(workspaceId, { overrides: {}, overridesAuthoritative: true })
+    );
+    const signal = new AbortController().signal;
+    const call = () => manager.callToolForPluginHook(workspaceId, key, "check", {}, { signal });
+    expect(await call()).toEqual({ content: [{ type: "text", text: "{}" }] });
+
+    // A server enabled since the serve: re-serving (what a model's MCP call does after a direct
+    // edit) would start it. A hook call refuses instead and starts nothing.
+    servers.serve("hook-late", {});
+    configService.listServers = mock(() =>
+      Promise.resolve({ [key]: stdioConfig("hook-guard"), late: stdioConfig("hook-late") })
+    );
+    diskOverrides = { disabledServers: [key] };
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(call()).rejects.toThrow("disabled");
+    expect(callToolForHook).toHaveBeenCalledTimes(1);
+    expect(servers.connectCount("hook-late")).toBe(0);
+  });
+
   test("settings: read validates and caches; update sends only the changes and the workspace _meta", async () => {
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-cad") });
     const calls: Array<{ name: string; args: unknown; meta: unknown }> = [];

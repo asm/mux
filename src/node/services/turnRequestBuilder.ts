@@ -1855,6 +1855,7 @@ export class TurnRequestBuilder {
         metadata,
         hostCheckoutRoot,
         journal: this.dependencies.durableEventJournalFor(workspaceId),
+        mcpServerManager: this.dependencies.bindings.mcpServerManager,
       });
     }
 

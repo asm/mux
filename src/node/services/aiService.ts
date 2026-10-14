@@ -505,6 +505,7 @@ export class AIService extends EventEmitter {
       metadata: metadata.data,
       hostCheckoutRoot: runtimeContext.data.hostCheckoutRoot,
       journal: this.durableEventJournalFor(workspaceId),
+      mcpServerManager: this.turnRequestBuilderBindings.mcpServerManager,
     });
     return Ok(eventSpine.captureRequestAssembly(workspaceId));
   }
@@ -513,11 +514,28 @@ export class AIService extends EventEmitter {
     return eventSpine.hasMiddleware("message.send");
   }
 
-  /** Run the message.send prompt-hook chain for one new message (fail-open). */
+  /**
+   * Run the message.send prompt-hook chain for one new message (fail-open). Loads the
+   * workspace's lazy hooks first (the same setup as request building), so the first send after a
+   * restart sees them too.
+   */
   async runMessageSendHooks(
     workspaceId: string,
     input: MessageSendHookInput
   ): Promise<MessageSendHookOutcome> {
+    const snapshot = await this.captureRequestAssemblySnapshot(workspaceId).catch(
+      (error: unknown) => {
+        log.warn("Prompt hooks: hook setup failed; running the hooks already loaded", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+        return null;
+      }
+    );
+    if (snapshot?.success === false) {
+      log.debug("Prompt hooks: hook setup skipped", { workspaceId, error: snapshot.error });
+    }
+    // After the setup above, so the check sees the hooks it loaded.
     const cwd = eventSpine.hasMiddleware("message.send")
       ? await this.resolvePromptHookCwd(workspaceId)
       : undefined;

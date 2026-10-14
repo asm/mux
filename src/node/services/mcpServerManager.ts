@@ -5,7 +5,7 @@ import { getOwn } from "@/common/utils/getOwn";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { OAuthClientProvider, PriorDiscovery } from "@modelcontextprotocol/client";
-import type { Tool } from "ai";
+import { jsonSchema, type Tool } from "ai";
 import { getExecutionScope } from "./tools/withExecutionScope";
 import { MCPIconRegistry, type MCPIconOwner } from "./mcpIconRegistry";
 import { resolveServerIcon } from "./mcpServerIcon";
@@ -1364,6 +1364,8 @@ interface MCPServerInstance {
   tools: Record<string, Tool>;
   prompts: MCPPrompt[];
   getPrompt: MCPClientHandle["getPrompt"];
+  /** Codex plugin hooks (see MCPServerManager.callToolForPluginHook). */
+  callToolForHook: MCPClientHandle["callToolForHook"];
   /**
    * MCP Apps (artifacts experiment): present only when the connection announced the
    * extension. Tool metadata includes tools hidden from the model.
@@ -4651,6 +4653,91 @@ export class MCPServerManager {
   }
 
   /**
+   * tools/call for a Codex-format plugin hook, on a server that is ALREADY running and enabled in
+   * this workspace. It never starts or reconnects a server (Codex: hooks use an existing
+   * connection), so a hook whose server is off, excluded or not yet started fails, and the
+   * runner fails open. The caller builds `serverKey` from the hook's own plugin instance, so a
+   * hook can never reach another plugin's or the user's servers.
+   *
+   * The cached enabled set only gates the cheap early refusal. The dispatch itself goes through
+   * invokeServerOperation (Codex PRRT_kwDOPxxmWM6rNIIg), like an MCP Apps tool call: it re-reads
+   * the overrides and runs inside the epoch and admission fences, so a server that another
+   * backend or a direct settings edit disabled after the last serve is refused.
+   */
+  async callToolForPluginHook(
+    workspaceId: string,
+    serverKey: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    options: { signal: AbortSignal }
+  ): Promise<unknown> {
+    const entry = this.workspaceServers.get(workspaceId);
+    if (!entry?.enabledServerNames.has(serverKey)) {
+      throw new Error(`MCP server '${serverKey}' is not enabled in this workspace`);
+    }
+    const instance = entry.instances.get(serverKey);
+    if (instance === undefined || instance.isClosed) {
+      throw new Error(`MCP server '${serverKey}' is not running`);
+    }
+    // The served-tool gate (Codex PRRT_kwDOPxxmWM6rN775, PRRT_kwDOPxxmWM6rN8uX): it re-derives
+    // enablement and the project/workspace tool allowlists at the call, inside the epoch and
+    // admission fences, like a model's MCP tool call. `reconcile: false`: where a model's call
+    // would re-serve (and so start or reconnect servers), a hook call is refused instead.
+    const hookTool: Tool = {
+      inputSchema: jsonSchema({ type: "object" }),
+      execute: () => {
+        // Dispatch-time instance: the gate's checks ran synchronously before this.
+        const current = this.workspaceServers.get(workspaceId)?.instances.get(serverKey);
+        if (current === undefined || current.isClosed) {
+          throw new Error(`MCP server '${serverKey}' is not running`);
+        }
+        this.markActivity(workspaceId);
+        return current.callToolForHook(toolName, args, options);
+      },
+    };
+    const gated = this.gateServedToolOnEnablement(
+      workspaceId,
+      serverKey,
+      toolName,
+      hookTool,
+      entry.enabledServers[serverKey],
+      { reconcile: false }
+    );
+    assert(gated.execute !== undefined, "the gate keeps execute");
+    return await gated.execute(args, {
+      toolCallId: `plugin-hook:${toolName}`,
+      messages: [],
+      abortSignal: options.signal,
+      context: undefined,
+    });
+  }
+
+  /**
+   * Whether callToolForPluginHook would dispatch `toolName` on `serverKey` now, from cached state
+   * only (no disk read, no serve): enabled (an override publication repairs this set) and running,
+   * not invalidated, and allowed by the project and workspace tool allowlists. The runner asks
+   * before it denies a call that is too large for the hook to check.
+   */
+  canCallToolForPluginHook(workspaceId: string, serverKey: string, toolName: string): boolean {
+    const entry = this.workspaceServers.get(workspaceId);
+    const info = entry?.enabledServers[serverKey];
+    const instance = entry?.instances.get(serverKey);
+    if (
+      entry === undefined ||
+      info === undefined ||
+      instance === undefined ||
+      instance.isClosed ||
+      !entry.enabledServerNames.has(serverKey) ||
+      this.overridesInvalidationGenerations.has(workspaceId)
+    ) {
+      return false;
+    }
+    const overrides = this.lastWorkspaceRequestOptions.get(workspaceId)?.overrides;
+    const allowlist = effectiveToolAllowlist(serverKey, info.toolAllowlist, overrides);
+    return allowlist === null || allowlist.has(toolName);
+  }
+
+  /**
    * Whether a send or prompt discovery recorded this workspace's request options. Without them
    * server operations cannot start servers (invokeServerOperation), e.g. right after a restart.
    */
@@ -5917,7 +6004,9 @@ export class MCPServerManager {
     serverName: string,
     toolName: string,
     tool: Tool,
-    servedInfo: MCPServerInfo | undefined
+    servedInfo: MCPServerInfo | undefined,
+    /** false (plugin hooks): refuse instead of re-serving, so the gate never starts a server. */
+    gateOptions: { reconcile: boolean } = { reconcile: true }
   ): Tool {
     if (!tool.execute) {
       return tool;
@@ -6058,7 +6147,11 @@ export class MCPServerManager {
                     this.forgetWorkspaceOverrides(workspaceId);
                   }
                 }
-                if (this.overridesInvalidationGenerations.has(workspaceId)) {
+                // Without reconciling, the live marker makes decide() refuse the call.
+                if (
+                  gateOptions.reconcile &&
+                  this.overridesInvalidationGenerations.has(workspaceId)
+                ) {
                   const latest = this.lastWorkspaceRequestOptions.get(workspaceId);
                   if (latest !== undefined) {
                     await this.ensureWorkspaceServers(latest, false, abortSignal);
@@ -6122,15 +6215,18 @@ export class MCPServerManager {
             ) {
               throw revoked(`server '${serverName}'`);
             }
+            // Object.hasOwn, not `in`: a tool named after an Object.prototype member
+            // (constructor, toString) would otherwise pass an allowlist that excludes it (Codex
+            // PRRT_kwDOPxxmWM6rb5ps).
             if (
-              !(
-                toolName in
+              !Object.hasOwn(
                 this.applyToolAllowlist(
                   serverName,
                   { [toolName]: tool },
                   info.toolAllowlist,
                   overrides
-                )
+                ),
+                toolName
               )
             ) {
               throw revoked(`tool '${serverName}/${toolName}'`);
@@ -7044,6 +7140,8 @@ export class MCPServerManager {
           prompts: [],
           getPrompt: (promptName, args, options) =>
             readyClient.getPrompt(promptName, args, options),
+          callToolForHook: (toolName, args, options) =>
+            readyClient.callToolForHook(toolName, args, options),
           ...(appResultStore ? { apps: readyClient } : {}),
           settings: readyClient,
           refreshPrompts: (options) => readyClient.prompts(options),
@@ -7346,6 +7444,8 @@ export class MCPServerManager {
         tools,
         prompts: [],
         getPrompt: (promptName, args, options) => activeClient.getPrompt(promptName, args, options),
+        callToolForHook: (toolName, args, options) =>
+          activeClient.callToolForHook(toolName, args, options),
         ...(appResultStore ? { apps: activeClient } : {}),
         settings: activeClient,
         refreshPrompts: (options) => activeClient.prompts(options),

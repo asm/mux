@@ -48,6 +48,7 @@ function setup(hooks: PluginHookDefinition[], answer: (input: Record<string, unk
   const state = { allowed: true };
   const deps: CodexHookRunnerDeps = {
     isHookAllowed: () => Promise.resolve(state.allowed),
+    canCallPluginTool: () => true,
     callPluginTool: (call) => {
       calls.push(call.input);
       return Promise.resolve(answer(call.input));
@@ -155,6 +156,12 @@ describe("PreToolUse", () => {
     const gateFails = setup([hook("PreToolUse")], () => deny);
     gateFails.deps.isHookAllowed = () => Promise.reject(new Error("trust store unreadable"));
     expect((await runTool(gateFails.spine, "bash", {})).executed).toBe(true);
+
+    // A hung trust gate (a stalled filesystem) ends at the hook timeout too.
+    const gateHangs = setup([hook("PreToolUse", { timeoutSeconds: 0.05 })], () => deny);
+    gateHangs.deps.isHookAllowed = () => new Promise(() => undefined);
+    expect((await runTool(gateHangs.spine, "bash", {})).executed).toBe(true);
+    expect(gateHangs.calls).toEqual([]);
   });
 
   test("a trust gate that never settles ends at the hook deadline, and on cancel", async () => {
@@ -316,6 +323,7 @@ describe("PreToolUse", () => {
     });
     const deps: CodexHookRunnerDeps = {
       isHookAllowed: () => Promise.resolve(true),
+      canCallPluginTool: () => true,
       callPluginTool: () =>
         Promise.resolve(
           json({

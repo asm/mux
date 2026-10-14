@@ -49,6 +49,8 @@ export interface FakeServerBehavior {
   hang?: boolean;
   /** MCP Apps client methods, used when the manager connects with MCP Apps enabled. */
   apps?: Partial<Pick<MCPClientHandle, "toolUi" | "hasTool" | "callToolForApp" | "readResource">>;
+  /** Raw tools/call for plugin hooks (MCPServerManager.callToolForPluginHook). */
+  callToolForHook?: MCPClientHandle["callToolForHook"];
   /** OpenAI structured settings client methods. */
   settings?: Partial<Pick<MCPClientHandle, "settingsCapability" | "callSettingsTool">>;
 }
@@ -270,6 +272,8 @@ export class FakeMcpServers {
       priorDiscovery: () =>
         modern ? { kind: "modern" as const, discover: {} } : { kind: "legacy" as const },
       close: behavior.close ?? (() => Promise.resolve()),
+      callToolForHook:
+        behavior.callToolForHook ?? (() => Promise.reject(new Error("no hook tool in this fake"))),
       ...behavior.apps,
       settingsCapability: () => undefined,
       ...behavior.settings,
