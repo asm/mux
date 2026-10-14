@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { X } from "lucide-react";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
@@ -399,6 +399,36 @@ function useExposedClose(
 }
 
 /**
+ * A view that could not be shown. A failed load (an error) can be retried where the host
+ * offers Reload (its app tab remounts the frame); a missing view cannot.
+ */
+function McpAppViewUnavailable(props: {
+  header: ReactNode;
+  inline: boolean;
+  error: string | null;
+  onReload?: () => void;
+}) {
+  return (
+    <div className="flex min-h-0 flex-col">
+      {props.header}
+      <div className="text-danger p-4 text-xs">
+        {props.inline ? null : "This view is no longer available. "}
+        {props.error ?? "The view could not be loaded."}
+      </div>
+      {props.onReload != null && props.error != null && (
+        <button
+          type="button"
+          onClick={props.onReload}
+          className="border-border-light focus-visible:ring-accent mx-4 self-start rounded border px-2 py-0.5 text-xs focus-visible:ring-1"
+        >
+          Reload
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
  * Close the channel of a document that left the frame: a new one replaced it, it navigated away
  * (the frame is removed until Reload, which loads a new document), or the view unmounted. The
  * HTML standard asks to close discarded ports. StrictMode replays effects (setup, cleanup,
@@ -429,6 +459,8 @@ export function McpAppFrame(props: {
   variant?: McpAppFrameVariant;
   /** Panel only: closes the panel's host (its app tab). */
   onClose?: () => void;
+  /** Panel only: loads the view again (its tab remounts the frame), offered when loading failed. */
+  onReload?: () => void;
   /**
    * Panel only: receives the frame's close sequence (the view's teardown, then onClose), so a
    * host's own dismissal (a modal's Escape or outside click) closes the view the same way.
@@ -752,13 +784,12 @@ export function McpAppFrame(props: {
     );
   if (current.view == null || srcDoc == null || grant == null) {
     return (
-      <div className="flex min-h-0 flex-col">
-        {header}
-        <div className="text-danger p-4 text-xs">
-          {inline ? null : "This view is no longer available. "}
-          {current.error ?? "The view could not be loaded."}
-        </div>
-      </div>
+      <McpAppViewUnavailable
+        header={header}
+        inline={inline}
+        error={current.error}
+        onReload={props.onReload}
+      />
     );
   }
   return (
