@@ -301,6 +301,50 @@ function issuersMatch(a: string, b: string): boolean {
 }
 
 /**
+ * Whether the tokens' granted scope holds every base scope of the plugin. A stored token
+ * without `scope` fails when base scopes are required: it can come from an earlier sign-in at
+ * this URL that requested less. Xum records the requested scope when a grant omits it (RFC 6749
+ * §5.1), and a refresh without scope keeps the stored one (§6), so its own grants carry it.
+ */
+function grantCoversBaseScopes(
+  scope: string | undefined,
+  config: MCPServerOAuthConfig | undefined
+): boolean {
+  return missingBaseScopes(scope, config).length === 0;
+}
+
+/** Scope strings are space-separated sets (RFC 6749 §3.3); a configured entry can hold several. */
+function scopeSet(scopes: readonly string[]): Set<string> {
+  return new Set(scopes.flatMap((scope) => scope.split(/\s+/)).filter(Boolean));
+}
+
+/** The plugin's base scopes that `scope` (a granted scope string) does not hold. */
+function missingBaseScopes(
+  scope: string | undefined,
+  config: MCPServerOAuthConfig | undefined
+): string[] {
+  const granted = scopeSet(scope !== undefined ? [scope] : []);
+  return [...scopeSet(config?.baseScopes ?? [])].filter((base) => !granted.has(base));
+}
+
+/**
+ * The scope an interactive grant stores. A grant without scope is the requested scope (RFC 6749
+ * §5.1): record it, so the base-scope check can read it later. Tokens without a base scope
+ * would read as signed out (storedClientMatches): fail the sign-in with the reason instead of
+ * reporting "Login complete" (#6141).
+ */
+function checkedGrantScope(
+  granted: string | undefined,
+  flow: Pick<OAuthFlowBase, "scope" | "plugin">
+): string | undefined {
+  const scope = granted ?? flow.scope;
+  const missing = missingBaseScopes(scope, flow.plugin?.config);
+  if (missing.length === 0) return scope;
+  // The scope names come from the consented plugin config, not from the server.
+  throw new Error(`The authorization server did not grant required scopes: ${missing.join(" ")}`);
+}
+
+/**
  * The use-time rule that decides whether stored credentials may serve a server: they belong
  * to the client and the issuer that minted them. A plugin with another provided client, or one
  * that pins another issuer (a second plugin at the same URL, an update, a remove and re-add),
@@ -315,16 +359,37 @@ function issuersMatch(a: string, b: string): boolean {
  * plugin update that moves authorizationServerBase to another origin could collect it. Without
  * a pinned issuer unstamped credentials pass, like in the SDK (non-plugin servers unchanged).
  *
- * Known limit: a change of only scopes or resource (same client, same issuer) keeps the old
- * tokens and their old grant until the server asks for re-authorization; the update-time
- * sign-out covers the normal path. Follow-up for scope coverage: #6141.
+ * Tokens whose granted scope lacks one of the plugin's baseScopes do not match either (#6141):
+ * a plugin can reuse a URL that an earlier sign-in authorized with narrower scopes. Known limit:
+ * a change of only defaultScopes or resource (same client, same issuer) keeps the old tokens
+ * until the server asks for re-authorization; the update-time sign-out covers the normal path.
  */
 function storedClientMatches(
   stored: MCPOAuthStoredCredentials | null | undefined,
   config: MCPServerOAuthConfig | undefined
 ): boolean {
+  return storedClientUsable(stored, config) && grantCoversBaseScopes(stored?.tokens?.scope, config);
+}
+
+/**
+ * storedClientMatches without the scope check: whether the stored client may serve a refresh.
+ * After invalid_grant the SDK drops the tokens and retries with the client; refusing it there
+ * would make the SDK register a new client instead of reaching the sign-in-required path.
+ */
+function storedClientUsable(
+  stored: MCPOAuthStoredCredentials | null | undefined,
+  config: MCPServerOAuthConfig | undefined
+): boolean {
   if (config?.clientId !== undefined && stored?.clientInformation?.client_id !== config.clientId)
     return false;
+  return storedIssuerMatches(stored, config);
+}
+
+/** The pinned-issuer part of storedClientMatches. */
+function storedIssuerMatches(
+  stored: MCPOAuthStoredCredentials | null | undefined,
+  config: MCPServerOAuthConfig | undefined
+): boolean {
   const issuer = pinnedIssuer(config);
   if (issuer === undefined) return true;
   // Each record the SDK reads must be bound to the pinned issuer: its SEP-2352 stamp, or for a
@@ -350,8 +415,22 @@ function storedClientMatches(
  * authorizationServerBase replaced the client record. A late token of the old issuer would
  * leave a mixed record that storedClientMatches refuses, signing the new issuer out (#6297).
  * So the SDK's issuer stamps must match; a legacy unstamped record has none to compare.
+ *
+ * A background refresh started from one stored grant. When another write replaced that grant
+ * (a new sign-in, or another refresh), the refresh answer is dropped: it would overwrite the
+ * newer grant, and a scope-less answer would carry that grant's scope (#6141).
  */
 function tokenWriteConflict(
+  stored: MCPOAuthStoredCredentials | undefined,
+  input: { clientId?: string; tokens: MCPOAuthTokens; refreshedFrom?: MCPOAuthTokens }
+): string | undefined {
+  if (input.refreshedFrom !== undefined && !sameGrant(stored?.tokens, input.refreshedFrom))
+    return "of a refresh whose token another write replaced";
+  return clientConflict(stored?.clientInformation, input.clientId, input.tokens);
+}
+
+/** The client and issuer part of tokenWriteConflict. */
+function clientConflict(
   storedClient: MCPOAuthClientInformation | undefined,
   clientId: string | undefined,
   tokens: MCPOAuthTokens
@@ -363,6 +442,19 @@ function tokenWriteConflict(
   return issuersMatch(storedClient.issuer, issuer)
     ? undefined
     : "of another issuer than the stored client's";
+}
+
+/** A refresh response without scope keeps the refreshed grant's scope (RFC 6749 §6). */
+function refreshedScope(input: { tokens: MCPOAuthTokens; refreshedFrom?: MCPOAuthTokens }): {
+  scope?: string;
+} {
+  const scope = input.tokens.scope ?? input.refreshedFrom?.scope;
+  return scope !== undefined ? { scope } : {};
+}
+
+/** The same stored grant: the SDK's issuer back-stamp keeps both tokens. */
+function sameGrant(a: MCPOAuthTokens | undefined, b: MCPOAuthTokens): boolean {
+  return a?.access_token === b.access_token && a.refresh_token === b.refresh_token;
 }
 
 /** The identity of a stored client record: its ID and SEP-2352 issuer stamp (null: none). */
@@ -1668,10 +1760,11 @@ export class McpOauthService {
     return {
       tokens: () => Promise.resolve(undefined),
       saveTokens: async (tokens) => {
+        const scope = checkedGrantScope(tokens.scope, flow);
         await this.saveTokens({
           serverUrl: flow.serverUrlForStoreKey,
           // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-          tokens: tokens as unknown as MCPOAuthTokens,
+          tokens: { ...tokens, scope } as unknown as MCPOAuthTokens,
           legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
           flowGeneration: flow.signOutGeneration,
           clientId: flow.clientInformation?.client_id ?? flow.plugin?.config.clientId,
@@ -1751,6 +1844,15 @@ export class McpOauthService {
     };
   }
 
+  /** The stored tokens when they may serve this server (storedClientMatches). */
+  private async readMatchingTokens(
+    serverUrl: string,
+    oauth: MCPServerOAuthConfig | undefined
+  ): Promise<MCPOAuthTokens | undefined> {
+    const creds = await this.getValidStoredCredentials({ serverUrl });
+    return storedClientMatches(creds, oauth) ? creds?.tokens : undefined;
+  }
+
   private createBackgroundProvider(input: {
     serverUrl: string;
     serverName?: string;
@@ -1759,17 +1861,19 @@ export class McpOauthService {
     let discoveryState: OAuthDiscoveryState | undefined;
     // The client a refresh runs with: its tokens are saved only while that client is stored.
     let refreshedWithClientId: string | undefined;
+    // The stored grant auth() read before it refreshes (see saveTokens refreshedFrom). Only a
+    // read with the SDK's context counts: a transport request reads tokens without one.
+    let refreshedFrom: MCPOAuthTokens | undefined;
     // The stored client record the refresh read; the SDK's back-stamp may replace only it.
     // The SDK reads the client before every write; undefined means nothing was read yet.
     let readClient: StoredClientIdentity | undefined;
     const pluginState = pluginDiscoveryState(input.oauth);
 
     return {
-      tokens: async () => {
-        const creds = await this.getValidStoredCredentials({ serverUrl: input.serverUrl });
-        if (!storedClientMatches(creds, input.oauth)) return undefined;
-        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-        return creds?.tokens as unknown as MCPOAuthTokens | undefined;
+      tokens: async (ctx) => {
+        const tokens = await this.readMatchingTokens(input.serverUrl, input.oauth);
+        if (ctx !== undefined) refreshedFrom = tokens;
+        return tokens;
       },
       saveTokens: async (tokens) => {
         await this.saveTokens({
@@ -1778,6 +1882,7 @@ export class McpOauthService {
           tokens: tokens as unknown as MCPOAuthTokens,
           legacyBinding: deriveAuthorizationServerBinding(discoveryState),
           clientId: refreshedWithClientId ?? input.oauth?.clientId,
+          refreshedFrom,
         });
       },
       saveDiscoveryState: (state) => {
@@ -1821,7 +1926,7 @@ export class McpOauthService {
       },
       clientInformation: async () => {
         const creds = await this.getValidStoredCredentials({ serverUrl: input.serverUrl });
-        const stored = storedClientMatches(creds, input.oauth)
+        const stored = storedClientUsable(creds, input.oauth)
           ? creds?.clientInformation
           : undefined;
         refreshedWithClientId = stored?.client_id;
@@ -2126,15 +2231,16 @@ export class McpOauthService {
     flowGeneration?: number;
     /** The client the tokens were issued to (the flow's or the refresh's). */
     clientId?: string;
+    /**
+     * A background refresh: the stored grant it started from. The save is dropped once another
+     * write replaced that grant; a response without scope keeps its scope (RFC 6749 §6).
+     */
+    refreshedFrom?: MCPOAuthTokens;
   }): Promise<void> {
     const saved = await this.storeLock.withLock(this.storeFilePath, async () => {
       if (this.isStaleFlowSave(input.serverUrl, input.flowGeneration)) return false;
       const store = await this.ensureStoreLoadedLocked();
-      const conflict = tokenWriteConflict(
-        store.entries[input.serverUrl]?.clientInformation,
-        input.clientId,
-        input.tokens
-      );
+      const conflict = tokenWriteConflict(store.entries[input.serverUrl], input);
       if (conflict !== undefined) {
         log.info(`[MCP OAuth] Dropping tokens ${conflict}`, { serverUrl: input.serverUrl });
         return false;
@@ -2155,7 +2261,7 @@ export class McpOauthService {
       }
 
       creds.serverUrl = input.serverUrl;
-      creds.tokens = { ...input.tokens, ...legacyBinding };
+      creds.tokens = { ...input.tokens, ...refreshedScope(input), ...legacyBinding };
       creds.updatedAtMs = Date.now();
 
       await this.persistStoreLocked(store);
