@@ -534,6 +534,23 @@ function normalizeRemoteEntry(
   };
 }
 
+/** Normalize one (translated) entry by its transport; a translation error skips it. */
+async function normalizeServerEntry(
+  translated: ReturnType<typeof translateCodexMcpEntry>,
+  ctx: NormalizeContext
+): Promise<{ info: MCPServerInfo } | { error: string } | { skip: string }> {
+  if (translated.error !== undefined) return { error: translated.error };
+  const entry = translated.entry;
+  if (entry.type === "streamable-http" || entry.type === "sse")
+    return normalizeRemoteEntry(entry, ctx);
+  if (entry.type !== "stdio")
+    return { error: `unknown server 'type' ${JSON.stringify(entry.type)}` };
+  const result = await normalizeStdioEntry(entry, ctx);
+  if ("info" in result && translated.forwardEnv !== undefined)
+    result.info.forwardEnv = translated.forwardEnv;
+  return result;
+}
+
 /**
  * Why a server entry cannot load at all, before dialect handling. `__proto__` is refused because
  * the registry's consent record (a `z.record`) drops that key on parse (#6534): the server could
@@ -691,16 +708,7 @@ export async function loadPluginMcpServers(
 
     // §7.2.2 rules 3-4: invalid entries and unknown transports are skipped
     // individually; sibling servers keep loading.
-    let result: { info: MCPServerInfo } | { error: string } | { skip: string };
-    if (entry.type === "stdio") {
-      result = await normalizeStdioEntry(entry, normalizeCtx);
-    } else if (entry.type === "streamable-http" || entry.type === "sse") {
-      result = normalizeRemoteEntry(entry, normalizeCtx);
-    } else {
-      reportEntry("error", `unknown server 'type' ${JSON.stringify(entry.type)}`);
-      continue;
-    }
-
+    const result = await normalizeServerEntry(codex, normalizeCtx);
     if ("error" in result) {
       reportEntry("error", result.error);
       continue;

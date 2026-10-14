@@ -984,6 +984,23 @@ async function mkdirSelfHealing(target: string): Promise<void> {
 }
 
 /**
+ * Codex `env_vars`: copy only the named host variables (unset ones are skipped, as in
+ * codex-rs create_env_for_mcp_server). Configured env wins, so PLUGIN_ROOT/PLUGIN_DATA stay put.
+ */
+function withForwardedHostEnv(
+  forwardEnv: string[] | undefined,
+  env: Record<string, string> | undefined
+): Record<string, string> | undefined {
+  // Own properties only: `constructor` would read an inherited function. Object.fromEntries
+  // keeps a host variable named `__proto__`, which an assignment would drop.
+  const forwarded = (forwardEnv ?? []).flatMap((name): Array<[string, string]> => {
+    const value = Object.hasOwn(process.env, name) ? process.env[name] : undefined;
+    return typeof value === "string" ? [[name, value]] : [];
+  });
+  return forwarded.length > 0 ? { ...Object.fromEntries(forwarded), ...env } : env;
+}
+
+/**
  * Compose the shell command string and exec options for a stdio server.
  *
  * Servers with `args` set (Agent Plugins) run in argv mode: `command` and each
@@ -1025,10 +1042,12 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
     }
   }
 
+  const env = withForwardedHostEnv(info.forwardEnv, info.env);
+
   return {
     command,
     ...(info.cwd !== undefined ? { cwd: info.cwd } : {}),
-    ...(info.env !== undefined ? { env: info.env } : {}),
+    ...(env !== undefined ? { env } : {}),
     hostEnv,
   };
 }
@@ -4478,6 +4497,8 @@ export class MCPServerManager {
           command: info.command,
           args: info.args ?? null,
           env: info.env ?? null,
+          // JSON.stringify drops it when unset, so other servers keep their signature.
+          forwardEnv: info.forwardEnv,
           cwd: info.cwd ?? null,
         };
         continue;

@@ -37,6 +37,8 @@ const STDIO_FIELDS: Record<keyof MCPStdioServerInfo, FieldRule> = {
   command: "include",
   args: "include",
   env: "include",
+  // Each named host variable reaches the server (Codex `env_vars`), so a new name needs review.
+  forwardEnv: "include",
   cwd: "include",
   disabled: "exclude",
   toolAllowlist: "exclude",

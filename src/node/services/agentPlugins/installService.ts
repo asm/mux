@@ -49,7 +49,7 @@ import {
   skillConsentFrontmatter,
 } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { log } from "@/node/services/log";
-import type { MCPServerInfo, MCPServerOAuthConfig } from "@/common/types/mcp";
+import type { MCPServerInfo, MCPServerOAuthConfig, MCPStdioServerInfo } from "@/common/types/mcp";
 import type { McpOauthService } from "@/node/services/mcpOauthService";
 import {
   pluginClientSecretFor,
@@ -666,6 +666,40 @@ async function pathExists(candidate: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/** Consent-preview details of a stdio launch beyond its argv: cwd, env and host env. */
+function stdioLaunchDetails(
+  info: MCPStdioServerInfo,
+  rewrite: (value: string) => string,
+  finalTargetPath: string
+): string[] {
+  // Env VALUES are execution-relevant (e.g. NODE_OPTIONS=--require=…
+  // auto-loads code the argv never shows), so consent must disclose the
+  // full assignment, quoted like the argv so boundaries are unambiguous.
+  const envAssignments = Object.entries(info.env ?? {})
+    .filter(([key]) => key !== "PLUGIN_ROOT" && key !== "PLUGIN_DATA")
+    .map(([key, value]) => `${key}=${shellQuote(rewrite(value))}`);
+  const details: string[] = [];
+  // cwd is execution-relevant too: prepareStdioLaunch passes it to the
+  // runtime, so `node server.js` resolves scripts/configs relative to
+  // it — including from WRITABLE persistent plugin data — and the argv
+  // alone would imply a different resolution (capabilitySurface treats
+  // cwd as consent-relevant for the same reason). The loader defaults
+  // cwd to the plugin root; only a DEVIATION from the reviewed tree
+  // root needs calling out.
+  if (info.cwd !== undefined && rewrite(info.cwd) !== finalTargetPath) {
+    details.push(`cwd: ${shellQuote(rewrite(info.cwd))}`);
+  }
+  if (envAssignments.length > 0) {
+    details.push(`env: ${envAssignments.join(" ")}`);
+  }
+  // Codex `env_vars`: the server receives these host values (often credentials). Only the
+  // names are shown, never the values.
+  if (info.forwardEnv !== undefined) {
+    details.push(`host env: ${info.forwardEnv.map(shellQuote).join(" ")}`);
+  }
+  return details;
 }
 
 /** Preview warning for a skill whose SKILL.md `name` is only a display name. */
@@ -2422,26 +2456,7 @@ export class AgentPluginInstallService {
       info.args !== undefined
         ? [info.command, ...info.args].map(rewrite).map(shellQuote).join(" ")
         : rewrite(info.command);
-    // Env VALUES are execution-relevant (e.g. NODE_OPTIONS=--require=…
-    // auto-loads code the argv never shows), so consent must disclose the
-    // full assignment, quoted like the argv so boundaries are unambiguous.
-    const envAssignments = Object.entries(info.env ?? {})
-      .filter(([key]) => key !== "PLUGIN_ROOT" && key !== "PLUGIN_DATA")
-      .map(([key, value]) => `${key}=${shellQuote(rewrite(value))}`);
-    const details: string[] = [];
-    // cwd is execution-relevant too: prepareStdioLaunch passes it to the
-    // runtime, so `node server.js` resolves scripts/configs relative to
-    // it — including from WRITABLE persistent plugin data — and the argv
-    // alone would imply a different resolution (capabilitySurface treats
-    // cwd as consent-relevant for the same reason). The loader defaults
-    // cwd to the plugin root; only a DEVIATION from the reviewed tree
-    // root needs calling out.
-    if (info.cwd !== undefined && rewrite(info.cwd) !== finalTargetPath) {
-      details.push(`cwd: ${shellQuote(rewrite(info.cwd))}`);
-    }
-    if (envAssignments.length > 0) {
-      details.push(`env: ${envAssignments.join(" ")}`);
-    }
+    const details = stdioLaunchDetails(info, rewrite, finalTargetPath);
     return {
       serverName: info.plugin.serverName,
       transport: "stdio",
