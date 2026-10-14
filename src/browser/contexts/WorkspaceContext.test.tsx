@@ -1003,6 +1003,133 @@ describe("WorkspaceContext", () => {
     });
   });
 
+  // A reconnect reloads projects and metadata through the new client. Until the reload answers,
+  // both contexts keep what they show and do not report "loading" again (stale-while-revalidate).
+  describe.each([...GAP_MODES])("reload after a reconnect (%s)", (mode) => {
+    test("keeps the loaded projects and metadata until the reload answers", async () => {
+      createMockAPI({
+        workspace: { list: () => Promise.resolve([createWorkspaceMetadata({ id: "ws-old" })]) },
+        projects: { list: () => Promise.resolve([["/old", { workspaces: [] }]]) },
+      });
+      const contexts = await setupWithConnection(mode);
+      await waitFor(() => expect(contexts.project().userProjects.has("/old")).toBe(true));
+      expect(contexts.workspace().workspaceMetadata.has("ws-old")).toBe(true);
+
+      // The next server answers only when the test lets it.
+      let answerProjects: (() => void) | null = null;
+      let answerSnapshot: (() => void) | null = null;
+      const projectsAnswered = new Promise<void>((resolve) => (answerProjects = resolve));
+      const snapshotAnswered = new Promise<void>((resolve) => (answerSnapshot = resolve));
+      currentClientMock = {
+        ...currentClientMock,
+        projects: {
+          ...currentClientMock.projects,
+          list: () => projectsAnswered.then(() => [["/new", { workspaces: [] }]]),
+        },
+        workspace: {
+          ...currentClientMock.workspace,
+          onMetadata: () =>
+            Promise.resolve(
+              (async function* () {
+                await snapshotAnswered;
+                yield {
+                  type: "snapshot" as const,
+                  workspaces: [createWorkspaceMetadata({ id: "ws-new" })],
+                };
+                await new Promise(() => undefined);
+              })()
+            ),
+        },
+      };
+
+      await contexts.harness.drop();
+      contexts.harness.reconnect();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+
+      expect(contexts.project().loading).toBe(false);
+      expect(contexts.project().loaded).toBe(true);
+      expect(contexts.project().userProjects.has("/old")).toBe(true);
+      expect(contexts.workspace().loading).toBe(false);
+      expect(contexts.workspace().loaded).toBe(true);
+      expect(contexts.workspace().workspaceMetadata.has("ws-old")).toBe(true);
+
+      act(() => {
+        answerSnapshot?.();
+        answerProjects?.();
+      });
+      await waitFor(() => expect(contexts.workspace().workspaceMetadata.has("ws-new")).toBe(true));
+      await waitFor(() => expect(contexts.project().userProjects.has("/new")).toBe(true));
+      expect(contexts.workspace().workspaceMetadata.has("ws-old")).toBe(false);
+      expect(contexts.project().userProjects.has("/old")).toBe(false);
+    });
+  });
+
+  // Only a loaded snapshot makes later reloads non-blocking. Without one the app must keep its
+  // loader for the new client, not leave it with an empty metadata map.
+  describe.each([...GAP_MODES])("reconnect before a first snapshot (%s)", (mode) => {
+    test("shows loading again for the new client", async () => {
+      const { workspace: workspaceApi } = createMockAPI();
+      workspaceApi.onMetadata.mockImplementation(() =>
+        Promise.resolve(
+          // eslint-disable-next-line require-yield
+          (async function* () {
+            await Promise.resolve();
+          })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+        )
+      );
+      const contexts = await setupWithConnection(mode);
+      await waitFor(() => expect(contexts.workspace().loading).toBe(false));
+      expect(contexts.workspace().loaded).toBe(false);
+
+      // The next server never sends its snapshot.
+      currentClientMock = {
+        ...currentClientMock,
+        workspace: {
+          ...currentClientMock.workspace,
+          onMetadata: () =>
+            Promise.resolve(
+              // eslint-disable-next-line require-yield
+              (async function* () {
+                await new Promise(() => undefined);
+              })()
+            ),
+        },
+      };
+      await contexts.harness.drop();
+      contexts.harness.reconnect();
+      await waitFor(() => expect(contexts.workspace().loading).toBe(true));
+      expect(contexts.workspace().loaded).toBe(false);
+    });
+
+    // A stream lost with the connection rejects with ConnectionLostError: no load failure, so
+    // the startup loader stays for the whole outage, not only once the new client arrives.
+    test("a drop before the first snapshot keeps loading during the outage", async () => {
+      const { workspace: workspaceApi } = createMockAPI();
+      workspaceApi.onMetadata.mockImplementation(() =>
+        Promise.resolve(
+          // eslint-disable-next-line require-yield
+          (async function* () {
+            await new Promise(() => undefined);
+          })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+        )
+      );
+      const contexts = await setupWithConnection(mode, { awaitLoad: false });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+      expect(contexts.workspace().loading).toBe(true);
+
+      await contexts.harness.drop();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+      expect(contexts.workspace().loading).toBe(true);
+      expect(contexts.workspace().loaded).toBe(false);
+    });
+  });
+
   describe("archiveWorkspace", () => {
     test("succeeds even when persisted layout is invalid JSON shape", async () => {
       const workspaceId = "ws-archive-invalid-layout";
@@ -2397,7 +2524,7 @@ function createDraftServiceClient(service: DraftService): TestApiOverrides<APICl
 }
 
 /** Like setupWithProjectContext(), over a connection the test drops (connection.testHarness). */
-async function setupWithConnection(mode: GapMode) {
+async function setupWithConnection(mode: GapMode, options?: { awaitLoad?: boolean }) {
   const harness = createConnectionHarness(mode, () => currentClientMock);
   const workspaceRef = { current: null as WorkspaceContext | null };
   const projectRef = { current: null as ReturnType<typeof useProjectContext> | null };
@@ -2418,7 +2545,9 @@ async function setupWithConnection(mode: GapMode) {
     </harness.Wrapper>
   );
   getWorkspaceStoreRaw().setClient(harness.client);
-  await waitFor(() => expect(workspaceRef.current?.loading).toBe(false));
+  if (options?.awaitLoad !== false) {
+    await waitFor(() => expect(workspaceRef.current?.loading).toBe(false));
+  }
   return { harness, workspace: () => workspaceRef.current!, project: () => projectRef.current! };
 }
 

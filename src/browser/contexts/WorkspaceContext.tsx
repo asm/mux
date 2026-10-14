@@ -41,6 +41,7 @@ import {
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { appendPinnedTimestamp, reassignPinnedTimestamps } from "@/common/utils/pin";
 import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { findAdjacentWorkspaceId } from "@/browser/utils/ui/workspaceDomNav";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import { setWorkspaceAiMetadata } from "@/browser/utils/aiSelectionIntent";
@@ -406,6 +407,15 @@ function buildActiveWorkspaceMetadataMap(
   return metadataMap;
 }
 
+/** The workspace IDs whose last metadata update arrived after `arrival` (an arrival count). */
+function getIdsArrivedAfter(lastByWorkspaceId: Map<string, number>, arrival: number): Set<string> {
+  const ids = new Set<string>();
+  for (const [workspaceId, arrivedAt] of lastByWorkspaceId) {
+    if (arrivedAt > arrival) ids.add(workspaceId);
+  }
+  return ids;
+}
+
 export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const { api } = useAPI();
   // Handlers use only the live client: offline they keep returning their result (for example
@@ -473,6 +483,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const routedDraftIdRef = useRef<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loaded, setLoaded] = useState(false);
+  // For the metadata effect: a new client shows the loader again until a first snapshot loads.
+  const loadedRef = useRef(loaded);
+  loadedRef.current = loaded;
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [workspaceDraftPromotionsByProject, setWorkspaceDraftPromotionsByProject] =
@@ -892,13 +905,16 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   // The metadata stream owns the initial load: its first event is a snapshot built after the
   // server attached the listener, so no change can fall between the load and the updates (#5189).
   useEffect(() => {
-    setLoading(true);
+    // After a first snapshot, a new client (reconnect) reloads behind the shown metadata, so
+    // neither `loading` nor `loaded` resets here.
     if (!api) {
       // api not available yet - effect will run again when api connects
-      setLoaded(false);
       setLoadError("API not connected");
       return;
     }
+    // No snapshot loaded yet (a failure or a lost connection ended the last load): the new client
+    // shows the loader again, or the app would leave it with an empty metadata map.
+    if (!loadedRef.current) setLoading(true);
     const controller = new AbortController();
     const { signal } = controller;
     let snapshotApplied = false;
@@ -1545,7 +1561,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
   const refreshWorkspaceMetadata = useCallback(async () => {
     if (!api) {
-      setLoaded(false);
+      // Keep `loaded` and the shown metadata: the reconnect reloads them.
       setLoadError("API not connected");
       return;
     }
@@ -1556,10 +1572,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       // A snapshot that arrived after the request, plus the updates after it, supersedes this list.
       if (arrivals.lastSnapshot > requestedAt) return;
       // Rows an update touched after the request keep their current state, including a deletion.
-      const touchedIds = new Set<string>();
-      for (const [workspaceId, arrivedAt] of arrivals.lastByWorkspaceId) {
-        if (arrivedAt > requestedAt) touchedIds.add(workspaceId);
-      }
+      const touchedIds = getIdsArrivedAfter(arrivals.lastByWorkspaceId, requestedAt);
       const listed = buildActiveWorkspaceMetadataMap(
         metadataList.filter((metadata) => !touchedIds.has(metadata.id))
       );
@@ -1574,6 +1587,8 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       setLoaded(true);
       setLoadError(null);
     } catch (error) {
+      // A lost connection is no load error: the reconnect reloads.
+      if (isConnectionLostError(error)) return;
       console.error("Failed to load workspace metadata:", error);
       // Keep the previous metadata map on failure so scoped preferences are not pruned.
       setLoadError(getErrorMessage(error));

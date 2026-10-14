@@ -218,6 +218,11 @@ export type RuntimeAvailabilityState =
   | { status: "failed" }
   | { status: "loaded"; data: RuntimeAvailabilityMap };
 
+/** True for a real (non-blank) creation draft ID. */
+function isDraftId(draftId: string | null | undefined): draftId is string {
+  return typeof draftId === "string" && draftId.trim().length > 0;
+}
+
 function isWorkspaceDraftEmpty(workspaceId: string): boolean {
   const draft = getDraftStore().getView({ kind: "workspace", workspaceId });
   return draft.text.trim().length === 0 && draft.attachmentCount === 0;
@@ -312,7 +317,7 @@ export function useCreationWorkspace({
   // single auto-naming/manual-name state).
   const workspaceNameScopeId =
     projectPath.trim().length > 0
-      ? typeof draftId === "string" && draftId.trim().length > 0
+      ? isDraftId(draftId)
         ? getDraftScopeId(projectPath, draftId)
         : getPendingScopeId(projectPath)
       : null;
@@ -332,6 +337,10 @@ export function useCreationWorkspace({
   // Destructure name state functions for use in callbacks
   const { waitForGeneration } = workspaceNameState;
 
+  // The project whose runtimes are shown. Only a new project shows the runtimes as "loading"
+  // again: a new client (reconnect) reloads the same project behind the shown values.
+  const shownProjectPathRef = useRef<string | null>(null);
+
   // Load branches and runtime availability on mount with mounted guard
   useEffect(() => {
     if (kind === "scratch") {
@@ -340,8 +349,13 @@ export function useCreationWorkspace({
     }
     if (!projectPath.length || !api) return;
     let mounted = true;
+    // Every load resets the branch load, a reload (reconnect) too: it is the send barrier for a
+    // trunk branch (#6033), and the branches can change while offline.
     setBranchLoad("loading");
-    setRuntimeAvailabilityState({ status: "loading" });
+    if (shownProjectPathRef.current !== projectPath) {
+      shownProjectPathRef.current = projectPath;
+      setRuntimeAvailabilityState({ status: "loading" });
+    }
     // Both requests run at once and settle independently. Send waits for the branch list (#6033),
     // so it must not also wait for the runtime probe (Docker, Podman, devcontainer CLI), which can
     // take several seconds after the branches are ready.
@@ -596,7 +610,7 @@ export function useCreationWorkspace({
           })
           .catch(() => null);
 
-        const isDraftScope = typeof draftId === "string" && draftId.trim().length > 0;
+        const isDraftScope = isDraftId(draftId);
         const clearPendingDraft = () => {
           // Once the workspace exists, drop the draft even if the initial send fails
           // so we don't keep a hidden placeholder in the sidebar.
@@ -688,7 +702,7 @@ export function useCreationWorkspace({
                 },
         });
 
-        if (typeof draftId === "string" && draftId.trim().length > 0 && promoteWorkspaceDraft) {
+        if (isDraftId(draftId) && promoteWorkspaceDraft) {
           // UI-only: show the created workspace in-place where the draft was rendered.
           promoteWorkspaceDraft(projectPath, draftId, metadata);
         }
