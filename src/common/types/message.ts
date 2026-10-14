@@ -234,6 +234,13 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
    * persists it instead of classifying (and billing) again.
    */
   autoModelRouting?: AutoModelRoutingRecord;
+  /**
+   * The diverted send already ran the message.send prompt hooks: the redispatch must not run them
+   * a second time. Only Xum sets it (stripClientPluginSendHookFields drops a client's).
+   */
+  pluginSendHooksApplied?: true;
+  /** The diverted send's prompt-hook context, restored on the redispatched user row. */
+  pluginHookContext?: PluginHookContextEntry[];
 }
 
 /**
