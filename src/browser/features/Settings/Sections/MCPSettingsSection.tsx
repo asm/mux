@@ -1,4 +1,5 @@
 import { useClaudeDesign } from "@/browser/hooks/useClaudeDesign";
+import { publishGlobalMcpEnablementChanged } from "@/browser/utils/workspaceMcpMutations";
 import {
   McpAppViewDomainsSection,
   unlistedMcpAppViewDomains,
@@ -949,6 +950,7 @@ export const MCPSettingsSection: React.FC = () => {
         if (!result.success) {
           setError(result.error ?? "Failed to remove MCP server");
         } else {
+          publishGlobalMcpEnablementChanged();
           clearTestResult(name);
           await refresh();
         }
@@ -981,6 +983,8 @@ export const MCPSettingsSection: React.FC = () => {
             [name]: { ...prev[name], disabled: enabled },
           }));
           setError(result.error ?? "Failed to update server");
+        } else {
+          publishGlobalMcpEnablementChanged();
         }
       } catch (err) {
         // Revert on error
@@ -1078,6 +1082,7 @@ export const MCPSettingsSection: React.FC = () => {
         setError(result.error ?? "Failed to add MCP server");
         return;
       }
+      publishGlobalMcpEnablementChanged();
 
       setNewServer({ name: "", transport: "stdio", value: "", headersRows: [] });
       setNewTestResult(null);
@@ -1155,6 +1160,7 @@ export const MCPSettingsSection: React.FC = () => {
       if (!result.success) {
         setError(result.error ?? "Failed to update MCP server");
       } else {
+        publishGlobalMcpEnablementChanged();
         // Clear cached test result since config changed
         clearTestResult(editing.name);
         setEditing(null);

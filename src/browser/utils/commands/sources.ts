@@ -48,6 +48,37 @@ import {
   transcriptViews,
   type McpAppViewRef,
 } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
+import {
+  MCP_APP_ENTRYPOINT_NOT_CONNECTED,
+  openMcpAppEntrypoint,
+} from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
+import { mcpAppEntrypointDescription } from "@/browser/features/RightSidebar/AppViewTab/mcpAppEntrypoints";
+import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
+
+/**
+ * One palette action per MCP App entry point: opens its app tab (calling the tool with {}) or
+ * focuses the one it has. The palette has closed by then, so a failure shows as a toast.
+ */
+function entrypointActions(
+  api: APIClient | null,
+  workspaceId: string,
+  entrypoints: readonly McpAppEntrypoint[],
+  navigation: string
+): CommandAction[] {
+  return entrypoints.map((entrypoint) => ({
+    id: CommandIds.navOpenAppEntrypoint(entrypoint.viewKey),
+    title: `Open Plugin View: ${entrypoint.title}`,
+    subtitle: mcpAppEntrypointDescription(entrypoint),
+    section: navigation,
+    keywords: ["plugin", "view", "app", "mcp", entrypoint.serverName],
+    run: async () => {
+      const error = api
+        ? await openMcpAppEntrypoint(api, workspaceId, entrypoint)
+        : MCP_APP_ENTRYPOINT_NOT_CONNECTED;
+      if (error !== null) showCommandFeedbackToast({ type: "error", message: error });
+    },
+  }));
+}
 
 /**
  * The workspace's MCP App views (the loaded transcript's, then ones opened this session), each
@@ -183,8 +214,10 @@ export interface BuildSourcesParams {
   onStartWorkspaceCreation: (projectPath: string) => void;
   onStartMultiProjectWorkspaceCreation: () => void;
   multiProjectWorkspacesEnabled: boolean;
-  /** artifacts experiment: gates "Open Artifacts" and "Open File as Artifact…". */
+  /** artifacts experiment: gates "Open Artifacts", "Open File as Artifact…" and entry points. */
   artifactsEnabled?: boolean;
+  /** The selected workspace's MCP App entry points; undefined until listed. */
+  mcpAppEntrypoints?: readonly McpAppEntrypoint[];
   /** perfFlightRecorder experiment: gates "Report slowness". */
   perfFlightRecorderEnabled?: boolean;
   /** sessionTapes experiment: gates "Save open session tapes" and "Reveal session tapes folder". */
@@ -934,6 +967,9 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                   run: () => openMcpAppViewTab(wsId, view),
                 })
               ),
+              // One per MCP App entry point of an enabled server: opens its app tab (calling
+              // the tool with {}) or focuses the one it has.
+              ...entrypointActions(p.api, wsId, p.mcpAppEntrypoints ?? [], section.navigation),
               {
                 id: CommandIds.navOpenFileAsArtifact(),
                 title: "Open File as Artifact…",

@@ -133,6 +133,8 @@ import {
   nextRecentAppViewTabs,
   withAppViewTab,
 } from "./AppViewTab/appViewTabs";
+import { useMcpAppEntrypoints } from "./AppViewTab/mcpAppEntrypoints";
+import { openMcpAppEntrypointInNewTab } from "./AppViewTab/openMcpAppEntrypoint";
 import { ReviewAssistedStatsReporter } from "@/browser/features/RightSidebar/CodeReview/ReviewPanel";
 import {
   NewTabLabel,
@@ -435,6 +437,9 @@ interface RightSidebarTabsetNodeProps {
 
 const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) => {
   const tabsetBaseId = `${props.baseId}-${props.node.id}`;
+  const { api } = useAPI();
+  // Listed (artifacts experiment only) by App's loader; empty or undefined otherwise.
+  const entrypoints = useMcpAppEntrypoints(props.workspaceId);
 
   // Content container class comes from tab registry - each tab defines its own padding/overflow
   const tabsetContentClassName = cn(
@@ -742,6 +747,13 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
               creatingSideChat={props.creatingSideChat}
               autoFocus={props.launcherAutoFocusTabsetId === props.node.id}
               onAutoFocusConsumed={props.onLauncherAutoFocusConsumed}
+              entrypoints={entrypoints}
+              onOpenEntrypoint={(entrypoint, isCurrent) =>
+                // Like a tool: the app tab replaces this New tab (or the open one is focused).
+                openMcpAppEntrypointInNewTab(api, props.workspaceId, entrypoint, isCurrent, (tab) =>
+                  props.setLayout((prev) => openToolFromNewTab(prev, props.node.id, tab))
+                )
+              }
             />
           </div>
         )}
