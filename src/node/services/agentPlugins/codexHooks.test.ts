@@ -120,6 +120,48 @@ describe("loadPluginCodexHooks", () => {
     expect(warnings).toHaveLength(1);
   });
 
+  test("bounds the work for a pointer: entries, repeated files and hook count", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-bounds");
+    const many = { hooks: { Stop: [{ hooks: Array.from({ length: 300 }, () => scan) }] } };
+    const plugin = await writePlugin(
+      tmp.path,
+      { "hooks/one.json": { hooks: { Stop: [{ hooks: [scan] }] } }, "hooks/many.json": many },
+      { "com.openai": { hooks: Array.from({ length: 1000 }, () => "./hooks/one.json") } }
+    );
+    const withPointer = (hooks: unknown[]) => ({
+      rootPath: plugin.rootPath,
+      openai: readOpenAIExtension({ extensions: { "com.openai": { hooks } } }).extension,
+      openaiManifestPath: "plugin.json",
+    });
+    // The same file repeated is read once.
+    expect((await loadPluginCodexHooks(plugin)).hooks).toHaveLength(1);
+    // Only the first 32 entries are read.
+    const inline = { hooks: { Stop: [{ hooks: [scan] }] } };
+    const fromEntries = await loadPluginCodexHooks(withPointer(Array(40).fill(inline)));
+    expect(fromEntries.hooks).toHaveLength(32);
+    // At most 256 hooks per plugin.
+    const { hooks, warnings } = await loadPluginCodexHooks(withPointer(["./hooks/many.json"]));
+    expect(hooks).toHaveLength(256);
+    expect(warnings).toEqual(["More than 256 hooks; ignoring the rest"]);
+  });
+
+  test("bounds the warnings of invalid pointer entries and invalid groups", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-warning-bounds");
+    const invalidGroups = { hooks: { Stop: Array<number>(1000).fill(1) } };
+    const plugin = await writePlugin(
+      tmp.path,
+      { "hooks/bad.json": invalidGroups },
+      { "com.openai": { hooks: ["./hooks/bad.json", ...Array<number>(100_000).fill(1)] } }
+    );
+
+    const { warnings } = await loadPluginCodexHooks(plugin);
+
+    // Discovery's readOpenAIExtension drops the 100,000 invalid raw entries, so the loader sees
+    // one entry. Its 1000 invalid groups: 50 warnings are kept, plus a summary of the rest.
+    expect(warnings).toHaveLength(51);
+    expect(warnings.at(-1)).toBe("950 more hook warnings not shown");
+  });
+
   test("a hooks file path cannot take an inline source's hook keys", async () => {
     using tmp = new DisposableTempDir("codex-hooks-key-collision");
     const document = { hooks: { Stop: [{ hooks: [scan] }] } };

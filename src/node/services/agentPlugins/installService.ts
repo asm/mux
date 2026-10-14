@@ -2105,6 +2105,8 @@ export class AgentPluginInstallService {
         warnings
       );
       const hook = this.collectHook(plugin);
+      const codexHooks = await loadPluginCodexHooks(plugin);
+      warnings.push(...codexHooks.warnings);
       const openaiInterface = await interfaceSummary(plugin, warnings);
       const agents = (await this.collectAgentFiles(plugin.agentsDir)).map((agent) => agent.name);
       const workflows = await this.collectComponentFiles(plugin.workflowsDir, ".js");
@@ -2135,6 +2137,7 @@ export class AgentPluginInstallService {
         skills,
         mcpServers,
         ...(hook !== undefined ? { hook } : {}),
+        codexHooks: codexHooks.hooks,
         agents,
         workflows,
         slashCommands,
