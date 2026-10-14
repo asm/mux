@@ -1,6 +1,6 @@
 import { ContextManagementService } from "./contextManagement/contextManagementService";
 import { eventSpine } from "./events/eventSpine";
-import { runMessageSendHooks } from "./agentPlugins/promptHooks";
+import { runMessageSendHooks, runTurnStopHooks } from "./agentPlugins/promptHooks";
 import { mock } from "bun:test";
 import { EventEmitter } from "events";
 
@@ -165,6 +165,9 @@ export function createAgentSessionAIServiceFake(
       (workspaceId: string, input: Parameters<typeof runMessageSendHooks>[2]) =>
         runMessageSendHooks(eventSpine, workspaceId, input)
     ),
+    runTurnStopHooks: mock((workspaceId: string, input: Parameters<typeof runTurnStopHooks>[2]) =>
+      runTurnStopHooks(eventSpine, workspaceId, input)
+    ),
     ...createStreamLifecycleMocks(),
     streamMessage: mock<AgentSessionAIService["streamMessage"]>(() =>
       Promise.resolve(
@@ -193,6 +196,7 @@ export interface AgentSessionHarnessOptions extends Pick<
   | "autoModelRouter"
   | "hasExternalSendPreflight"
   | "hasExternalManualSendPreflight"
+  | "callerOwnsTurnEnd"
 > {
   workspaceId: string;
   contextManagement?: ContextManagementService;
@@ -304,6 +308,7 @@ export async function createAgentSessionHarness(
     autoModelRouter: options.autoModelRouter,
     hasExternalSendPreflight: options.hasExternalSendPreflight,
     hasExternalManualSendPreflight: options.hasExternalManualSendPreflight,
+    callerOwnsTurnEnd: options.callerOwnsTurnEnd,
   });
 
   const events: WorkspaceChatMessage[] = [];

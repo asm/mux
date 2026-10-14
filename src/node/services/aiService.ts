@@ -1,10 +1,16 @@
 import { createAssistantMessageId } from "@/node/services/utils/messageIds";
-import { eventSpine, type RequestAssemblySnapshot } from "./events/eventSpine";
+import {
+  eventSpine,
+  type RequestAssemblySnapshot,
+  type TurnStopContext,
+} from "./events/eventSpine";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
 import {
   runMessageSendHooks,
+  runTurnStopHooks,
   type MessageSendHookInput,
   type MessageSendHookOutcome,
+  type TurnStopHookOutcome,
 } from "./agentPlugins/promptHooks";
 import * as path from "path";
 import { EventEmitter } from "events";
@@ -513,6 +519,14 @@ export class AIService extends EventEmitter {
     input: MessageSendHookInput
   ): Promise<MessageSendHookOutcome> {
     return runMessageSendHooks(eventSpine, workspaceId, input);
+  }
+
+  /** Run the turn.stop prompt-hook chain for one finished turn (fail-open). */
+  runTurnStopHooks(
+    workspaceId: string,
+    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive">
+  ): Promise<TurnStopHookOutcome> {
+    return runTurnStopHooks(eventSpine, workspaceId, input);
   }
 
   releaseMockStreamStartGate(workspaceId: string): void {
