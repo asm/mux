@@ -28,6 +28,7 @@ import { EventEmitter } from "node:events";
 import type { Tool } from "ai";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { log } from "@/node/services/log";
+import { getErrorMessage } from "@/common/utils/errors";
 
 // ---------------------------------------------------------------------------
 // Observer events (read-only fan-out)
@@ -109,10 +110,30 @@ export interface CompactionPrepareContext {
   readonly reason: "on-send" | "mid-stream" | "continuous-eager";
 }
 
+/**
+ * Why Xum is sending a message (prompt-hook input). Derived by AgentSession from the send's own
+ * provenance signals (see resolveMessageSendOrigin).
+ */
+export type MessageSendOrigin = "user" | "task" | "goal" | "plan-review" | "system";
+
+/**
+ * `message.send` (the Codex UserPromptSubmit event): middleware sees each new message before Xum
+ * saves it. A compaction request's own prompt never reaches it (only texts queued behind it). It
+ * cannot rewrite the text (Codex hooks cannot either); it may block the send.
+ */
+export interface MessageSendContext {
+  readonly workspaceId: string;
+  readonly origin: MessageSendOrigin;
+  readonly text: string;
+  /** Set to refuse the send. useBefore skips the rest of the chain (first block wins). */
+  blocked?: { pluginName: string; reason: string };
+}
+
 export interface WaterfallPointMap {
   "tool.execute": ToolExecuteContext;
   "request.assemble": RequestAssembleContext;
   "compaction.prepare": CompactionPrepareContext;
+  "message.send": MessageSendContext;
 }
 
 export type WaterfallNext = () => Promise<void>;
@@ -131,7 +152,7 @@ interface Registration {
   preservesToolset: boolean;
 }
 
-/** Duck-check for contexts that support blocking (currently tool.execute). */
+/** Duck-check for contexts that support blocking (tool.execute, message.send). */
 function isBlocked(ctx: unknown): boolean {
   return (
     typeof ctx === "object" &&
@@ -238,7 +259,20 @@ export class EventSpine {
     return this.use(
       point,
       async (ctx, next) => {
-        await callback(ctx);
+        if (point === "message.send") {
+          // message.send consumers are independent plugin guards: one that throws is logged and
+          // skipped, so it cannot end the chain before a later plugin's block. Isolated here
+          // because only the spine dispatches per consumer; runMessageSendHooks sees one chain.
+          try {
+            await callback(ctx);
+          } catch (error) {
+            log.warn("Prompt hooks: a message.send consumer failed; running the next one", {
+              error: getErrorMessage(error),
+            });
+          }
+        } else {
+          await callback(ctx);
+        }
         if (!isBlocked(ctx)) {
           await next();
         }

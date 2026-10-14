@@ -21,7 +21,8 @@ import type { AIService } from "./aiService";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { PreparedStreamMessage } from "./turnRequestBuilder";
-import type { RequestAssemblySnapshot } from "./events/eventSpine";
+import type { MessageSendOrigin, RequestAssemblySnapshot } from "./events/eventSpine";
+import type { MessageSendHookInput, MessageSendHookOutcome } from "./agentPlugins/promptHooks";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import {
   isProviderEligibleMessage,
@@ -258,6 +259,7 @@ import {
   inheritOpenWorkspaceTurnMetadata,
   computeKeepRecentTailStamp,
   isCompactionRequestMetadata,
+  type CompactionRequestMetadata,
 } from "./contextManagement/compactionRequests";
 import {
   RetryManager,
@@ -488,6 +490,96 @@ function stripGoalInterventionPolicy(options: SendMessageOptions): SendMessageOp
   const streamOptions: SendMessageOptions = { ...options };
   delete streamOptions.goalInterventionPolicy;
   return streamOptions;
+}
+
+/**
+ * Origin a message.send prompt hook sees, derived from the send's own provenance (first match
+ * wins):
+ * - plan-review: plan-review feedback metadata.
+ * - goal: goal-loop turns (goalKind / goalContinuation, sub-agent goal task turns).
+ * - task: TaskService task turns (taskTurnKind), delegated workspace turns, and automatic
+ *   agent-attributed rows that are not synthetic (sub-agent briefs).
+ * - system: every other synthetic or automatic send (auto-resume, compaction follow-ups,
+ *   bash-monitor wakes, workflow continuations, parent wakes with child reports, heartbeats).
+ * - user: everything else (typed messages, edits, queued user messages).
+ */
+function resolveMessageSendOrigin(
+  muxMetadata: unknown,
+  internal: SendMessageInternalOptions | undefined,
+  acceptanceOrigin: TurnAcceptanceOrigin
+): MessageSendOrigin {
+  if (carriesPlanReviewMetadata(muxMetadata)) return "plan-review";
+  const taskTurnKind = internal?.taskTurnKind;
+  if (
+    internal?.goalKind != null ||
+    internal?.goalContinuation === true ||
+    taskTurnKind === "goal_continuation" ||
+    taskTurnKind === "goal_budget_limit"
+  )
+    return "goal";
+  const metadataType =
+    typeof muxMetadata === "object" && muxMetadata !== null && "type" in muxMetadata
+      ? muxMetadata.type
+      : undefined;
+  if (taskTurnKind != null || metadataType === "workspace-turn-task") return "task";
+  if (
+    acceptanceOrigin === "automatic" &&
+    internal?.agentInitiated === true &&
+    internal.synthetic !== true
+  )
+    return "task";
+  if (internal?.synthetic === true || acceptanceOrigin === "automatic") return "system";
+  return "user";
+}
+
+/**
+ * The user-authored text a compaction request carries, for the message.send hooks: the inline
+ * `/compact` follow-up and the texts queued behind the request. The compaction prompt itself
+ * never reaches the hooks. A manual request's follow-up is checked here, where a block can still
+ * stop the whole send: it later dispatches as an automatic send, which no plugin may block.
+ * Automatic requests (mid-stream, idle, heartbeat) carry no user text in their follow-up.
+ */
+function compactionTextForSendHooks(
+  muxMetadata: CompactionRequestMetadata,
+  internal: SendMessageInternalOptions | undefined,
+  manual: boolean
+): string | undefined {
+  const followUpText = manual ? compactionFollowUpPrompt(muxMetadata) : undefined;
+  const batchedText = internal?.textBatchedBehindCompaction;
+  // Undefined means no user content at all. Attachment-only content is content: it reaches the
+  // hooks with empty text, like a direct attachment-only send (Codex PRRT_kwDOPxxmWM6rZqyv).
+  if (followUpText === undefined && batchedText === undefined) return undefined;
+  return [followUpText, batchedText]
+    .filter((text): text is string => typeof text === "string" && text.trim().length > 0)
+    .join("\n");
+}
+
+/**
+ * A compaction request's follow-up as the redispatch will send it (dispatchPendingFollowUpOnce):
+ * review notes are formatted into the prompt, so a review-only follow-up is a real prompt and
+ * the hooks see every review. Same precedence as getCompactionFollowUpContent (legacy requests
+ * use continueMessage).
+ */
+function compactionFollowUpPrompt(muxMetadata: CompactionRequestMetadata): string | undefined {
+  const followUp = muxMetadata.parsed.followUpContent ?? muxMetadata.parsed.continueMessage;
+  if (followUp == null) return undefined;
+  const text: unknown = followUp.text;
+  const hasText = typeof text === "string" && text.trim().length > 0;
+  const hasReviews = (followUp.reviews?.length ?? 0) > 0;
+  // Legacy continueMessage follow-ups carried attachments as imageParts.
+  const files: unknown =
+    "fileParts" in followUp
+      ? followUp.fileParts
+      : "imageParts" in followUp
+        ? followUp.imageParts
+        : undefined;
+  const hasFiles = Array.isArray(files) && files.length > 0;
+  // A follow-up with no text, reviews or files sends nothing the hooks could check.
+  if (!hasText && !hasReviews && !hasFiles) return undefined;
+  return prepareUserMessageForSend({
+    text: typeof text === "string" ? text : "",
+    reviews: followUp.reviews,
+  }).finalText;
 }
 
 function getGoalStreamOriginKind(input: {
@@ -838,6 +930,13 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   captureRequestAssemblySnapshot?(
     workspaceId: string
   ): Promise<Result<RequestAssemblySnapshot, SendMessageError>>;
+  /** Whether any message.send hook is registered (lets a send skip work done only for hooks). */
+  hasMessageSendHooks?(): boolean;
+  /** The message.send prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
+  runMessageSendHooks?(
+    workspaceId: string,
+    input: MessageSendHookInput
+  ): Promise<MessageSendHookOutcome>;
   resolveXumToolScopeForWorkspace?(
     metadata: WorkspaceMetadata,
     runtime: Runtime,
@@ -1017,6 +1116,12 @@ interface SendMessageInternalOptions {
    * wakes run as their own turn instead; mid-stream forcing still protects the context limit.
    */
   skipOnSendCompaction?: boolean;
+  /**
+   * Texts sent after a queued compaction request and batched into it (MessageQueue joins them
+   * into the request's message). The message.send prompt hooks run on these texts only: the
+   * compaction prompt never reaches them, but separately sent user text must.
+   */
+  textBatchedBehindCompaction?: string;
   /**
    * Task-attempt obligation for this send (see TurnAdmissionToken): notified of the coordinator's
    * admission inside the synchronous prepare callback. Its staleness is already composed into
@@ -4352,6 +4457,36 @@ export class AgentSession {
     }
   }
 
+  /**
+   * Run the message.send prompt hooks for this message. A compaction request's own text never
+   * reaches them, only the user text it carries (compactionTextForSendHooks).
+   *
+   * Only a send a person made (typed, edited, queued, plan-review feedback) can be blocked.
+   * Automatic senders (goals, tasks, wakes, follow-ups) retry a refused send, so a block would
+   * loop: their sends run the whole chain, keep the hooks' context and ignore every block.
+   */
+  private async runPluginSendHooks(
+    message: string,
+    muxMetadata: unknown,
+    internal: SendMessageInternalOptions | undefined,
+    acceptanceOrigin: TurnAcceptanceOrigin
+  ): Promise<MessageSendHookOutcome> {
+    const canBlock = internal?.synthetic !== true && acceptanceOrigin === "manual";
+    const hookText = isCompactionRequestMetadata(muxMetadata)
+      ? compactionTextForSendHooks(muxMetadata, internal, canBlock)
+      : message;
+    if (this.aiService.runMessageSendHooks == null || hookText == null) {
+      return { kind: "none" };
+    }
+    const outcome = await this.aiService.runMessageSendHooks(this.workspaceId, {
+      text: hookText,
+      origin: resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin),
+      canBlock,
+    });
+    assert(canBlock || outcome.kind !== "blocked", "a send no plugin may refuse was blocked");
+    return outcome;
+  }
+
   private async prepareMessage(
     message: string,
     options: (SendMessageOptions & { fileParts?: FilePart[] }) | undefined,
@@ -4643,6 +4778,55 @@ export class AgentSession {
       return refuseBeforeAcceptance(
         createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
       );
+
+    // A client retry of an accepted send (same send ids after a lost response) adds nothing:
+    // the accepted row wins over anything the hooks decide.
+    const sendIdsAlreadyAccepted = async (): Promise<boolean> => {
+      if (sendIdentities.length === 0) return false;
+      const known = await this.historyService.decideSendIds(this.workspaceId, sendIdentities);
+      return known.success && this.settleKnownSendIds(known.data, attempt)?.success === true;
+    };
+    // Checked before the hooks run, so their side effects (logs, notifications) do not repeat
+    // for such a retry. History is read only when hooks exist.
+    if (this.aiService.hasMessageSendHooks?.() === true && (await sendIdsAlreadyAccepted())) {
+      return Ok(undefined);
+    }
+
+    // Prompt hooks (message.send): before the pricing gate (its rejected-input row), routing,
+    // @file snapshots, edit truncation and every history write, so a block leaves history
+    // unchanged.
+    const pluginSend = await this.runPluginSendHooks(
+      message,
+      options?.muxMetadata,
+      internal,
+      attempt.acceptanceOrigin
+    );
+    if (await cancelBeforeAcceptance()) {
+      return Ok(undefined);
+    }
+    // The hooks can take seconds: recheck admission before acting on their outcome. A send whose
+    // admission went stale meanwhile must get the stale refusal, not a permanent plugin block.
+    if (isAdmissionStale())
+      return refuseBeforeAcceptance(
+        createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
+      );
+    if (pluginSend.kind === "blocked") {
+      // The original send can be accepted while the hooks ran (a retry racing it): its block
+      // must not report failure for a message history now holds.
+      if (await sendIdsAlreadyAccepted()) return Ok(undefined);
+      const blockedError: SendMessageError = {
+        type: "plugin_blocked",
+        plugin: pluginSend.pluginName,
+        reason: pluginSend.reason,
+      };
+      // A direct send shows the reason in its composer toast and keeps the draft. A queued send
+      // has no caller UI, so the reason goes into the transcript (completePreparation restores
+      // the queued input to the composer).
+      if (attempt.queued) {
+        this.emitChatEvent(createStreamErrorMessage(buildStreamErrorEventData(blockedError)));
+      }
+      return refuseBeforeAcceptance(blockedError);
+    }
 
     // Last-line-of-defence pricing gate: every dispatch path (initial sends,
     // sendQueuedMessages, dispatchPendingFollowUp,

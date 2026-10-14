@@ -1,6 +1,11 @@
 import { createAssistantMessageId } from "@/node/services/utils/messageIds";
 import { eventSpine, type RequestAssemblySnapshot } from "./events/eventSpine";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
+import {
+  runMessageSendHooks,
+  type MessageSendHookInput,
+  type MessageSendHookOutcome,
+} from "./agentPlugins/promptHooks";
 import * as path from "path";
 import { EventEmitter } from "events";
 import * as fs from "fs/promises";
@@ -496,6 +501,18 @@ export class AIService extends EventEmitter {
       journal: this.durableEventJournalFor(workspaceId),
     });
     return Ok(eventSpine.captureRequestAssembly(workspaceId));
+  }
+
+  /** Run the message.send prompt-hook chain for one new message (fail-open). */
+  hasMessageSendHooks(): boolean {
+    return eventSpine.hasMiddleware("message.send");
+  }
+
+  runMessageSendHooks(
+    workspaceId: string,
+    input: MessageSendHookInput
+  ): Promise<MessageSendHookOutcome> {
+    return runMessageSendHooks(eventSpine, workspaceId, input);
   }
 
   releaseMockStreamStartGate(workspaceId: string): void {
