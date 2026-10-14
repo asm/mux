@@ -179,6 +179,8 @@ export interface TurnStopContext {
   readonly messageId: string;
   /** The workspace path (Codex common field `cwd`), when Xum could resolve it. */
   readonly cwd?: string;
+  /** The model the turn streamed with (Codex common field `model`). */
+  readonly model?: string;
   /** The reply's trailing text, or null when the turn ended on a tool call or without text. */
   readonly lastAssistantMessage: string | null;
   /** True when Stop already continued this turn (Codex stop_hook_active). */

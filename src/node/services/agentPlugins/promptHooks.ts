@@ -134,7 +134,10 @@ export type TurnStopHookOutcome = { kind: "none" } | { kind: "continue"; prompt:
 export async function runTurnStopHooks(
   spine: EventSpine,
   workspaceId: string,
-  input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive" | "cwd">
+  input: Pick<
+    TurnStopContext,
+    "messageId" | "lastAssistantMessage" | "stopHookActive" | "cwd" | "model"
+  >
 ): Promise<TurnStopHookOutcome> {
   if (!spine.hasMiddlewareFor("turn.stop", workspaceId)) return { kind: "none" };
   const ctx: TurnStopContext = { workspaceId, ...input, continueReasons: [] };

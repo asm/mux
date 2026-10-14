@@ -117,7 +117,7 @@ export function registerCodexPluginHooks(
           for (const hook of prompt) {
             const output = await invoke(
               hook,
-              { prompt: ctx.text },
+              { ...promptEventFields(), prompt: ctx.text },
               "UserPromptSubmit",
               registration,
               parseUserPromptSubmitOutput,
@@ -154,6 +154,7 @@ export function registerCodexPluginHooks(
             const output = await invoke(
               hook,
               {
+                ...promptEventFields(ctx.messageId, ctx.model),
                 stop_hook_active: ctx.stopHookActive,
                 last_assistant_message: ctx.lastAssistantMessage,
               },
@@ -240,6 +241,29 @@ async function runToolHooks(
   if (ctx.executed) await runPostToolHooks(ctx, post, view, toolEvent, notes, registration, call);
   // Model-visible tool context rides on the tool result (logged in chat.jsonl with it).
   if (notes.length > 0 && ctx.executed) ctx.result = annotate(ctx.result, notes, registration);
+}
+
+/**
+ * Codex's common fields for UserPromptSubmit and Stop (hooks/src/events/user_prompt_submit.rs,
+ * stop.rs; Codex PRRT_kwDOPxxmWM6rN7nt). Stop's `turn_id` is the finished turn's assistant
+ * message ID, and its `model` the one the turn streamed with. `model` is Xum's provider-qualified
+ * string (`openai:gpt-5.2`, gateway prefixes kept), as on tool events: trusted guards match on
+ * it, so it must not change form in place. Codex sends the bare name; that parity needs a new
+ * field (tracked on #6166, Codex security review PRRT_kwDOPxxmWM6scwO-). UserPromptSubmit has neither yet:
+ * its hooks run before the turn ID exists and before auto routing and fallback pick the model, so
+ * any value there could be wrong, and a guard must not act on a wrong model (Codex
+ * PRRT_kwDOPxxmWM6sZTZ2, PRRT_kwDOPxxmWM6sZTZ9; tracked on #6166).
+ * `permission_mode` is always "bypassPermissions": Xum asks no tool approval, and Codex sends
+ * that value for the same policy (it never sends "plan"). `transcript_path` is null: chat.jsonl
+ * is not a Codex transcript, and Codex allows null.
+ */
+function promptEventFields(turnId?: string, model?: string): Record<string, unknown> {
+  return {
+    ...(turnId !== undefined ? { turn_id: turnId } : {}),
+    ...(model !== undefined ? { model } : {}),
+    permission_mode: "bypassPermissions",
+    transcript_path: null,
+  };
 }
 
 /**

@@ -37,7 +37,10 @@ afterEach(async () => {
   }
 });
 
-type StopCall = Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive">;
+type StopCall = Pick<
+  TurnStopContext,
+  "messageId" | "lastAssistantMessage" | "stopHookActive" | "model"
+>;
 
 function addConsumer(decide: (ctx: TurnStopContext) => void, calls?: StopCall[]): void {
   unregisters.push(
@@ -48,6 +51,7 @@ function addConsumer(decide: (ctx: TurnStopContext) => void, calls?: StopCall[])
           messageId: ctx.messageId,
           lastAssistantMessage: ctx.lastAssistantMessage,
           stopHookActive: ctx.stopHookActive,
+          model: ctx.model,
         });
         decide(ctx);
       },
@@ -66,6 +70,8 @@ async function setup(
     ending?: (turn: number) => "completed" | "aborted";
     /** Routing record the prepared request streams with (stream-start). */
     streamRouting?: (turn: number) => AutoModelRoutingRecord | undefined;
+    /** A refusal fallback answered turn N with this model (stream-end metadata). */
+    fallbackModel?: (turn: number) => string | undefined;
     /** Runs while turn N streams, before it ends. */
     whileStreaming?: (turn: number, h: AgentSessionHarness) => void;
     session?: Omit<AgentSessionHarnessOptions, "workspaceId" | "aiEmitter" | "aiServiceOverrides">;
@@ -106,7 +112,7 @@ async function setup(
                 streamEnd: {
                   type: "stream-end",
                   workspaceId,
-                  metadata: { model },
+                  metadata: endMetadata(input.fallbackModel?.(turns)),
                   parts: input.parts?.(turns) ?? [{ type: "text", text: `reply ${turns}` }],
                 },
               };
@@ -117,6 +123,13 @@ async function setup(
   holder.h = h;
   harnesses.push(h);
   return { h, streams: () => turns, requests };
+}
+
+/** Stream-end metadata: the turn's model, or a refusal fallback that answered instead. */
+function endMetadata(fallbackModel: string | undefined) {
+  return fallbackModel === undefined
+    ? { model }
+    : { model: fallbackModel, modelFallback: { requestedModel: model, refusedModels: [model] } };
 }
 
 /** Wait until no turn runs and nothing is queued (each continuation is its own turn). */
@@ -200,6 +213,8 @@ describe("turn.stop", () => {
       messageId: "a1",
       lastAssistantMessage: "reply 1",
       stopHookActive: false,
+      // Codex `model` (PRRT_kwDOPxxmWM6rN7nt): the model the turn streamed with.
+      model,
     });
 
     // A new message from the user starts a new turn: Stop may continue it again.
@@ -210,6 +225,33 @@ describe("turn.stop", () => {
       ...[false, true, true, true],
     ]);
     expect(streams()).toBe(8);
+  });
+
+  test("the Stop hooks see the model that answered after a refusal fallback", async () => {
+    // Codex PRRT_kwDOPxxmWM6sbewj: only the stream-end reports the fallback model.
+    const calls: StopCall[] = [];
+    addConsumer(() => undefined, calls);
+    const { h } = await setup({
+      fallbackModel: (turn) => (turn === 1 ? "anthropic:claude-haiku-4-5" : undefined),
+    });
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+
+    expect(calls.map((call) => call.model)).toEqual(["anthropic:claude-haiku-4-5"]);
+  });
+
+  test("without a fallback the Stop hooks see the raw model the turn streamed with", async () => {
+    // Tool events send the raw provider-qualified string (gateway prefix kept): Stop matches it.
+    const calls: StopCall[] = [];
+    addConsumer(() => undefined, calls);
+    const gateway = "mux-gateway:anthropic/claude-haiku-4-5";
+    const { h } = await setup();
+
+    await h.session.sendMessage("fix the tests", { ...options, model: gateway });
+    await settle(h);
+
+    expect(calls.map((call) => call.model)).toEqual([gateway]);
   });
 
   test("one consumer's halt overrides every continuation", async () => {

@@ -1052,7 +1052,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   /** The turn.stop prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
   runTurnStopHooks?(
     workspaceId: string,
-    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive">
+    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive" | "model">
   ): Promise<TurnStopHookOutcome>;
   resolveXumToolScopeForWorkspace?(
     metadata: WorkspaceMetadata,
@@ -1380,6 +1380,22 @@ interface PreparationAttempt {
   evaluatorGoalCostUsd?: number;
   /** The send ids this attempt carries: pending (getPendingSendIds) until the attempt settles. */
   sendIdentities?: readonly SendIdentity[];
+}
+
+/**
+ * The model the Stop hooks see, in the form tool events use: the raw provider-qualified string
+ * the turn streamed with (gateway prefixes kept), so one guard matches both events. After a
+ * refusal fallback only the stream-end payload names the model that answered (Codex
+ * PRRT_kwDOPxxmWM6sbewj); it carries the metadata identity, which drops a non-Coder gateway
+ * prefix. Direct and Coder models read the same in both forms.
+ */
+function stopHookModel(
+  payload: StreamEndEvent,
+  provenance: StopContinuationProvenance
+): string | undefined {
+  return payload.metadata.modelFallback == null
+    ? (provenance.streamModel ?? payload.metadata.model)
+    : payload.metadata.model;
 }
 
 export class AgentSession {
@@ -10607,6 +10623,7 @@ export class AgentSession {
       messageId: payload.messageId,
       lastAssistantMessage: lastAssistantText(payload.parts),
       stopHookActive: this.stopHookContinuations > 0,
+      model: stopHookModel(payload, provenance),
     });
     if (outcome.kind === "none" || options == null) {
       this.stopHookContinuations = 0;

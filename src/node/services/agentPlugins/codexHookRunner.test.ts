@@ -439,6 +439,7 @@ describe("PreToolUse", () => {
     const fields = {
       id: "call-1",
       turn: "assistant-1",
+      // Xum's provider-qualified string (Codex sends the bare name; see promptEventFields).
       model: "openai:gpt-4o",
       mode: "bypassPermissions",
     };
@@ -827,6 +828,30 @@ describe("PostToolUse", () => {
 });
 
 describe("UserPromptSubmit and Stop", () => {
+  test("prompt and Stop events carry Codex's common fields", async () => {
+    // Codex PRRT_kwDOPxxmWM6rN7nt (user_prompt_submit.rs, stop.rs).
+    const input = { turn: "${turn_id}", model: "${model}", mode: "${permission_mode}" };
+    const { spine, calls } = setup(
+      [hook("UserPromptSubmit", { input }), hook("Stop", { input })],
+      () => null
+    );
+
+    await runMessageSendHooks(spine, workspaceId, { text: "fix", origin: "user", canBlock: true });
+    await runTurnStopHooks(spine, workspaceId, {
+      messageId: "assistant-1",
+      lastAssistantMessage: "done",
+      stopHookActive: false,
+      model: "openai:gpt-4o",
+    });
+
+    expect(calls).toEqual([
+      // A prompt hook runs before the turn has an ID and before routing picks its model:
+      // both expand to null rather than to a value that could be wrong.
+      { turn: null, model: null, mode: "bypassPermissions" },
+      { turn: "assistant-1", model: "openai:gpt-4o", mode: "bypassPermissions" },
+    ]);
+  });
+
   test("a Stop hook's stopReason reaches the user, never the model", async () => {
     // Codex PRRT_kwDOPxxmWM6rgpoD (hooks/src/events/stop.rs: a Stop entry).
     const { spine, notices } = setup([hook("Stop")], () =>
