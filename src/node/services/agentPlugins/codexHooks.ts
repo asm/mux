@@ -65,8 +65,6 @@ const MAX_HOOK_POINTER_ENTRIES = 32;
 const MAX_PLUGIN_HOOKS = 256;
 /** Warnings kept per plugin: each file can hold ~100k invalid groups, each one a warning. */
 const MAX_HOOK_WARNINGS = 50;
-/** Codex default handler timeout, in seconds. */
-export const DEFAULT_HOOK_TIMEOUT_SECONDS = 600;
 
 /** A parsed hook; the trust review state is added by pluginHookTrust.ts. */
 export type PluginHookDefinition = Omit<AgentPluginHook, "review">;
@@ -305,8 +303,7 @@ function parseHandler(
         server,
         tool,
         input: input ?? {},
-        timeoutSeconds:
-          typeof timeout === "number" ? Math.max(1, timeout) : DEFAULT_HOOK_TIMEOUT_SECONDS,
+        ...(typeof timeout === "number" ? { timeoutSeconds: Math.max(1, timeout) } : {}),
         ...(typeof statusMessage === "string" ? { statusMessage } : {}),
       };
     }

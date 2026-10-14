@@ -2,10 +2,12 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
-import { tool } from "ai";
+import { jsonSchema, tool, type Tool } from "ai";
 import { z } from "zod";
 import { withHooks } from "./withHooks";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { eventSpine } from "@/node/services/events/eventSpine";
+import { sanitizeMCPToolsForOpenAI } from "@/common/utils/tools/schemaSanitizer";
 
 describe("withHooks", () => {
   let tempDir: string;
@@ -323,5 +325,61 @@ exit 0
     expect(result.value).toBe(42);
     expect(result.hook_output).toContain("post ran:");
     expect(result.hook_output).toContain('"value":42');
+  });
+
+  test("hook rewrites see the MCP tool's full schema, not the OpenAI-sanitized one", async () => {
+    const schema = {
+      type: "object" as const,
+      properties: { name: { type: "string" as const, minLength: 1 } },
+      required: ["name"],
+    };
+    const mcpTool = tool({
+      description: "MCP tool",
+      inputSchema: jsonSchema(schema),
+      execute: () => Promise.resolve({ ok: true }),
+    }) as Tool;
+    const { scan: sanitized } = sanitizeMCPToolsForOpenAI({ scan: mcpTool });
+    const seen: unknown[] = [];
+    const unregister = eventSpine.useBefore("tool.execute", (ctx) => {
+      seen.push(ctx.inputJsonSchema?.());
+    });
+    try {
+      const wrapped = withHooks("scan", sanitized, {
+        runtime,
+        cwd: tempDir,
+        runtimeTempDir: tempDir,
+        workspaceId: "test-ws",
+      });
+      await wrapped.execute!({ name: "a" }, {} as never);
+    } finally {
+      unregister();
+    }
+    expect(seen).toEqual([schema]);
+  });
+
+  test("a post-block keeps the model-visible result: the hook's feedback replaces the output", async () => {
+    // Codex PRRT_kwDOPxxmWM6r6NnK: the pipeline reports a post-block to nested callers, but an
+    // ordinary tool call still returns the feedback exactly as before.
+    const feedback = { error: "[plugin:guard] secrets stay out" };
+    const unregister = eventSpine.use(
+      "tool.execute",
+      async (ctx, next) => {
+        await next();
+        ctx.result = feedback;
+        ctx.postBlocked = true;
+      },
+      { workspaceId: "post-block-ws" }
+    );
+    try {
+      const wrapped = withHooks(
+        "test_tool",
+        createTestTool(() => Promise.resolve({ output: "SECRET" })),
+        { runtime, cwd: tempDir, runtimeTempDir: tempDir, workspaceId: "post-block-ws" }
+      );
+      const result: unknown = await wrapped.execute!({ input: "x" }, {} as never);
+      expect(result).toEqual(feedback);
+    } finally {
+      unregister();
+    }
   });
 });

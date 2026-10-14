@@ -70,6 +70,8 @@ export interface ToolExecuteContext {
   args: unknown;
   readonly host: ToolExecutionHost;
   readonly abortSignal?: AbortSignal;
+  /** The tool's input JSON schema, when the caller holds the Tool (validates hook rewrites). */
+  readonly inputJsonSchema?: () => unknown;
   /** Set by the terminal after the tool actually executed. */
   executed: boolean;
   /** Set by the terminal; mutable after next() returns (middleware may augment). */
@@ -80,6 +82,14 @@ export interface ToolExecuteContext {
    * must not call next().
    */
   blocked?: { result: unknown };
+  /**
+   * Set by middleware AFTER the tool ran, when a post hook blocks its result (Codex PostToolUse
+   * `decision: "block"`). The model still sees `result` (the hook's feedback replaces the
+   * output), but a nested caller that runs the tool on its own behalf (mux.load, memory index
+   * authorization) must treat the call as blocked and keep the original output from its caller:
+   * runThroughToolHookPipeline reports it as a block.
+   */
+  postBlocked?: true;
 }
 
 export interface RequestAssembleContext {
