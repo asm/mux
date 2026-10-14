@@ -12,6 +12,7 @@ import type {
   McpAppEntrypoint,
   McpAppOpenEntrypointRequestSchema,
   McpAppModelContextRequestSchema,
+  McpAppWidgetStateRequestSchema,
   McpAppResourceReadRequestSchema,
   McpAppToolCallRequestSchema,
   McpAppToolCallResult,
@@ -29,7 +30,7 @@ import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { isSystemProjectEntry } from "@/common/utils/systemProjects";
 import type { ORPCContext } from "@/node/orpc/context";
 import { buildMcpToolName } from "@/common/utils/tools/mcpToolName";
-import type { McpAppResultRecord } from "./mcpAppResultStore";
+import { mcpAppWidgetStateBindingOf, type McpAppResultRecord } from "./mcpAppResultStore";
 import { displayConnectionKey } from "./mcpServerIdentity";
 
 export type McpAppsContext = Pick<
@@ -159,6 +160,30 @@ function assertMcpAppsEnabled(context: McpAppsContext): void {
   }
 }
 
+/** What a view gets from its result record; without one it opens with tool input only. */
+function viewFieldsOfRecord(record: McpAppResultRecord | null) {
+  if (record === null) {
+    return {
+      resultAvailable: false,
+      result: null,
+      widgetState: null,
+      widgetStateBinding: null,
+      invocation: null,
+    };
+  }
+  return {
+    resultAvailable: record.result !== null,
+    result: record.result,
+    widgetState: record.widgetState ?? null,
+    widgetStateBinding: mcpAppWidgetStateBindingOf(record),
+    invocation: {
+      serverName: record.serverName,
+      toolName: record.toolName,
+      arguments: record.arguments,
+    },
+  };
+}
+
 export async function getMcpAppView(
   context: McpAppsContext,
   input: z.infer<typeof McpAppViewRequestSchema>,
@@ -203,7 +228,6 @@ export async function getMcpAppView(
       input.resourceUri,
       signal !== undefined ? { signal } : undefined
     );
-    const result = record?.result ?? null;
     const boundServerName = record?.serverName ?? input.serverName;
     const approvalProjectPath = await approvalProjectPathOf(
       context,
@@ -214,20 +238,11 @@ export async function getMcpAppView(
       success: true,
       data: {
         ...resource,
-        resultAvailable: result !== null,
-        result,
+        ...viewFieldsOfRecord(record),
         // Taken before the read below: the list read is at least this new.
         approvedDomainsRevision: committedViewDomainsRevision,
         approvedDomains: approvedDomainsIn(context, approvalProjectPath, boundServerName),
         approvalProjectPath,
-        invocation:
-          record !== null
-            ? {
-                serverName: record.serverName,
-                toolName: record.toolName,
-                arguments: record.arguments,
-              }
-            : null,
       },
     };
   } catch (error) {
@@ -394,6 +409,39 @@ export async function updateMcpAppModelContext(
   }
   try {
     await context.mcpServerManager.setMcpAppModelContext(input.workspaceId, record, input.text);
+    return { success: true, data: {} };
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+/**
+ * window.openai.setWidgetState of a view. Like updateMcpAppModelContext, the view's result record
+ * binds the server, and the store refuses a write whose binding is not the current record's.
+ */
+export async function setMcpAppWidgetState(
+  context: McpAppsContext,
+  input: z.infer<typeof McpAppWidgetStateRequestSchema>
+): Promise<Result<Record<string, never>, string>> {
+  assertMcpAppsEnabled(context);
+  const record = await context.mcpServerManager.getMcpAppResult(
+    input.workspaceId,
+    input.toolCallId
+  );
+  if (
+    record === null ||
+    (input.serverName !== record.serverName &&
+      input.serverName !== displayConnectionKey(record.serverName))
+  ) {
+    return { success: false, error: "This view cannot store widget state" };
+  }
+  try {
+    await context.mcpServerManager.setMcpAppWidgetState(
+      input.workspaceId,
+      input.toolCallId,
+      input.binding,
+      input.state
+    );
     return { success: true, data: {} };
   } catch (error) {
     return { success: false, error: getErrorMessage(error) };

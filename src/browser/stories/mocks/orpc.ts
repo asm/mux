@@ -2588,6 +2588,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           data: { approvedDomains: entry.origins, revision: ++mockViewDomainsRevision },
         });
       },
+      setWidgetState: () => Promise.resolve({ success: true as const, data: {} }),
       listViewDomains: () =>
         options.mcpAppViewDomainsListError != null
           ? Promise.reject(new Error(options.mcpAppViewDomainsListError))

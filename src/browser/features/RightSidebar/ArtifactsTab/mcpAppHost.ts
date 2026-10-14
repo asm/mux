@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   MCP_APP_MODEL_CONTEXT_MAX_BYTES,
+  MCP_APP_WIDGET_STATE_MAX_BYTES,
   MCP_APP_READ_URI_MAX_CHARS,
   MCP_APP_TOOL_CALL_WINDOW_MS,
   MCP_APP_TOOL_CALLS_PER_WINDOW,
@@ -64,6 +65,78 @@ const SizeChangedParams = z.object({
   height: z.number().finite().optional(),
 });
 const LogParams = z.object({ level: z.string().max(32).optional(), data: z.unknown().optional() });
+/** xum/widget-state: JSON of at most MCP_APP_WIDGET_STATE_MAX_BYTES (the backend's cap too). */
+const WidgetStateParams = z.object({ state: z.unknown().refine(isStorableWidgetState) });
+
+/**
+ * JSON within the cap, which JSON keeps exactly: no cycle, BigInt, NaN, Infinity, undefined
+ * member, sparse array, array property, Date, Map or other class instance, so the stored state
+ * is what the widget set.
+ *
+ * SECURITY: the value comes from the view by structured clone, which keeps shared references and
+ * cycles, so a small message can stand for a huge or endless JSON text. An iterative walk (no
+ * recursion, so no stack to exhaust) runs first. It gives up after MCP_APP_WIDGET_STATE_MAX_BYTES
+ * units (every node and string character is at least one byte of JSON) or below
+ * WIDGET_STATE_MAX_DEPTH, so JSON.stringify only ever sees a small, shallow value.
+ */
+function isStorableWidgetState(state: unknown): boolean {
+  const value = state ?? null;
+  if (!isBoundedJson(value)) return false;
+  return new TextEncoder().encode(JSON.stringify(value)).length <= MCP_APP_WIDGET_STATE_MAX_BYTES;
+}
+
+/** Deeper widget state is refused: JSON.stringify recurses once per level. */
+const WIDGET_STATE_MAX_DEPTH = 64;
+
+function isBoundedJson(root: unknown): boolean {
+  const pending: Array<{ value: unknown; depth: number }> = [{ value: root, depth: 0 }];
+  let left = MCP_APP_WIDGET_STATE_MAX_BYTES;
+  for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
+    const { value, depth } = next;
+    left -= jsonCost(value);
+    if (left < 0 || depth > WIDGET_STATE_MAX_DEPTH) return false;
+    if (isJsonScalar(value)) continue;
+    const children = jsonChildren(value, left);
+    if (children === null) return false;
+    for (const child of children) pending.push({ value: child, depth: depth + 1 });
+  }
+  return true;
+}
+
+/** At least the bytes `value` takes in JSON, not counting its children. */
+function jsonCost(value: unknown): number {
+  return typeof value === "string" ? value.length + 1 : 1;
+}
+
+function isJsonScalar(value: unknown): boolean {
+  return (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value))
+  );
+}
+
+/**
+ * The members of an array without holes or extra properties, or the keys and members of a plain
+ * object; null for anything else (a number JSON changes, a class instance, a function) or when
+ * it has more members than `left` budget units.
+ */
+function jsonChildren(value: unknown, left: number): unknown[] | null {
+  if (typeof value !== "object" || value === null) return null;
+  if (Array.isArray(value)) return isPlainArray(value, left) ? value : null;
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return null;
+  const entries = Object.entries(value);
+  // Keys are pushed as strings, so their length is spent like any string's.
+  return entries.length > left ? null : entries.flat();
+}
+
+function isPlainArray(value: readonly unknown[], left: number): boolean {
+  if (value.length > left || Object.keys(value).length !== value.length) return false;
+  for (let i = 0; i < value.length; i++) if (!(i in value)) return false;
+  return true;
+}
 const ToolCallParams = z.object({
   name: z.string().min(1).max(256),
   arguments: z.record(z.string(), z.unknown()).optional(),
@@ -186,6 +259,11 @@ export interface McpAppHostOptions {
   /** Store the view's model context; it replaces the previous one ("" clears it). */
   updateModelContext: (text: string) => Promise<void>;
   /**
+   * Keep the view's window.openai widget state (xum/widget-state, sent by mcpAppOpenAiShim.ts)
+   * for the next document of the same view instance. Called in arrival order.
+   */
+  saveWidgetState: (state: unknown) => void;
+  /**
    * Prepare a switch to a mode from availableDisplayModes other than the current one: returns
    * the move, or null when the host cannot show the view in that mode now (the mode stays).
    * A move unmounts this instance, so the host runs it only once the view has its reply.
@@ -199,6 +277,25 @@ export interface McpAppHostOptions {
   onSizeChanged: (size: { width?: number; height?: number }) => void;
   onInitialized: () => void;
   log: (message: string, data?: unknown) => void;
+}
+
+/** notifications/message from the view, into the host's debug log. */
+function logViewMessage(params: unknown, options: Pick<McpAppHostOptions, "log">): void {
+  const parsed = LogParams.safeParse(params);
+  if (parsed.success) options.log(`view log (${parsed.data.level ?? "info"})`, parsed.data.data);
+}
+
+/**
+ * xum/widget-state from the window.openai shim: only the view's own state for its own next
+ * document, so no consent, but capped like the backend.
+ */
+function handleWidgetState(
+  params: unknown,
+  options: Pick<McpAppHostOptions, "saveWidgetState" | "log">
+): void {
+  const parsed = WidgetStateParams.safeParse(params);
+  if (parsed.success) options.saveWidgetState(parsed.data.state);
+  else options.log("dropped widget state that is not JSON or over the size limit");
 }
 
 export function clampMcpAppHeight(height: number): number {
@@ -490,12 +587,12 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         });
         return;
       }
-      case "notifications/message": {
-        const parsed = LogParams.safeParse(params);
-        if (parsed.success)
-          options.log(`view log (${parsed.data.level ?? "info"})`, parsed.data.data);
+      case "xum/widget-state":
+        handleWidgetState(params, options);
         return;
-      }
+      case "notifications/message":
+        logViewMessage(params, options);
+        return;
       default:
         // Unknown notifications have no reply channel; drop them.
         return;

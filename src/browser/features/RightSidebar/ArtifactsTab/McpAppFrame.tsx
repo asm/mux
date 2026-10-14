@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "re
 import { X } from "lucide-react";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
-import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI, type APIClient } from "@/browser/contexts/API";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
@@ -24,6 +24,12 @@ import {
   newMcpAppDocumentNonce,
 } from "./mcpAppDocumentChannel";
 import { mcpAppOpenAiShimScript, type McpAppOpenAiSeed } from "./mcpAppOpenAiShim";
+import {
+  flushOfflineMcpAppWidgetStates,
+  mcpAppWidgetStateSeed,
+  mcpAppWidgetStateTarget,
+  saveMcpAppWidgetState,
+} from "./mcpAppWidgetState";
 import {
   createMcpAppHost,
   declaresFullscreenOnly,
@@ -482,6 +488,24 @@ function useCloseDiscardedDocumentChannel(
   }, [viewDocument, frameMounted]);
 }
 
+/** The widget state a view document starts with; null before the view loaded. */
+function widgetStateSeedOf(
+  workspaceId: string,
+  loaded: Loaded | null,
+  viewDocument: { nonce: string } | null
+): unknown {
+  if (loaded === null) return null;
+  const target = mcpAppWidgetStateTarget(workspaceId, loaded.toolCallId, loaded.view);
+  return mcpAppWidgetStateSeed(viewDocument, target);
+}
+
+/** Widget states saved while Xum reconnected go out with the new client (mcpAppWidgetState.ts). */
+function useFlushOfflineWidgetStates(liveApi: APIClient | null) {
+  useEffect(() => {
+    if (liveApi) flushOfflineMcpAppWidgetStates(liveApi);
+  }, [liveApi]);
+}
+
 export function McpAppFrame(props: {
   workspaceId: string;
   view: McpAppViewRef;
@@ -522,6 +546,7 @@ export function McpAppFrame(props: {
   useEffect(() => {
     apiRef.current = liveApi;
   }, [liveApi]);
+  useFlushOfflineWidgetStates(liveApi);
   // Fetched once per tool call: a reconnect must not fetch it again (a failed refetch replaced a
   // working view with an error). A failed fetch is retried with the next client.
   const viewLoaded = loaded?.toolCallId === toolCallId && loaded.view != null;
@@ -607,13 +632,15 @@ export function McpAppFrame(props: {
   const documentKey = mcpAppViewDocumentKey(current, grant);
   const guard = useFrameNavigationGuard(documentKey);
   const { navigatedRef, leave: leaveDocument } = guard;
-  // The window.openai globals start with this host context (useMcpAppViewDocument).
+  // The window.openai globals start with this host context (useMcpAppViewDocument), and with
+  // this view instance's last widget state (mcpAppWidgetState.ts).
   const viewDocument = useMcpAppViewDocument(documentKey, guard.frameKey, () => ({
     theme,
     displayMode: inline ? "inline" : "fullscreen",
     locale: navigator.language,
     platform: hostPlatform(),
     maxHeight: inline ? inlineMaxHeight() : null,
+    widgetState: widgetStateSeedOf(workspaceId, current, null),
   }));
   const srcDoc = buildMcpAppViewSrcDoc(current, grant, viewDocument);
 
@@ -687,6 +714,13 @@ export function McpAppFrame(props: {
         return result.data;
       },
       // Bound like callTool: the backend attributes the context to the view's result record.
+      // Through the latest client and loaded view; the write outlives this frame.
+      saveWidgetState: (state) =>
+        saveMcpAppWidgetState(
+          apiRef.current,
+          mcpAppWidgetStateTarget(workspaceId, toolCallId, latest.current.result),
+          state
+        ),
       updateModelContext: async (text) => {
         const client = apiRef.current;
         if (client == null) throw new Error("Xum is reconnecting. Try again once it is back.");
