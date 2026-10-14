@@ -2526,7 +2526,9 @@ export class McpOauthService {
     try {
       await this.persistStoreLocked(store);
     } catch (error) {
-      // Store read/repair must never crash the app at startup.
+      // Store read/repair must never crash the app at startup. Keep the in-memory state: the
+      // failed write dropped the cache, and the file still holds what the repair replaces.
+      this.store = store;
       log.warn("[MCP OAuth] Failed to persist store file; continuing with in-memory state", {
         error,
       });
@@ -2540,6 +2542,11 @@ export class McpOauthService {
     await writeFileAtomic(this.storeFilePath, JSON.stringify(store, null, 2), {
       encoding: "utf-8",
       mode: 0o600,
+    }).catch((error: unknown) => {
+      // The caller already changed the cached store: drop it, so the next read reloads the
+      // file. Otherwise a failed sign-out reads as done and a retry would not write it (#6122).
+      this.store = null;
+      throw error;
     });
     // Another process can replace the file right after this write, so a stat here can name
     // its file: reread on the next use instead (the cache is this process's own content).
