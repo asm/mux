@@ -1,13 +1,13 @@
 import { matchesNameBySegmentPrefix } from "@/browser/utils/suggestionMatching";
 import type { SlashSuggestion } from "@/browser/utils/slashCommands/types";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { InvocableSkill } from "@/common/types/agentSkill";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 
 interface InlineSkillSuggestionContext {
   /** The token typed after `$`. Empty string is allowed (just typed `$`). */
   partial: string;
   /** Already-loaded descriptors for current discovery target. */
-  descriptors: AgentSkillDescriptor[];
+  descriptors: InvocableSkill[];
   mcpPrompts?: MCPPromptDescriptor[];
 }
 
@@ -27,6 +27,9 @@ export function getInlineSkillSuggestions(
 ): SlashSuggestion[] {
   const skills = context.descriptors
     .filter((descriptor) => descriptor.userInvocable !== false)
+    // The inline `$` parser reads bare names only, so a qualified suggestion
+    // would be dropped on send.
+    .filter((descriptor) => !descriptor.name.includes(":"))
     .filter((descriptor) => matchesNameBySegmentPrefix(descriptor.name, context.partial))
     .map((descriptor) => ({
       id: `inline-skill:${descriptor.name}`,
