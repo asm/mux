@@ -786,6 +786,8 @@ export const mcpOauth = {
         projectPath: z.string().optional(),
         serverName: z.string(),
         pendingServer: MCPOAuthPendingServerSchema.optional(),
+        // Caller-generated so Cancel can name the flow while the start runs (#6565).
+        flowId: z.string().optional(),
       })
       .strict(),
     output: ResultSchema(
@@ -816,6 +818,8 @@ export const mcpOauth = {
         projectPath: z.string().optional(),
         serverName: z.string(),
         pendingServer: MCPOAuthPendingServerSchema.optional(),
+        // Caller-generated so Cancel can name the flow while the start runs (#6565).
+        flowId: z.string().optional(),
       })
       .strict(),
     output: ResultSchema(
@@ -1023,6 +1027,7 @@ export const projects = {
           projectPath: z.string(),
           serverName: z.string(),
           pendingServer: MCPOAuthPendingServerSchema.optional(),
+          flowId: z.string().optional(),
         })
         .strict(),
       output: ResultSchema(
@@ -1053,6 +1058,7 @@ export const projects = {
           projectPath: z.string(),
           serverName: z.string(),
           pendingServer: MCPOAuthPendingServerSchema.optional(),
+          flowId: z.string().optional(),
         })
         .strict(),
       output: ResultSchema(
