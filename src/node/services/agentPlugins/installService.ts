@@ -44,7 +44,10 @@ import {
   resolveSkillWhenToUse,
 } from "@/common/orpc/schemas/agentSkill";
 import { resolveSkillPaths } from "@/common/utils/skills/skillPaths";
-import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
+import {
+  parseSkillMarkdown,
+  skillConsentFrontmatter,
+} from "@/node/services/agentSkills/parseSkillMarkdown";
 import { log } from "@/node/services/log";
 import type { MCPServerInfo, MCPServerOAuthConfig } from "@/common/types/mcp";
 import type { McpOauthService } from "@/node/services/mcpOauthService";
@@ -663,6 +666,18 @@ async function pathExists(candidate: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/** Preview warning for a skill whose SKILL.md `name` is only a display name. */
+function displayNameWarnings(
+  label: string,
+  dirName: string,
+  displayName: string | undefined
+): string[] {
+  if (displayName === undefined) return [];
+  return [
+    `${label}/${dirName}: SKILL.md name '${displayName}' is not the directory name; it loads as '${dirName}'`,
+  ];
 }
 
 function shortenHome(absPath: string): string {
@@ -2290,12 +2305,15 @@ export class AgentPluginInstallService {
           content,
           byteSize: stat.size,
           directoryName: dirNameParsed.data,
+          // Mirror runtime discovery: a display name loads under the dir name.
+          allowDisplayName: true,
         });
+        warnings.push(...displayNameWarnings(label, dirName, parsed.displayName));
         skills.push({
           name: parsed.frontmatter.name,
           ...skillConsentFields({
             relativeDir: path.relative(pluginRoot, path.join(skillsDir, dirName)),
-            frontmatter: parsed.frontmatter,
+            frontmatter: skillConsentFrontmatter(parsed),
           }),
           ...(parsed.frontmatter.description !== undefined
             ? { description: parsed.frontmatter.description }
