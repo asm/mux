@@ -50,17 +50,35 @@ import {
  * background timers, and updates never auto-apply.
  */
 
-/** Compact source display, e.g. "github.com/foo/grill @ main". */
+/** Compact source display, e.g. "github.com/foo/grill @ main" or "github.com/cursor/plugins/pstack @ main". */
 function formatSource(item: AgentPluginListItem): string | null {
   if (!item.source) {
     return null;
   }
-  const url = item.source.url
+  const ref = item.source.refType === "commit" ? item.source.ref.slice(0, 12) : item.source.ref;
+  return `${displayRepoUrl(item.source.url)}${subpathSuffix(item.source.subpath)} @ ${ref}`;
+}
+
+/**
+ * Clone URL without scheme and `.git` ("github.com/foo/grill"), so a monorepo
+ * folder appended to it reads as a path, not as an invalid `….git/pstack` URL.
+ */
+function displayRepoUrl(url: string): string {
+  return url
     .replace(/^https:\/\//, "")
     .replace(/^git@([^:]+):/, "$1/")
     .replace(/\.git$/, "");
-  const ref = item.source.refType === "commit" ? item.source.ref.slice(0, 12) : item.source.ref;
-  return `${url} @ ${ref}`;
+}
+
+/** Trimmed optional text-field value, or null when empty. */
+function optionalField(value: string): string | null {
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/** Monorepo plugin folder appended to a source URL ("/pstack"), or nothing for root installs. */
+function subpathSuffix(subpath: string | undefined): string {
+  return subpath === undefined ? "" : `/${subpath}`;
 }
 
 const Badge: React.FC<{
@@ -488,6 +506,7 @@ const AddPluginPanel: React.FC<{
   const { api } = useAPI();
   const [input, setInput] = useState("");
   const [ref, setRef] = useState("");
+  const [subpath, setSubpath] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<AgentPluginInstallPreview | null>(null);
@@ -503,7 +522,8 @@ const AddPluginPanel: React.FC<{
     try {
       const result = await api.agentPlugins.preview({
         input: input.trim(),
-        ref: ref.trim().length > 0 ? ref.trim() : null,
+        ref: optionalField(ref),
+        subpath: optionalField(subpath),
       });
       if (result.success) {
         setPreview(result.data);
@@ -520,6 +540,10 @@ const AddPluginPanel: React.FC<{
     } finally {
       setBusy(false);
     }
+  };
+
+  const previewOnEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") void handlePreview();
   };
 
   const handleInstall = async () => {
@@ -559,12 +583,10 @@ const AddPluginPanel: React.FC<{
               id="plugin-source"
               type="text"
               autoFocus
-              placeholder="e.g., owner/repo, owner/repo@v1.2.0, or https://github.com/owner/repo.git"
+              placeholder="e.g., owner/repo, owner/repo/path/to/plugin, owner/repo@v1.2.0, or https://github.com/owner/repo.git"
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void handlePreview();
-              }}
+              onKeyDown={previewOnEnter}
               spellCheck={false}
               className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
             />
@@ -579,9 +601,24 @@ const AddPluginPanel: React.FC<{
               placeholder="e.g., main, v1.2.0, or a full 40-character SHA"
               value={ref}
               onChange={(e) => setRef(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void handlePreview();
-              }}
+              onKeyDown={previewOnEnter}
+              spellCheck={false}
+              className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
+            />
+          </div>
+          {/* Full URLs (GitLab, self-hosted, SSH, file) cannot carry a folder
+              in the source field, so monorepo folders need their own field. */}
+          <div>
+            <label htmlFor="plugin-subpath" className="text-muted mb-1 block text-xs">
+              Plugin folder in the repository (optional — for monorepos)
+            </label>
+            <input
+              id="plugin-subpath"
+              type="text"
+              placeholder="e.g., packages/my-plugin"
+              value={subpath}
+              onChange={(e) => setSubpath(e.target.value)}
+              onKeyDown={previewOnEnter}
               spellCheck={false}
               className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
             />
@@ -636,7 +673,8 @@ const AddPluginPanel: React.FC<{
                 have no natural break points and would overflow the card on
                 phone widths. */}
             <p className="text-muted text-[11px] break-all">
-              {preview.source.url} @ {preview.source.ref} →{" "}
+              {displayRepoUrl(preview.source.url)}
+              {subpathSuffix(preview.source.subpath)} @ {preview.source.ref} →{" "}
               <code className="text-accent-text">{preview.targetPath}</code>
               {preview.manifest.authorName ? ` · by ${preview.manifest.authorName}` : ""}
               {preview.manifest.license ? ` · ${preview.manifest.license}` : ""}
