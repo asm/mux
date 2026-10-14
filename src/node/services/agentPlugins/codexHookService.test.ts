@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { EventSpine, type ToolExecuteContext } from "@/node/services/events/eventSpine";
+import { runMessageSendHooks } from "./promptHooks";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { CodexPluginHookService, type EnsureCodexHooksArgs } from "./codexHookService";
@@ -42,20 +43,20 @@ describe("CodexPluginHookService", () => {
   const pluginRoot = (name: string) => path.join(xumHome, "plugins", name);
   const instanceId = (name: string) => computePluginInstanceId(pluginRoot(name));
 
-  const preToolUse = (server: string) =>
-    JSON.stringify({
-      hooks: { PreToolUse: [{ hooks: [{ type: "mcp_tool", server, tool: "check" }] }] },
-    });
+  const preToolUse = (server: string) => ({
+    hooks: { PreToolUse: [{ hooks: [{ type: "mcp_tool", server, tool: "check" }] }] },
+  });
 
   /**
-   * `manifests`: "root" writes plugin.json; "codex" only .codex-plugin/plugin.json; "overlay" a
-   * root plugin.json plus a .codex-plugin/plugin.json whose hooks pointer names hooks/custom.json
-   * (served by `custom`).
+   * `document` is hooks/hooks.json. `manifests`: "root" writes plugin.json; "codex" only
+   * .codex-plugin/plugin.json; "overlay" a root plugin.json plus a .codex-plugin/plugin.json whose
+   * hooks pointer names hooks/custom.json (served by `custom`).
    */
   async function writePlugin(
     name: string,
     server: string,
     managed = true,
+    document: unknown = preToolUse(server),
     manifests: "root" | "codex" | "overlay" = "root"
   ) {
     await fs.mkdir(path.join(pluginRoot(name), "hooks"), { recursive: true });
@@ -71,9 +72,15 @@ describe("CodexPluginHookService", () => {
         path.join(pluginRoot(name), ".codex-plugin", "plugin.json"),
         JSON.stringify(manifests === "overlay" ? { name, hooks: "./hooks/custom.json" } : { name })
       );
-      await fs.writeFile(path.join(pluginRoot(name), "hooks", "custom.json"), preToolUse("custom"));
+      await fs.writeFile(
+        path.join(pluginRoot(name), "hooks", "custom.json"),
+        JSON.stringify(preToolUse("custom"))
+      );
     }
-    await fs.writeFile(path.join(pluginRoot(name), "hooks", "hooks.json"), preToolUse(server));
+    await fs.writeFile(
+      path.join(pluginRoot(name), "hooks", "hooks.json"),
+      JSON.stringify(document)
+    );
     if (!managed) return;
     const registryPath = path.join(xumHome, PLUGIN_REGISTRY_FILE_NAME);
     const existing = await fs.readFile(registryPath, "utf8").then(
@@ -181,7 +188,7 @@ describe("CodexPluginHookService", () => {
     async (fixture) => {
       // Codex PRRT_kwDOPxxmWM6r2lvU and PRRT_kwDOPxxmWM6r2lvb: the gate before each call reloads
       // the hooks the way discovery reads the package, not from a root plugin.json alone.
-      await writePlugin("guard", "scanner", true, fixture.manifests);
+      await writePlugin("guard", "scanner", true, undefined, fixture.manifests);
       await trustAll("guard");
       await service.ensureWorkspaceHooks(args());
 
@@ -407,5 +414,142 @@ describe("CodexPluginHookService", () => {
 
     expect((await runBash()).executed).toBe(true);
     expect(calledKeys).toEqual([]);
+  });
+
+  describe("UserPromptSubmit after a restart", () => {
+    const promptPlugin = (timeout?: number) =>
+      writePlugin("guard", "scanner", true, {
+        hooks: {
+          UserPromptSubmit: [
+            {
+              hooks: [
+                {
+                  type: "mcp_tool",
+                  server: "scanner",
+                  tool: "check",
+                  ...(timeout !== undefined ? { timeout } : {}),
+                },
+              ],
+            },
+          ],
+        },
+      });
+    let serverRunning: boolean;
+    const promptArgs = (): EnsureCodexHooksArgs => ({
+      ...args(),
+      mcp: {
+        canCallToolForPluginHook: () => serverRunning,
+        // Like MCPServerManager.callToolForPluginHook: a server that is not running is refused.
+        callToolForPluginHook: (_workspaceId, serverKey) => {
+          calledKeys.push(serverKey);
+          return serverRunning
+            ? Promise.resolve({ structuredContent: { decision: "block", reason: "No secrets." } })
+            : Promise.reject(new Error(`MCP server '${serverKey}' is not running`));
+        },
+      },
+    });
+    const send = () =>
+      runMessageSendHooks(spine, workspaceId, { text: "key=abc", origin: "user", canBlock: true });
+
+    beforeEach(() => {
+      serverRunning = false;
+    });
+
+    test("the hooks wait for the turn's MCP startup, so the first prompt is checked", async () => {
+      await promptPlugin();
+      await trustAll("guard");
+      await service.ensureWorkspaceHooks(promptArgs());
+      const startServers = async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        serverRunning = true;
+        return true;
+      };
+
+      await service.prepareForPromptHooks(workspaceId, startServers);
+
+      expect(await send()).toMatchObject({ kind: "blocked", reason: "No secrets." });
+    });
+
+    test("without the wait the hook would miss the first prompt (fails open)", async () => {
+      await promptPlugin();
+      await trustAll("guard");
+      await service.ensureWorkspaceHooks(promptArgs());
+
+      expect(await send()).toEqual({ kind: "none" });
+      expect(calledKeys).toHaveLength(1);
+    });
+
+    test("a slow startup is bounded by the hook timeout, then the hook fails open", async () => {
+      // 1s is the shortest timeout: the parser raises anything below it, as Codex does.
+      await promptPlugin(1);
+      await trustAll("guard");
+      await service.ensureWorkspaceHooks(promptArgs());
+      let aborted = false;
+      const startServers = (signal: AbortSignal) =>
+        new Promise<boolean>((resolve) => {
+          signal.addEventListener("abort", () => {
+            aborted = true;
+            resolve(false);
+          });
+        });
+
+      const started = performance.now();
+      await service.prepareForPromptHooks(workspaceId, startServers);
+
+      // The startup never settles on its own: only the 1s hook timeout ends the wait.
+      expect(performance.now() - started).toBeLessThan(3_000);
+      expect(aborted).toBe(true);
+      expect(await send()).toEqual({ kind: "none" });
+    });
+
+    test("a canceled send ends the startup wait at once", async () => {
+      await promptPlugin();
+      await trustAll("guard");
+      await service.ensureWorkspaceHooks(promptArgs());
+      let aborted = false;
+      const startServers = (signal: AbortSignal) =>
+        new Promise<boolean>((resolve) => {
+          signal.addEventListener("abort", () => {
+            aborted = true;
+            resolve(false);
+          });
+        });
+      const cancel = new AbortController();
+      setTimeout(() => cancel.abort(), 10);
+
+      const started = performance.now();
+      await service.prepareForPromptHooks(workspaceId, startServers, cancel.signal);
+
+      // The default hook timeout is far longer: only the cancellation ends the wait this soon.
+      expect(performance.now() - started).toBeLessThan(1_000);
+      expect(aborted).toBe(true);
+    });
+
+    test("a failed startup is logged and the hooks still run", async () => {
+      await promptPlugin();
+      await trustAll("guard");
+      await service.ensureWorkspaceHooks(promptArgs());
+
+      await service.prepareForPromptHooks(workspaceId, () =>
+        Promise.reject(new Error("runtime not ready"))
+      );
+
+      expect(await send()).toEqual({ kind: "none" });
+      expect(calledKeys).toHaveLength(1);
+    });
+
+    test("no UserPromptSubmit hook: nothing is started", async () => {
+      await writePlugin("guard", "scanner");
+      await trustAll("guard");
+      await service.ensureWorkspaceHooks(args());
+      let starts = 0;
+
+      await service.prepareForPromptHooks(workspaceId, () => {
+        starts++;
+        return Promise.resolve(true);
+      });
+
+      expect(starts).toBe(0);
+    });
   });
 });

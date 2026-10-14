@@ -991,7 +991,8 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   /** The message.send prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
   runMessageSendHooks?(
     workspaceId: string,
-    input: MessageSendHookInput
+    input: MessageSendHookInput,
+    cancelSignal?: AbortSignal
   ): Promise<MessageSendHookOutcome>;
   /** The turn.stop prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
   runTurnStopHooks?(
@@ -4577,11 +4578,15 @@ export class AgentSession {
     // A turn.stop continuation never reaches the hooks (see skipPromptHooks).
     if (internal?.skipPromptHooks === true) return { kind: "none" };
     const run = (text: string) =>
-      runMessageSendHooks(this.workspaceId, {
-        text,
-        origin: resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin),
-        canBlock,
-      });
+      runMessageSendHooks(
+        this.workspaceId,
+        {
+          text,
+          origin: resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin),
+          canBlock,
+        },
+        internal?.cancelSignal
+      );
     if (!isCompactionRequestMetadata(muxMetadata))
       return this.assertSendHookOutcome(await run(message), canBlock);
     // A compaction request carries up to two user messages; its own prompt never reaches the

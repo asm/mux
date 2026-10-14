@@ -24,7 +24,12 @@ import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
 import { discoverAgentPluginAt, discoverAgentPlugins, type AgentPluginInfo } from "./discovery";
 import { loadPluginCodexHooks, type PluginHookDefinition } from "./codexHooks";
-import { registerCodexPluginHooks, type CodexHookRunnerDeps } from "./codexHookRunner";
+import {
+  HOOK_DEFAULT_TIMEOUT_SECONDS,
+  HOOK_MAX_TIMEOUT_SECONDS,
+  registerCodexPluginHooks,
+  type CodexHookRunnerDeps,
+} from "./codexHookRunner";
 import { buildPluginServerKey, computePluginInstanceId } from "./mcpConfig";
 import { isPluginHookTrusted, readPluginHookTrust } from "./pluginHookTrust";
 import { PLUGIN_REGISTRY_FILE_NAME } from "./registry";
@@ -48,6 +53,8 @@ export interface EnsureCodexHooksArgs {
 interface WorkspaceRegistration {
   fingerprint: string;
   unregister: () => void;
+  /** Longest UserPromptSubmit hook timeout (ms); undefined when the workspace has none. */
+  promptHookBudgetMs?: number;
 }
 
 export class CodexPluginHookService {
@@ -114,10 +121,65 @@ export class CodexPluginHookService {
         deps: this.depsFor(entry.plugin, args),
       })
     );
+    const promptTimeouts: number[] = [];
+    for (const hook of runnable.flatMap((entry) => entry.hooks)) {
+      if (hook.event !== "UserPromptSubmit" || hook.handler.type !== "mcp_tool") continue;
+      const seconds = hook.handler.timeoutSeconds ?? HOOK_DEFAULT_TIMEOUT_SECONDS;
+      promptTimeouts.push(Math.min(seconds, HOOK_MAX_TIMEOUT_SECONDS));
+    }
     this.registrations.set(args.workspaceId, {
       fingerprint,
       unregister: () => unregisters.forEach((unregister) => unregister()),
+      ...(promptTimeouts.length > 0
+        ? { promptHookBudgetMs: Math.max(...promptTimeouts) * 1000 }
+        : {}),
     });
+  }
+
+  /**
+   * Before the UserPromptSubmit hooks run: wait for the workspace's MCP startup, the same one the
+   * turn runs right after (`startServers`), bounded by the longest of those hooks' timeouts.
+   * Without this, the first prompt after a restart reaches the hooks before their plugin's server
+   * runs, and they fail open. A failed or slow startup is logged and the hooks run anyway (they
+   * then fail open as before). No-op when the workspace has no UserPromptSubmit hook. A canceled
+   * send (`cancelSignal`) ends the wait at once.
+   */
+  async prepareForPromptHooks(
+    workspaceId: string,
+    startServers: (signal: AbortSignal) => Promise<boolean>,
+    cancelSignal?: AbortSignal
+  ): Promise<void> {
+    const budgetMs = this.registrations.get(workspaceId)?.promptHookBudgetMs;
+    if (budgetMs === undefined || cancelSignal?.aborted === true) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onCancel = () => controller.abort();
+    cancelSignal?.addEventListener("abort", onCancel, { once: true });
+    try {
+      const outcome = await Promise.race([
+        startServers(controller.signal).then((ready) => (ready ? "started" : "not-ready")),
+        new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => {
+            resolve("timeout");
+            controller.abort();
+          }, budgetMs);
+        }),
+        new Promise<"canceled">((resolve) => {
+          controller.signal.addEventListener("abort", () => resolve("canceled"), { once: true });
+        }),
+      ]);
+      if (outcome !== "started" && outcome !== "canceled") {
+        log.warn("Plugin hooks: MCP startup before UserPromptSubmit did not finish", {
+          workspaceId,
+          outcome,
+        });
+      }
+    } catch (error) {
+      log.warn("Plugin hooks: MCP startup before UserPromptSubmit failed", { workspaceId, error });
+    } finally {
+      clearTimeout(timer);
+      cancelSignal?.removeEventListener("abort", onCancel);
+    }
   }
 
   async disposeWorkspace(workspaceId: string): Promise<void> {
