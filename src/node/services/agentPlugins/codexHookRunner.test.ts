@@ -1,4 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { DisposableTempDir } from "@/node/services/tempDir";
+import { loadPluginCodexHooks } from "./codexHooks";
 import { EventSpine, type ToolExecuteContext } from "@/node/services/events/eventSpine";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { PluginHookDefinition } from "./codexHooks";
@@ -60,11 +64,13 @@ async function runTool(
   toolName: string,
   args: unknown,
   inputJsonSchema?: unknown,
+  mcpOrigin?: { serverName: string; toolName: string },
   opts: { abortSignal?: AbortSignal; result?: unknown } = {}
 ): Promise<ToolExecuteContext> {
   const ctx: ToolExecuteContext = {
     toolName,
     args,
+    ...(mcpOrigin !== undefined ? { mcpOrigin } : {}),
     host: { runtime: new LocalRuntime("/tmp"), runtimeTempDir: "/tmp", cwd: "/w", workspaceId },
     ...(inputJsonSchema !== undefined ? { inputJsonSchema: () => inputJsonSchema } : {}),
     ...(opts.abortSignal !== undefined ? { abortSignal: opts.abortSignal } : {}),
@@ -162,7 +168,7 @@ describe("PreToolUse", () => {
     onCancel.deps.isHookAllowed = () => new Promise(() => undefined);
     const cancel = new AbortController();
     setTimeout(() => cancel.abort(), 20);
-    const ctx = await runTool(onCancel.spine, "bash", {}, undefined, {
+    const ctx = await runTool(onCancel.spine, "bash", {}, undefined, undefined, {
       abortSignal: cancel.signal,
     });
     expect(ctx.executed).toBe(false);
@@ -306,7 +312,9 @@ describe("PreToolUse", () => {
       return new Promise(() => undefined);
     });
 
-    const ctx = await runTool(spine, "bash", {}, undefined, { abortSignal: controller.signal });
+    const ctx = await runTool(spine, "bash", {}, undefined, undefined, {
+      abortSignal: controller.signal,
+    });
 
     expect(ctx.executed).toBe(false);
     expect(ctx.blocked?.result).toEqual({ error: "Tool call interrupted while plugin hooks ran." });
@@ -392,6 +400,104 @@ describe("PreToolUse", () => {
   });
 });
 
+describe("Codex tool names", () => {
+  test("a Codex hooks.json for Bash works unedited on Xum's bash tool", async () => {
+    // Shape and names from the Codex hooks docs: matcher ^Bash$, ${tool_input.command}.
+    using tmp = new DisposableTempDir("codex-bash-hooks");
+    await fs.mkdir(path.join(tmp.path, "hooks"));
+    await fs.writeFile(
+      path.join(tmp.path, "hooks", "hooks.json"),
+      JSON.stringify({
+        hooks: {
+          PreToolUse: [
+            {
+              matcher: "^Bash$",
+              hooks: [
+                {
+                  type: "mcp_tool",
+                  server: "guard",
+                  tool: "check_command",
+                  input: { command: "${tool_input.command}", tool: "${tool_name}" },
+                  timeout: 30,
+                },
+              ],
+            },
+          ],
+        },
+      })
+    );
+    // No com.openai extension: the default hooks/hooks.json.
+    const { hooks } = await loadPluginCodexHooks({ rootPath: await fs.realpath(tmp.path) });
+    const { spine, calls } = setup(hooks, () => deny);
+
+    const ctx = await runTool(spine, "bash", { script: "rm -rf /", display_name: "Clean" });
+
+    expect(calls).toEqual([{ command: "rm -rf /", tool: "Bash" }]);
+    expect(ctx.executed).toBe(false);
+  });
+
+  test("MCP tools match and are named mcp__<server>__<tool>, from their origin", async () => {
+    const { spine, calls } = setup(
+      [hook("PreToolUse", { matcher: "^mcp__scanner__.*", input: { name: "${tool_name}" } })],
+      () => deny
+    );
+
+    await runTool(spine, "plugin_0123456789abcdef_scanner_scan_ab12", {}, undefined, {
+      serverName: "plugin:0123456789abcdef:scanner",
+      toolName: "scan",
+    });
+    await runTool(spine, "other_scan", {}, undefined, { serverName: "other", toolName: "scan" });
+    // A user server whose name only looks like a plugin key keeps its whole name.
+    await runTool(spine, "user_scan", {}, undefined, {
+      serverName: "plugin:abc:scanner",
+      toolName: "scan",
+    });
+
+    expect(calls).toEqual([{ name: "mcp__scanner__scan" }]);
+  });
+
+  test("MCP name parts keep only [A-Za-z0-9_], as Codex sanitizes them", async () => {
+    const { spine, calls } = setup(
+      [
+        hook("PreToolUse", {
+          matcher: "^mcp__Scan_Server__Find_Issues$",
+          input: { n: "${tool_name}" },
+        }),
+      ],
+      () => deny
+    );
+
+    await runTool(spine, "scan_server_find_issues", {}, undefined, {
+      serverName: "Scan Server",
+      toolName: "Find-Issues",
+    });
+
+    expect(calls).toEqual([{ n: "mcp__Scan_Server__Find_Issues" }]);
+  });
+
+  test("a Codex-shaped updatedInput maps back to Xum's arguments before the schema check", async () => {
+    const schema = {
+      type: "object",
+      properties: { script: { type: "string" }, display_name: { type: "string" } },
+      required: ["script"],
+      additionalProperties: false,
+    };
+    const { spine } = setup([hook("PreToolUse", { matcher: "^Bash$" })], () =>
+      json({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          updatedInput: { command: "echo rewritten", display_name: "Echo" },
+        },
+      })
+    );
+
+    const ctx = await runTool(spine, "bash", { script: "rm -rf /" }, schema);
+
+    expect(ctx.result).toEqual({ ran: { script: "echo rewritten", display_name: "Echo" } });
+  });
+});
+
 describe("PostToolUse", () => {
   test("receives the tool response; block replaces the result with the feedback", async () => {
     const { spine, calls } = setup(
@@ -431,8 +537,10 @@ describe("PostToolUse", () => {
     const mcpResult = { content: [{ type: "text", text: "out" }] };
     const xumResult = { type: "content", value: [{ type: "text", text: "out" }] };
 
-    const raw = await runTool(spine, "mcp_x", {}, undefined, { result: mcpResult });
-    const converted = await runTool(spine, "mcp_x", {}, undefined, { result: xumResult });
+    const raw = await runTool(spine, "mcp_x", {}, undefined, undefined, { result: mcpResult });
+    const converted = await runTool(spine, "mcp_x", {}, undefined, undefined, {
+      result: xumResult,
+    });
 
     const note = { type: "text", text: "[plugin:guard] Note." };
     expect(raw.result).toMatchObject({ content: [mcpResult.content[0], note] });

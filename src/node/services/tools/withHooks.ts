@@ -23,6 +23,7 @@ import type { Tool } from "ai";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
+import { readMcpToolOrigin } from "@/node/services/agentPlugins/codexToolNames";
 import { unsanitizedTool } from "@/common/utils/tools/schemaSanitizer";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { WithHookOutput, MayHaveHookOutput } from "@/common/types/tools";
@@ -139,6 +140,7 @@ export function withHooks<TParameters, TResult>(
       abortSignal,
       // The full schema: OpenAI requests carry a sanitized copy that drops constraints.
       inputJsonSchema: () => extractToolJsonSchema(unsanitizedTool(tool)),
+      mcpOrigin: readMcpToolOrigin(tool),
       execute: (currentArgs) =>
         Promise.resolve(executeFn.call(tool, currentArgs, options) as TResult | Promise<TResult>),
     });
@@ -170,6 +172,8 @@ export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
   abortSignal?: AbortSignal;
   /** See ToolExecuteContext.inputJsonSchema. */
   inputJsonSchema?: () => unknown;
+  /** See ToolExecuteContext.mcpOrigin. */
+  mcpOrigin?: { serverName: string; toolName: string };
   execute: (args: TArgs) => Promise<TResult>;
 }): Promise<ToolHookPipelineOutcome<TResult>> {
   const { toolName, config } = input;
@@ -187,6 +191,7 @@ export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
     },
     abortSignal: input.abortSignal,
     ...(input.inputJsonSchema != null ? { inputJsonSchema: input.inputJsonSchema } : {}),
+    ...(input.mcpOrigin != null ? { mcpOrigin: input.mcpOrigin } : {}),
     executed: false,
   };
 

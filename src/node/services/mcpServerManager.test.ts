@@ -62,6 +62,7 @@ import {
   MCP_STDIO_LAUNCH_FENCE_MS,
 } from "@/constants/mcp";
 import { FakeMcpServers, MCP_STARTUP_TIMEOUT_MS } from "./mcpServerManager.testHarness";
+import { readMcpToolOrigin } from "./agentPlugins/codexToolNames";
 import type { McpOauthService } from "./mcpOauthService";
 
 const PROJECT_PATH = "/tmp/project";
@@ -667,6 +668,20 @@ describe("MCPServerManager", () => {
     expect(servers.connectCount("apps-toggle")).toBe(2);
     await manager.getToolsForWorkspace(request);
     expect(servers.connectCount("apps-toggle")).toBe(2);
+  });
+
+  test("served tools carry their server and original tool name for Codex plugin hooks", async () => {
+    configService.listServers.mockResolvedValue({ "Scan Server": stdioConfig("origin-tag") });
+    servers.serve("origin-tag", { tools: { "Find-Issues": testTool() } });
+
+    const { tools } = await manager.getToolsForWorkspace(workspaceRequest("origin-tag"));
+
+    const served = Object.values(tools);
+    expect(served).toHaveLength(1);
+    expect(readMcpToolOrigin(served[0])).toEqual({
+      serverName: "Scan Server",
+      toolName: "Find-Issues",
+    });
   });
 
   test("settings: read validates and caches; update sends only the changes and the workspace _meta", async () => {

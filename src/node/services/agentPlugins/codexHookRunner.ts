@@ -24,6 +24,7 @@ import { AjvJsonSchemaValidator } from "@modelcontextprotocol/client/validators/
 import { log } from "@/node/services/log";
 import { compileHookMatcher, type PluginHookDefinition } from "./codexHooks";
 import { isPlainObject } from "./manifest";
+import { codexToolView, type CodexToolView } from "./codexToolNames";
 
 /** Xum's limits for one hook call, in seconds (Codex's default is 600). */
 export const HOOK_DEFAULT_TIMEOUT_SECONDS = 10;
@@ -117,14 +118,17 @@ async function runToolHooks(
 ): Promise<void> {
   const notes: string[] = [];
   const call = { cwd: ctx.host.cwd, abortSignal: ctx.abortSignal };
-  for (const hook of pre.filter((candidate) => matches(candidate, ctx.toolName))) {
-    const output = await invoke(
-      hook,
-      { tool_name: ctx.toolName, tool_input: ctx.args },
-      "PreToolUse",
-      registration,
-      call
-    );
+  // Codex names and fields (Bash, mcp__<server>__<tool>, tool_input.command), so a Codex
+  // hooks.json works without edits. Xum's own names and fields stay available too.
+  const view = codexToolView(ctx.toolName, ctx.mcpOrigin);
+  const toolEvent = () => ({
+    tool_name: view.codexName ?? ctx.toolName,
+    tool_input: isPlainObject(ctx.args)
+      ? { ...ctx.args, ...view.toCodexFields(ctx.args) }
+      : ctx.args,
+  });
+  for (const hook of pre.filter((candidate) => matches(candidate, ctx.toolName, view))) {
+    const output = await invoke(hook, toolEvent(), "PreToolUse", registration, call);
     if (ctx.abortSignal?.aborted) break;
     if (output === null) continue;
     // Codex: PreToolUse does not support continue: false, stopReason or "ask"; such a run fails
@@ -150,7 +154,7 @@ async function runToolHooks(
       return;
     }
     if (output.updatedInput !== undefined) {
-      applyUpdatedInput(ctx, output, registration, hook);
+      applyUpdatedInput(ctx, output, view, registration, hook);
       if (ctx.blocked) return;
     }
     if (output.additionalContext !== undefined) notes.push(output.additionalContext);
@@ -162,10 +166,10 @@ async function runToolHooks(
   }
   await next();
   if (ctx.executed) {
-    for (const hook of post.filter((candidate) => matches(candidate, ctx.toolName))) {
+    for (const hook of post.filter((candidate) => matches(candidate, ctx.toolName, view))) {
       const output = await invoke(
         hook,
-        { tool_name: ctx.toolName, tool_input: ctx.args, tool_response: ctx.result },
+        { ...toolEvent(), tool_response: ctx.result },
         "PostToolUse",
         registration,
         call
@@ -191,6 +195,7 @@ async function runToolHooks(
 function applyUpdatedInput(
   ctx: ToolExecuteContext,
   output: HookOutput,
+  view: CodexToolView,
   registration: CodexHookRegistration,
   hook: PluginHookDefinition
 ): void {
@@ -198,6 +203,8 @@ function applyUpdatedInput(
     warn(registration, hook, "returned updatedInput without permissionDecision allow; ignoring it");
     return;
   }
+  // A Codex-shaped rewrite (Bash `command`) maps back to Xum's names before the schema check.
+  const updated = view.fromCodexInput(output.updatedInput);
   const schema = ctx.inputJsonSchema?.();
   if (schema === undefined) {
     // No schema to check the rewrite against (a caller that omitted it): deny. Running the
@@ -211,7 +218,7 @@ function applyUpdatedInput(
     };
     return;
   }
-  if (!matchesToolSchema(schema, output.updatedInput)) {
+  if (!matchesToolSchema(schema, updated)) {
     // Deny, as for a missing schema: the hook allowed only its rewrite, so running the original
     // arguments would bypass it (a mux.load guard that narrows a read to a range, Codex
     // PRRT_kwDOPxxmWM6rb3ih).
@@ -223,7 +230,7 @@ function applyUpdatedInput(
     };
     return;
   }
-  ctx.args = output.updatedInput;
+  ctx.args = updated;
 }
 
 /**
@@ -249,10 +256,13 @@ function matchesToolSchema(schema: unknown, value: unknown): boolean {
   }
 }
 
-function matches(hook: PluginHookDefinition, toolName: string): boolean {
+function matches(hook: PluginHookDefinition, toolName: string, view: CodexToolView): boolean {
   // The parser already proved the matcher compiles, with the same Codex-dialect translation
-  // (inline flags, whole-name lists). Codex applies it to tool_name.
-  return hook.matcher === undefined || compileHookMatcher(hook.matcher).test(toolName);
+  // (inline flags, whole-name lists). Codex applies it to tool_name; Xum tests both the Xum
+  // name and the Codex alias.
+  if (hook.matcher === undefined) return true;
+  const matcher = compileHookMatcher(hook.matcher);
+  return matcher.test(toolName) || (view.codexName !== undefined && matcher.test(view.codexName));
 }
 
 async function invoke(
