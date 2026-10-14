@@ -204,6 +204,36 @@ describe("compaction input trim on the wire", () => {
     expect(messageOf("call_s2")).toBeGreaterThan(messageOf("call_s1"));
   });
 
+  test("counts a row's prompt-hook context, which the provider receives inside that row", async () => {
+    // The hook text lives in metadata until it renders into the row. Rendered after the trim,
+    // it would be invisible to the budget: this history fits without it (no trim), and the
+    // request would then grow past the budget with it.
+    const hookText = "y".repeat(40_000);
+    const history: MuxMessage[] = [
+      createMuxMessage("hooked-user", "user", "check the policy", {
+        pluginHookContext: [{ pluginId: "guard", text: hookText }],
+      }),
+      createMuxMessage("hooked-answer", "assistant", "ok"),
+      ...toolTurn("a", 40_000),
+      HISTORY[HISTORY.length - 1],
+    ];
+    const withoutHook = history.map((row) => {
+      if (row.metadata?.pluginHookContext === undefined) return row;
+      const { pluginHookContext: _hook, ...metadata } = row.metadata;
+      return { ...row, metadata };
+    });
+    // The budget fits the history without the hook text, not with it.
+    const budget = 14_000;
+    const untrimmed = JSON.stringify((await assemble("openai", budget, withoutHook)).messages);
+    expect(untrimmed).not.toContain("Compaction input trimmed");
+
+    const text = JSON.stringify((await assemble("openai", budget, history)).messages);
+
+    // The hooked turn is the oldest one, so the trim leaves it out; its hook text never ships.
+    expect(text).toContain("Compaction input trimmed to fit the context window: 1 oldest turns");
+    expect(text).not.toContain(hookText);
+  });
+
   test("sizes the redacted projection: provider-invisible output does not trigger a trim", async () => {
     // Most of this result is ui_only data, which applyToolOutputRedaction removes before send.
     const uiOnlyTurn: MuxMessage[] = [

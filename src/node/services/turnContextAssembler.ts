@@ -81,6 +81,7 @@ import {
   type AnthropicCacheTtl,
 } from "@/common/utils/ai/cacheStrategy";
 import { prepareMessagesForProvider } from "./messagePipeline";
+import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
 
 const keepContextRow = (message: MuxMessage) =>
   !isModelHiddenMessage(message) && !message.metadata?.contextBudgetRejected;
@@ -322,8 +323,17 @@ export async function assemblePromptPayload(
     options.providerForMessages,
     options.effectiveThinkingLevel
   );
+  // Prompt-hook context renders BEFORE the compaction trim: the trim counts each row's parts, not
+  // its metadata, so unrendered context (up to PLUGIN_HOOK_CONTEXT_MAX_CHARS per user row) would
+  // pass the budget and then grow the request past it in messagePipeline. Rendered rows drop
+  // the metadata, so messagePipeline's own pass renders nothing twice. It also renders before the
+  // token-budget [id: ...] tag, which must stay last.
+  const renderHookContextFirst =
+    options.compactionInputBudgetTokens != null || options.tagHistoryItemIds === true;
   const providerRequestMessages = await trimToCompactionInputBudget(
-    prepared.providerRequestMessages,
+    renderHookContextFirst
+      ? renderPluginHookContextForProvider(prepared.providerRequestMessages)
+      : prepared.providerRequestMessages,
     options.compactionInputBudgetTokens,
     options.modelString,
     options.requestContextMessage

@@ -12,14 +12,20 @@ import type {
   MessageSendContext,
   MessageSendOrigin,
 } from "@/node/services/events/eventSpine";
+import type { PluginHookContextEntry } from "@/common/types/message";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
+import {
+  PLUGIN_HOOK_CONTEXT_MAX_CHARS,
+  renderPluginHookContextEntry,
+} from "@/node/utils/messages/renderPluginHookContextForProvider";
 
 /** Block reasons are shown to the user; longer ones are cut. */
 const MESSAGE_SEND_BLOCK_REASON_MAX_CHARS = 500;
 
 export type MessageSendHookOutcome =
   | { kind: "none" }
+  | { kind: "context"; entries: PluginHookContextEntry[] }
   | { kind: "blocked"; pluginName: string; reason: string };
 
 export interface MessageSendHookInput {
@@ -39,7 +45,7 @@ export async function runMessageSendHooks(
   input: MessageSendHookInput
 ): Promise<MessageSendHookOutcome> {
   if (!spine.hasMiddleware("message.send")) return { kind: "none" };
-  const base = { workspaceId, origin: input.origin, text: input.text };
+  const base = { workspaceId, origin: input.origin, text: input.text, additionalContext: [] };
   const ctx: MessageSendContext = input.canBlock
     ? base
     : {
@@ -74,5 +80,22 @@ export async function runMessageSendHooks(
       reason: reason.slice(0, MESSAGE_SEND_BLOCK_REASON_MAX_CHARS),
     };
   }
-  return { kind: "none" };
+  const kept: PluginHookContextEntry[] = [];
+  let size = 0;
+  for (const entry of ctx.additionalContext) {
+    const text = entry.text.trim();
+    if (text.length === 0) continue;
+    // Charge the whole rendered block (plugin ID, wrapper, escaping), not just the text: many
+    // tiny entries or a long plugin ID must not slip past the cap.
+    const rendered = renderPluginHookContextEntry({ pluginId: entry.pluginId, text }).length;
+    if (size + rendered > PLUGIN_HOOK_CONTEXT_MAX_CHARS) {
+      log.warn("Prompt hooks: message.send context over the cap; dropping the rest", {
+        workspaceId,
+      });
+      break;
+    }
+    kept.push({ pluginId: entry.pluginId, text });
+    size += rendered;
+  }
+  return kept.length > 0 ? { kind: "context", entries: kept } : { kind: "none" };
 }
