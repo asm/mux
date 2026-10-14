@@ -27,15 +27,20 @@ import {
   type MCPClientHandle,
   type MCPGetPromptResult,
   type MCPPrompt,
+  type MCPRawCallToolResult,
 } from "@/node/services/mcpClient";
 import {
   MCP_SETTINGS_WORKSPACE_META_KEY,
+  boundMCPSettingsToolResult,
+  MAX_MCP_SETTINGS_TOOL_RESULT,
   filterMCPSettingValues,
   parseMCPSettingsReadResult,
   validateMCPSettingValue,
   type MCPSettingValue,
   type MCPSettingsReadSnapshot,
+  type MCPSettingsGroup,
   type MCPSettingsSnapshot,
+  type MCPSettingsToolAction,
 } from "@/common/utils/mcpSettings";
 import type {
   McpAppModelContext,
@@ -1419,7 +1424,14 @@ interface MCPServerInstance {
     "toolUi" | "hasTool" | "callToolForApp" | "readResource" | "appEntrypoints"
   >;
   /** OpenAI structured settings (`openai/settings`); its tools are hidden from the model. */
-  settings?: Pick<MCPClientHandle, "settingsCapability" | "callSettingsTool">;
+  settings?: Pick<
+    MCPClientHandle,
+    | "settingsCapability"
+    | "callSettingsTool"
+    | "settingsToolAction"
+    | "callSettingsActionTool"
+    | "relistTools"
+  >;
   /** True once the underlying MCP client/transport has been closed. */
   isClosed: boolean;
   /**
@@ -1715,7 +1727,7 @@ export class MCPServerManager {
     { started: number; applied: number }
   >();
   /** Dedupes send-path background tool refreshes per instance; see refreshInstanceToolsInBackground. */
-  private readonly toolRefreshesInFlight = new WeakMap<MCPServerInstance, Promise<void>>();
+  private readonly toolRefreshesInFlight = new WeakMap<MCPServerInstance, Promise<boolean>>();
   /**
    * Prompt catalogs of idle-stopped servers, by workspace, with the start
    * config they were fetched under. The restart seeds each restarted
@@ -2566,19 +2578,22 @@ export class MCPServerManager {
 
   /**
    * One deduped tools/list refresh of a modern-era instance; never rejects (a failed refresh
-   * keeps the cached tools). Legacy instances have no refresh and resolve at once.
+   * keeps the cached tools). Resolves false when the refresh failed. Legacy instances have no
+   * refresh and resolve true at once (tools/list_changed re-lists them).
    */
-  private refreshInstanceTools(instance: MCPServerInstance): Promise<void> {
+  private refreshInstanceTools(instance: MCPServerInstance): Promise<boolean> {
     const inFlight = this.toolRefreshesInFlight.get(instance);
     if (inFlight !== undefined) return inFlight;
-    if (instance.isClosed || !instance.refreshTools) return Promise.resolve();
+    if (instance.isClosed || !instance.refreshTools) return Promise.resolve(true);
     const refresh = instance
       .refreshTools()
+      .then(() => true)
       .catch((error: unknown) => {
         log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
           name: instance.name,
           error: getErrorMessage(error),
         });
+        return false;
       })
       .finally(() => {
         if (this.toolRefreshesInFlight.get(instance) === refresh) {
@@ -5215,9 +5230,170 @@ export class MCPServerManager {
       log.warn(`[MCP] Settings of '${serverName}': ${warning}`, { workspaceId });
     assert(source !== undefined, "a settings snapshot comes from a server instance");
     this.cacheSettings(source.instance, workspaceId, source.requestId, snapshot.values);
-    const instanceToken = this.settingsInstanceToken(source.instance);
-    this.rememberSettingsSchema(workspaceId, serverName, instanceToken, snapshot);
-    return { ...snapshot, instanceToken };
+    const { instance } = source;
+    const instanceToken = this.settingsInstanceToken(instance);
+    const read = {
+      ...snapshot,
+      layout: await this.withSettingsToolActions(
+        instance,
+        workspaceId,
+        serverName,
+        snapshot.layout,
+        options
+      ),
+    };
+    // The hash covers what this read returns (its layout carries the tool actions), the same
+    // object a save's fresh read is compared with (runSettingsSave).
+    this.rememberSettingsSchema(workspaceId, serverName, instanceToken, read);
+    return { ...read, instanceToken };
+  }
+
+  /**
+   * The layout with each tool item's action (see settingsToolAction). The catalog is refreshed
+   * first (bounded, as for MCP App entry points): after tools/list_changed the held catalog
+   * would show a new tool as unavailable and keep a removed one runnable.
+   */
+  private async withSettingsToolActions(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    layout: MCPSettingsGroup[],
+    options: { signal?: AbortSignal } | undefined
+  ): Promise<MCPSettingsGroup[]> {
+    if (layout.some((group) => group.items.some((item) => item.kind === "tool")))
+      await this.refreshAppCatalogs([{ instance }], options?.signal);
+    return layout.map((group) => ({
+      ...group,
+      items: group.items.map((item) => {
+        if (item.kind !== "tool") return item;
+        const action = this.settingsToolAction(instance, workspaceId, serverName, item.tool);
+        return action === undefined ? item : { ...item, action };
+      }),
+    }));
+  }
+
+  /**
+   * A layout tool item's action: a tool the server lists and the tool allowlist allows. An MCP
+   * App tool needs MCP Apps (the artifacts experiment and an apps connection): without them it
+   * has no action, so it is never run as a regular tool without its view.
+   */
+  private settingsToolAction(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    toolName: string
+  ): MCPSettingsToolAction | undefined {
+    const action = instance.settings?.settingsToolAction(toolName);
+    const allowlist = this.appToolAllowlist(workspaceId, serverName);
+    if (allowlist !== null && !allowlist.has(toolName)) return undefined;
+    return action?.opensApp === true && !this.canOpenApps(instance) ? undefined : action;
+  }
+
+  /** MCP Apps work on this instance now: the experiment is on and it has an apps connection. */
+  private canOpenApps(instance: MCPServerInstance): boolean {
+    return this.mcpApps?.isEnabled() === true && instance.apps !== undefined;
+  }
+
+  /**
+   * A fresh tools/list for a settings action: a modern instance refreshes through its response
+   * cache (refreshInstanceTools). A legacy instance has no such refresh, and without MCP Apps
+   * nothing re-lists it on tools/list_changed, so it lists again here. Resolves false on failure.
+   */
+  private refreshSettingsActionTools(instance: MCPServerInstance): Promise<boolean> {
+    if (instance.refreshTools !== undefined || instance.settings === undefined)
+      return this.refreshInstanceTools(instance);
+    return instance.settings.relistTools().then(
+      () => true,
+      (error: unknown) => {
+        log.debug("[MCP] Tool list refresh for a settings action failed", {
+          name: instance.name,
+          error: getErrorMessage(error),
+        });
+        return false;
+      }
+    );
+  }
+
+  /**
+   * Refresh the running instance's catalog before a settings action dispatch (bounded). Fails
+   * closed: when the refresh times out or fails, the held catalog can be stale (a tool that
+   * became writable still reads as read-only and would run without the user's confirmation),
+   * so the dispatch is refused instead of falling back to it.
+   */
+  private async refreshSettingsActionCatalog(
+    workspaceId: string,
+    serverName: string,
+    signal: AbortSignal | undefined
+  ): Promise<void> {
+    const instance = this.workspaceServers.get(workspaceId)?.instances.get(serverName);
+    if (instance === undefined || instance.isClosed) return;
+    const refreshed = await raceWithAbortAndTimeout(this.refreshSettingsActionTools(instance), {
+      ...(signal !== undefined ? { signal } : {}),
+      timeoutMs: MCP_APP_CATALOG_REFRESH_TIMEOUT_MS,
+    });
+    if (refreshed.kind !== "ok" || !refreshed.value)
+      throw new Error(`Could not refresh ${serverName}'s tools; try again`);
+  }
+
+  /**
+   * Run a settings layout tool action: the spec calls the same-server tool with `{}` and shows
+   * the text of its result. Refused when the server instance is not the one the dialog read,
+   * when the tool has no action (see settingsToolAction) or opens an MCP App, and when a tool
+   * without `readOnlyHint: true` runs without the user's confirmation.
+   */
+  async runSettingsTool(
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    instanceToken: string,
+    options: { confirmed: boolean; signal?: AbortSignal }
+  ): Promise<{ text: string; isError: boolean }> {
+    // A tool that tools/list_changed removed since the dialog read is refused.
+    await this.refreshSettingsActionCatalog(workspaceId, serverName, options.signal);
+    // One-shot dispatch, like callMcpAppTool: an epoch retry must not run the tool twice.
+    let dispatched: Promise<MCPRawCallToolResult> | null = null;
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP settings tool '${serverName}/${toolName}'`,
+      (instance) => {
+        if (dispatched !== null) return dispatched;
+        const refusal = this.settingsToolRefusal(instance, workspaceId, serverName, toolName, {
+          instanceToken,
+          confirmed: options.confirmed,
+        });
+        if (refusal !== null) return Promise.reject(refusal);
+        assert(instance.settings !== undefined, "a settings tool action has a settings client");
+        log.info("[MCP] Settings tool action", { workspaceId, serverName, toolName });
+        dispatched = instance.settings.callSettingsActionTool(
+          toolName,
+          { [MCP_SETTINGS_WORKSPACE_META_KEY]: workspaceId },
+          options
+        );
+        return dispatched;
+      },
+      settingsToolResultText,
+      options
+    );
+  }
+
+  /** Why runSettingsTool refuses to call the tool on this instance; null when it may. */
+  private settingsToolRefusal(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    request: { instanceToken: string; confirmed: boolean }
+  ): Error | null {
+    const currentToken = this.settingsInstanceToken(instance);
+    if (!this.isSettingsTokenAccepted(workspaceId, serverName, currentToken, request.instanceToken))
+      return staleSettingsInstanceError(serverName);
+    const action = this.settingsToolAction(instance, workspaceId, serverName, toolName);
+    if (action === undefined) return new Error(`'${serverName}' has no tool named '${toolName}'`);
+    if (action.opensApp) return new Error(`'${action.title}' opens an MCP App: not supported yet`);
+    if (!action.readOnly && !request.confirmed)
+      return new Error(`'${action.title}' runs only after a confirmation`);
+    return null;
   }
 
   /** Saves in flight per workspace and server (settingsSavesSettled). */
@@ -5257,6 +5433,27 @@ export class MCPServerManager {
    * and its save is refused.
    */
   private readonly settingsSchemaHashes = new Map<string, string>();
+
+  /**
+   * Whether a request that names `requestToken` (the dialog's read) may act on this workspace
+   * and server's instance with `currentToken`: the same instance, or a restarted one (idle stop,
+   * crash restart) whose last read showed the same schema. Saves (runSettingsSave, right after a
+   * fresh read) and tool actions (settingsToolRefusal, against the instance's last read) share
+   * this rule. An instance no read has seen yet has no hash and is refused. Both lookups use the
+   * workspace and server, so a token read from another server never matches.
+   */
+  private isSettingsTokenAccepted(
+    workspaceId: string,
+    serverName: string,
+    currentToken: string,
+    requestToken: string
+  ): boolean {
+    if (currentToken === requestToken) return true;
+    const hashOf = (token: string) =>
+      this.settingsSchemaHashes.get(settingsSchemaKey(workspaceId, serverName, token));
+    const current = hashOf(currentToken);
+    return current !== undefined && current === hashOf(requestToken);
+  }
 
   private rememberSettingsSchema(
     workspaceId: string,
@@ -5313,11 +5510,7 @@ export class MCPServerManager {
     if (prior === null) throw new Error(`MCP server '${serverName}' has no settings`);
     // Another instance (restarted or replaced since the dialog read): the save still lands when
     // it shows the schema the dialog validated against, else the user must reopen.
-    if (
-      prior.instanceToken !== instanceToken &&
-      this.settingsSchemaHashes.get(settingsSchemaKey(workspaceId, serverName, instanceToken)) !==
-        settingsSchemaHash(prior)
-    )
+    if (!this.isSettingsTokenAccepted(workspaceId, serverName, prior.instanceToken, instanceToken))
       throw staleSettingsInstanceError(serverName);
     const values = await this.updateSettings(
       workspaceId,
@@ -8122,7 +8315,29 @@ export class MCPServerManager {
   }
 }
 
-/** Instance tokens whose settings schema saveSettings remembers (see settingsSchemaHashes). */
+/** A CallToolResult content part's text; "" for any other part. */
+function textPartOf(part: unknown): string {
+  if (part === null || typeof part !== "object" || Reflect.get(part, "type") !== "text") return "";
+  return String(Reflect.get(part, "text"));
+}
+
+/** A settings tool action's result for the dialog: its text parts, bounded. */
+function settingsToolResultText(result: MCPRawCallToolResult): { text: string; isError: boolean } {
+  const parts: unknown[] = Array.isArray(result.content) ? result.content : [];
+  // Collected only up to the bound (one unit past it, so the bound still marks the cut): many
+  // or huge server parts must not build an unbounded string first.
+  let text = "";
+  for (const part of parts) {
+    if (text.length > MAX_MCP_SETTINGS_TOOL_RESULT) break;
+    const partText = textPartOf(part);
+    if (partText === "") continue;
+    const room = MAX_MCP_SETTINGS_TOOL_RESULT + 1 - text.length;
+    text += (text.length > 0 ? "\n" : "") + partText.slice(0, room);
+  }
+  return { text: boundMCPSettingsToolResult(text), isError: result.isError === true };
+}
+
+/** Instance tokens whose settings schema is remembered (settingsSchemaHashes). */
 const MAX_REMEMBERED_SETTINGS_SCHEMAS = 256;
 
 function settingsSaveKey(workspaceId: string, serverName: string): string {
@@ -8147,7 +8362,10 @@ function settingsSchemaKey(workspaceId: string, serverName: string, token: strin
   return `${settingsSaveKey(workspaceId, serverName)}\0${token}`;
 }
 
-/** What a save validates against: the schema and its layout, never the values. */
+/**
+ * What a save or a tool action checks a restarted instance against (isSettingsTokenAccepted):
+ * the schema and its layout, tool actions included, never the values.
+ */
 function settingsSchemaHash(snapshot: Pick<MCPSettingsSnapshot, "properties" | "layout">): string {
   return crypto
     .createHash("sha256")
