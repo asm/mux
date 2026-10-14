@@ -6,7 +6,7 @@ import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import { sideChatCapabilityGrants } from "@/node/services/sideChat";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
-import { log } from "@/node/services/log";
+import { eventSpine } from "@/node/services/events/eventSpine";
 import { codexPluginHookService } from "./codexHookService";
 import { agentPluginHookService } from "./hookService";
 import { resolveAgentPluginsMcpContext } from "./mcpConfig";
@@ -45,7 +45,7 @@ export async function prepareWorkspaceRequestHooks(args: {
         isWorkspaceTrustedForSharedExecution(metadata, config.loadConfigOrDefault().projects),
       mcp: args.mcpServerManager,
       notifyUser: (pluginName, message) =>
-        log.info("Plugin hook message", { workspaceId: metadata.id, pluginName, message }),
+        eventSpine.emit("plugin.hook.notice", { workspaceId: metadata.id, pluginName, message }),
     });
   }
 }

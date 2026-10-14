@@ -1351,6 +1351,8 @@ export class AgentSession {
     [];
   private readonly initListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
+  /** Unsubscribes the plugin-hook notice relay (see the constructor). */
+  private readonly unsubscribePluginHookNotices: () => void;
   private readonly stopEmptyErroredReplyDeletes: () => void;
   private readonly coordinator = new TurnCoordinator({
     streamStarted: (payload) => {
@@ -1928,6 +1930,17 @@ export class AgentSession {
 
     this.attachAiListeners();
     this.attachInitListeners();
+    // A plugin hook's systemMessage reaches the user as a live chat event only: it is never
+    // written to history, so no request (and no replay) can carry it to the model.
+    this.unsubscribePluginHookNotices = eventSpine.subscribe("plugin.hook.notice", (notice) => {
+      if (notice.workspaceId !== this.workspaceId) return;
+      this.emitChatEvent({
+        type: "plugin-hook-notice",
+        workspaceId: notice.workspaceId,
+        plugin: notice.pluginName,
+        message: notice.message,
+      });
+    });
     // A subscription is lazy: protect an existing engine before any caller can
     // send through this new session, even before replay is first pulled.
     const existingStream = this.streamManager.getStreamInfo(this.workspaceId);
@@ -2046,6 +2059,7 @@ export class AgentSession {
         // recovery policy, but still presents its captured terminal exactly once below.
         for (const { event, handler } of this.aiListeners) this.aiService.off(event, handler);
         this.aiListeners.length = 0;
+        this.unsubscribePluginHookNotices();
         for (const { event, handler } of this.initListeners)
           this.initStateManager.off(event, handler as never);
         this.initListeners.length = 0;
