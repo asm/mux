@@ -714,5 +714,41 @@ describe("useBoundedTranscriptReveal", () => {
       for (const cap of [TRANSCRIPT_REVEAL_AUTO_MAX_ROWS, MAX + 0.5])
         expect(() => renderSlice(cap)).toThrow();
     });
+
+    // One reconciliation each (#6667 review deferral, F20 PR3a-1).
+    test("deleting the end rows on both sides of the edge falls back to the newest kept row", () => {
+      const { reveal, readBack, setProps, props } = renderSlice(MAX);
+      readBack();
+      const { toIndex } = reveal();
+      const keptId = props().messages[toIndex - 51].id;
+      setProps({
+        messages: props().messages.filter((_, i) => i < toIndex - 50 || i > toIndex),
+      });
+      expect(reveal().toIndex).toBe(toIndex - 50);
+      expect(props().messages[reveal().toIndex - 1].id).toBe(keptId);
+    });
+
+    test("rows replaced inside the slice stay mounted when the end row goes later", () => {
+      const { reveal, readBack, setProps, props } = renderSlice(MAX);
+      readBack();
+      const { toIndex } = reveal();
+      const replaced = props().messages.map((row, i) =>
+        i >= toIndex - 20 && i < toIndex ? { id: `${row.id}-v2` } : row
+      );
+      setProps({ messages: replaced });
+      setProps({ messages: props().messages.filter((_, i) => i !== toIndex) });
+      expect(reveal().toIndex).toBe(toIndex);
+      // Replace, append, then delete every older newer row at once: nothing the reader kept
+      // unmounts; the slice ends at the tail (the appended rows).
+      setProps({
+        messages: props().messages.map((row, i) => (i === toIndex - 1 ? { id: "v3" } : row)),
+      });
+      setProps({ messages: [...props().messages, ...rows(3, "new")] });
+      const gone = (i: number) =>
+        (i >= toIndex - 30 && i < toIndex - 10) || (i >= toIndex && i < LONG - 1);
+      setProps({ messages: props().messages.filter((_, i) => !gone(i)) });
+      expect(reveal().toIndex).toBe(props().messages.length);
+      expect(props().messages.findIndex((row) => row.id === "v3")).toBe(toIndex - 21);
+    });
   });
 });

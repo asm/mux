@@ -91,6 +91,8 @@ interface RevealState {
   /** First unmounted newer row while detached, anchored by id like the start; null ⇒ the tail. */
   endMessageId: string | null;
   endIndexHint: number;
+  /** The rows `endIndexHint` indexes, for the fallback when the end row is gone. */
+  endRows: readonly RevealRow[];
 }
 
 /**
@@ -128,10 +130,31 @@ function nearestSafeCutAtOrAfter(index: number, length: number, isSafeCut: IsSaf
 
 /** A detached slice's stored end: its first unmounted row survives deleted mounted rows. */
 function storedSliceEnd(state: RevealState, rows: readonly RevealRow[], isSafeCut: IsSafeCut) {
-  const { endMessageId: id, endIndexHint: hint } = state;
+  const { endMessageId: id, endIndexHint: hint, endRows } = state;
   if (id === null) return rows.length;
-  const endIndex = rows[hint]?.id === id ? hint : rows.findIndex((row) => row.id === id);
-  return nearestSafeCutAtOrBefore(endIndex === -1 ? hint : endIndex, rows.length, isSafeCut);
+  const found = rows[hint]?.id === id ? hint : rows.findIndex((row) => row.id === id);
+  if (found !== -1) return nearestSafeCutAtOrBefore(found, rows.length, isSafeCut);
+  return endAtNearestUnmountedRow(rows, endRows, hint, isSafeCut);
+}
+
+/**
+ * Where the end goes once its row is gone, even when one reconciliation also deleted mounted rows
+ * before it (#6667 review): the nearest still-present row that was unmounted (`endRows[hint+1..]`),
+ * so mounted rows replaced since stay mounted. If none survives, every row the reader had not
+ * reached is gone and the slice ends at the tail: unmounting what follows could hide read rows.
+ */
+function endAtNearestUnmountedRow(
+  rows: readonly RevealRow[],
+  endRows: readonly RevealRow[],
+  hint: number,
+  isSafeCut: IsSafeCut
+): number {
+  const indexById = new Map(rows.map((row, index) => [row.id, index]));
+  for (let newer = hint + 1; newer < endRows.length; newer += 1) {
+    const index = indexById.get(endRows[newer].id);
+    if (index !== undefined) return nearestSafeCutAtOrBefore(index, rows.length, isSafeCut);
+  }
+  return rows.length;
 }
 
 /**
@@ -163,7 +186,7 @@ function withSliceEnd(state: RevealState, messages: readonly RevealRow[], to: nu
   const endIndexHint = endMessageId === null ? 0 : to;
   return state.endMessageId === endMessageId && state.endIndexHint === endIndexHint
     ? state
-    : { ...state, endMessageId, endIndexHint };
+    : { ...state, endMessageId, endIndexHint, endRows: messages };
 }
 
 interface RevealSnapshot {
@@ -307,6 +330,7 @@ function startState<Row extends RevealRow>(
     targetMessageId: null,
     endMessageId: null,
     endIndexHint: 0,
+    endRows: [],
   };
   const cut = nextStepCut(length, TRANSCRIPT_REVEAL_TAIL_ROWS, inputs);
   if (cut === 0) return { ...base, anchorMessageId: null, anchorIndexHint: 0 };
