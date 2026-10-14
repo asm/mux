@@ -478,6 +478,32 @@ export function useMcpAppViewReloadKey(workspaceId: string, toolCallId: string):
 }
 
 /**
+ * Views that declared fullscreen but not inline in their latest ui/initialize. Their cards show
+ * the "Open in tab" notice instead of a frame. A server update that adds inline clears the
+ * mark at the view's next initialize. Session only: a later session finds out again on mount.
+ */
+const fullscreenOnlyViews = new Set<string>();
+
+/** Record whether the view declared fullscreen but not inline (its latest initialize). */
+export function setMcpAppViewFullscreenOnly(
+  workspaceId: string,
+  toolCallId: string,
+  fullscreenOnly: boolean
+): void {
+  const key = lookupKey(workspaceId, toolCallId);
+  if (fullscreenOnlyViews.has(key) === fullscreenOnly) return;
+  if (fullscreenOnly) fullscreenOnlyViews.add(key);
+  else fullscreenOnlyViews.delete(key);
+  emit();
+}
+
+export function useMcpAppViewFullscreenOnly(workspaceId: string, toolCallId: string): boolean {
+  return useSyncExternalStore(subscribe, () =>
+    fullscreenOnlyViews.has(lookupKey(workspaceId, toolCallId))
+  );
+}
+
+/**
  * Where a view is mounted outside its tool card: its app tab (also on phones, where the sidebar
  * shows full-screen). Counted per workspace, tool call and host, so every place that can show a
  * view yields to it and at most one live instance runs. "card" is an expanded tool card, which

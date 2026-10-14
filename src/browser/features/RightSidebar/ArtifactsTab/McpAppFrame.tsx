@@ -26,11 +26,19 @@ import {
 import { mcpAppOpenAiShimScript, type McpAppOpenAiSeed } from "./mcpAppOpenAiShim";
 import {
   createMcpAppHost,
+  declaresFullscreenOnly,
   type McpAppConsentRequest,
+  type McpAppDisplayMode,
   type McpAppHost,
   type McpAppHostContext,
 } from "./mcpAppHost";
-import { isMcpAppViewHosted, openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
+import {
+  isMcpAppViewHosted,
+  setMcpAppViewFullscreenOnly,
+  openMcpAppViewTab,
+  reloadMcpAppView,
+  type McpAppViewRef,
+} from "./mcpAppViewsStore";
 import {
   newestMcpAppViewDomains,
   publishMcpAppViewDomains,
@@ -365,6 +373,27 @@ function useContainerDimensionsUpdates(hostRef: { current: McpAppHost | null }, 
     posted: (message: unknown) => rememberPostedDimensions(sent, message),
     flush: () => flushRef.current(),
   };
+}
+
+/**
+ * Runs an accepted display-mode move of a view (setDisplayMode): fullscreen opens or focuses
+ * its tab, any other mode (inline) closes the tab so its expanded card takes the view back.
+ */
+function moveViewTo(
+  mode: McpAppDisplayMode,
+  input: { workspaceId: string; view: McpAppViewRef; onClose?: () => void }
+) {
+  if (mode === "fullscreen") {
+    openMcpAppViewTab(input.workspaceId, input.view);
+    return;
+  }
+  // The user collapsed the card during the teardown wait: closing the tab would leave the view
+  // without a frame. It stays in its tab and loads again (it was torn down).
+  if (!isMcpAppViewHosted(input.workspaceId, input.view.toolCallId, "card")) {
+    reloadMcpAppView(input.workspaceId, input.view.toolCallId);
+    return;
+  }
+  input.onClose?.();
 }
 
 /** The domain prompt's text: the origins, and the project that keeps the approval. */
@@ -705,15 +734,24 @@ export function McpAppFrame(props: {
       // Inline only while the card is expanded in the loaded transcript: a collapsed (or
       // unloaded) card mounts no inline instance, so closing the tab would lose the view.
       // The host runs the move later; skip it once this instance is gone (closed meanwhile).
+      // A view that declared fullscreen but not inline is not hosted inline (#6181): marked,
+      // its cards show the "Open in tab" notice instead of a frame (mcpAppViewsStore.ts), so a
+      // card instance that learns it unmounts, and the user opens the view in its tab. A later
+      // declaration with inline clears the mark. A list-less initialize (the window.openai
+      // shim's) says nothing about the modes, so it keeps the mark of an earlier mount.
+      onViewDisplayModes: (modes) => {
+        if (modes === undefined) return;
+        setMcpAppViewFullscreenOnly(workspaceId, toolCallId, declaresFullscreenOnly(modes));
+      },
       setDisplayMode: (mode) => {
         if (mode === "inline" && !isMcpAppViewHosted(workspaceId, toolCallId, "card")) return null;
         return () => {
           if (hostRef.current !== host) return;
-          if (mode === "fullscreen") {
-            openMcpAppViewTab(workspaceId, latest.current.view);
-            return;
-          }
-          latest.current.onClose?.();
+          moveViewTo(mode, {
+            workspaceId,
+            view: latest.current.view,
+            onClose: latest.current.onClose,
+          });
         };
       },
       log: (message, data) =>
