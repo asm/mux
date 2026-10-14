@@ -1,6 +1,7 @@
 /**
- * Runs trusted Codex-format `mcp_tool` hooks (hooks.json) on Xum's hook points: PreToolUse and
- * PostToolUse on `tool.execute`. Source: https://learn.chatgpt.com/docs/hooks.
+ * Runs trusted Codex-format `mcp_tool` hooks (hooks.json) on Xum's hook points:
+ * PreToolUse and PostToolUse on `tool.execute`, UserPromptSubmit on `message.send`, and Stop on
+ * `turn.stop`. Source: https://learn.chatgpt.com/docs/hooks.
  *
  * Security (the fix for #6042's P1-a and P1-b): `deps.isHookAllowed` runs before EACH call. It
  * reads the trust store and the plugin and project state at that moment, never a snapshot from
@@ -102,6 +103,82 @@ export function registerCodexPluginHooks(
       spine.use(
         "tool.execute",
         (ctx, next) => runToolHooks(ctx, next, pre, post, registration),
+        scope
+      )
+    );
+  }
+  const prompt = forEvent("UserPromptSubmit");
+  if (prompt.length > 0) {
+    unregisters.push(
+      spine.useBefore(
+        "message.send",
+        async (ctx) => {
+          for (const hook of prompt) {
+            const output = await invoke(
+              hook,
+              { prompt: ctx.text },
+              "UserPromptSubmit",
+              registration,
+              { cwd: ctx.cwd }
+            );
+            if (output === null) continue;
+            // Codex: a block without a non-empty reason is an invalid result and fails open
+            // (its context is dropped too); continue: false blocks on its own.
+            if (
+              output.decision === "block" &&
+              output.reason === undefined &&
+              output.continue !== false
+            ) {
+              warn(
+                registration,
+                hook,
+                "returned decision block without a reason; ignoring its output"
+              );
+              continue;
+            }
+            if (output.decision === "block" || output.continue === false) {
+              ctx.blocked = {
+                pluginName: registration.pluginName,
+                reason: output.reason ?? output.stopReason ?? "Blocked by a plugin hook.",
+              };
+              return;
+            }
+            if (output.additionalContext !== undefined) {
+              ctx.additionalContext.push({
+                pluginId: registration.pluginName,
+                text: output.additionalContext,
+              });
+            }
+          }
+        },
+        scope
+      )
+    );
+  }
+  const stop = forEvent("Stop");
+  if (stop.length > 0) {
+    unregisters.push(
+      spine.useBefore(
+        "turn.stop",
+        async (ctx) => {
+          for (const hook of stop) {
+            const output = await invoke(
+              hook,
+              {
+                stop_hook_active: ctx.stopHookActive,
+                last_assistant_message: ctx.lastAssistantMessage,
+              },
+              "Stop",
+              registration,
+              { cwd: ctx.cwd }
+            );
+            if (output === null) continue;
+            if (output.continue === false) ctx.halted = { pluginName: registration.pluginName };
+            else if (output.decision === "block" && output.reason !== undefined) {
+              ctx.continueReasons.push(output.reason);
+            }
+          }
+        },
         scope
       )
     );
@@ -372,33 +449,39 @@ function lookup(root: unknown, dottedPath: string): unknown {
 }
 
 /**
- * The hook's output from an MCP call result: `structuredContent`, else the first text content as
- * JSON. Plain text counts only for UserPromptSubmit (Codex adds it as context). An `isError`
- * result is a failure.
+ * The hook's output from an MCP call result: every text content block, joined with newlines and
+ * read as JSON, as Codex does (hook_mcp_executor.rs). Codex ignores `structuredContent`; Xum
+ * reads it only when the result has no text. Plain text counts only for UserPromptSubmit (Codex
+ * adds it as context). An `isError` result is a failure.
  */
 export function parseHookOutput(result: unknown, eventName: string): HookOutput | null {
   const plainTextIsContext = eventName === "UserPromptSubmit";
   if (!isPlainObject(result)) throw new Error("the MCP result is not an object");
   if (result.isError === true) throw new Error("the MCP tool returned an error");
+  const content: unknown[] = Array.isArray(result.content) ? result.content : [];
+  const joined = content
+    .flatMap((part) =>
+      isPlainObject(part) && part.type === "text" && typeof part.text === "string"
+        ? [part.text]
+        : []
+    )
+    .join("\n")
+    .trim();
   let raw: unknown = result.structuredContent;
-  if (!isPlainObject(raw)) {
-    const content = Array.isArray(result.content) ? result.content : [];
-    const first: unknown = content.find(
-      (part: unknown) => isPlainObject(part) && part.type === "text"
-    );
-    const text = isPlainObject(first) && typeof first.text === "string" ? first.text.trim() : "";
-    if (text.length === 0) return null;
+  if (joined.length > 0) {
     try {
-      raw = JSON.parse(text);
+      raw = JSON.parse(joined);
     } catch {
-      return plainTextIsContext ? { additionalContext: cut(text) } : null;
+      return plainTextIsContext ? { additionalContext: cut(joined) } : null;
     }
   }
   if (!isPlainObject(raw)) return null;
   // Codex's schema requires hookSpecificOutput.hookEventName to name this event; an output
-  // tagged for another event (or untagged) is malformed and fails open.
+  // tagged for another event (or untagged) is malformed and fails open. Codex reads JSON null on
+  // every optional field as absent (serde `Option`), so each check below treats null as omitted:
+  // a serializer that writes null defaults (`"hookSpecificOutput": null`) must not void a block.
   if (
-    raw.hookSpecificOutput !== undefined &&
+    raw.hookSpecificOutput != null &&
     !(isPlainObject(raw.hookSpecificOutput) && raw.hookSpecificOutput.hookEventName === eventName)
   ) {
     throw new Error(`hookSpecificOutput is not tagged hookEventName "${eventName}"`);
@@ -436,7 +519,7 @@ export function parseHookOutput(result: unknown, eventName: string): HookOutput 
     reason: text(raw.reason),
     permissionDecision: text(specific.permissionDecision),
     permissionDecisionReason: text(specific.permissionDecisionReason),
-    ...(specific.updatedInput !== undefined ? { updatedInput: specific.updatedInput } : {}),
+    ...(specific.updatedInput != null ? { updatedInput: specific.updatedInput } : {}),
     additionalContext: text(specific.additionalContext),
   };
   return Object.fromEntries(

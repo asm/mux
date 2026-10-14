@@ -45,10 +45,16 @@ export interface MessageSendHookInput {
 export async function runMessageSendHooks(
   spine: EventSpine,
   workspaceId: string,
-  input: MessageSendHookInput
+  input: MessageSendHookInput & { cwd?: string }
 ): Promise<MessageSendHookOutcome> {
   if (!spine.hasMiddleware("message.send")) return { kind: "none" };
-  const base = { workspaceId, origin: input.origin, text: input.text, additionalContext: [] };
+  const base = {
+    workspaceId,
+    origin: input.origin,
+    text: input.text,
+    ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+    additionalContext: [],
+  };
   const ctx: MessageSendContext = input.canBlock
     ? base
     : {
@@ -113,7 +119,7 @@ export type TurnStopHookOutcome = { kind: "none" } | { kind: "continue"; prompt:
 export async function runTurnStopHooks(
   spine: EventSpine,
   workspaceId: string,
-  input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive">
+  input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive" | "cwd">
 ): Promise<TurnStopHookOutcome> {
   if (!spine.hasMiddleware("turn.stop")) return { kind: "none" };
   const ctx: TurnStopContext = { workspaceId, ...input, continueReasons: [] };

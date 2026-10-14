@@ -11,6 +11,7 @@ import {
   registerCodexPluginHooks,
   type CodexHookRunnerDeps,
 } from "./codexHookRunner";
+import { runMessageSendHooks, runTurnStopHooks } from "./promptHooks";
 
 const workspaceId = "ws";
 
@@ -181,6 +182,46 @@ describe("PreToolUse", () => {
       json({ hookSpecificOutput: { hookEventName: "PostToolUse", permissionDecision: "deny" } })
     );
     expect((await runTool(spine, "bash", {})).executed).toBe(true);
+  });
+
+  test("JSON null on an optional field is absent (Codex): a block or deny still holds", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6rgpoH): a serializer that writes null defaults must not void a guard.
+    const nulls = { continue: null, stopReason: null, systemMessage: null, suppressOutput: null };
+    const outputs = [
+      json({ ...nulls, decision: "block", reason: "no rm", hookSpecificOutput: null }),
+      json({
+        ...nulls,
+        decision: null,
+        reason: null,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: "no rm",
+          updatedInput: null,
+          additionalContext: null,
+        },
+      }),
+    ];
+    for (const output of outputs) {
+      const { spine } = setup([hook("PreToolUse")], () => output);
+      const ctx = await runTool(spine, "bash", { script: "rm -rf /" });
+      expect(ctx.blocked?.result).toEqual({
+        error: "Tool call blocked by plugin 'guard' hook: no rm",
+      });
+    }
+
+    // An allow with updatedInput: null is an allow without a rewrite: the original call runs.
+    const allow = setup([hook("PreToolUse")], () =>
+      json({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          updatedInput: null,
+        },
+      })
+    );
+    const ran = await runTool(allow.spine, "bash", { script: "ls" });
+    expect(ran.result).toEqual({ ran: { script: "ls" } });
   });
 
   test("a decision that is not an exact Codex enum value is malformed and fails open", async () => {
@@ -548,16 +589,150 @@ describe("PostToolUse", () => {
   });
 });
 
-test("hooks that cannot run are never called", async () => {
-  const { spine, calls } = setup(
-    [
-      hook("PreToolUse", { status: "unsupported-handler" }),
-      hook("SessionStart", { status: "ignored-event" }),
-    ],
-    () => deny
-  );
-  expect((await runTool(spine, "bash", {})).executed).toBe(true);
-  expect(calls).toEqual([]);
+describe("UserPromptSubmit and Stop", () => {
+  test("UserPromptSubmit blocks, or adds context (JSON or plain text)", async () => {
+    const block = setup([hook("UserPromptSubmit", { input: { p: "${prompt}" } })], () =>
+      json({ decision: "block", reason: "Contains a token." })
+    );
+    expect(
+      await runMessageSendHooks(block.spine, workspaceId, {
+        text: "key=abc",
+        origin: "user",
+        canBlock: true,
+      })
+    ).toEqual({
+      kind: "blocked",
+      pluginName: "guard",
+      reason: "Contains a token.",
+    });
+    expect(block.calls).toEqual([{ p: "key=abc" }]);
+
+    const plain = setup([hook("UserPromptSubmit")], () => ({
+      content: [{ type: "text", text: "Ask for a repro first." }],
+    }));
+    expect(
+      await runMessageSendHooks(plain.spine, workspaceId, {
+        text: "fix",
+        origin: "user",
+        canBlock: true,
+      })
+    ).toEqual({
+      kind: "context",
+      entries: [{ pluginId: "guard", text: "Ask for a repro first." }],
+    });
+  });
+
+  test("UserPromptSubmit: hookSpecificOutput: null is absent (Codex), so the block holds", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6rgpoH): before, the null made the output malformed and the
+    // prompt was sent.
+    const { spine } = setup([hook("UserPromptSubmit")], () =>
+      json({ decision: "block", reason: "secret detected", hookSpecificOutput: null })
+    );
+    expect(
+      await runMessageSendHooks(spine, workspaceId, {
+        text: "key=abc",
+        origin: "user",
+        canBlock: true,
+      })
+    ).toEqual({ kind: "blocked", pluginName: "guard", reason: "secret detected" });
+  });
+
+  test("prompt and Stop events carry the workspace cwd", async () => {
+    const prompt = setup([hook("UserPromptSubmit", { input: { dir: "${cwd}" } })], () => null);
+    await runMessageSendHooks(prompt.spine, workspaceId, {
+      text: "hi",
+      origin: "user",
+      canBlock: true,
+      cwd: "/w",
+    });
+    const stop = setup([hook("Stop", { input: { dir: "${cwd}" } })], () => null);
+    await runTurnStopHooks(stop.spine, workspaceId, {
+      messageId: "a1",
+      lastAssistantMessage: null,
+      stopHookActive: false,
+      cwd: "/w",
+    });
+    expect([...prompt.calls, ...stop.calls]).toEqual([{ dir: "/w" }, { dir: "/w" }]);
+  });
+
+  test("Stop: decision block continues with the reason; continue false halts", async () => {
+    const input = { messageId: "a1", lastAssistantMessage: "done", stopHookActive: false };
+    const more = setup([hook("Stop", { input: { last: "${last_assistant_message}" } })], () =>
+      json({ decision: "block", reason: "Run the tests again." })
+    );
+    expect(await runTurnStopHooks(more.spine, workspaceId, input)).toEqual({
+      kind: "continue",
+      prompt: "Run the tests again.",
+    });
+    expect(more.calls).toEqual([{ last: "done" }]);
+
+    // One hook asks to continue, another says continue: false: the halt wins (Codex).
+    const halt = setup(
+      [hook("Stop", { key: "a", input: { n: 1 } }), hook("Stop", { key: "b", input: { n: 2 } })],
+      (input) =>
+        input.n === 1
+          ? json({ decision: "block", reason: "Run the tests again." })
+          : { structuredContent: { continue: false } }
+    );
+    expect(await runTurnStopHooks(halt.spine, workspaceId, input)).toEqual({ kind: "none" });
+  });
+
+  test("UserPromptSubmit: a block without a reason fails open (Codex), continue false still blocks", async () => {
+    const send = (answer: unknown) =>
+      runMessageSendHooks(setup([hook("UserPromptSubmit")], () => answer).spine, workspaceId, {
+        text: "fix",
+        origin: "user",
+        canBlock: true,
+      });
+    expect(await send(json({ decision: "block" }))).toEqual({ kind: "none" });
+    expect(
+      await send(
+        json({ decision: "block", reason: "  ", hookSpecificOutput: { additionalContext: "c" } })
+      )
+    ).toEqual({ kind: "none" });
+    expect(await send(json({ continue: false }))).toMatchObject({ kind: "blocked" });
+  });
+
+  test("the decision comes from every text block, as Codex reads it, not from structuredContent", async () => {
+    const answer = {
+      content: [
+        { type: "text", text: '{"decision": "block",' },
+        { type: "text", text: '"reason": "Contains a token."}' },
+      ],
+      structuredContent: { scanned: 3 },
+    };
+    const prompt = setup([hook("UserPromptSubmit")], () => answer);
+    expect(
+      await runMessageSendHooks(prompt.spine, workspaceId, {
+        text: "fix",
+        origin: "user",
+        canBlock: true,
+      })
+    ).toMatchObject({ kind: "blocked", reason: "Contains a token." });
+    const stop = setup([hook("Stop")], () => ({
+      content: [{ type: "text", text: JSON.stringify({ continue: false }) }],
+      structuredContent: { decision: "block", reason: "metadata, not a decision" },
+    }));
+    expect(
+      await runTurnStopHooks(stop.spine, workspaceId, {
+        messageId: "a1",
+        lastAssistantMessage: "done",
+        stopHookActive: false,
+      })
+    ).toEqual({ kind: "none" });
+  });
+
+  test("hooks that cannot run are never called", async () => {
+    const { spine, calls } = setup(
+      [
+        hook("PreToolUse", { status: "unsupported-handler" }),
+        hook("SessionStart", { status: "ignored-event" }),
+      ],
+      () => deny
+    );
+    expect((await runTool(spine, "bash", {})).executed).toBe(true);
+    expect(calls).toEqual([]);
+  });
 });
 
 describe("expandHookTemplate", () => {
