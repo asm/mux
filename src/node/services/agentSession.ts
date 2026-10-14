@@ -314,7 +314,15 @@ import {
   isProviderConfigFixableError,
 } from "@/common/utils/messages/retryEligibility";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
-import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
+import {
+  discoverAgentSkills,
+  readAgentSkill,
+  type ResolvedAgentSkill,
+} from "@/node/services/agentSkills/agentSkillsService";
+import {
+  pluginSiblingNoteFor,
+  prependPluginSiblingNote,
+} from "@/node/services/agentSkills/pluginSiblingNote";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import {
   createLoadedSkillSnapshot,
@@ -348,7 +356,11 @@ import type { XumToolScope } from "@/common/types/toolScope";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
-import { parseSkillLookupName } from "@/common/utils/agentSkills/skillLookupName";
+import {
+  listInvocableSkills,
+  parseSkillLookupName,
+} from "@/common/utils/agentSkills/skillLookupName";
+import type { InvocableSkill } from "@/common/types/agentSkill";
 import type { MemorySessionContext } from "@/node/services/memoryService";
 import {
   type CachedMemoryContext,
@@ -380,6 +392,38 @@ type AgentSessionInterruptResult = Result<void> & { streamStopped?: true };
 export type { FileState } from "@/node/services/utils/fileChangeTracker";
 
 type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPolicy"]>;
+
+/** The skill-storage context a snapshot's readAgentSkill call used. */
+interface SkillLookupContext {
+  runtime: Runtime;
+  workspacePath: string;
+  options: Parameters<typeof readAgentSkill>[3];
+}
+
+/**
+ * The plugin sibling note for skill snapshots. Discovery runs at most once per
+ * materialization, with the first plugin skill's lookup context (the same
+ * precedence its readAgentSkill call used), and never for non-plugin skills.
+ */
+function createPluginSiblingNoteResolver(
+  workspaceId: string
+): (resolved: ResolvedAgentSkill, context: SkillLookupContext) => Promise<string | null> {
+  let invocableSkills: Promise<readonly InvocableSkill[]> | undefined;
+  return async (resolved, context) => {
+    if (resolved.pluginName == null) return null;
+    invocableSkills ??= discoverAgentSkills(context.runtime, context.workspacePath, context.options)
+      .then(listInvocableSkills)
+      .catch((error: unknown) => {
+        // The note is advisory: never fail the send because of it.
+        log.warn("Failed to discover agent skills for the plugin sibling note", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+        return [];
+      });
+    return pluginSiblingNoteFor(resolved, await invocableSkills);
+  };
+}
 
 // Wake continuations must retain their delegated turn correlation through candidate preparation.
 // An explicit correlation (a workspace-turn-task row, or a wake row that reactivated an inactive
@@ -13576,6 +13620,7 @@ export class AgentSession {
       }
     }
 
+    const resolvePluginSiblingNote = createPluginSiblingNoteResolver(this.workspaceId);
     const snapshotMessages: MuxMessage[] = [];
     for (const ref of refs) {
       // A lookup name: bare, or `<plugin>:<skill>` for a plugin skill. The ref's
@@ -13589,6 +13634,9 @@ export class AgentSession {
       }
 
       let resolved: Awaited<ReturnType<typeof readAgentSkill>>;
+      // The context readAgentSkill used, so the sibling note discovers skills
+      // with the same precedence.
+      let lookupContext: SkillLookupContext;
       try {
         // claude-skills-compat experiment: resolve slash-invoked skills with the same
         // roots as discovery. The gate is an optional AgentSessionAIService capability.
@@ -13613,16 +13661,21 @@ export class AgentSession {
                 includeClaudeSkills,
               })
             : null;
-        resolved = await readAgentSkill(
-          skillCtx?.runtime ?? runtime,
-          skillCtx?.workspacePath ?? skillDiscoveryPath,
-          ref.skillName,
-          {
+        lookupContext = {
+          runtime: skillCtx?.runtime ?? runtime,
+          workspacePath: skillCtx?.workspacePath ?? skillDiscoveryPath,
+          options: {
             ...(skillCtx != null
               ? { roots: skillCtx.roots, containment: skillCtx.containment }
               : {}),
             includeClaudeSkills,
-          }
+          },
+        };
+        resolved = await readAgentSkill(
+          lookupContext.runtime,
+          lookupContext.workspacePath,
+          ref.skillName,
+          lookupContext.options
         );
       } catch (error) {
         // Inline refs skip unknown skills, but an unreadable skill (unreachable host,
@@ -13682,7 +13735,13 @@ export class AgentSession {
       // Host-read skills in off-host workspaces (e.g. global plugin skills on
       // SSH/Docker) tell the model their files are not where bash runs. Added
       // before hashing so the snapshot hash covers the note.
-      const body = prependSkillDirectoryOffHostNote(injectedBody, skillDirectory);
+      // Plugin skills name sibling skills by bare name; map the shadowed ones to
+      // their qualified names. The off-host note stays the very first line.
+      const siblingNote = await resolvePluginSiblingNote(resolved, lookupContext);
+      const body = prependSkillDirectoryOffHostNote(
+        prependPluginSiblingNote(injectedBody, siblingNote),
+        skillDirectory
+      );
 
       // Include the parsed YAML frontmatter in the hash so frontmatter-only edits (e.g. description)
       // generate a new snapshot and keep the UI hover preview in sync. The hash also covers

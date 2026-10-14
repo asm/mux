@@ -1014,6 +1014,19 @@ export interface ResolvedAgentSkill {
    * outside content.
    */
   pluginRoot?: string;
+  /**
+   * Plugin name for Agent Plugin skills, so callers can tell the model the
+   * qualified names of this plugin's shadowed siblings (pluginSiblingNote.ts).
+   */
+  pluginName?: string;
+}
+
+/** Stamp a plugin skill's plugin name on its read result (see ResolvedAgentSkill.pluginName). */
+function withPluginName(
+  resolved: ResolvedAgentSkill | null,
+  pluginName: string | undefined
+): ResolvedAgentSkill | null {
+  return resolved != null && pluginName != null ? { ...resolved, pluginName } : resolved;
 }
 
 /** Read a non-plugin SKILL.md for a direct skill read; every failure throws. */
@@ -1152,13 +1165,16 @@ async function readCandidateSkill(
     const stat = await candidate.runtime.stat(skillDir);
     if (!stat.isDirectory) return null;
 
-    return await readAgentSkillFromDir(
-      candidate.runtime,
-      skillDir,
-      name,
-      candidate.scope,
-      candidate.pluginRoot,
-      candidate.skillConsent
+    return withPluginName(
+      await readAgentSkillFromDir(
+        candidate.runtime,
+        skillDir,
+        name,
+        candidate.scope,
+        candidate.pluginRoot,
+        candidate.skillConsent
+      ),
+      candidate.pluginName
     );
   } catch (error) {
     // An unreadable skill (transport, permission) must not let a lower-scope
