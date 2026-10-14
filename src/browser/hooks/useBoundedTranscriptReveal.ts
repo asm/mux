@@ -91,8 +91,12 @@ interface RevealState {
   /** First unmounted newer row while detached, anchored by id like the start; null ⇒ the tail. */
   endMessageId: string | null;
   endIndexHint: number;
-  /** The rows `endIndexHint` indexes, for the fallback when the end row is gone. */
-  endRows: readonly RevealRow[];
+  /**
+   * Ids of the next unmounted rows after the end row, for the fallback when it is gone; [] at the
+   * tail. Ids only, so a detached slice never keeps an obsolete transcript reachable (#6669), and
+   * at most `maxMountedRows` of them, so a step costs O(cap), not O(transcript) (#6676 review).
+   */
+  endRows: readonly string[];
 }
 
 /**
@@ -134,24 +138,25 @@ function storedSliceEnd(state: RevealState, rows: readonly RevealRow[], isSafeCu
   if (id === null) return rows.length;
   const found = rows[hint]?.id === id ? hint : rows.findIndex((row) => row.id === id);
   if (found !== -1) return nearestSafeCutAtOrBefore(found, rows.length, isSafeCut);
-  return endAtNearestUnmountedRow(rows, endRows, hint, isSafeCut);
+  return endAtNearestUnmountedRow(rows, endRows, isSafeCut);
 }
 
 /**
  * Where the end goes once its row is gone, even when one reconciliation also deleted mounted rows
- * before it (#6667 review): the nearest still-present row that was unmounted (`endRows[hint+1..]`),
- * so mounted rows replaced since stay mounted. If none survives, every row the reader had not
- * reached is gone and the slice ends at the tail: unmounting what follows could hide read rows.
+ * before it (#6667 review): the nearest still-present row that was unmounted (`endRows`), so
+ * mounted rows replaced since stay mounted. If none survives, the slice ends at the tail, which the
+ * cap then clamps: unmounting what follows could hide read rows. `endRows` holds one cap of rows.
+ * With all of them gone too, the clamp can mount a few more unread rows than the nearest survivor
+ * would (as many as the update deleted inside the slice); it never hides one.
  */
 function endAtNearestUnmountedRow(
   rows: readonly RevealRow[],
-  endRows: readonly RevealRow[],
-  hint: number,
+  endRows: readonly string[],
   isSafeCut: IsSafeCut
 ): number {
   const indexById = new Map(rows.map((row, index) => [row.id, index]));
-  for (let newer = hint + 1; newer < endRows.length; newer += 1) {
-    const index = indexById.get(endRows[newer].id);
+  for (const id of endRows) {
+    const index = indexById.get(id);
     if (index !== undefined) return nearestSafeCutAtOrBefore(index, rows.length, isSafeCut);
   }
   return rows.length;
@@ -184,10 +189,13 @@ function resolveSliceEnd(
 function withSliceEnd(state: RevealState, messages: readonly RevealRow[], to: number): RevealState {
   const endMessageId = to < messages.length ? messages[to].id : null;
   const endIndexHint = endMessageId === null ? 0 : to;
-  return state.endMessageId === endMessageId && state.endIndexHint === endIndexHint
-    ? state
-    : { ...state, endMessageId, endIndexHint, endRows: messages };
+  if (state.endMessageId === endMessageId && state.endIndexHint === endIndexHint) return state;
+  return { ...state, endMessageId, endIndexHint, endRows: sliceEndIds(state, messages, to) };
 }
+
+/** Ids of up to one cap of rows after the end row; none at the tail (see `endRows`). */
+const sliceEndIds = (state: RevealState, messages: readonly RevealRow[], to: number) =>
+  messages.slice(to + 1, to + 1 + (state.maxMountedRows ?? 0)).map((row) => row.id);
 
 interface RevealSnapshot {
   messages: readonly RevealRow[];
@@ -255,6 +263,60 @@ function revealThroughState(
   if (index >= snapshot.fromIndex || previous.generation !== snapshot.generation) return previous;
   const targetMessageId = snapshot.messages[index].id;
   return previous.targetMessageId === targetMessageId ? previous : { ...previous, targetMessageId };
+}
+
+/**
+ * Whether the automatic reveal must stop counting: always while detached (`toIndex < length`), so
+ * deletions in the unmounted newer rows cannot resume it; attached, main's mounted-rows budget.
+ */
+function isBudgetSpent(
+  state: RevealState,
+  slice: Pick<RevealSnapshot, "messages" | "fromIndex" | "toIndex">
+): boolean {
+  const length = slice.messages.length;
+  return slice.toIndex < length || length - slice.fromIndex >= state.autoRowLimit;
+}
+
+/**
+ * Load older: attached, main's rule (one more budget of mounted rows). Detached, or about to be,
+ * the walk ends at the row one budget older (revealThrough's target rule) instead of a count, so
+ * no deletion elsewhere can lengthen it (F20 PR3a-2); a vanished target ends it early.
+ */
+function revealMoreState(
+  previous: RevealState,
+  snapshot: RevealSnapshot,
+  max: number | undefined,
+  isSafeCut: IsSafeCut
+): RevealState {
+  if (previous.generation !== snapshot.generation) return previous;
+  const length = snapshot.messages.length;
+  const limit = length - snapshot.fromIndex + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS;
+  if (max === undefined || (snapshot.toIndex === length && limit <= max)) {
+    return previous.autoRowLimit >= limit ? previous : { ...previous, autoRowLimit: limit };
+  }
+  if (snapshot.fromIndex === 0) return previous;
+  const cut = nearestSafeCutAtOrBefore(
+    snapshot.fromIndex - TRANSCRIPT_REVEAL_AUTO_MAX_ROWS,
+    length,
+    isSafeCut
+  );
+  return { ...previous, targetMessageId: snapshot.messages[cut].id };
+}
+
+/**
+ * Where the slice starts once its start row is gone. Attached: main's rule, the old index. Detached
+ * (#6669 round 7): as many rows before the end as were mounted, so every surviving mounted row
+ * stays mounted even when the deleted run put the old start index past the new length. Rows
+ * deleted below it mount instead, never more.
+ */
+function vanishedStartFallback(
+  state: RevealState,
+  messages: readonly RevealRow[],
+  isSafeCut: IsSafeCut
+): number {
+  if (state.endMessageId === null) return state.anchorIndexHint;
+  const mountedBefore = state.endIndexHint - state.anchorIndexHint;
+  return storedSliceEnd(state, messages, isSafeCut) - mountedBefore;
 }
 
 /** Largest safe cut at or before `index`, clamped to [0, length]; 0 is always safe. */
@@ -425,7 +487,9 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
       setState(current);
     }
     fromIndex = nearestSafeCutAtOrBefore(
-      anchorIndex === -1 ? current.anchorIndexHint : anchorIndex,
+      anchorIndex !== -1
+        ? anchorIndex
+        : vanishedStartFallback(current, args.messages, args.isSafeCut),
       length,
       args.isSafeCut
     );
@@ -459,11 +523,10 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
       setState(current);
     }
   }
-  const mountedRows = length - fromIndex;
   const isRevealPaused =
     current.anchorMessageId !== null &&
     current.targetMessageId === null &&
-    mountedRows >= current.autoRowLimit;
+    isBudgetSpent(current, { messages: args.messages, fromIndex, toIndex });
 
   // The scheduled step reads the latest COMMITTED inputs when it runs, not what it captured
   // when scheduled: grouping can change while a frame is pending. Published from a layout
@@ -505,8 +568,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
           return previous;
         }
         // A frame that slipped past cancellation must not step a reveal that paused meanwhile.
-        const snapshotMountedRows = snapshot.messages.length - snapshot.fromIndex;
-        if (previous.targetMessageId === null && snapshotMountedRows >= previous.autoRowLimit) {
+        if (previous.targetMessageId === null && isBudgetSpent(previous, snapshot)) {
           return previous;
         }
         const cut = nextStepCut(
@@ -525,12 +587,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   // the rows and boundary it just rendered.
   const revealMore = () => {
     const snapshot = latest.current;
-    const limit = snapshot.messages.length - snapshot.fromIndex + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS;
-    setState((previous) =>
-      previous.generation !== snapshot.generation || previous.autoRowLimit >= limit
-        ? previous
-        : { ...previous, autoRowLimit: limit }
-    );
+    setState((previous) => revealMoreState(previous, snapshot, max, args.isSafeCut));
   };
   const revealNewer = () => {
     setState((previous) => revealNewerState(previous, latest.current, max, args.isSafeCut));
