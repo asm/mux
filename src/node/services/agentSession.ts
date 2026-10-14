@@ -327,6 +327,12 @@ import {
 } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { substituteSkillArguments } from "@/node/services/agentSkills/skillArguments";
 import {
+  assertSkillDirectoryPlaceholdersResolved,
+  resolveSkillDirectory,
+  skillDirectoryEnv,
+  substituteSkillDirectoryPlaceholdersOutsideDirectives,
+} from "@/node/services/agentSkills/skillDirectory";
+import {
   injectSkillDynamicContext,
   SKILL_DYNAMIC_COMMAND_TIMEOUT_MS,
   SKILL_DYNAMIC_OUTPUT_CAP_BYTES,
@@ -13407,10 +13413,21 @@ export class AgentSession {
         muxMetadata.skillName === ref.skillName
           ? (muxMetadata.arguments ?? "")
           : null;
-      const substitutedBody =
+      const argumentBody =
         slashArgumentText != null
           ? substituteSkillArguments(skill.body, slashArgumentText).body
           : skill.body;
+      // ${CLAUDE_SKILL_DIR}/${CLAUDE_PLUGIN_ROOT} next: after arguments (Claude Code's
+      // order), before dynamic context. Directive lines keep the placeholders and get
+      // the values as env vars, so !`sh "${CLAUDE_SKILL_DIR}/x.sh"` runs the bundled
+      // script without reparsing the path as shell. `runtime` is where bash runs.
+      const skillDirectory = resolveSkillDirectory(resolved, runtime, {
+        discoveredOutsideWorkspace: skillDiscoveryPath !== workspacePath,
+      });
+      const substitutedBody = substituteSkillDirectoryPlaceholdersOutsideDirectives(
+        argumentBody,
+        skillDirectory
+      );
 
       // Dynamic context injection (default-off experiment): replace whole-line
       // !`command` directives with their output. Ordering matters: it runs after
@@ -13419,12 +13436,13 @@ export class AgentSession {
       // (different command outputs naturally produce distinct snapshots). Every
       // ref in this materialization path is user-initiated (slash "/skill" or
       // inline "$skill"); the model-side agent_skill_read tool takes a separate
-      // path and always sees the raw body.
+      // path and never runs directives (it only substitutes skill directories).
       const body = await this.maybeInjectSkillDynamicContext({
         skillName: skill.frontmatter.name,
         body: substitutedBody,
         runtime,
         workspacePath,
+        env: skillDirectoryEnv(skillDirectory),
       });
 
       // Include the parsed YAML frontmatter in the hash so frontmatter-only edits (e.g. description)
@@ -13482,6 +13500,8 @@ export class AgentSession {
     body: string;
     runtime: Runtime;
     workspacePath: string;
+    /** Skill-directory variables for directive commands (skillDirectoryEnv). */
+    env: Record<string, string>;
   }): Promise<string> {
     if (!this.aiService.isExperimentEnabled(EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT)) {
       return args.body;
@@ -13505,8 +13525,13 @@ export class AgentSession {
         // lives behind hook/trust plumbing that is not reachable here, and directive
         // commands should not depend on tool-specific env anyway.
         execute: async (command) => {
+          // Never run a directive with an unresolved skill-directory placeholder:
+          // the shell would expand it to "" and target a path at the filesystem
+          // root. The thrown reason becomes the directive's failure note.
+          assertSkillDirectoryPlaceholdersResolved(command, args.env);
           const execResult = await execBuffered(args.runtime, command, {
             cwd: args.workspacePath,
+            env: args.env,
             // Runtime-level timeout (seconds) actually kills the process; the
             // module-level race in injectSkillDynamicContext bounds our wait.
             timeout: Math.ceil(SKILL_DYNAMIC_COMMAND_TIMEOUT_MS / 1000),
