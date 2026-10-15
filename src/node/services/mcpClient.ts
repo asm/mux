@@ -359,7 +359,7 @@ function addSettingsToolAction(
  * Mirrors @ai-sdk/mcp's mcpToModelOutput so model-visible tool results stay
  * identical across the SDK swap.
  */
-function mcpToModelOutput({
+export function mcpToModelOutput({
   output,
 }: {
   output: unknown;
