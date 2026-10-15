@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import {
   clearSettingsToolResults,
+  forgetSettingsToolRuns,
+  forgetSettingsToolRunsExcept,
   publishSettingsToolWrite,
   subscribeSettingsToolWrites,
   settingsToolRunsOf,
@@ -26,6 +28,14 @@ test("settings tool runs: tracked per workspace and server until each run ends o
   expect(settingsToolRunsOf("ws-runs")).toEqual({});
 });
 
+test("settings tool runs: a removed workspace's entries go, and a late run end does not return", () => {
+  const end = startSettingsToolRun("ws-removed", "cad", "cad.reset");
+  forgetSettingsToolRuns("ws-removed");
+  expect(settingsToolRunsOf("ws-removed")).toEqual({});
+  end({ text: "done", isError: false });
+  expect(settingsToolRunsOf("ws-removed")).toEqual({});
+});
+
 test("a writing run's end reaches the dialogs of its workspace only", async () => {
   const reread: string[] = [];
   const stop = subscribeSettingsToolWrites("ws-write", (serverName) => {
@@ -46,4 +56,26 @@ test("a writing run's end reaches the dialogs of its workspace only", async () =
   await publishSettingsToolWrite("ws-write", "cad", readWithoutDialog);
   other();
   expect(reread).toEqual(["cad", "backend"]);
+});
+
+test("a metadata snapshot drops the idle entries of workspaces it no longer lists", () => {
+  const kept = startSettingsToolRun("ws-listed", "cad", "cad.reset");
+  startSettingsToolRun(
+    "ws-deleted-elsewhere",
+    "cad",
+    "cad.reset"
+  )({ text: "done", isError: false });
+  // An archived workspace is not in the snapshot either: its run in flight stays.
+  const archived = startSettingsToolRun("ws-archived", "cad", "cad.reset");
+  // An empty snapshot can mean a failed metadata read: it drops nothing.
+  forgetSettingsToolRunsExcept(new Set());
+  expect(settingsToolRunsOf("ws-deleted-elsewhere").cad?.results).toEqual({
+    "cad.reset": { text: "done", isError: false },
+  });
+  forgetSettingsToolRunsExcept(new Set(["ws-listed"]));
+  expect(settingsToolRunsOf("ws-deleted-elsewhere")).toEqual({});
+  expect(settingsToolRunsOf("ws-listed").cad?.running).toEqual(["cad.reset"]);
+  expect(settingsToolRunsOf("ws-archived").cad?.running).toEqual(["cad.reset"]);
+  kept(null);
+  archived(null);
 });

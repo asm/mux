@@ -21,7 +21,8 @@ type WorkspaceSettingsToolRuns = Readonly<Record<string, ServerSettingsToolRuns>
  * MCP dialog unmounts its settings sections (the sidebar row even unmounts the dialog), and a
  * reopen used to forget a run still in flight: Run and Save settings were enabled while it ran.
  * Results live here too, so a section remounted by a reopen or re-read still shows the result.
- * Module-level and in memory only: a reload ends every run anyway.
+ * Module-level and in memory only: a reload ends every run anyway. A removed workspace's
+ * entries go with it (forgetSettingsToolRuns).
  */
 const runsByWorkspace = new Map<string, WorkspaceSettingsToolRuns>();
 const listeners = new Set<() => void>();
@@ -65,15 +66,28 @@ export function startSettingsToolRun(
   return (result) => {
     if (ended) return;
     ended = true;
-    update(workspaceId, serverName, (runs) => {
-      const index = runs.running.indexOf(toolName);
-      return {
-        running: runs.running.filter((_, i) => i !== index),
-        results:
-          result === null ? withoutResult(runs, toolName) : { ...runs.results, [toolName]: result },
-      };
-    });
+    endSettingsToolRun(workspaceId, serverName, toolName, result);
   };
+}
+
+/** One run of `toolName` ends: it leaves `running`, and its result (if any) shows. */
+function endSettingsToolRun(
+  workspaceId: string,
+  serverName: string,
+  toolName: string,
+  result: SettingsToolRunResult | null
+): void {
+  const runs = serverSettingsToolRuns(settingsToolRunsOf(workspaceId), serverName);
+  const index = runs.running.indexOf(toolName);
+  // Forgotten (its workspace was removed): a late end must not bring the entry back.
+  if (index === -1) return;
+  update(workspaceId, serverName, (current) => ({
+    running: current.running.filter((_, i) => i !== index),
+    results:
+      result === null
+        ? withoutResult(current, toolName)
+        : { ...current.results, [toolName]: result },
+  }));
 }
 
 /** A new dialog open starts without the results of earlier opens (runs in flight stay). */
@@ -82,6 +96,28 @@ export function clearSettingsToolResults(workspaceId: string): void {
   if (workspace === undefined) return;
   for (const serverName of Object.keys(workspace))
     update(workspaceId, serverName, (runs) => ({ running: runs.running, results: {} }));
+}
+
+/** The workspace was removed: drop its runs and results. */
+export function forgetSettingsToolRuns(workspaceId: string): void {
+  if (!runsByWorkspace.delete(workspaceId)) return;
+  for (const listener of listeners) listener();
+}
+
+/**
+ * A metadata snapshot (a reconnect) lists the backend's active workspaces: drop the idle
+ * entries (results only) of the others. Another Xum instance can remove a workspace while this
+ * renderer is offline. A workspace with a run in flight keeps its entry: the snapshot leaves
+ * out archived workspaces too, and an unarchived one must still wait for its run. That run's
+ * end leaves only its result behind. An empty snapshot proves nothing: the backend lists none
+ * when its metadata read fails, so it keeps every entry (WorkspaceContext treats an empty
+ * snapshot the same way).
+ */
+export function forgetSettingsToolRunsExcept(workspaceIds: ReadonlySet<string>): void {
+  if (workspaceIds.size === 0) return;
+  for (const [workspaceId, servers] of [...runsByWorkspace])
+    if (!workspaceIds.has(workspaceId) && !Object.values(servers).some((r) => r.running.length > 0))
+      forgetSettingsToolRuns(workspaceId);
 }
 
 export function settingsToolRunsOf(workspaceId: string): WorkspaceSettingsToolRuns {
