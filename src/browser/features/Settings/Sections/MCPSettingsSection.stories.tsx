@@ -551,6 +551,59 @@ export const ProjectSettingsOAuthLoggedIn: Story = {
   },
 };
 
+/**
+ * #6622: the server refused a tool call with 403 insufficient_scope. The tokens stay, and the row
+ * names the scopes and the next step. Phone width: long scope URLs wrap. Out of Pixel snapshots
+ * (snapshot budget); the play checks it.
+ */
+export const ProjectSettingsOAuthInsufficientScope: Story = {
+  decorators: withDesktopWindowApi,
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <MCPSettingsSectionStoryShell
+      setup={() =>
+        setupMCPSettingsSectionStory({
+          servers: {
+            "remote-oauth": {
+              transport: "http",
+              url: "https://example.com/mcp",
+              disabled: false,
+            },
+          },
+          mcpOauthAuthStatus: new Map<string, MCPOAuthAuthStatus>([
+            [
+              "https://example.com/mcp",
+              {
+                serverUrl: "https://example.com/mcp",
+                isLoggedIn: true,
+                hasRefreshToken: true,
+                updatedAtMs: Date.now() - 60_000,
+                insufficientScopes: ["https://www.googleapis.com/auth/drive.file", "files.write"],
+              },
+            ],
+          ]),
+        })
+      }
+    >
+      <div style={{ width: 375 }}>
+        <MCPSettingsSection />
+      </div>
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const body = within(canvasElement.ownerDocument.body);
+    await body.findByText(/Logged in/i);
+    const scopes = "https://www.googleapis.com/auth/drive.file files.write";
+    // By role, not by copy: the prompt is the status line that names the scopes.
+    const prompt = (await body.findAllByRole("status")).find((el) =>
+      el.textContent?.includes(scopes)
+    );
+    if (!prompt) throw new Error("The sign-in prompt must name the requested scopes");
+    await expect(prompt.textContent).toContain(scopes);
+    await expect(prompt.scrollWidth).toBeLessThanOrEqual(prompt.clientWidth + 1);
+  },
+};
+
 function setupDesignStory(
   enabled = true,
   reuseEnabled = false,
