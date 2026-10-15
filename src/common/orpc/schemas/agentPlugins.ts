@@ -146,7 +146,12 @@ export const AgentPluginManifestSummarySchema = z.object({
  * source + SHA, the manifest, every skill, and every MCP server command line.
  */
 /** The component kinds with consent records (#6498, #6629). */
-export const AgentPluginComponentKindSchema = z.enum(["skills", "mcpServers", "workflows"]);
+export const AgentPluginComponentKindSchema = z.enum([
+  "skills",
+  "mcpServers",
+  "workflows",
+  "agents",
+]);
 
 export const AgentPluginInstallPreviewSchema = z.object({
   source: AgentPluginGitSourceSchema,

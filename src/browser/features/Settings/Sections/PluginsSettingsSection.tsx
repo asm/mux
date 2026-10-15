@@ -957,6 +957,7 @@ const REVIEWED_KIND_LABEL: Record<AgentPluginComponentRef["kind"], string> = {
   skills: "Skill",
   mcpServers: "MCP server",
   workflows: "Workflow",
+  agents: "Agent",
 };
 
 /**

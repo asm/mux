@@ -72,6 +72,8 @@ export const AgentPluginComponentConsentSchema = z.object({
   // is reviewed, so each such plugin needs one review (no backfill). An older build strips
   // the key on read and keeps it on save (installService mergeRawConsent).
   workflows: z.record(z.string(), z.string()).default({}),
+  // Agents by ID (#6629), with the same upgrade rules as workflows.
+  agents: z.record(z.string(), z.string()).default({}),
 });
 
 export const AgentPluginInstallEntrySchema = z.object({
