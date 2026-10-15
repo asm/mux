@@ -3577,6 +3577,29 @@ describe("AgentPluginInstallService", () => {
       await failing.dispose();
     });
 
+    test("Settings shows a recorded URL without its query, fragment or user info (#6627)", async () => {
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      await fsPromises.writeFile(
+        path.join(muxRoot, "plugin-sign-outs-pending.json"),
+        JSON.stringify({
+          version: 1,
+          urls: [
+            "https://user:pw@mcp.example.com/mcp?api_key=s3cret#frag",
+            "not a url",
+            // A non-HTTP URL nests another URL in its path, user info included.
+            "blob:https://user:pw@mcp.example.com/mcp?key=secret",
+          ],
+        })
+      );
+      const status = await restarted.pendingSignOutStatus();
+      expect(status).toEqual({
+        kind: "pending",
+        servers: ["https://mcp.example.com/mcp?…", "(an unreadable URL)", "(an unreadable URL)"],
+      });
+    });
+
     test("Settings reads the pending, the failed and the corrupt record (#6627)", async () => {
       const { failing, result } = await updateWithFailingSignOut(stopStub);
       await result;

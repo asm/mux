@@ -282,6 +282,25 @@ function unusableRecordReason(error: unknown, file: string): string {
 }
 
 /**
+ * A recorded sign-out URL as Settings shows it (#6627). The query, the fragment and the user info
+ * can hold a secret from the plugin manifest, so they are left out. "?…" marks a removed query or
+ * fragment.
+ */
+function displaySignOutUrl(url: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return "(an unreadable URL)";
+  }
+  // Remote MCP servers are HTTP(S). Another scheme (blob:) can nest a URL with user info in its
+  // path, so it is shown as unreadable.
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return "(an unreadable URL)";
+  const cut = parsed.search !== "" || parsed.hash !== "";
+  return `${parsed.origin}${parsed.pathname}${cut ? "?…" : ""}`;
+}
+
+/**
  * The URLs a parsed sign-out record names, for the Settings recovery (#6627). See
  * recordedUrlsForRecovery: a record of another version without readable `urls` throws.
  */
@@ -4560,7 +4579,11 @@ export class AgentPluginInstallService {
     }
     // An empty record still fences discovery while it exists (the next pass deletes it).
     const lastError = this.pendingSignOutLastError;
-    return { kind: "pending", servers, ...(lastError !== undefined ? { lastError } : {}) };
+    return {
+      kind: "pending",
+      servers: servers.map(displaySignOutUrl),
+      ...(lastError !== undefined ? { lastError } : {}),
+    };
   }
 
   /**
@@ -4623,7 +4646,8 @@ export class AgentPluginInstallService {
       const key = oauth.credentialKey(serverUrl) ?? serverUrl;
       if (done.has(key)) continue;
       const failure = await signOutFailure(oauth, serverUrl, deadline, this.inFlightSignOuts);
-      if (failure !== undefined) throw new Error(`Could not sign out of ${serverUrl}: ${failure}`);
+      if (failure !== undefined)
+        throw new Error(`Could not sign out of ${displaySignOutUrl(serverUrl)}: ${failure}`);
       done.add(key);
     }
   }
