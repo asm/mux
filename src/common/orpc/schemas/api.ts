@@ -2180,6 +2180,16 @@ export const workspace = {
     }),
     output: ResultSchema(z.void(), z.string()),
   },
+  // User-only messaging tag for a root chat (see WorkspaceMetadata.messagingTag). There is
+  // deliberately no UI for it: users set it through the API (e.g. `xum api workspace
+  // set-messaging-tag`), and no agent tool may set a tag. `tag: null` (or empty) clears it.
+  setMessagingTag: {
+    input: z.object({
+      workspaceId: z.string(),
+      tag: z.string().nullable(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
+  },
   // Recipient-side delivery preference for agent messages that arrive while this workspace is
   // busy (see WorkspaceMetadata.agentMessageDispatchMode).
   setAgentMessageDispatchMode: {

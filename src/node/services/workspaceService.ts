@@ -416,6 +416,7 @@ import {
   type AgentMessageDispatchMode,
   getValidAgentMessageDispatchMode,
   getValidUnrelatedWorkspaceConsent,
+  normalizeMessagingTag,
 } from "@/common/orpc/schemas/workspace";
 import type {
   ArchiveLossyUntrackedFilesConfirmation,
@@ -2445,6 +2446,73 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
 function aliasesProjectMetadataDir(projectName: string): boolean {
   const folded = projectName.replace(/[. ]+$/, "").toLowerCase();
   return PROJECT_METADATA_DIR_NAMES.some((dirName) => dirName === folded);
+}
+
+/**
+ * Why an entry may not carry a messaging tag, or null when it may (see setMessagingTag).
+ * Root chats only: a side chat is discarded with its main chat, and a sub-agent child's
+ * parent owns its messaging — tagging either would create a link that outlives its meaning.
+ */
+function messagingTagRootRefusal(
+  entry: Pick<Workspace, "parentWorkspaceId" | "sideChatParentWorkspaceId">
+): string | null {
+  if (entry.sideChatParentWorkspaceId != null) {
+    return "Messaging tags can only be set on a root chat, not a side chat.";
+  }
+  if (entry.parentWorkspaceId != null) {
+    return "Messaging tags can only be set on a root chat, not a sub-agent chat.";
+  }
+  return null;
+}
+
+/**
+ * Applies a tag write to a fresh entry. Re-mints the revocation generation only on a
+ * real change (mirroring consent's repeat-on rule): a clear/re-tag cycle must fence
+ * tag-linked sends admitted under the previous link, while a no-op write fences nothing.
+ */
+function applyMessagingTag(
+  entry: Pick<Workspace, "messagingTag" | "messagingTagGeneration">,
+  normalizedTag: string | null
+): void {
+  if ((entry.messagingTag ?? null) === normalizedTag) {
+    return;
+  }
+  if (normalizedTag === null) {
+    delete entry.messagingTag;
+  } else {
+    entry.messagingTag = normalizedTag;
+  }
+  entry.messagingTagGeneration = crypto.randomUUID();
+}
+
+/** Root-only refusal first, then tag validation: the value a tag write may persist. */
+function messagingTagWriteValue(
+  entry: Pick<Workspace, "parentWorkspaceId" | "sideChatParentWorkspaceId">,
+  tag: string | null
+): Result<string | null, string> {
+  const refusal = messagingTagRootRefusal(entry);
+  if (refusal != null) {
+    return Err(refusal);
+  }
+  return resolveMessagingTagValue(tag);
+}
+
+/**
+ * Resolves user tag input to the value to persist: null clears (null/empty input), a
+ * normalized tag sets, and anything else is an error the caller returns before any write.
+ */
+function resolveMessagingTagValue(tag: string | null): Result<string | null, string> {
+  if (tag === null || tag.trim() === "") {
+    return Ok(null);
+  }
+  const normalized = normalizeMessagingTag(tag);
+  if (normalized === null) {
+    return Err(
+      "Invalid messaging tag: use 1-32 characters, starting with a letter or digit, " +
+        "followed by letters, digits, hyphens, or underscores (an optional leading @ is allowed)."
+    );
+  }
+  return Ok(normalized);
 }
 
 function mintUnrelatedWorkspaceConsent(): string {
@@ -9227,6 +9295,7 @@ export class WorkspaceService
       | "setHeartbeatSettings"
       | "unsetHeartbeatSettings"
       | "setUnrelatedWorkspaceConsent"
+      | "setMessagingTag"
       | "setAgentMessageDispatchMode"
       | "executeHeartbeat"
   ): Result<HeartbeatWorkspaceConfigEntry, string> {
@@ -9483,6 +9552,64 @@ export class WorkspaceService
       return Ok(undefined);
     } catch (error) {
       return Err(`Failed to update unrelated workspace consent: ${getErrorMessage(error)}`);
+    }
+  }
+
+  /**
+   * User-only messaging tag for a root chat: chats sharing a tag may message each other
+   * (TaskService resolves that relation). Only user API clients call this — no agent tool may
+   * set a tag, and it is never routed through the generic `tags` map. `null`/empty clears the
+   * tag (absent is the only untagged representation); an invalid tag is rejected before any
+   * write. Side chats and sub-agent children are refused: tagging is root-chat only. This
+   * never mints or changes unrelated-workspace consent. Like the consent switch, Ok means
+   * committed to config AND published on the metadata channel; recency is not bumped.
+   */
+  async setMessagingTag(workspaceId: string, tag: string | null): Promise<Result<void, string>> {
+    try {
+      const resolved = this.resolveHeartbeatWorkspaceEntry(workspaceId, "setMessagingTag");
+      if (!resolved.success) {
+        return Err(resolved.error);
+      }
+      const { normalizedWorkspaceId, projectPath, workspacePath, workspaceEntry } = resolved.data;
+      // Root-only, then validate before any write: an invalid tag must not persist or publish.
+      const tagValue = messagingTagWriteValue(workspaceEntry, tag);
+      if (!tagValue.success) {
+        return Err(tagValue.error);
+      }
+      const normalizedTag = tagValue.data;
+
+      // Mutate inside the serialized editConfig transform against the FRESH entry (see
+      // findFreshWorkspaceEntry): a stale snapshot write could resurrect a removed workspace.
+      let outcome: Result<void, string> = Err(this.workspaceNotFoundError());
+      await this.config.editConfig((freshConfig) => {
+        const entry = this.findFreshWorkspaceEntry(freshConfig, {
+          projectPath,
+          workspaceId: normalizedWorkspaceId,
+          workspacePath,
+        });
+        if (!entry) {
+          outcome = Err(this.workspaceNotFoundError());
+          return freshConfig;
+        }
+        // Re-check on the fresh entry: it may have become a child/side chat since resolution.
+        const freshRefusal = messagingTagRootRefusal(entry);
+        if (freshRefusal != null) {
+          outcome = Err(freshRefusal);
+          return freshConfig;
+        }
+        outcome = Ok(undefined);
+        applyMessagingTag(entry, normalizedTag);
+        return freshConfig;
+      });
+      if (!outcome.success) {
+        return Err(outcome.error);
+      }
+      // Publish after every successful write, including no-ops (same reason as consent above):
+      // Ok means committed AND published, so clients observe the tag once this acks.
+      await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
+      return Ok(undefined);
+    } catch (error) {
+      return Err(`Failed to update messaging tag: ${getErrorMessage(error)}`);
     }
   }
 
