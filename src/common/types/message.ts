@@ -1302,6 +1302,7 @@ export interface MuxReasoningPart {
    * - OpenAI/xAI Responses (esp. store=false/ZDR): itemId + reasoningEncryptedContent
    *   so the next turn can restore encrypted reasoning without server-side storage.
    * - Google: { google: { thoughtSignature } }
+   * - Google Vertex AI: { googleVertex: { thoughtSignature } }
    */
   providerOptions?: {
     anthropic?: {
@@ -1321,6 +1322,9 @@ export interface MuxReasoningPart {
       reasoningEncryptedContent?: string | null;
     };
     google?: {
+      thoughtSignature?: string;
+    };
+    googleVertex?: {
       thoughtSignature?: string;
     };
   };

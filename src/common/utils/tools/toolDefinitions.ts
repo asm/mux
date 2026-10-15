@@ -3683,6 +3683,7 @@ export function getAvailableTools(
         ? [...baseTools, "web_search", "x_search"]
         : baseTools;
     case "google":
+    case "google-vertex":
       if (supportsGoogleNativeToolsWithFunctionTools(modelId)) {
         return [...baseTools, "google_search", "url_context"];
       }
