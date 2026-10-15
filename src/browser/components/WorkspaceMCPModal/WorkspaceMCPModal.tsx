@@ -30,7 +30,11 @@ import {
   MCPServerSettingsSection,
   type MCPServerSettingsSectionHandle,
 } from "./MCPServerSettingsSection";
-import { clearSettingsToolResults, useSettingsToolRuns } from "./settingsToolRuns";
+import {
+  clearSettingsToolResults,
+  subscribeSettingsToolWrites,
+  useSettingsToolRuns,
+} from "./settingsToolRuns";
 import { ToolSelector } from "@/browser/components/ToolSelector/ToolSelector";
 import {
   MCPServerIdentityBadge,
@@ -207,6 +211,11 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
 
     void loadData();
   }, [open, api, projectPath, workspaceId, settingsRequests]);
+
+  // A tool that can write (a reset, an import) may have changed a server's settings: read them
+  // again (the backend's read refreshes its settings caches too). The run can have started in
+  // an earlier mount of this dialog, so its end reaches whichever dialog is open now.
+  useSettingsToolWriteRereads(open, workspaceId, readServerSettings, settingsRequests);
 
   // Fetch/refresh tools for a server
   const fetchTools = useCallback(
@@ -644,6 +653,28 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
     </Dialog>
   );
 };
+
+/** While the dialog is open, `reread` runs after each writing settings tool run of the workspace. */
+function useSettingsToolWriteRereads(
+  open: boolean,
+  workspaceId: string,
+  readServerSettings: (
+    serverNames: string[],
+    onOpen: boolean,
+    scope: SettingsRequestScope
+  ) => Promise<void>,
+  settingsRequests: SettingsRequests
+) {
+  // No ref: the listener keeps the read of the render that subscribed it, so it always reads
+  // `workspaceId` (a ref updated at render time could hold the next workspace's read while the
+  // old subscription still runs).
+  useEffect(() => {
+    if (!open) return;
+    return subscribeSettingsToolWrites(workspaceId, (serverName) =>
+      readServerSettings([serverName], true, settingsRequests.current())
+    );
+  }, [open, workspaceId, readServerSettings, settingsRequests]);
+}
 
 /** A server's settings note when no snapshot is shown: a failed read, or a server not running. */
 function ServerSettingsNote(props: {

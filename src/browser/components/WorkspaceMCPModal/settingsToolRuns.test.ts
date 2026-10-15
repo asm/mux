@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import {
   clearSettingsToolResults,
+  publishSettingsToolWrite,
+  subscribeSettingsToolWrites,
   settingsToolRunsOf,
   startSettingsToolRun,
 } from "./settingsToolRuns";
@@ -22,4 +24,26 @@ test("settings tool runs: tracked per workspace and server until each run ends o
   expect(settingsToolRunsOf("ws-runs").cad).toEqual({ running: ["cad.reset"], results: {} });
   second(null);
   expect(settingsToolRunsOf("ws-runs")).toEqual({});
+});
+
+test("a writing run's end reaches the dialogs of its workspace only", async () => {
+  const reread: string[] = [];
+  const stop = subscribeSettingsToolWrites("ws-write", (serverName) => {
+    reread.push(serverName);
+    return Promise.resolve();
+  });
+  const other = subscribeSettingsToolWrites("ws-other", () => {
+    reread.push("other");
+    return Promise.resolve();
+  });
+  const readWithoutDialog = () => {
+    reread.push("backend");
+    return Promise.resolve();
+  };
+  await publishSettingsToolWrite("ws-write", "cad", readWithoutDialog);
+  stop();
+  // No dialog of the workspace is open: the backend still reads (it refreshes its caches).
+  await publishSettingsToolWrite("ws-write", "cad", readWithoutDialog);
+  other();
+  expect(reread).toEqual(["cad", "backend"]);
 });
