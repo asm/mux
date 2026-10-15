@@ -1664,6 +1664,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
     },
     mcpOauth: {
+      onInsufficientScope: async function* (): AsyncGenerator<string> {
+        // Stories record no prompts at runtime.
+      },
       getAuthStatus: (input: { serverUrl: string }) => {
         const status = mcpOauthAuthStatus.get(input.serverUrl);
         return Promise.resolve(
