@@ -91,6 +91,8 @@ import {
   serverConsentFingerprint,
   skillConsentDetail,
   skillConsentFingerprint,
+  skillReviewDirectives,
+  directivesField,
   type ComponentConsent,
 } from "./componentConsent";
 import type { OpenAIPluginInterface } from "./openaiExtension";
@@ -2685,7 +2687,10 @@ export class AgentPluginInstallService {
           ...skillConsentFields({
             relativeDir: path.relative(pluginRoot, path.join(skillsDir, dirName)),
             frontmatter: skillConsentFrontmatter(parsed),
+            body: parsed.body,
           }),
+          // The commands the skill can run when invoked (#6617): shown, then fingerprinted.
+          ...directivesField(skillReviewDirectives(parsed.body)),
           ...(parsed.frontmatter.description !== undefined
             ? { description: parsed.frontmatter.description }
             : {}),
@@ -3741,9 +3746,10 @@ export class AgentPluginInstallService {
       warnings
     );
     return {
-      skills: skills.map(({ name, description }) => ({
+      skills: skills.map(({ name, description, directives }) => ({
         name,
         ...(description !== undefined ? { description } : {}),
+        ...directivesField(directives),
       })),
       mcpServers,
       /** What this review showed, as consent fingerprints (#6498). Never sent to the renderer. */

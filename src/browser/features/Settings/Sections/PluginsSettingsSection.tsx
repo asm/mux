@@ -170,6 +170,24 @@ const PluginInterfaceDetails: React.FC<{ info: AgentPluginInterfaceSummary }> = 
   );
 };
 
+/**
+ * #6617: a skill's directive commands run when the user invokes it, so the review shows them.
+ * The backend escapes invisible characters; React escapes the rest.
+ */
+const SkillDirectives: React.FC<{ directives?: readonly string[] }> = (props) => {
+  if (props.directives === undefined || props.directives.length === 0) return null;
+  return (
+    <span className="block">
+      <span className="text-muted block">Can run these commands when invoked:</span>
+      {props.directives.map((command, index) => (
+        <code key={index} className="text-foreground block font-mono break-all whitespace-pre-wrap">
+          {command}
+        </code>
+      ))}
+    </span>
+  );
+};
+
 /** Only skills/MCP are selective; keep full-package consent below this shared chooser. */
 const ComponentChooser: React.FC<{
   inventory: Pick<AgentPluginComponents, "skills" | "mcpServers">;
@@ -183,10 +201,15 @@ const ComponentChooser: React.FC<{
       const label = group === "skills" ? "Skills" : "MCP servers";
       const entries =
         group === "skills"
-          ? props.inventory.skills.map((skill) => ({ name: skill.name, detail: skill.description }))
+          ? props.inventory.skills.map((skill) => ({
+              name: skill.name,
+              detail: skill.description,
+              directives: skill.directives,
+            }))
           : props.inventory.mcpServers.map((server) => ({
               name: server.serverName,
               detail: `${server.transport} · ${server.summary}`,
+              directives: undefined,
             }));
       const imported = props.imported?.[group] ?? [];
       const selectable = entries.map((entry) => entry.name);
@@ -224,7 +247,7 @@ const ComponentChooser: React.FC<{
             </Button>
           </div>
           {entries.length === 0 && <p className="text-muted text-xs">None available</p>}
-          {entries.map(({ name, detail }) => (
+          {entries.map(({ name, detail, directives }) => (
             <label key={name} className="flex items-start gap-2 text-xs">
               <Checkbox
                 aria-label={name}
@@ -244,6 +267,7 @@ const ComponentChooser: React.FC<{
                 {detail && (
                   <span className="text-muted block break-all whitespace-pre-wrap">{detail}</span>
                 )}
+                <SkillDirectives directives={directives} />
               </span>
             </label>
           ))}
