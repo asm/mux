@@ -58,14 +58,16 @@ import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/Work
 import {
   forkWorkspaceFromMenu,
   getErrorAnchor,
+  requestGenerateWorkspaceTitle,
   stopWorkspaceRuntime,
 } from "../WorkspaceActionsMenuContent/workspaceActionHandlers";
+import { useHeaderTitleEdit, WorkspaceHeaderTitle } from "./WorkspaceHeaderTitle";
 import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 
 import { SkillIndicator } from "../SkillIndicator/SkillIndicator";
 import { WorkspaceLinks } from "../WorkspaceLinks/WorkspaceLinks";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 
 import { useWorkspaceActions, useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -74,6 +76,7 @@ import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/const
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import {
   NARROW_VIEWPORT_MAX_WIDTH_PX,
+  RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
   WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
 } from "@/constants/layout";
 import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
@@ -81,6 +84,7 @@ import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/r
 import { focusRightSidebarTab } from "@/browser/utils/rightSidebarTabFocus";
 import type { TabType } from "@/browser/types/rightSidebar";
 import { useAgentSkills, useAgentSkillsLoaded } from "@/browser/stores/AgentSkillsStore";
+import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
 
 interface WorkspaceMenuBarProps {
   workspaceId: string;
@@ -149,7 +153,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   onOpenSidebar,
   sidebarFullscreen = false,
 }) => {
-  const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { preflightArchiveWorkspace, archiveWorkspace, archivingWorkspaceIds, setWorkspacePinned } =
     useWorkspaceActions();
   const isArchiving = archivingWorkspaceIds.has(workspaceId);
@@ -197,14 +201,19 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const moreActionsButtonRef = useRef<HTMLButtonElement | null>(null);
   const menuBarRef = useRef<HTMLDivElement | null>(null);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const titleEdit = useHeaderTitleEdit(workspaceId, moreActionsButtonRef);
   const archiveError = usePopoverError();
   const forkError = usePopoverError();
   const stopRuntimeError = usePopoverError();
 
-  const [rightSidebarCollapsed] = usePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false, {
-    // This state is toggled from RightSidebar, so we need cross-component updates.
-    listener: true,
-  });
+  const [rightSidebarCollapsed] = usePersistedState<boolean>(
+    RIGHT_SIDEBAR_COLLAPSED_KEY,
+    RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
+    {
+      // This state is toggled from RightSidebar, so we need cross-component updates.
+      listener: true,
+    }
+  );
 
   // Notification on response toggle (workspace-level) - defaults to disabled
   const notifyOnResponse =
@@ -481,12 +490,12 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
 
   const handleForkWorkspace = async (anchorEl: HTMLElement) => {
     const anchor = getErrorAnchor(anchorEl);
-    const error = await forkWorkspaceFromMenu(api, workspaceId);
+    const error = await forkWorkspaceFromMenu(liveApi, workspaceId);
     if (error) forkError.showError(workspaceId, error, anchor);
   };
 
   const handleStopRuntime = async () => {
-    const error = await stopWorkspaceRuntime(api, runtimeStatusStore, workspaceId);
+    const error = await stopWorkspaceRuntime(liveApi, runtimeStatusStore, workspaceId);
     if (error) {
       stopRuntimeError.showError(workspaceId, error, getErrorAnchor(moreActionsButtonRef.current));
     }
@@ -626,6 +635,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         onClick={(event: React.MouseEvent<HTMLDivElement>) => {
           event.stopPropagation();
         }}
+        onCloseAutoFocus={titleEdit.onMenuCloseAutoFocus}
       >
         {/* Keep MCP configuration in the more actions menu to keep the workspace menu bar lean. */}
         <WorkspaceActionsMenuContent
@@ -639,6 +649,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             isRightSidebarHidden: timelineSidebarHidden,
           }}
           actions={{
+            editTitle: titleEdit.start,
+            generateTitle: () => requestGenerateWorkspaceTitle(workspaceId),
             configureMcp: () => setMcpModalOpen(true),
             configureHeartbeat: () => setHeartbeatModalOpen(true),
             configureMessaging: () => setUnrelatedMessagingWorkspaceId(workspaceId),
@@ -706,9 +718,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             <TooltipContent>Open sidebar ({formatKeybind(KEYBINDS.TOGGLE_SIDEBAR)})</TooltipContent>
           </Tooltip>
         )}
-        <span className="min-w-0 truncate text-sm" data-testid="workspace-title">
-          {workspaceTitle ?? workspaceName}
-        </span>
+        <WorkspaceHeaderTitle
+          workspaceId={workspaceId}
+          title={workspaceTitle ?? workspaceName}
+          edit={titleEdit}
+        />
         {/* Touch and keyboard users need a focusable control for workspace details. */}
         <Popover open={detailsPopoverOpen} onOpenChange={setDetailsPopoverOpen}>
           <Tooltip
@@ -854,7 +868,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                   href="https://mux.coder.com/config/notifications"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-accent hover:underline"
+                  className="text-accent-text hover:underline"
                 >
                   Learn more
                 </a>
@@ -864,8 +878,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         </Popover>
         <SkillIndicator
           loadedSkills={loadedSkills}
-          availableSkills={skillList.skills}
+          availableSkills={listInvocableSkills(skillList)}
           invalidSkills={skillList.invalidSkills}
+          skillWarnings={skillList.skillWarnings}
           unavailableSources={skillList.unavailableSources}
           skillLoadErrors={skillLoadErrors}
           loading={!skillListLoaded}

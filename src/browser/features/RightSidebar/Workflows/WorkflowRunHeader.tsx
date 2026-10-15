@@ -1,7 +1,7 @@
 import React from "react";
 import { Check, ChevronRight, Clock, Coins, Play, RotateCcw, Square, Workflow } from "lucide-react";
 
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import { canRetryWorkflowFromCheckpoint } from "@/common/utils/workflowRetryEligibility";
 
@@ -48,8 +48,11 @@ interface WorkflowRunHeaderProps {
 }
 
 export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
-  const { api } = useAPI();
+  // Run actions need a live connection. While Xum reconnects the run stays on screen, but its
+  // actions are disabled (`blocked`), so a click never silently does nothing.
+  const api = useLiveAPI();
   const [busy, setBusy] = React.useState(false);
+  const blocked = busy || api == null;
   const [actionError, setActionError] = React.useState<string | null>(null);
 
   const run = props.run;
@@ -62,7 +65,7 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
   const canRerun = rerunScriptPath != null;
 
   const runAction = async (action: () => Promise<unknown>) => {
-    if (api == null || busy) {
+    if (blocked) {
       return;
     }
     setBusy(true);
@@ -115,7 +118,7 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
   return (
     <div className="border-border flex flex-col gap-2.5 border-b pb-3.5">
       <div className="flex items-center gap-2">
-        <span className="text-accent flex min-w-0 items-center gap-2">
+        <span className="text-accent-text flex min-w-0 items-center gap-2">
           <Workflow className="h-[15px] w-[15px] shrink-0" />
           <span className="text-content-primary truncate text-[15px] font-semibold">
             {run.workflow.name}
@@ -222,16 +225,16 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
 
       <div className="flex flex-wrap gap-2">
         {isLive ? (
-          <button type="button" className={BTN_DEFAULT} onClick={interrupt} disabled={busy}>
+          <button type="button" className={BTN_DEFAULT} onClick={interrupt} disabled={blocked}>
             <Square className="h-3 w-3" /> Interrupt
           </button>
         ) : run.status === "interrupted" ? (
           <>
-            <button type="button" className={BTN_ACCENT} onClick={resume} disabled={busy}>
+            <button type="button" className={BTN_ACCENT} onClick={resume} disabled={blocked}>
               <Play className="h-3 w-3" /> Resume
             </button>
             {canRerun && (
-              <button type="button" className={BTN_DEFAULT} onClick={rerun} disabled={busy}>
+              <button type="button" className={BTN_DEFAULT} onClick={rerun} disabled={blocked}>
                 <RotateCcw className="h-3 w-3" /> Re-run
               </button>
             )}
@@ -239,12 +242,12 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
         ) : (
           <>
             {canRetry && (
-              <button type="button" className={BTN_ACCENT} onClick={retry} disabled={busy}>
+              <button type="button" className={BTN_ACCENT} onClick={retry} disabled={blocked}>
                 <Play className="h-3 w-3" /> Retry from checkpoint
               </button>
             )}
             {canRerun && (
-              <button type="button" className={BTN_DEFAULT} onClick={rerun} disabled={busy}>
+              <button type="button" className={BTN_DEFAULT} onClick={rerun} disabled={blocked}>
                 <RotateCcw className="h-3 w-3" /> Re-run
               </button>
             )}

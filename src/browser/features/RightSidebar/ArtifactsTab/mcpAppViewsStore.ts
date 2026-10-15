@@ -8,7 +8,9 @@ import { mcpToolDisplayName } from "@/common/utils/mcp/mcpToolDisplayName";
 import { mcpServerConsentName, mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 import { MCP_APP_VIEW_RECORDS_MAX_IDS } from "@/common/utils/mcpApps";
 import { getNestedToolStatus } from "@/browser/features/Tools/Shared/toolStatus";
+import type { McpAppEntrypoint, McpAppViewRecord } from "@/common/orpc/schemas/mcpApps";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
+import { mcpAppEntrypointViewOf, useMcpAppEntrypointView } from "../AppViewTab/mcpAppEntrypoints";
 
 /**
  * MCP Apps views (artifacts experiment), per workspace, for app tabs and the command palette:
@@ -20,6 +22,9 @@ import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
 export interface McpAppViewRef {
   toolCallId: string;
   serverName: string;
+  /** What the tab shows for the server when it differs from serverName's display form (an
+   * entry point's "<plugin> · <server>"); serverName itself can be an internal plugin key. */
+  serverLabel?: string;
   resourceUri: string;
   toolName: string;
   /** Tool title (or name) shown in the tab label. */
@@ -29,6 +34,8 @@ export interface McpAppViewRef {
   cancelled: boolean;
   /** The call returned an error (a subset of `cancelled`). */
   failed: boolean;
+  /** An entry point's view: its type, so a `thread` tab says so (withEntrypointScope). */
+  entrypointType?: McpAppEntrypoint["type"];
 }
 
 /** Longest argument summary shown next to a view's label. */
@@ -248,7 +255,8 @@ export function useMcpAppViews(workspaceId: string): readonly McpAppViewRef[] {
  * Lookups of views the loaded transcript lacks, by workspace and tool call: "pending" while the
  * backend is asked, "missing" when it answered that it has no result record, "failed" when the
  * request failed. Only "missing" is final: a failed lookup runs again the next time a tab asks
- * (it remounts, or the API client reconnects). A found view joins the session list
+ * (it remounts, the API client reconnects, or the user reloads the view: reloadMcpAppView).
+ * A found view joins the session list
  * (viewsByWorkspace) and its entry is dropped.
  */
 const recordLookups = new Map<string, "pending" | "missing" | "failed">();
@@ -272,15 +280,52 @@ function lookUpViewRecord(api: APIClient, workspaceId: string, toolCallId: strin
   queuedLookups.set(workspaceId, queued);
 }
 
+/**
+ * A tab mounts before App's entry point loader marks its workspace as listing (child effects run
+ * first): a key that turned out to be an entry point (or may be one, while the list is pending)
+ * is not a tool call, so it is not looked up. It is asked again if a settled list lacks it.
+ */
+function withoutEntrypointKeys(workspaceId: string, toolCallIds: Iterable<string>): string[] {
+  return [...toolCallIds].filter((id) => {
+    if (mcpAppEntrypointViewOf(workspaceId, id) === undefined) return true;
+    recordLookups.delete(lookupKey(workspaceId, id));
+    emit();
+    return false;
+  });
+}
+
 function flushViewRecordLookups() {
   const batches = [...queuedLookups];
   queuedLookups.clear();
   for (const [workspaceId, { api, toolCallIds }] of batches) {
-    const ids = [...toolCallIds];
+    const ids = withoutEntrypointKeys(workspaceId, toolCallIds);
     for (let i = 0; i < ids.length; i += MCP_APP_VIEW_RECORDS_MAX_IDS) {
       requestViewRecords(api, workspaceId, ids.slice(i, i + MCP_APP_VIEW_RECORDS_MAX_IDS));
     }
   }
+}
+
+/**
+ * The tool call view a result record describes, or null without one. An entry point's record
+ * outlives its entry point, and only the entry point list shows that view (the list lacked it,
+ * or it would not be looked up): its tab is unavailable, also after a restart, when no retired
+ * key remembers it.
+ */
+function toolCallViewOfRecord(toolCallId: string, view: McpAppViewRecord): McpAppViewRef | null {
+  if (view === null || view.entrypoint === true) return null;
+  return {
+    toolCallId,
+    serverName: view.serverName,
+    resourceUri: view.resourceUri,
+    toolName: view.toolName,
+    label: mcpToolDisplayName(view.toolName, { key: view.serverName }),
+    arguments: view.arguments ?? {},
+    // The record's outcome says how a call without a result ended, so the view gets
+    // tool-cancelled like a card in the transcript. A record without one (a completed call, or
+    // one written before outcomes) opens with "Result no longer available" when it has no result.
+    cancelled: view.outcome !== undefined,
+    failed: view.outcome === "failed",
+  };
 }
 
 function requestViewRecords(api: APIClient, workspaceId: string, toolCallIds: string[]) {
@@ -296,23 +341,13 @@ function requestViewRecords(api: APIClient, workspaceId: string, toolCallIds: st
       const found: McpAppViewRef[] = [];
       for (const { toolCallId, view } of result.data) {
         if (!toolCallIds.includes(toolCallId)) continue;
-        if (view === null) {
+        const ref = toolCallViewOfRecord(toolCallId, view);
+        if (ref === null) {
           recordLookups.set(lookupKey(workspaceId, toolCallId), "missing");
           continue;
         }
         recordLookups.delete(lookupKey(workspaceId, toolCallId));
-        found.push({
-          toolCallId,
-          serverName: view.serverName,
-          resourceUri: view.resourceUri,
-          toolName: view.toolName,
-          label: mcpToolDisplayName(view.toolName, { key: view.serverName }),
-          arguments: view.arguments ?? {},
-          // The record does not say how the call ended: a call without a result opens with
-          // "Result no longer available" instead of tool-cancelled.
-          cancelled: false,
-          failed: false,
-        });
+        found.push(ref);
       }
       // An ID the answer left out was not looked up: it can be asked again.
       for (const id of toolCallIds) {
@@ -350,18 +385,40 @@ export function useMcpAppView(
       store.getWorkspaceState(workspaceId).loading ||
       store.getWorkspaceState(workspaceId).isHydratingTranscript
   );
-  const view = views.find((v) => v.toolCallId === toolCallId) ?? null;
+  // An entry point's view has no transcript row: only the current entry point list resolves it
+  // (so its tab remounts after a reload, and goes unavailable once its server is disabled),
+  // never the session list or a stored record. Undefined: the key is not an entry point.
+  const entrypoint = useMcpAppEntrypointView(workspaceId, toolCallId);
+  const view =
+    entrypoint === undefined || entrypoint === "loading"
+      ? (views.find((v) => v.toolCallId === toolCallId) ?? null)
+      : entrypoint;
   const lookup = useSyncExternalStore(subscribe, () =>
     recordLookups.get(lookupKey(workspaceId, toolCallId))
   );
-  const lookUp = view === null && !loading && toolCallId !== "" && api != null;
+  const lookUp = view === null && entrypoint === undefined && !loading && toolCallId !== "";
+  // A reload retries a failed lookup (lookUpViewRecord skips only pending and missing ones).
+  const reloadKey = useMcpAppViewReloadKey(workspaceId, toolCallId);
   // Fetching from the backend is an external side effect, so an effect, not render.
   useEffect(() => {
-    if (lookUp) lookUpViewRecord(api, workspaceId, toolCallId);
-  }, [lookUp, api, workspaceId, toolCallId]);
+    if (lookUp && api != null) lookUpViewRecord(api, workspaceId, toolCallId);
+  }, [lookUp, api, workspaceId, toolCallId, reloadKey]);
   if (view !== null) return view;
+  // Retired (null) or still being listed ("loading").
+  if (entrypoint !== undefined) return entrypoint;
   // A failed lookup shows as unavailable until it is retried.
   return loading || (lookUp && lookup !== "missing" && lookup !== "failed") ? "loading" : null;
+}
+
+/**
+ * Whether the view's record lookup failed (the request, not a missing record), so a retry
+ * (reloadMcpAppView) can still find it. useMcpAppView returns null for both.
+ */
+export function useMcpAppViewLookupFailed(workspaceId: string, toolCallId: string): boolean {
+  return useSyncExternalStore(
+    subscribe,
+    () => recordLookups.get(lookupKey(workspaceId, toolCallId)) === "failed"
+  );
 }
 
 /**
@@ -371,11 +428,105 @@ export function useMcpAppView(
  * still resolves.
  */
 export function openMcpAppViewTab(workspaceId: string, view: McpAppViewRef) {
+  keepMcpAppViewRef(workspaceId, view);
+  focusMcpAppViewTab(workspaceId, view.toolCallId);
+}
+
+/**
+ * Keep the view's ref for the session, so its tab still resolves after the call leaves the
+ * loaded transcript. For callers that open the tab themselves (the Overview card).
+ */
+export function keepMcpAppViewRef(workspaceId: string, view: McpAppViewRef) {
   const current = getMcpAppViews(workspaceId).filter((v) => v.toolCallId !== view.toolCallId);
   viewsByWorkspace.set(workspaceId, [view, ...current]);
   emit();
+}
+
+/**
+ * Open or focus a tab whose view resolves without the session list (an entry point's resolves
+ * from the entry point list only, so it must not linger in the session list).
+ */
+export function focusMcpAppViewTab(workspaceId: string, toolCallId: string) {
   window.dispatchEvent(
-    createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId, toolCallId: view.toolCallId })
+    createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId, toolCallId })
+  );
+}
+
+/**
+ * Reloads asked for per view, by workspace and tool call. A host passes the count into its
+ * frame's key, so a bump remounts the frame and it loads the view again (McpAppFrame loads a
+ * view once per tool call). Used after an entry point ran again for a tab that is open.
+ */
+// Never pruned on purpose: an entry holds one number, and only a user's pick that ran an entry
+// point again adds one, so the map stays small for a session. Dropping an entry when its tab
+// closes would need a close hook and gain nothing (a missing count reads as 0).
+const reloadCounts = new Map<string, number>();
+
+/** Remount every frame that shows the view, so it loads the view again. */
+export function reloadMcpAppView(workspaceId: string, toolCallId: string): void {
+  const key = lookupKey(workspaceId, toolCallId);
+  reloadCounts.set(key, (reloadCounts.get(key) ?? 0) + 1);
+  emit();
+}
+
+/**
+ * The app tab maximized over the window, per workspace (#6165: the spec's fullscreen display
+ * mode). At most one: maximizing another view restores the first. Session only.
+ */
+const maximizedViews = new Map<string, string>();
+
+/** Maximize the view's app tab over the window, or restore it. */
+export function setMcpAppViewMaximized(
+  workspaceId: string,
+  toolCallId: string,
+  maximized: boolean
+): void {
+  const current = maximizedViews.get(workspaceId) === toolCallId;
+  if (current === maximized) return;
+  if (maximized) maximizedViews.set(workspaceId, toolCallId);
+  else maximizedViews.delete(workspaceId);
+  emit();
+}
+
+export function isMcpAppViewMaximized(workspaceId: string, toolCallId: string): boolean {
+  return maximizedViews.get(workspaceId) === toolCallId;
+}
+
+export function useMcpAppViewMaximized(workspaceId: string, toolCallId: string): boolean {
+  return useSyncExternalStore(subscribe, () => isMcpAppViewMaximized(workspaceId, toolCallId));
+}
+
+/** The view's reload count: part of its frame's key. */
+export function useMcpAppViewReloadKey(workspaceId: string, toolCallId: string): number {
+  return useSyncExternalStore(
+    subscribe,
+    () => reloadCounts.get(lookupKey(workspaceId, toolCallId)) ?? 0
+  );
+}
+
+/**
+ * Views that declared fullscreen but not inline in their latest ui/initialize. Their cards show
+ * the "Open in tab" notice instead of a frame. A server update that adds inline clears the
+ * mark at the view's next initialize. Session only: a later session finds out again on mount.
+ */
+const fullscreenOnlyViews = new Set<string>();
+
+/** Record whether the view declared fullscreen but not inline (its latest initialize). */
+export function setMcpAppViewFullscreenOnly(
+  workspaceId: string,
+  toolCallId: string,
+  fullscreenOnly: boolean
+): void {
+  const key = lookupKey(workspaceId, toolCallId);
+  if (fullscreenOnlyViews.has(key) === fullscreenOnly) return;
+  if (fullscreenOnly) fullscreenOnlyViews.add(key);
+  else fullscreenOnlyViews.delete(key);
+  emit();
+}
+
+export function useMcpAppViewFullscreenOnly(workspaceId: string, toolCallId: string): boolean {
+  return useSyncExternalStore(subscribe, () =>
+    fullscreenOnlyViews.has(lookupKey(workspaceId, toolCallId))
   );
 }
 

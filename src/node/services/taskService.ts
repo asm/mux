@@ -145,6 +145,7 @@ import { readPlanFile } from "@/node/utils/runtime/helpers";
 import { resolvePlanFileLocation } from "@/node/utils/runtime/planLocation";
 import {
   coerceNonEmptyString,
+  readTaskParentBranch,
   tryReadGitHeadCommitSha,
   findWorkspaceEntry,
   markChildGoalPauseOwed,
@@ -307,6 +308,7 @@ import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibil
 import type { SendMessageAccepted, SendMessageError, StreamErrorType } from "@/common/types/errors";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import type { StartupRecoveryState } from "@/node/services/startupRecovery";
 import { judgeLifecycleMarkerOwner } from "@/node/services/lifecycleMarkerOwners";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
@@ -977,7 +979,6 @@ interface PreparedTaskReservation {
   taskRuntimeConfig: RuntimeConfig;
   parentRuntimeConfig: RuntimeConfig;
   sharedWorkspacePath: string | undefined;
-  parentIsSharedTask: boolean;
   parentBranchName: string | undefined;
   skipInitHook: boolean;
   definitionSource: string | undefined;
@@ -1216,6 +1217,57 @@ const WORKSPACE_BUSY_IDLE_ONLY_SEND_MESSAGE = "Workspace is busy; idle-only send
  */
 const MULTI_PROJECT_SHARED_ISOLATION_ERROR =
   'isolation: "none" is not supported for multi-project workspaces; omit isolation or pass isolation: "fork" to run the sub-agent in forked checkouts.';
+
+/**
+ * Whether startup recovery acts on this row: a `running` or `awaiting_report` task (a legacy row
+ * without a taskStatus reads as running) that no other live backend holds a use lease on.
+ */
+function isActiveStartupTask(
+  task: AgentTaskWorkspaceEntry,
+  inUseElsewhere: ReadonlySet<string>
+): boolean {
+  if (!task.id || inUseElsewhere.has(task.id)) return false;
+  return ["running", "awaiting_report"].includes(task.taskStatus ?? "running");
+}
+
+/**
+ * Whether startup recovery re-drives this row. Archived rows are not re-driven. Archiving stops a
+ * task's stream but keeps its taskStatus (see isActiveAgentTaskEntry), and every send to an
+ * archived workspace is refused, so a re-drive failed on every restart. An unarchive makes the row
+ * an ordinary one again, and a task_send_message to it unarchives and reactivates it.
+ */
+function isStartupRedriveCandidate(
+  task: AgentTaskWorkspaceEntry,
+  inUseElsewhere: ReadonlySet<string>
+): boolean {
+  return (
+    isActiveStartupTask(task, inUseElsewhere) &&
+    !isWorkspaceArchived(task.archivedAt, task.unarchivedAt)
+  );
+}
+
+/**
+ * A legacy task row (no taskStatus) has no durable evidence that it was running: startup recovery
+ * sends it the restart nudge only for an interrupted history tail.
+ */
+function lacksLegacyRestartEvidence(
+  task: AgentTaskWorkspaceEntry,
+  state: StartupRecoveryState | undefined
+): boolean {
+  return task.taskStatus == null && state !== "interrupted";
+}
+
+/**
+ * A legacy task row that startup recovery has no work for: no restart evidence, no pending
+ * guidance, and an `idle` probe, which proves no compaction follow-up is pending either.
+ */
+function isIdleLegacyStartupTask(
+  task: AgentTaskWorkspaceEntry,
+  state: StartupRecoveryState | undefined,
+  pendingGuidanceCount: number
+): boolean {
+  return state === "idle" && pendingGuidanceCount === 0 && lacksLegacyRestartEvidence(task, state);
+}
 
 function isWorkspaceBusyIdleOnlySend(error: unknown): boolean {
   return (
@@ -1730,15 +1782,41 @@ function collectReferencedTaskIdsFromTaskToolOutput(output: unknown, into: Set<s
   }
 }
 
-type CompletedTaskReportReceipt =
-  | { kind: "initial"; taskId: string; reportMarkdown: string }
-  | {
-      kind: "continuation";
-      taskId: string;
-      handleId?: string;
-      messageId: string;
-      reportMarkdown: string;
-    };
+type CompletedTaskReportReceipt = (
+  | { kind: "initial"; taskId: string }
+  | { kind: "continuation"; taskId: string; handleId?: string; messageId: string }
+) & {
+  reportMarkdown: string;
+  /** Where reportMarkdown starts in the full report, when the row is one paged page. */
+  pageOffset?: number;
+};
+
+/**
+ * A paged row (task_await, or a foreground task since #6427) holds one page of a long report:
+ * its pageOffset is its startCharOffset, 0 for a first page that only carries nextCharOffset.
+ * Undefined for a whole report.
+ */
+function readReportPageOffset(row: Record<string, unknown>): number | undefined {
+  if (typeof row.startCharOffset === "number") return row.startCharOffset;
+  return typeof row.nextCharOffset === "number" ? 0 : undefined;
+}
+
+/**
+ * Whether a continuation receipt shows the owner this exact report: the whole text, or any
+ * non-empty page of it at the page's own offset. Reading one page (with its continuation note)
+ * delivers the result, so its terminal notification must not wake the owner again.
+ */
+function receiptMatchesReport(
+  receipt: Extract<CompletedTaskReportReceipt, { kind: "continuation" }>,
+  reportMarkdown: string | undefined
+): boolean {
+  if (receipt.reportMarkdown === reportMarkdown) return true;
+  if (reportMarkdown == null || receipt.pageOffset == null) return false;
+  return (
+    receipt.reportMarkdown.length > 0 &&
+    reportMarkdown.startsWith(receipt.reportMarkdown, receipt.pageOffset)
+  );
+}
 
 /** Read only canonical task-result containers, never arbitrary JSON or prose. */
 function completedTaskReports(toolName: unknown, output: unknown): CompletedTaskReportReceipt[] {
@@ -1769,13 +1847,36 @@ function completedTaskReports(toolName: unknown, output: unknown): CompletedTask
     if (taskId == null) return [];
     if (typeof messageId === "string") {
       return [
-        { kind: "continuation", taskId, handleId, messageId, reportMarkdown: row.reportMarkdown },
+        {
+          kind: "continuation",
+          taskId,
+          handleId,
+          messageId,
+          reportMarkdown: row.reportMarkdown,
+          pageOffset: readReportPageOffset(row),
+        },
       ];
     }
     return handleId == null
-      ? [{ kind: "initial", taskId, reportMarkdown: row.reportMarkdown }]
+      ? [
+          {
+            kind: "initial",
+            taskId,
+            reportMarkdown: row.reportMarkdown,
+            pageOffset: readReportPageOffset(row),
+          },
+        ]
       : [];
   });
+}
+
+/**
+ * Same text and same page position. A visible projection that drops a page's offset fields
+ * (nextCharOffset/startCharOffset) hides that more text exists and where to read it, so it does
+ * not prove delivery of the genuine paged row.
+ */
+function sameReportPage(a: CompletedTaskReportReceipt, b: CompletedTaskReportReceipt): boolean {
+  return a.reportMarkdown === b.reportMarkdown && a.pageOffset === b.pageOffset;
 }
 
 function sameTaskReportReceipt(
@@ -1785,7 +1886,7 @@ function sameTaskReportReceipt(
   return (
     a.kind === b.kind &&
     a.taskId === b.taskId &&
-    a.reportMarkdown === b.reportMarkdown &&
+    sameReportPage(a, b) &&
     (a.kind === "initial" ||
       (b.kind === "continuation" && a.messageId === b.messageId && a.handleId === b.handleId))
   );
@@ -5669,15 +5770,16 @@ export class TaskService implements AgentTaskIntegration {
     let config = this.config.loadConfigOrDefault();
     let taskIndex = this.buildAgentTaskIndex(config);
     const startupTasks = () =>
-      this.listAgentTaskWorkspaces(config).filter(
-        (task) =>
-          task.id &&
-          !inUseElsewhere.has(task.id) &&
-          ["running", "awaiting_report"].includes(task.taskStatus ?? "running")
+      this.listAgentTaskWorkspaces(config).filter((task) =>
+        isStartupRedriveCandidate(task, inUseElsewhere)
       );
 
-    // Workflow cancellation is authoritative even when a child has its own Stop or question.
-    for (const task of startupTasks()) {
+    // Workflow cancellation is authoritative even when a child has its own Stop or question, and
+    // for archived rows too: a cancelled run's archived child must not stay active until unarchive.
+    const activeTasks = this.listAgentTaskWorkspaces(config).filter((task) =>
+      isActiveStartupTask(task, inUseElsewhere)
+    );
+    for (const task of activeTasks) {
       await this.interruptTaskRecoveryForInactiveWorkflowOwner(
         // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         task.id!,
@@ -5855,6 +5957,9 @@ export class TaskService implements AgentTaskIntegration {
         skippedRunningDueToActiveDescendants += 1;
         continue;
       }
+      // Decided before the attempt rotation below: that rotation writes the whole config file,
+      // and a large config with many legacy rows outlived the startup step bound (#6511).
+      if (isIdleLegacyStartupTask(task, states.get(task.id), pendingGuidance.length)) continue;
 
       // Admission classification: startup re-drive (compaction follow-up, guidance replay or the
       // restart nudge) = new UNOWNED attempt; rotate + mark once before the first send, guarded
@@ -5933,7 +6038,7 @@ export class TaskService implements AgentTaskIntegration {
       }
 
       // Legacy tasks lack active-status evidence. Durable compaction/guidance above still wins.
-      if (task.taskStatus == null && states.get(task.id) !== "interrupted") continue;
+      if (lacksLegacyRestartEvidence(task, states.get(task.id))) continue;
       const isPlanLike = await this.isPlanLikeTaskWorkspace({
         projectPath: task.projectPath,
         workspace: task,
@@ -6652,11 +6757,15 @@ export class TaskService implements AgentTaskIntegration {
         !parentIsMultiProject);
     const sharedWorkspacePath = useSharedWorkspace ? parentWorkspacePath : undefined;
     // Branch actually checked out in the parent's checkout (see create() for rationale).
-    const parentIsSharedTask = parentEntry?.workspace.taskIsolation === "none";
-    const parentBranchName = parentIsSharedTask
-      ? (coerceNonEmptyString(parentEntry?.workspace.taskTrunkBranch) ??
-        coerceNonEmptyString(parentMeta.name))
-      : coerceNonEmptyString(parentMeta.name);
+    const parentBranchRead = await this.readCancellable(
+      readTaskParentBranch(parentEntry, parentMeta, () => ({
+        runtime,
+        workspacePath: parentWorkspacePath,
+      })),
+      signal
+    );
+    if (parentBranchRead.kind !== "ok") return Err(progress.interruptedError());
+    const parentBranchName = parentBranchRead.value;
     if (args.isolation === "none" && !useSharedWorkspace) {
       log.debug("Task.createMany: isolation=none not honored; falling back to fork", {
         parentWorkspaceId,
@@ -6800,7 +6909,6 @@ export class TaskService implements AgentTaskIntegration {
       taskRuntimeConfig,
       parentRuntimeConfig,
       sharedWorkspacePath,
-      parentIsSharedTask,
       parentBranchName,
       skipInitHook,
       definitionSource,
@@ -6981,9 +7089,9 @@ export class TaskService implements AgentTaskIntegration {
           : {}),
         // Real branch checked out in the parent's checkout: persisted as taskTrunkBranch and used
         // by orchestrateFork's create-fallback when the fork cannot detect a source branch
-        // (a shared parent's synthetic name never names a real branch). Gated to shared parents
-        // to keep the existing branch-discovery fallback otherwise.
-        ...(plan.parentIsSharedTask && plan.parentBranchName != null
+        // (a shared parent's synthetic name, or an auto-named worktree parent's, names no
+        // branch). Only then: other parents keep the existing branch-discovery fallback.
+        ...(plan.parentBranchName != null && plan.parentBranchName !== plan.parentMeta.name
           ? { preferredTrunkBranch: plan.parentBranchName }
           : {}),
       });
@@ -8626,15 +8734,14 @@ export class TaskService implements AgentTaskIntegration {
       (args.isolation === "none" &&
         runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
         !parentIsMultiProject);
-    // The branch actually checked out in the parent's checkout. When the parent is itself an
-    // isolation: "none" task, parentMeta.name is a synthetic agent workspace name with no real
-    // branch — the shared checkout sits on the parent's own persisted taskTrunkBranch. Persisting
-    // the real branch keeps dequeue fork-fallbacks (preferredTrunkBranch) on an existing base.
-    const parentIsSharedTask = parentEntry?.workspace.taskIsolation === "none";
-    const parentBranchName = parentIsSharedTask
-      ? (coerceNonEmptyString(parentEntry?.workspace.taskTrunkBranch) ??
-        coerceNonEmptyString(parentMeta.name))
-      : coerceNonEmptyString(parentMeta.name);
+    // The branch actually checked out in the parent's checkout (see readTaskParentBranch): an
+    // isolation: "none" parent's name, and an auto-named worktree parent's, name no branch.
+    // Persisting the real branch keeps dequeue fork-fallbacks (preferredTrunkBranch) on an
+    // existing base, and a shared task's review base on the branch its checkout is on.
+    const parentBranchName = await readTaskParentBranch(parentEntry, parentMeta, () => ({
+      runtime,
+      workspacePath: parentWorkspacePath,
+    }));
     if (args.isolation === "none" && !useSharedWorkspace) {
       log.debug("Task.create: isolation=none not honored; falling back to fork", {
         taskId,
@@ -9104,9 +9211,10 @@ export class TaskService implements AgentTaskIntegration {
           parentMetadata: parentMeta,
           allowCreateFallback: true,
           // Create-fallback base when the fork cannot detect a source branch — a shared parent's
-          // synthetic name never names a real branch, so supply the actual checked-out branch.
-          // Gated to shared parents to keep the existing branch-discovery fallback otherwise.
-          ...(parentIsSharedTask && parentBranchName != null
+          // synthetic name, or an auto-named worktree parent's, names no branch, so supply the
+          // actual checked-out branch. Only then: other parents keep the existing
+          // branch-discovery fallback.
+          ...(parentBranchName != null && parentBranchName !== parentMeta.name
             ? { preferredTrunkBranch: parentBranchName }
             : {}),
           trusted:
@@ -13323,7 +13431,7 @@ export class TaskService implements AgentTaskIntegration {
                   report.kind === "continuation" &&
                   (report.handleId == null || report.handleId === record.handleId) &&
                   report.messageId === record.messageId &&
-                  report.reportMarkdown === record.reportMarkdown
+                  receiptMatchesReport(report, record.reportMarkdown)
               );
           }
         }
@@ -16587,7 +16695,7 @@ export class TaskService implements AgentTaskIntegration {
 
   listAgentTaskExecutionEntries(
     config: ReturnType<Config["loadConfigOrDefault"]>
-  ): Array<{ id?: string; taskExecutionId?: string }> {
+  ): Array<Pick<WorkspaceConfigEntry, "id" | "taskExecutionId" | "taskExecutionStatus">> {
     return this.listAgentTaskWorkspaces(config);
   }
 

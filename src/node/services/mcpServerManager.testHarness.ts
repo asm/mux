@@ -48,9 +48,25 @@ export interface FakeServerBehavior {
   /** Never finish connecting, so only the manager's startup deadline ends the attempt. */
   hang?: boolean;
   /** MCP Apps client methods, used when the manager connects with MCP Apps enabled. */
-  apps?: Partial<Pick<MCPClientHandle, "toolUi" | "hasTool" | "callToolForApp" | "readResource">>;
+  apps?: Partial<
+    Pick<
+      MCPClientHandle,
+      "toolUi" | "hasTool" | "callToolForApp" | "readResource" | "appEntrypoints"
+    >
+  >;
+  /** Raw tools/call for plugin hooks (MCPServerManager.callToolForPluginHook). */
+  callToolForHook?: MCPClientHandle["callToolForHook"];
   /** OpenAI structured settings client methods. */
-  settings?: Partial<Pick<MCPClientHandle, "settingsCapability" | "callSettingsTool">>;
+  settings?: Partial<
+    Pick<
+      MCPClientHandle,
+      | "settingsCapability"
+      | "callSettingsTool"
+      | "settingsToolAction"
+      | "callSettingsActionTool"
+      | "relistTools"
+    >
+  >;
 }
 
 type BehaviorSource =
@@ -270,8 +286,12 @@ export class FakeMcpServers {
       priorDiscovery: () =>
         modern ? { kind: "modern" as const, discover: {} } : { kind: "legacy" as const },
       close: behavior.close ?? (() => Promise.resolve()),
+      callToolForHook:
+        behavior.callToolForHook ?? (() => Promise.reject(new Error("no hook tool in this fake"))),
       ...behavior.apps,
       settingsCapability: () => undefined,
+      settingsToolAction: () => undefined,
+      relistTools: () => Promise.resolve(),
       ...behavior.settings,
     };
     // Tests supply loosely typed prompt/result fixtures; the manager validates them itself.

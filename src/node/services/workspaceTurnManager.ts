@@ -10,7 +10,7 @@ import {
 import assert from "node:assert/strict";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
-import { type Config } from "@/node/config";
+import { type Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { StreamManager } from "@/node/services/streamManager";
 import {
@@ -57,6 +57,7 @@ import {
 } from "@/node/runtime/Runtime";
 import {
   coerceNonEmptyString,
+  readWorkspaceBranch,
   tryReadGitBranchMatchesOrigin,
   tryReadGitCurrentBranch,
   tryReadGitPathsClean,
@@ -210,6 +211,12 @@ interface ResolvedWorkspaceLifecycleTarget {
   taskTitle?: string;
   workspaceId: string;
   metadata: WorkspaceMetadata | null;
+}
+
+type ExecutionMirror = Pick<WorkspaceConfigEntry, "taskExecutionId" | "taskExecutionStatus">;
+
+function sameExecutionMirror(a: ExecutionMirror, b: ExecutionMirror): boolean {
+  return a.taskExecutionId === b.taskExecutionId && a.taskExecutionStatus === b.taskExecutionStatus;
 }
 
 function parseTerminalSubagentExecutionVersion(content: string): string | null {
@@ -1555,33 +1562,37 @@ export class WorkspaceTurnManager {
       }
     } else {
       let ownerContext: WorkspaceTurnAgentContext | undefined;
-      // Owner-side vouching for the created checkout's agent definitions requires proof
-      // that the target's base IS the branch actually checked out in the owner. The
-      // workspace name cannot prove it: branch→name sanitization is not injective
-      // (feature/foo and feature-foo both map to feature-foo) in BOTH directions — a
-      // request naming the owner's workspace name may be a distinct colliding branch, and
-      // the omitted-arg default (parentMeta.name, passed as trunkBranch to create below)
-      // may itself differ from a slash-branch owner's real branch. A different/unproven
-      // base means agents may exist only on the target branch (owner-side misses must not
-      // fail-fast) and the target branch may shadow ANY id (unreachable targets fail
-      // closed in validateWorkspaceTurnAgentIdForTarget).
-      const requestedTrunkBranch = coerceNonEmptyString(args.workspace?.trunkBranch);
-      let ownerVouchesForTargetBase = false;
-      if (requestedAgentId != null) {
-        ownerContext = buildWorkspaceAgentContext({
+      const buildOwnerContext = () =>
+        buildWorkspaceAgentContext({
           runtimeConfig: parentMeta.runtimeConfig,
           projectPath: parentMeta.projectPath,
           workspaceName: parentMeta.name,
           persistedWorkspacePath: parentEntry?.workspace.path,
           subProjectPath: parentMeta.subProjectPath,
         });
-        const effectiveTrunkBranch = requestedTrunkBranch ?? parentMeta.name;
+      // An omitted trunkBranch is the owner's branch: for a worktree owner, the branch its
+      // checkout is on, which an auto-named owner's workspace name does not name.
+      const trunkBranch =
+        coerceNonEmptyString(args.workspace?.trunkBranch) ??
+        (await readWorkspaceBranch(parentMeta.runtimeConfig, parentMeta.name, buildOwnerContext));
+      // Owner-side vouching for the created checkout's agent definitions requires proof
+      // that the target's base IS the branch actually checked out in the owner. The
+      // workspace name cannot prove it: branch→name sanitization is not injective
+      // (feature/foo and feature-foo both map to feature-foo) in BOTH directions — a
+      // request naming the owner's workspace name may be a distinct colliding branch, and
+      // the omitted-arg default (the workspace name, for owners other than worktrees) may
+      // itself differ from a slash-branch owner's real branch. A different/unproven
+      // base means agents may exist only on the target branch (owner-side misses must not
+      // fail-fast) and the target branch may shadow ANY id (unreachable targets fail
+      // closed in validateWorkspaceTurnAgentIdForTarget).
+      let ownerVouchesForTargetBase = false;
+      if (requestedAgentId != null) {
+        ownerContext = buildOwnerContext();
         const ownerBranch = await tryReadGitCurrentBranch(
           ownerContext.runtime,
           ownerContext.workspacePath
         );
-        const ownerBranchMatchesTargetBase =
-          ownerBranch != null && ownerBranch === effectiveTrunkBranch;
+        const ownerBranchMatchesTargetBase = ownerBranch != null && ownerBranch === trunkBranch;
         // Branch equality is not checkout equality: the child is created from COMMITTED
         // branch state, so uncommitted agent-definition changes in the owner (a shadow
         // added or removed) make owner-side resolution diverge from what the target will
@@ -1603,7 +1614,7 @@ export class WorkspaceTurnManager {
             ? await tryReadGitBranchMatchesOrigin(
                 ownerContext.runtime,
                 ownerContext.workspacePath,
-                effectiveTrunkBranch
+                trunkBranch
               )
             : undefined;
         // An explicit branchName can attach the worktree to an EXISTING branch of that
@@ -1617,10 +1628,11 @@ export class WorkspaceTurnManager {
           ownerCommitMatchesOrigin === true;
         // Pre-create stage: catch obviously bad ids (unknown/hidden/disabled) against the
         // OWNER's checkout before creating any workspace. Fatal only when the owner's
-        // checked-out branch provably IS the target's base (an omitted trunkBranch still
-        // resolves to parentMeta.name, which may be a DIFFERENT branch than a slash-branch
-        // owner's — that distinct branch could carry target-only agents); otherwise the
-        // miss is advisory and the target checkout is authoritative post-create.
+        // checked-out branch provably IS the target's base (an omitted trunkBranch of an owner
+        // other than a worktree still resolves to parentMeta.name, which may be a DIFFERENT
+        // branch than a slash-branch owner's — that distinct branch could carry target-only
+        // agents); otherwise the miss is advisory and the target checkout is authoritative
+        // post-create.
         const validation = await this.validateWorkspaceTurnAgentId({
           cfg,
           agentId: requestedAgentId,
@@ -1671,7 +1683,7 @@ export class WorkspaceTurnManager {
         : await this.workspaceService.create(
             parentMeta.projectPath,
             args.workspace?.branchName,
-            args.workspace?.trunkBranch ?? parentMeta.name,
+            trunkBranch,
             title,
             parentMeta.runtimeConfig,
             parentMeta.subProjectPath,
@@ -6071,15 +6083,7 @@ export class WorkspaceTurnManager {
             continue;
           }
         } else {
-          await this.taskHost.editWorkspaceEntry(
-            task.id,
-            (workspace) => {
-              workspace.taskExecutionId = normalized.handleId;
-              workspace.taskExecutionStatus = normalized.status;
-            },
-            { allowMissing: true }
-          );
-          await this.taskHost.emitWorkspaceMetadata(task.id);
+          await this.persistRecoveredTerminalExecutionMirror(task.id, task, normalized);
         }
         if (isActiveWorkspaceTurnTaskStatus(normalized.status)) {
           this.activeWorkspaceTurnHandleByWorkspaceId.set(task.id, {
@@ -6101,6 +6105,43 @@ export class WorkspaceTurnManager {
         });
       }
     }
+  }
+
+  /**
+   * Startup reconciliation's write for a terminal handle: a compare-and-set against the mirror
+   * the startup snapshot read. With many tasks the pass outlives the startup step bound, so it
+   * overlaps early clients: a parent can reawaken the child after the snapshot was read, and that
+   * reawakening's mirror (new handle, `running`) must win. Rewriting the stale terminal pointer
+   * over it made the live child read as idle-after-report, so its own task and workflow_run
+   * spawns were refused with "cannot spawn new tasks after agent_report".
+   */
+  private async persistRecoveredTerminalExecutionMirror(
+    workspaceId: string,
+    snapshot: ExecutionMirror,
+    record: WorkspaceTurnTaskHandleRecord
+  ): Promise<void> {
+    assert(
+      !isActiveWorkspaceTurnTaskStatus(record.status),
+      "persistRecoveredTerminalExecutionMirror: record must be terminal"
+    );
+    const target: ExecutionMirror = {
+      taskExecutionId: record.handleId,
+      taskExecutionStatus: record.status,
+    };
+    // The snapshot already holds this outcome, so the compare-and-set below could only leave the
+    // row as it is. Skip the edit: each one rewrites the whole config file, and a large config has
+    // hundreds of settled mirrors (#6511).
+    if (sameExecutionMirror(snapshot, target)) return;
+    await this.taskHost.editWorkspaceEntry(
+      workspaceId,
+      (workspace) => {
+        if (!sameExecutionMirror(workspace, snapshot)) return;
+        workspace.taskExecutionId = target.taskExecutionId;
+        workspace.taskExecutionStatus = target.taskExecutionStatus;
+      },
+      { allowMissing: true }
+    );
+    await this.taskHost.emitWorkspaceMetadata(workspaceId);
   }
 
   /**

@@ -22,6 +22,7 @@ import {
 import type { Instructions, ModelMessage, SystemModelMessage, Tool } from "ai";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
+import type { CountCompactionRowTokens } from "@/common/utils/messages/compactionRowSizing";
 import { trimCompactionInput } from "@/common/utils/messages/trimCompactionInput";
 import { createCompactionRowCounter, projectCompactionInput } from "./compactionInputSizing";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
@@ -29,7 +30,8 @@ import type { DesktopCapability } from "@/common/types/desktop";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { InvocableSkill } from "@/common/types/agentSkill";
+import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
 import type { InstructionSources } from "@/common/types/instructions";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -80,6 +82,7 @@ import {
   type AnthropicCacheTtl,
 } from "@/common/utils/ai/cacheStrategy";
 import { prepareMessagesForProvider } from "./messagePipeline";
+import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
 
 const keepContextRow = (message: MuxMessage) =>
   !isModelHiddenMessage(message) && !message.metadata?.contextBudgetRejected;
@@ -259,8 +262,8 @@ function tagUserRowsWithHistoryItemIds(messages: MuxMessage[]): MuxMessage[] {
       return message;
     }
     const tag = `[id: ${getHistoryItemId(message)}]`;
-    // Append inside the last text part: mergeConsecutiveUserMessages joins the text parts of
-    // merged rows into one, so the tag stays at the end of this row's text.
+    // Append inside the last text part: mergeConsecutiveUserMessages keeps each row's parts in
+    // order, so the tag stays at the end of this row's text.
     const lastText = message.parts.findLastIndex((part) => part.type === "text");
     return {
       ...message,
@@ -285,16 +288,32 @@ function tagUserRowsWithHistoryItemIds(messages: MuxMessage[]): MuxMessage[] {
 async function trimToCompactionInputBudget(
   messages: MuxMessage[],
   budgetTokens: number | undefined,
-  modelString: string
+  modelString: string,
+  requestContextMessage: MuxMessage | undefined
 ): Promise<MuxMessage[]> {
   if (budgetTokens == null) return messages;
+  const countRow = createCompactionRowCounter(modelString);
   const sized = projectCompactionInput(messages);
   const trim = await trimCompactionInput(
     sized,
-    budgetTokens,
-    createCompactionRowCounter(modelString)
+    await historyShareOfBudget(budgetTokens, requestContextMessage, countRow),
+    countRow
   );
   return trim.messages === sized ? messages : trim.messages;
+}
+
+/**
+ * The request-only context (MCP Apps) is inserted after the trim but sent with the history, so
+ * it takes its share of the budget first. At least 1 token is left: the trim then cuts all it
+ * can, and the context_exceeded retry decides the rest.
+ */
+async function historyShareOfBudget(
+  budgetTokens: number,
+  requestContextMessage: MuxMessage | undefined,
+  countRow: CountCompactionRowTokens
+): Promise<number> {
+  const contextTokens = requestContextMessage ? await countRow(requestContextMessage) : 0;
+  return Math.max(1, budgetTokens - contextTokens);
 }
 
 export async function assemblePromptPayload(
@@ -305,10 +324,20 @@ export async function assemblePromptPayload(
     options.providerForMessages,
     options.effectiveThinkingLevel
   );
+  // Prompt-hook context renders BEFORE the compaction trim: the trim counts each row's parts, not
+  // its metadata, so unrendered context (up to PLUGIN_HOOK_CONTEXT_MAX_CHARS per user row) would
+  // pass the budget and then grow the request past it in messagePipeline. Rendered rows drop
+  // the metadata, so messagePipeline's own pass renders nothing twice. It also renders before the
+  // token-budget [id: ...] tag, which must stay last.
+  const renderHookContextFirst =
+    options.compactionInputBudgetTokens != null || options.tagHistoryItemIds === true;
   const providerRequestMessages = await trimToCompactionInputBudget(
-    prepared.providerRequestMessages,
+    renderHookContextFirst
+      ? renderPluginHookContextForProvider(prepared.providerRequestMessages)
+      : prepared.providerRequestMessages,
     options.compactionInputBudgetTokens,
-    options.modelString
+    options.modelString,
+    options.requestContextMessage
   );
   let messages = await prepareMessagesForProvider({
     messagesWithSentinel: addInterruptedSentinel(
@@ -666,7 +695,7 @@ export interface StreamSystemContextResult {
   /** Available subagent definitions for tool descriptions (undefined for subagent workspaces). */
   agentDefinitions: Awaited<ReturnType<typeof discoverAgentDefinitions>> | undefined;
   /** Available skills for tool descriptions. */
-  availableSkills: AgentSkillDescriptor[] | undefined;
+  availableSkills: InvocableSkill[] | undefined;
   /** Exact ancestor plan files surfaced in the prompt and forwarded through tool configuration. */
   ancestorPlanFilePaths: string[];
   /** Instruction snapshot used for the prompt; reuse it for tool-scoped instructions. */
@@ -1063,7 +1092,11 @@ export async function buildStreamSystemContext(
       // Used only for the project-runtime default-roots fallback (skillCtx.roots undefined).
       includeClaudeSkills: opts.claudeSkillsCompatEnabled,
     })
-      .then(requireReachableSkills)
+      .then((discovery) => {
+        requireReachableSkills(discovery);
+        // Shadowed plugin skills join the index under `<plugin>:<skill>`.
+        return listInvocableSkills(discovery);
+      })
       .catch((error: unknown) => {
         // An unreachable host must fail the turn, not silently drop the skills index (#4438).
         if (isRuntimeTransportError(error)) throw error;

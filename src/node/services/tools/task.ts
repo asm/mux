@@ -28,6 +28,7 @@ import { log } from "@/node/services/log";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 
 import { buildTaskGroupLaunches } from "@/common/utils/tools/taskGroups";
+import { pageTaskReportForResult } from "@/common/utils/tools/pageToolText";
 import {
   emitChatEventBestEffort,
   parseToolResult,
@@ -245,9 +246,14 @@ function toAggregatePendingStatus(
 }
 
 function serializeCompletedReport(report: CompletedTaskInfo) {
+  // A foreground result holds the first page of a long report, like task_await does; the
+  // note names the task_await call that reads the next page.
+  const page = pageTaskReportForResult(report.taskId, report.reportMarkdown, undefined);
   return {
     taskId: report.taskId,
-    reportMarkdown: report.reportMarkdown,
+    reportMarkdown: page.text,
+    nextCharOffset: page.nextCharOffset,
+    note: page.note,
     ...(report.carriesProjectSkillContent === true ? { carriesProjectSkillContent: true } : {}),
     structuredOutput: report.structuredOutput,
     title: report.title,
@@ -256,6 +262,21 @@ function serializeCompletedReport(report: CompletedTaskInfo) {
     modelString: report.modelString,
     thinkingLevel: report.thinkingLevel,
     desktopOwnerWorkspaceId: report.desktopOwnerWorkspaceId,
+  };
+}
+
+/** The first page of a foreground workspace turn's report, plus any supersede note. */
+function pageWorkspaceTurnReport(
+  taskId: string,
+  reportMarkdown: string,
+  supersedeNote: string | undefined
+): { reportMarkdown: string; nextCharOffset?: number; note?: string } {
+  const page = pageTaskReportForResult(taskId, reportMarkdown, undefined);
+  const notes = [supersedeNote, page.note].filter((note) => note != null);
+  return {
+    reportMarkdown: page.text,
+    nextCharOffset: page.nextCharOffset,
+    ...(notes.length > 0 ? { note: notes.join(" ") } : {}),
   };
 }
 
@@ -339,6 +360,8 @@ function buildCompletedTaskResult(params: {
       status: "completed",
       taskId: report.taskId,
       reportMarkdown: report.reportMarkdown,
+      nextCharOffset: report.nextCharOffset,
+      note: report.note,
       ...(report.carriesProjectSkillContent === true ? { carriesProjectSkillContent: true } : {}),
       structuredOutput: report.structuredOutput,
       title: report.title,
@@ -544,6 +567,16 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
             backgroundOnMessageQueued: true,
           });
           const targetWorkspaceId = report.workspaceId ?? created.data.workspaceId;
+          // The turn ran in the target workspace: its active segment is the
+          // report's context. Provenance applies before paging, so a withheld
+          // report is what the first page (and task_await's later pages) carry.
+          const gatedReport = applyTaskReportProvenance(
+            { reportMarkdown: report.reportMarkdown, title: report.title },
+            {
+              carries: await workspaceHistoryCarriesProjectSkillContent(config, targetWorkspaceId),
+              excludes: await toolExcludesProjectSkillContent(config),
+            }
+          );
           return parseToolResult(
             TaskToolResultSchema,
             {
@@ -551,21 +584,17 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
               taskId: created.data.taskId,
               workspaceId: targetWorkspaceId,
               handleKind: "workspace_turn" as const,
-              // The turn ran in the target workspace: its active segment is the
-              // report's context.
-              ...applyTaskReportProvenance(
-                { reportMarkdown: report.reportMarkdown, title: report.title },
-                {
-                  carries: await workspaceHistoryCarriesProjectSkillContent(
-                    config,
-                    targetWorkspaceId
-                  ),
-                  excludes: await toolExcludesProjectSkillContent(config),
-                }
-              ),
+              title: gatedReport.title,
+              ...(gatedReport.carriesProjectSkillContent === true
+                ? { carriesProjectSkillContent: true }
+                : {}),
               messageId: report.messageId,
               finalMessageRef: report.finalMessageRef,
-              ...(completedSupersedeNote != null ? { note: completedSupersedeNote } : {}),
+              ...pageWorkspaceTurnReport(
+                created.data.taskId,
+                gatedReport.reportMarkdown,
+                completedSupersedeNote
+              ),
             },
             "task"
           );

@@ -664,6 +664,9 @@ async function main(): Promise<number> {
     backgroundProcessManager,
     workspaceGoalService,
     keepBackgroundProcesses,
+    // sendAndAwait returns on each stream-end, and the run can exit after it: a turn.stop
+    // continuation queued after stream-end would run unseen (Codex PRRT_kwDOPxxmWM6rxPMC).
+    callerOwnsTurnEnd: true,
     // Direct CLI registration bypasses WorkspaceService.create, so a
     // preserved checkout could carry a stale `plugin:` MCP override into a
     // same-name reinstall on the first send; sanitize before announcing.
@@ -1503,6 +1506,9 @@ async function main(): Promise<number> {
                 run: () => backgroundProcessManager.terminateAll(),
               },
             ]),
+        // Hygiene, as in ServiceContainer.dispose: the watches are non-persistent, so they
+        // never hold the process open, but no callback reaches torn-down services.
+        { name: "config.stopWatchingConfigFile", run: () => config.stopWatchingConfigFile() },
         // Last: release the Effect runtime that owns the core graph.
         { name: "appRuntime.dispose", run: () => disposeAppRuntime(coreRuntime.managed) },
       ],

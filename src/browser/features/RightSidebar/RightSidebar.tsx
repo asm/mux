@@ -1,3 +1,4 @@
+import { RIGHT_SIDEBAR_DEFAULT_COLLAPSED } from "@/constants/layout";
 import React from "react";
 import { X } from "lucide-react";
 import {
@@ -22,7 +23,7 @@ import {
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, liveClientOf, type APIClient } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import {
@@ -39,6 +40,7 @@ import type { GoalCreateIntent } from "@/browser/features/RightSidebar/GoalTab";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { getErrorMessage } from "@/common/utils/errors";
 import { showFeedbackToast } from "@/browser/utils/feedbackToast";
 import { openSideChat } from "@/browser/utils/chatCommands";
@@ -63,7 +65,6 @@ import {
   isTerminalFocused,
   matchesNewSidebarTabKeybind,
 } from "@/browser/utils/ui/keybinds";
-import { SidebarCollapseButton } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { Button } from "@/browser/components/Button/Button";
 import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
@@ -99,6 +100,7 @@ import {
   collectAllTabsWithTabset,
   dockTabToEdge,
   findTabset,
+  findTopRightTabsetId,
   getDefaultRightSidebarLayoutState,
   getFocusedActiveTab,
   moveTabToTabset,
@@ -117,6 +119,7 @@ import {
 import {
   RightSidebarTabStrip,
   getTabName,
+  isSidebarControlTarget,
   type TabDragData,
 } from "@/browser/features/RightSidebar/RightSidebarTabStrip";
 import {
@@ -132,6 +135,8 @@ import {
   nextRecentAppViewTabs,
   withAppViewTab,
 } from "./AppViewTab/appViewTabs";
+import { useMcpAppEntrypoints } from "./AppViewTab/mcpAppEntrypoints";
+import { openMcpAppEntrypointInNewTab } from "./AppViewTab/openMcpAppEntrypoint";
 import { ReviewAssistedStatsReporter } from "@/browser/features/RightSidebar/CodeReview/ReviewPanel";
 import {
   NewTabLabel,
@@ -368,6 +373,8 @@ interface RightSidebarTabsetNodeProps {
   onPopOutTerminal: (tab: TabType) => void;
   /** Handler for the strip's "+" button: open (or show) this tabset's New tab */
   onAddNewTab: (tabsetId: string) => void;
+  /** Set only for the tabset whose strip shows the sidebar's collapse button */
+  onCollapseSidebar?: () => void;
   /** Open a tool from this tabset's New tab launcher (replaces the New tab) */
   onOpenToolFromNewTab: (tabsetId: string, tool: BaseTabType) => void;
   /** Create a terminal from this tabset's New tab launcher (replaces the New tab) */
@@ -432,8 +439,37 @@ interface RightSidebarTabsetNodeProps {
   showTabShortcuts: boolean;
 }
 
+/** A tabset pane's root element: using anything inside the pane focuses the pane. */
+const TabsetPaneRoot: React.FC<{
+  tabsetId: string;
+  setLayout: RightSidebarTabsetNodeProps["setLayout"];
+  children: React.ReactNode;
+}> = (props) => {
+  const setFocused = (event: React.SyntheticEvent) => {
+    // The collapse button sits in one pane's strip but acts on the whole sidebar, so Expand
+    // later returns to the pane the user was in.
+    if (isSidebarControlTarget(event.target)) return;
+    props.setLayout((prev) => setFocusedTabset(prev, props.tabsetId));
+  };
+  return (
+    // Keyboard focus moving into a pane (Tab, a launcher or terminal taking focus) focuses it
+    // too, not just a click, so pane-scoped shortcuts act on the pane the user is in.
+    <div
+      className="flex min-h-0 min-w-0 flex-1 flex-col"
+      data-tabset-id={props.tabsetId}
+      onMouseDownCapture={setFocused}
+      onFocusCapture={setFocused}
+    >
+      {props.children}
+    </div>
+  );
+};
+
 const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) => {
   const tabsetBaseId = `${props.baseId}-${props.node.id}`;
+  const { api } = useAPI();
+  // Listed (artifacts experiment only) by App's loader; empty or undefined otherwise.
+  const entrypoints = useMcpAppEntrypoints(props.workspaceId);
 
   // Content container class comes from tab registry - each tab defines its own padding/overflow
   const tabsetContentClassName = cn(
@@ -470,10 +506,6 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
   const showDockHints =
     props.isDraggingTab &&
     (isOverContent || isOverTop || isOverBottom || isOverLeft || isOverRight);
-
-  const setFocused = () => {
-    props.setLayout((prev) => setFocusedTabset(prev, props.node.id));
-  };
 
   const selectTab = (tab: TabType) => {
     if (isTerminalTab(tab)) {
@@ -641,20 +673,14 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
   };
 
   return (
-    // Keyboard focus moving into a pane (Tab, a launcher or terminal taking focus) focuses it
-    // too, not just a click, so pane-scoped shortcuts act on the pane the user is in.
-    <div
-      className="flex min-h-0 min-w-0 flex-1 flex-col"
-      data-tabset-id={props.node.id}
-      onMouseDownCapture={setFocused}
-      onFocusCapture={setFocused}
-    >
+    <TabsetPaneRoot tabsetId={props.node.id} setLayout={props.setLayout}>
       <SortableContext items={sortableIds} strategy={rectSortingStrategy}>
         <RightSidebarTabStrip
           ariaLabel="Sidebar views"
           items={items}
           tabsetId={props.node.id}
           onAddNewTab={() => props.onAddNewTab(props.node.id)}
+          onCollapseSidebar={props.onCollapseSidebar}
         />
       </SortableContext>
       <div
@@ -741,6 +767,13 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
               creatingSideChat={props.creatingSideChat}
               autoFocus={props.launcherAutoFocusTabsetId === props.node.id}
               onAutoFocusConsumed={props.onLauncherAutoFocusConsumed}
+              entrypoints={entrypoints}
+              onOpenEntrypoint={(entrypoint, isCurrent) =>
+                // Like a tool: the app tab replaces this New tab (or the open one is focused).
+                openMcpAppEntrypointInNewTab(api, props.workspaceId, entrypoint, isCurrent, (tab) =>
+                  props.setLayout((prev) => openToolFromNewTab(prev, props.node.id, tab))
+                )
+              }
             />
           </div>
         )}
@@ -814,7 +847,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
           );
         })}
       </div>
-    </div>
+    </TabsetPaneRoot>
   );
 };
 
@@ -846,6 +879,206 @@ const RegistryTabPanel: React.FC<{
     </div>
   );
 };
+
+/**
+ * Whether LLM debug logs are on: null until the config is read, so the layout keeps its Debug
+ * tab until the setting is known. A toggle (the LLM_DEBUG_LOGS_CHANGED event) wins over a config
+ * read still in flight.
+ */
+export function useLlmDebugLogsEnabled(api: APIClient | null): boolean | null {
+  const [llmDebugLogsEnabled, setLlmDebugLogsEnabled] = React.useState<boolean | null>(null);
+  const debugLogsLocalOverrideRef = React.useRef(false);
+
+  React.useEffect(() => {
+    // Without a client (a reconnect), keep the last known value: the layout keeps its tabs.
+    if (!api) {
+      return;
+    }
+
+    // Reset local override so a fresh config fetch can set the initial value.
+    debugLogsLocalOverrideRef.current = false;
+    let cancelled = false;
+
+    void api.config
+      .getConfig()
+      .then((cfg) => {
+        if (cancelled) {
+          return;
+        }
+
+        // If the user toggled debug logs while this config fetch was in flight,
+        // the event listener has already set the authoritative value.
+        if (debugLogsLocalOverrideRef.current) {
+          return;
+        }
+
+        setLlmDebugLogsEnabled(cfg.llmDebugLogs === true);
+      })
+      .catch((error: unknown) => {
+        // A lost connection says nothing about the setting: keep the Debug tab for the next client.
+        if (cancelled || isConnectionLostError(error)) {
+          return;
+        }
+
+        setLlmDebugLogsEnabled(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [api]);
+
+  React.useEffect(() => {
+    const handleLlmDebugLogsChanged = (event: Event) => {
+      const detail = (event as CustomEvent<{ enabled: boolean }>).detail;
+      debugLogsLocalOverrideRef.current = true;
+      setLlmDebugLogsEnabled(detail?.enabled === true);
+    };
+
+    window.addEventListener(CUSTOM_EVENTS.LLM_DEBUG_LOGS_CHANGED, handleLlmDebugLogsChanged);
+    return () =>
+      window.removeEventListener(CUSTOM_EVENTS.LLM_DEBUG_LOGS_CHANGED, handleLlmDebugLogsChanged);
+  }, []);
+
+  return llmDebugLogsEnabled;
+}
+
+/**
+ * The layout update that matches the terminal tabs of `layoutAtRequestStart` to the backend's
+ * sessions, or null when they already match: missing sessions get a tab, and tabs whose session
+ * is gone ("ghost" tabs) are removed.
+ */
+function reconcileTerminalTabs(
+  layoutAtRequestStart: RightSidebarLayoutState,
+  backendSessionIds: string[]
+): ((prev: RightSidebarLayoutState) => RightSidebarLayoutState) | null {
+  const backendSessionSet = new Set(backendSessionIds);
+
+  // Get current terminal tabs in layout
+  const currentTabs = collectAllTabs(layoutAtRequestStart.root);
+  const currentTerminalTabs = currentTabs.filter(isTerminalTab);
+  const currentTerminalSessionIds = new Set(
+    currentTerminalTabs.map(getTerminalSessionId).filter(Boolean)
+  );
+
+  // Find sessions that don't have tabs yet (add them)
+  const missingSessions = backendSessionIds.filter((sid) => !currentTerminalSessionIds.has(sid));
+
+  // Find tabs for sessions that no longer exist in backend (remove them)
+  const ghostTabs = currentTerminalTabs.filter((tab) => {
+    const sessionId = getTerminalSessionId(tab);
+    return sessionId && !backendSessionSet.has(sessionId);
+  });
+
+  if (missingSessions.length === 0 && ghostTabs.length === 0) return null;
+  return (prev) => {
+    let next = prev;
+
+    // Remove ghost tabs first
+    for (const ghostTab of ghostTabs) {
+      next = removeTabEverywhere(next, ghostTab);
+    }
+
+    // Add tabs for backend sessions that don't have tabs
+    for (const sessionId of missingSessions) {
+      next = addTabToFocusedTabset(next, makeTerminalTabType(sessionId), false);
+    }
+
+    return next;
+  };
+}
+
+/** Keeps the terminal tabs in sync with the backend's sessions (see the comment inside). */
+export function useTerminalSessionSync(
+  api: APIClient | null,
+  workspaceId: string,
+  layout: RightSidebarLayoutState,
+  setLayout: (updater: (prev: RightSidebarLayoutState) => RightSidebarLayoutState) => void
+): void {
+  // Sync terminal tabs with backend sessions on workspace mount.
+  // - Adds tabs for backend sessions that don't have tabs (restore after reload)
+  // - Removes "ghost" tabs for sessions that no longer exist (cleanup after app restart)
+  // Runs only on workspace change, not layout change (layout.root as a dependency would
+  // loop), so it snapshots the layout through a ref when the request starts. Comparing the
+  // backend list with that snapshot (not the latest layout) keeps terminals created or
+  // closed while the request is in flight from being removed or re-added.
+  const layoutForSessionSyncRef = React.useRef(layout);
+  React.useLayoutEffect(() => {
+    layoutForSessionSyncRef.current = layout;
+  });
+  React.useEffect(() => {
+    if (!api) return;
+
+    let cancelled = false;
+    const layoutAtRequestStart = layoutForSessionSyncRef.current;
+
+    void api.terminal
+      .listSessions({ workspaceId })
+      .then((backendSessionIds) => {
+        if (cancelled) return;
+
+        const reconcile = reconcileTerminalTabs(layoutAtRequestStart, backendSessionIds);
+        if (reconcile) setLayout(reconcile);
+      })
+      // A lost connection is no answer: the next client runs this sync again. The kept client's
+      // call fails at once while offline, and must not be an unhandled rejection.
+      .catch((error: unknown) => {
+        if (!isConnectionLostError(error)) {
+          console.error("Failed to sync terminal sessions:", error);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [api, workspaceId, setLayout]);
+}
+
+/**
+ * Whether the workspace can show a Desktop tab: null while unknown, so the layout keeps the tab.
+ */
+export function useDesktopAvailable(
+  api: APIClient | null,
+  desktopExperimentEnabled: boolean,
+  workspaceId: string
+): boolean | null {
+  const [desktopAvailable, setDesktopAvailable] = React.useState<boolean | null>(null);
+
+  React.useEffect(() => {
+    if (!desktopExperimentEnabled) {
+      setDesktopAvailable(false);
+      return;
+    }
+
+    // A degraded (slow) connection still has a usable api; only a missing api means offline.
+    // Offline keeps the last known value, so the layout keeps its Desktop tab.
+    if (!api) {
+      return;
+    }
+
+    let cancelled = false;
+
+    void api.desktop
+      .getCapability({ workspaceId })
+      .then((capability) => {
+        if (!cancelled) {
+          setDesktopAvailable(capability.available);
+        }
+      })
+      .catch((error: unknown) => {
+        // A lost connection is not a missing capability: keep the Desktop tab for the next client.
+        if (!cancelled && !isConnectionLostError(error)) {
+          setDesktopAvailable(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [api, desktopExperimentEnabled, workspaceId]);
+
+  return desktopAvailable;
+}
 
 const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   workspaceId,
@@ -903,9 +1136,13 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   // Manual collapse state (persisted globally)
   // WorkspaceShell expands it when it opens the phone full-screen view (see there).
-  const [collapsed, setCollapsed] = usePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false, {
-    listener: true,
-  });
+  const [collapsed, setCollapsed] = usePersistedState<boolean>(
+    RIGHT_SIDEBAR_COLLAPSED_KEY,
+    RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
+    {
+      listener: true,
+    }
+  );
   const [isReviewImmersive, setIsReviewImmersive] = usePersistedState<boolean>(
     getReviewImmersiveKey(workspaceId),
     false,
@@ -917,6 +1154,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // API for reading config and managing terminal sessions.
   const apiState = useAPI();
   const api = apiState.api;
+  const liveApi = liveClientOf(apiState);
   const desktopExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
   const artifactsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
   const browserExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_BROWSER);
@@ -941,9 +1179,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // Opening the tab by shortcut leaves focus where it was (usually the chat input), so the
   // panel claims focus once it renders, like terminals do with autoFocusTerminalSession.
   const [autoFocusArtifacts, setAutoFocusArtifacts] = React.useState(false);
-  const [llmDebugLogsEnabled, setLlmDebugLogsEnabled] = React.useState<boolean | null>(null);
-  const [desktopAvailable, setDesktopAvailable] = React.useState<boolean | null>(null);
-  const debugLogsLocalOverrideRef = React.useRef(false);
+  const llmDebugLogsEnabled = useLlmDebugLogsEnabled(api);
+  const desktopAvailable = useDesktopAvailable(api, desktopExperimentEnabled, workspaceId);
 
   const setDisplayedGoal = async (intent: {
     // RightSidebar buttons only ever request user-facing transitions;
@@ -957,14 +1194,14 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     // to mutate the existing goal record instead of archiving+recreating.
     editInPlace?: boolean;
   }) => {
-    if (!api) {
+    if (!liveApi) {
       throw new Error("Backend is not connected.");
     }
     // Target the goal this sidebar displayed: a goal replaced since then refuses the edit
     // (#5461) instead of receiving it.
     // Before the sidebar state loads, the displayed goal is unknown (not "no goal"): read it.
     const intendedGoalId = sidebarState == null ? undefined : intendedGoalIdOf(goal);
-    const result = await setGoalForIntendedGoal(api, workspaceId, intent, intendedGoalId);
+    const result = await setGoalForIntendedGoal(liveApi, workspaceId, intent, intendedGoalId);
     if (!result.success) {
       throw new Error(getGoalSetErrorMessage(result.error));
     }
@@ -1004,21 +1241,21 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   };
 
   const handleGoalClear = async () => {
-    if (!api) {
+    if (!liveApi) {
       throw new Error("Backend is not connected.");
     }
-    await api.workspace.clearGoal({ workspaceId });
+    await liveApi.workspace.clearGoal({ workspaceId });
   };
 
   const handleGoalCreate = async (intent: GoalCreateIntent) => {
-    if (!api) {
+    if (!liveApi) {
       throw new Error("Backend is not connected.");
     }
     // Apply shared defaults (turn cap + `alwaysRequireExplicitBudget`)
     // so the GoalTab form, slash command, and command palette produce
     // identical goals for identical inputs. Pass workspaceId so any
     // per-workspace override wins over the global.
-    const defaults = await loadGoalDefaults(api, workspaceId);
+    const defaults = await loadGoalDefaults(liveApi, workspaceId);
     const resolved = resolveGoalSetIntent(intent, defaults);
     if (hasGoalBudgetLimit(resolved.budgetCents)) {
       // Fetch provider config at submit time so quick submits before the
@@ -1027,7 +1264,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       // surfaces in lockstep.
       let freshProvidersConfig: unknown = providersConfig;
       try {
-        freshProvidersConfig = await api.providers.getConfig();
+        freshProvidersConfig = await liveApi.providers.getConfig();
       } catch {
         // Fall back to the hook value (which may still be null). Better
         // to surface the pricing-gate error than to leak the network
@@ -1043,56 +1280,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       ...(resolved.turnCap != null ? { turnCap: resolved.turnCap } : {}),
     });
   };
-
-  React.useEffect(() => {
-    if (!api) {
-      setLlmDebugLogsEnabled(null);
-      return;
-    }
-
-    // Reset local override so a fresh config fetch can set the initial value.
-    debugLogsLocalOverrideRef.current = false;
-    let cancelled = false;
-
-    void api.config
-      .getConfig()
-      .then((cfg) => {
-        if (cancelled) {
-          return;
-        }
-
-        // If the user toggled debug logs while this config fetch was in flight,
-        // the event listener has already set the authoritative value.
-        if (debugLogsLocalOverrideRef.current) {
-          return;
-        }
-
-        setLlmDebugLogsEnabled(cfg.llmDebugLogs === true);
-      })
-      .catch(() => {
-        if (cancelled) {
-          return;
-        }
-
-        setLlmDebugLogsEnabled(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api]);
-
-  React.useEffect(() => {
-    const handleLlmDebugLogsChanged = (event: Event) => {
-      const detail = (event as CustomEvent<{ enabled: boolean }>).detail;
-      debugLogsLocalOverrideRef.current = true;
-      setLlmDebugLogsEnabled(detail?.enabled === true);
-    };
-
-    window.addEventListener(CUSTOM_EVENTS.LLM_DEBUG_LOGS_CHANGED, handleLlmDebugLogsChanged);
-    return () =>
-      window.removeEventListener(CUSTOM_EVENTS.LLM_DEBUG_LOGS_CHANGED, handleLlmDebugLogsChanged);
-  }, []);
 
   // A tool explicitly requested for new layouts (RIGHT_SIDEBAR_TAB_KEY). Without one, a
   // workspace starts with just the New tab, which guides the user to the tools.
@@ -1222,38 +1409,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     initialActiveTab,
     setLayoutRaw,
   });
-
-  React.useEffect(() => {
-    if (!desktopExperimentEnabled) {
-      setDesktopAvailable(false);
-      return;
-    }
-
-    // A degraded (slow) connection still has a usable api; only a missing api means offline.
-    if (!api) {
-      setDesktopAvailable(null);
-      return;
-    }
-
-    let cancelled = false;
-
-    void api.desktop
-      .getCapability({ workspaceId })
-      .then((capability) => {
-        if (!cancelled) {
-          setDesktopAvailable(capability.available);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setDesktopAvailable(false);
-        }
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api, desktopExperimentEnabled, workspaceId]);
 
   React.useEffect(() => {
     if (desktopAvailable == null) {
@@ -1807,69 +1962,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
   }, [api, closeNonTerminalTab, handleCloseSideChat, layout, removeTerminalTab]);
 
-  // Sync terminal tabs with backend sessions on workspace mount.
-  // - Adds tabs for backend sessions that don't have tabs (restore after reload)
-  // - Removes "ghost" tabs for sessions that no longer exist (cleanup after app restart)
-  // Runs only on workspace change, not layout change (layout.root as a dependency would
-  // loop), so it snapshots the layout through a ref when the request starts. Comparing the
-  // backend list with that snapshot (not the latest layout) keeps terminals created or
-  // closed while the request is in flight from being removed or re-added.
-  const layoutForSessionSyncRef = React.useRef(layout);
-  React.useLayoutEffect(() => {
-    layoutForSessionSyncRef.current = layout;
-  });
-  React.useEffect(() => {
-    if (!api) return;
-
-    let cancelled = false;
-    const layoutAtRequestStart = layoutForSessionSyncRef.current;
-
-    void api.terminal.listSessions({ workspaceId }).then((backendSessionIds) => {
-      if (cancelled) return;
-
-      const backendSessionSet = new Set(backendSessionIds);
-
-      // Get current terminal tabs in layout
-      const currentTabs = collectAllTabs(layoutAtRequestStart.root);
-      const currentTerminalTabs = currentTabs.filter(isTerminalTab);
-      const currentTerminalSessionIds = new Set(
-        currentTerminalTabs.map(getTerminalSessionId).filter(Boolean)
-      );
-
-      // Find sessions that don't have tabs yet (add them)
-      const missingSessions = backendSessionIds.filter(
-        (sid) => !currentTerminalSessionIds.has(sid)
-      );
-
-      // Find tabs for sessions that no longer exist in backend (remove them)
-      const ghostTabs = currentTerminalTabs.filter((tab) => {
-        const sessionId = getTerminalSessionId(tab);
-        return sessionId && !backendSessionSet.has(sessionId);
-      });
-
-      if (missingSessions.length > 0 || ghostTabs.length > 0) {
-        setLayout((prev) => {
-          let next = prev;
-
-          // Remove ghost tabs first
-          for (const ghostTab of ghostTabs) {
-            next = removeTabEverywhere(next, ghostTab);
-          }
-
-          // Add tabs for backend sessions that don't have tabs
-          for (const sessionId of missingSessions) {
-            next = addTabToFocusedTabset(next, makeTerminalTabType(sessionId), false);
-          }
-
-          return next;
-        });
-      }
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api, workspaceId, setLayout]);
+  useTerminalSessionSync(api, workspaceId, layout, setLayout);
 
   // Handler to update a terminal's title (from OSC sequences)
   // Also persists to localStorage for reload survival
@@ -2336,6 +2429,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   );
 
   const isDraggingTab = activeDragData !== null;
+  // Full-screen mode closes from its header instead.
+  const collapseTabsetId = fullscreen ? null : findTopRightTabsetId(layout.root);
 
   const renderLayoutNode = (node: RightSidebarLayoutNode): React.ReactNode => {
     if (node.type === "split") {
@@ -2388,6 +2483,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         setLayout={setLayout}
         onPopOutTerminal={handlePopOutTerminal}
         onAddNewTab={handleAddNewTab}
+        onCollapseSidebar={node.id === collapseTabsetId ? () => setCollapsed(true) : undefined}
         onOpenToolFromNewTab={handleOpenToolFromNewTab}
         onOpenTerminalFromNewTab={handleOpenTerminalFromNewTab}
         onOpenSideChatFromNewTab={canStartSideChat ? handleStartSideChat : undefined}
@@ -2475,7 +2571,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             </Button>
           </div>
         )}
-        {!collapsed && (
+        {!collapsed ? (
           <div className="flex min-h-0 min-w-0 flex-1 flex-row">
             {/* Resize handle (left edge); full-screen mode has nothing to resize. */}
             {onStartResize && !fullscreen && (
@@ -2491,18 +2587,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
             <div className="flex min-h-0 min-w-0 flex-1 flex-col">
               {renderLayoutNode(layout.root)}
-              {/* Full-screen mode closes from its header instead. */}
-              {!fullscreen && (
-                <SidebarCollapseButton
-                  collapsed={collapsed}
-                  onToggle={() => setCollapsed(!collapsed)}
-                  side="right"
-                />
-              )}
             </div>
           </div>
-        )}
-        {collapsed && (
+        ) : (
           <RightSidebarOverview
             workspaceId={workspaceId}
             onExpand={handleExpandFromOverview}

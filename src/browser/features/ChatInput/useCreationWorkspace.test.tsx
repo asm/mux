@@ -1,6 +1,7 @@
 import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import {
   getAutoRoutingPick,
@@ -711,6 +712,65 @@ describe("useCreationWorkspace", () => {
     restoreDomGlobals();
   });
 
+  // A reconnect reloads branches and runtime availability through the new client. The creation
+  // controls keep the shown values until the reload answers. `branchLoad` is the send barrier
+  // (#6033), so it is "loading" until the new branch list answers.
+  describe.each([...GAP_MODES])("reload after a reconnect (%s)", (mode) => {
+    test("keeps the shown branches and runtimes, and blocks the send, until the reload answers", async () => {
+      setupWindow({
+        listBranches: mock(() => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })),
+      });
+      const harness = createConnectionHarness(mode, () => currentORPCClient ?? {});
+      const resultRef: { current: ReturnType<typeof useCreationWorkspace> | null } = {
+        current: null,
+      };
+      function Harness() {
+        resultRef.current = useCreationWorkspace({
+          projectPath: TEST_PROJECT_PATH,
+          onWorkspaceCreated: () => undefined,
+          message: "",
+        });
+        return null;
+      }
+      render(
+        <harness.Wrapper>
+          <Harness />
+        </harness.Wrapper>
+      );
+      await waitFor(() => expect(resultRef.current?.branchLoad).toBe("loaded"));
+      await waitFor(() =>
+        expect(resultRef.current?.runtimeAvailabilityState.status).toBe("loaded")
+      );
+
+      let answerBranches: (() => void) | null = null;
+      const branchesAnswered = new Promise<void>((resolve) => (answerBranches = resolve));
+      const previous = currentORPCClient;
+      if (!previous) throw new Error("setupWindow() sets the client");
+      currentORPCClient = {
+        ...previous,
+        projects: {
+          ...previous.projects,
+          listBranches: () =>
+            branchesAnswered.then(() => ({ branches: ["main", "next"], recommendedTrunk: "main" })),
+          runtimeAvailability: () => new Promise(() => undefined),
+        },
+      };
+      await harness.drop();
+      harness.reconnect();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+
+      expect(resultRef.current?.branchLoad).toBe("loading");
+      expect(resultRef.current?.branches).toEqual(["main"]);
+      expect(resultRef.current?.runtimeAvailabilityState.status).toBe("loaded");
+
+      act(() => answerBranches?.());
+      await waitFor(() => expect(resultRef.current?.branches).toEqual(["main", "next"]));
+      expect(resultRef.current?.branchLoad).toBe("loaded");
+    });
+  });
+
   test("loads branches when projectPath is provided", async () => {
     const listBranchesMock = mock(
       (): Promise<BranchListResult> =>
@@ -996,6 +1056,182 @@ describe("useCreationWorkspace", () => {
     // The next visit to the form must not offer the name of the workspace that now exists.
     expect(window.localStorage.getItem(nameStateKey)).toBeNull();
     await waitFor(() => expect(getHook().nameState.name).not.toBe("my-feature"));
+  });
+
+  describe("worktree creations hand a pending name to the backend", () => {
+    const setupPendingName = (selectedRuntime: ParsedRuntime, beforeRender?: () => void) => {
+      const generation = Promise.withResolvers<NameGenerationResult>();
+      const nameGenerationMock = mock(
+        (_args: NameGenerationArgs): Promise<NameGenerationResult> => generation.promise
+      );
+      const { workspaceApi } = setupWindow({
+        listBranches: mock(
+          (): Promise<BranchListResult> =>
+            Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+        ),
+        sendMessage: mock(
+          (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+            Promise.resolve({ success: true as const, data: {} })
+        ),
+        create: mock(
+          (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+            Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
+        ),
+        nameGeneration: nameGenerationMock,
+      });
+      draftSettingsState = createDraftSettingsHarness({ selectedRuntime, trunkBranch: "main" });
+      beforeRender?.();
+      const getHook = renderUseCreationWorkspace({
+        projectPath: TEST_PROJECT_PATH,
+        onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+        message: "launch workspace",
+      });
+      return { generation, nameGenerationMock, workspaceApi, getHook };
+    };
+    const generatedName: NameGenerationResult = {
+      success: true,
+      data: { name: "launch-a1b2", title: "Launch workspace", modelUsed: "test:model" },
+    };
+
+    test("creates at once without a branch name while the name is still generating", async () => {
+      const nameStateKey = getWorkspaceNameStateKey(getPendingScopeId(TEST_PROJECT_PATH));
+      const { generation, nameGenerationMock, workspaceApi, getHook } = setupPendingName(
+        { mode: "worktree" },
+        () =>
+          // A name generated for an earlier message is still in the default form.
+          window.localStorage.setItem(
+            nameStateKey,
+            JSON.stringify({
+              generatedIdentity: { name: "older-c3d4", title: "Older message" },
+              manualName: "",
+              autoGenerate: true,
+              lastGeneratedFor: "an older message",
+            })
+          )
+      );
+      expect(getHook().nameState.name).toBe("older-c3d4");
+      await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+      await waitFor(() => expect(nameGenerationMock.mock.calls.length).toBe(1));
+
+      let handleSendResult: CreationSendResult | undefined;
+      await act(async () => {
+        handleSendResult = await getHook().handleSend("launch workspace");
+      });
+
+      expect(handleSendResult).toEqual({ success: true });
+      const createRequest = workspaceApi.create.mock.calls[0]?.[0];
+      const formRequest = nameGenerationMock.mock.calls[0]?.[0];
+      // The form's request still runs, so the create names it for the backend to take over.
+      expect(typeof formRequest?.draftNamingId).toBe("string");
+      expect(createRequest?.nameGeneration).toEqual({
+        message: "launch workspace",
+        candidates: formRequest?.candidates ?? [],
+        draftNamingId: formRequest?.draftNamingId,
+      });
+      expect(createRequest?.branchName).toBeUndefined();
+      expect(createRequest?.title).toBeUndefined();
+      // The stale name must not be offered again by the next visit to the form.
+      expect(window.localStorage.getItem(nameStateKey)).toBeNull();
+
+      // The cancelled request's late result never lands in the form.
+      await act(async () => {
+        generation.resolve(generatedName);
+        await generation.promise;
+      });
+      expect(getHook().nameState.name).toBe("");
+    });
+
+    test("a send the trust prompt stops leaves the name generating in the form", async () => {
+      mockProjectConfigMap = new Map([[TEST_PROJECT_PATH, { workspaces: [], trusted: false }]]);
+      const { generation, nameGenerationMock, workspaceApi, getHook } = setupPendingName({
+        mode: "worktree",
+      });
+      await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+      await waitFor(() => expect(nameGenerationMock.mock.calls.length).toBe(1));
+
+      let sendPromise: Promise<CreationSendResult> | undefined;
+      act(() => {
+        sendPromise = getHook().handleSend("launch workspace");
+      });
+      await waitFor(() => expect(getHook().trustDialog).not.toBeNull());
+      const trustDialog = getHook().trustDialog;
+      if (!trustDialog || typeof trustDialog !== "object" || !("props" in trustDialog)) {
+        throw new Error("Expected trust dialog props");
+      }
+      act(() => {
+        (trustDialog.props as { onCancel: () => void }).onCancel();
+      });
+      expect(await sendPromise).toEqual({ success: false });
+      expect(workspaceApi.create.mock.calls.length).toBe(0);
+
+      await act(async () => {
+        generation.resolve(generatedName);
+        await generation.promise;
+      });
+      expect(getHook().nameState.name).toBe("launch-a1b2");
+    });
+
+    test("a failed create names the message in the form again", async () => {
+      const { generation, nameGenerationMock, workspaceApi, getHook } = setupPendingName({
+        mode: "worktree",
+      });
+      workspaceApi.create.mockImplementationOnce(() =>
+        Promise.resolve({ success: false, error: "disk full" } as WorkspaceCreateResult)
+      );
+      await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+      await waitFor(() => expect(nameGenerationMock.mock.calls.length).toBe(1));
+
+      let handleSendResult: CreationSendResult | undefined;
+      await act(async () => {
+        handleSendResult = await getHook().handleSend("launch workspace");
+      });
+      expect(handleSendResult).toEqual({ success: false });
+      expect(workspaceApi.create.mock.calls[0]?.[0]?.nameGeneration).toBeDefined();
+
+      await act(async () => {
+        generation.resolve(generatedName);
+        await generation.promise;
+      });
+      await waitFor(() => expect(getHook().nameState.name).toBe("launch-a1b2"));
+      expect(nameGenerationMock.mock.calls.length).toBe(2);
+    });
+
+    test("a non-worktree runtime still waits for the generated name", async () => {
+      const { generation, nameGenerationMock, workspaceApi, getHook } = setupPendingName({
+        mode: "local",
+      });
+      await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+      await waitFor(() => expect(nameGenerationMock.mock.calls.length).toBe(1));
+
+      let sendPromise: Promise<CreationSendResult> | undefined;
+      act(() => {
+        sendPromise = getHook().handleSend("launch workspace");
+      });
+      await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+      expect(workspaceApi.create.mock.calls.length).toBe(0);
+
+      await act(async () => {
+        generation.resolve(generatedName);
+        await sendPromise;
+      });
+      const createRequest = workspaceApi.create.mock.calls[0]?.[0];
+      expect(createRequest?.branchName).toBe("launch-a1b2");
+      expect(createRequest?.nameGeneration).toBeUndefined();
+    });
+
+    test("a name already generated for the message is sent as today", async () => {
+      const { generation, workspaceApi, getHook } = setupPendingName({ mode: "worktree" });
+      generation.resolve(generatedName);
+      await waitFor(() => expect(getHook().nameState.name).toBe("launch-a1b2"));
+
+      await act(async () => {
+        await getHook().handleSend("launch workspace");
+      });
+      const createRequest = workspaceApi.create.mock.calls[0]?.[0];
+      expect(createRequest?.branchName).toBe("launch-a1b2");
+      expect(createRequest?.title).toBe("Launch workspace");
+      expect(createRequest?.nameGeneration).toBeUndefined();
+    });
   });
 
   test("handleSend stages pending files after create and appends the attached-files notice", async () => {

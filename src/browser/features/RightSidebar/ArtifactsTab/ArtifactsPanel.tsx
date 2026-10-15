@@ -274,6 +274,14 @@ const SELECTION_EXTENDING_KEYS = new Set([
 ]);
 
 /**
+ * The annotate shortcut's first press, not its auto-repeat: a held key toggled annotate mode at
+ * the key-repeat rate (#6347). The frame's key bridge ignores repeats the same way.
+ */
+function matchesAnnotateShortcut(e: React.KeyboardEvent): boolean {
+  return !e.repeat && matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE);
+}
+
+/**
  * Artifacts tab (experiment: "artifacts"): files the agent writes to
  * $XUM_SCRATCH_DIR/artifacts, listed newest first with a preview of the selected one.
  */
@@ -884,7 +892,7 @@ export function ArtifactsPanel(props: {
       e.preventDefault();
       keepFocusForShortcuts(e.target);
       unpinShelfSelected();
-    } else if (matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE)) {
+    } else if (matchesAnnotateShortcut(e)) {
       e.preventDefault();
       toggleAnnotate();
     }
@@ -1145,7 +1153,7 @@ export function ArtifactsPanel(props: {
         <TooltipIfPresent tooltip="Artifacts changed since you looked">
           <span
             aria-label={`${changedPaths.size} changed`}
-            className="text-accent counter-nums flex shrink-0 items-center gap-1 text-[11px]"
+            className="text-accent-text counter-nums flex shrink-0 items-center gap-1 text-[11px]"
           >
             <span className="bg-accent h-1.5 w-1.5 rounded-full" />
             {changedPaths.size}
@@ -1225,7 +1233,7 @@ export function ArtifactsPanel(props: {
             aria-label={annotating ? "Stop annotating" : "Annotate"}
             aria-pressed={annotating}
             onClick={toggleAnnotate}
-            className={`${toolbarButtonClassName} ${annotating ? "text-accent border-accent" : ""}`}
+            className={`${toolbarButtonClassName} ${annotating ? "text-accent-text border-accent" : ""}`}
           >
             {annotating ? (
               <MessageSquareOff className="h-3.5 w-3.5" />

@@ -1,4 +1,10 @@
-import { formatKeybind, KEYBINDS, type Keybind } from "@/browser/utils/ui/keybinds";
+import {
+  formatKeybind,
+  isAltGraphPressed,
+  KEYBINDS,
+  matchesKeybind,
+  type Keybind,
+} from "@/browser/utils/ui/keybinds";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import {
@@ -16,7 +22,7 @@ import {
   Sparkles,
   Square,
 } from "lucide-react";
-import React from "react";
+import React, { useEffect, useRef } from "react";
 import {
   getWorkspaceActionGroups,
   type WorkspaceActionId,
@@ -80,10 +86,18 @@ const ACTION_ROWS: Record<WorkspaceActionId, ActionRow> = {
     testId: "workspace-terminal-button",
   },
   togglePinned: { label: "Pin workspace", icon: <Pin />, keybind: KEYBINDS.PIN_WORKSPACE },
-  markUnread: { label: "Mark unread", icon: <EyeOff /> },
-  toggleSubAgents: { label: "Show sub-agents", icon: <Eye /> },
-  fork: { label: "Fork workspace", icon: <GitBranch /> },
-  stopRuntime: { label: "Stop container", icon: <Square /> },
+  markUnread: { label: "Mark unread", icon: <EyeOff />, keybind: KEYBINDS.MARK_WORKSPACE_UNREAD },
+  toggleSubAgents: {
+    label: "Show sub-agents",
+    icon: <Eye />,
+    keybind: KEYBINDS.TOGGLE_COMPLETED_SUB_AGENTS,
+  },
+  fork: { label: "Fork workspace", icon: <GitBranch />, keybind: KEYBINDS.FORK_WORKSPACE },
+  stopRuntime: {
+    label: "Stop container",
+    icon: <Square />,
+    keybind: KEYBINDS.STOP_WORKSPACE_RUNTIME,
+  },
   archive: {
     label: "Archive workspace",
     icon: <ArchiveIcon />,
@@ -97,13 +111,14 @@ const UNPIN_ROW: ActionRow = {
   label: "Unpin workspace",
   icon: <PinOff />,
 };
-const HIDE_SUB_AGENTS_ROW: ActionRow = { label: "Hide sub-agents", icon: <EyeOff /> };
-// Sidebar rows: the menu bar handles these shortcuts for the SELECTED workspace, so a hint in
-// another row's menu would promise the wrong target (Codex on #6301).
-const SIDEBAR_MCP_ROW: ActionRow = { ...ACTION_ROWS.configureMcp, keybind: undefined };
-const SIDEBAR_MESSAGING_ROW: ActionRow = { ...ACTION_ROWS.configureMessaging, keybind: undefined };
+const HIDE_SUB_AGENTS_ROW: ActionRow = {
+  ...ACTION_ROWS.toggleSubAgents,
+  label: "Hide sub-agents",
+  icon: <EyeOff />,
+};
 
 interface WorkspaceActionButtonProps {
+  id: WorkspaceActionId;
   row: ActionRow;
   onClick: (e: React.MouseEvent<HTMLButtonElement>) => void;
 }
@@ -112,7 +127,7 @@ function WorkspaceActionButton(props: WorkspaceActionButtonProps) {
   return (
     <button
       type="button"
-      data-workspace-action-row
+      data-workspace-action-row={props.id}
       // focus:bg-hover marks the row the arrow keys reached, like the hover state (#6103).
       className="text-content-secondary bg-surface-primary hover:bg-hover focus:bg-hover block w-full rounded-sm px-2 py-1.5 text-left text-xs whitespace-nowrap outline-none"
       onClick={props.onClick}
@@ -160,10 +175,6 @@ export function getShownWorkspaceActionGroups(
 function getActionRow(id: WorkspaceActionId, props: WorkspaceActionsMenuContentProps): ActionRow {
   if (id === "togglePinned" && props.isPinned) return UNPIN_ROW;
   if (id === "toggleSubAgents" && props.subAgentsExpanded === true) return HIDE_SUB_AGENTS_ROW;
-  if (props.state.surface === "sidebar") {
-    if (id === "configureMcp") return SIDEBAR_MCP_ROW;
-    if (id === "configureMessaging") return SIDEBAR_MESSAGING_ROW;
-  }
   return ACTION_ROWS[id];
 }
 
@@ -174,11 +185,13 @@ function getActionRow(id: WorkspaceActionId, props: WorkspaceActionsMenuContentP
  */
 export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentProps> = (props) => {
   const groups = getShownWorkspaceActionGroups(props.state, props.actions);
+  const rootRef = useRef<HTMLDivElement>(null);
+  useRowShortcutKeys(rootRef, groups.flat(), props);
   return (
     // No menu role on purpose: the menu/menuitem pattern also requires roving Tab focus and
     // changes how the sidebar row's long-press handling sees this portal. The Radix Popover
     // stays a dialog of buttons, and the arrow keys are an extra on top of Tab (#6103).
-    <div onKeyDown={handleRowArrowKeys}>
+    <div ref={rootRef} onKeyDown={handleRowArrowKeys}>
       {groups.map((group, groupIndex) => (
         <React.Fragment key={group[0]}>
           {groupIndex > 0 && (
@@ -187,6 +200,7 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
           {group.map((id) => (
             <WorkspaceActionButton
               key={id}
+              id={id}
               row={getActionRow(id, props)}
               onClick={(e) => {
                 e.stopPropagation();
@@ -200,6 +214,94 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
     </div>
   );
 };
+
+const ROW_KEYBINDS = (Object.keys(ACTION_ROWS) as WorkspaceActionId[]).flatMap((id) => {
+  const keybind = ACTION_ROWS[id].keybind;
+  return keybind ? [{ id, keybind }] : [];
+});
+
+/**
+ * While a menu is open, the keys its rows hint act on the menu's own workspace (#6328). A sidebar
+ * row's menu is often not the selected workspace's, and the global handlers act on the selected
+ * one, so the menu takes the key before they see it. A row key whose row this menu hides does
+ * nothing here (fail closed) instead of reaching the selected workspace.
+ *
+ * The menu hears keys from its whole popover, not only from its rows: a click on the popover's
+ * padding or a separator focuses the popover itself, outside the rows, and the key then never
+ * passed through the menu (#6434). Keys from outside the popover keep their global meaning. The
+ * listener sits on the window's capture phase and exists only while the menu is mounted.
+ */
+function useRowShortcutKeys(
+  rootRef: React.RefObject<HTMLDivElement>,
+  shown: WorkspaceActionId[],
+  props: WorkspaceActionsMenuContentProps
+) {
+  const latestRef = useRef({ shown, props });
+  useEffect(() => {
+    latestRef.current = { shown, props };
+  });
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      const root = rootRef.current;
+      // Ctrl+Alt chords: AltGr types characters with the same modifiers.
+      if (!root || !isInMenuPopover(root, event.target) || isAltGraphPressed(event)) return;
+      handleRowShortcut(event, root, latestRef.current.shown, latestRef.current.props);
+    };
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, [rootRef]);
+}
+
+/** The key comes from the popover around the menu (Radix PopoverContent, role dialog). */
+function isInMenuPopover(root: HTMLElement, target: EventTarget | null): boolean {
+  const popover = root.closest('[role="dialog"]') ?? root;
+  return target instanceof Node && popover.contains(target);
+}
+
+function handleRowShortcut(
+  event: KeyboardEvent,
+  root: HTMLElement,
+  shown: WorkspaceActionId[],
+  props: WorkspaceActionsMenuContentProps
+) {
+  const match = ROW_KEYBINDS.find((row) => matchesKeybind(event, row.keybind));
+  if (!match) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  // A held key auto-repeats: run the row once (Codex on #6398).
+  if (event.repeat || !shown.includes(match.id)) return;
+  const rowButton = root.querySelector<HTMLElement>(`[data-workspace-action-row="${match.id}"]`);
+  swallowHeldKey(event.code || event.key);
+  props.onCloseMenu();
+  props.actions[match.id]?.(rowButton ?? root);
+}
+
+/**
+ * The key closes the menu, so the repeats of a held key land outside it, where the window
+ * handlers act on the SELECTED workspace (Codex on #6398). Swallow that key's auto-repeats at the
+ * window's capture phase, before every bubble-phase handler, until it is released, pressed anew
+ * or the window blurs.
+ */
+function swallowHeldKey(code: string) {
+  const swallow = (e: KeyboardEvent) => {
+    if ((e.code || e.key) !== code) return;
+    // A new press of the key (not an auto-repeat) is the user's next action: let it through.
+    if (!e.repeat) return stop();
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  };
+  const release = (e: KeyboardEvent) => {
+    if ((e.code || e.key) === code) stop();
+  };
+  const stop = () => {
+    window.removeEventListener("keydown", swallow, true);
+    window.removeEventListener("keyup", release, true);
+    window.removeEventListener("blur", stop);
+  };
+  window.addEventListener("keydown", swallow, true);
+  window.addEventListener("keyup", release, true);
+  window.addEventListener("blur", stop);
+}
 
 // ArrowDown/ArrowUp move focus between the rows and stop at the ends, as in ArtifactVersionMenu.
 // Tab still works. The popover focuses the first row when it opens (#6103).

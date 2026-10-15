@@ -64,6 +64,11 @@ import { log } from "./log";
 import { normalizeWhitespace, runEvaluationRecall } from "./memoryIntuitionEvaluation";
 import type { EvaluationResolveError, PinnedEvaluationModel } from "./providerModelFactory";
 import { runThroughToolHookPipeline, type HookConfig } from "./tools/withHooks";
+import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
+
+/** The memory tool's own schema: a hook's allowed rewrite of a view is checked against it. */
+const memoryInputJsonSchema = () =>
+  extractToolJsonSchema({ inputSchema: TOOL_DEFINITIONS.memory.schema });
 
 // Verification evidence stays private; memory_read exposes only the hook-filtered result.
 export type IntuitionReadResult = MemoryToolResult & {
@@ -291,6 +296,7 @@ async function authorizeIntuitionIndex(
                 args: input,
                 config: hooks,
                 abortSignal: signal,
+                inputJsonSchema: memoryInputJsonSchema,
                 execute: (current): Promise<MemoryToolResult> => {
                   const parsed = TOOL_DEFINITIONS.memory.schema.safeParse(current);
                   if (
@@ -537,6 +543,7 @@ export async function runMemoryIntuition(args: {
               args: input,
               config: args.hooks,
               abortSignal: signal,
+              inputJsonSchema: memoryInputJsonSchema,
               execute,
             })
           : { blocked: false as const, result: await execute(input) };

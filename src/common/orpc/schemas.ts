@@ -130,6 +130,7 @@ export {
   DeleteMessageSchema,
   ErrorEventSchema,
   GoalBudgetLimitedEventSchema,
+  PluginHookNoticeEventSchema,
   OnChatDowngradeReasonSchema,
   ReasoningDeltaEventSchema,
   ReasoningEndEventSchema,

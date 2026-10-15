@@ -50,6 +50,7 @@ import { AgentIdSchema } from "@/common/schemas/ids";
 import {
   AgentSkillPackageSchema,
   AgentSkillScopeSchema,
+  SkillLookupNameSchema,
   SkillNameSchema,
 } from "@/common/orpc/schemas/agentSkill";
 import {
@@ -589,6 +590,9 @@ const TaskToolCompletedReportSchema = z
     reportMarkdown: z.string(),
     /** The report's context carried project skill content (see task tool provenance). */
     carriesProjectSkillContent: z.boolean().optional(),
+    /** Set when reportMarkdown is the first page of a longer report; note names the next read. */
+    nextCharOffset: z.number().optional(),
+    note: z.string().optional(),
     title: z.string().optional(),
     structuredOutput: z.unknown().optional(),
     planFilePath: z.string().optional(),
@@ -644,6 +648,8 @@ export const TaskToolCompletedResultSchema = z
     reportMarkdown: z.string().optional(),
     /** Any delivered report's context carried project skill content. */
     carriesProjectSkillContent: z.boolean().optional(),
+    /** Set when reportMarkdown is the first page of a longer report (see note). */
+    nextCharOffset: z.number().optional(),
     title: z.string().optional(),
     structuredOutput: z.unknown().optional(),
     planFilePath: z.string().optional(),
@@ -1767,6 +1773,10 @@ export const AgentReportToolResultSchema = z.discriminatedUnion("success", [
 ]);
 const FILE_TOOL_PATH = z.string().describe("File path (absolute or workspace-relative)");
 const SKILL_NAME_PARAM = SkillNameSchema.describe("Skill directory name");
+// Read tools only: writes and deletes keep the bare SKILL_NAME_PARAM.
+const SKILL_LOOKUP_NAME_PARAM = SkillLookupNameSchema.describe(
+  "Skill name, or <plugin>:<skill> for a plugin's skill"
+);
 const FILE_LINE_RANGE_FIELDS = {
   offset: z.number().int().positive().nullish().describe("1-based start line (default 1)"),
   limit: z.number().int().positive().nullish().describe("Max lines from offset (default all)"),
@@ -2098,24 +2108,28 @@ export const XumConfigWriteToolResultSchema = z.union([
 /**
  * File read tool result - content or error.
  */
+const FileReadSuccessResultSchema = z.object({
+  success: z.literal(true),
+  file_size: z.number(),
+  modifiedTime: z.string(),
+  lines_read: z.number(),
+  content: z
+    .string()
+    .describe(
+      "File content with line numbers prepended as '<line_number>\\t<content>'. " +
+        "Line numbers are not part of the actual file content."
+    ),
+  warning: z.string().optional(),
+});
+
+const FileReadErrorResultSchema = z.object({
+  success: z.literal(false),
+  error: z.string(),
+});
+
 export const FileReadToolResultSchema = z.union([
-  z.object({
-    success: z.literal(true),
-    file_size: z.number(),
-    modifiedTime: z.string(),
-    lines_read: z.number(),
-    content: z
-      .string()
-      .describe(
-        "File content with line numbers prepended as '<line_number>\\t<content>'. " +
-          "Line numbers are not part of the actual file content."
-      ),
-    warning: z.string().optional(),
-  }),
-  z.object({
-    success: z.literal(false),
-    error: z.string(),
-  }),
+  FileReadSuccessResultSchema,
+  FileReadErrorResultSchema,
 ]);
 
 const AttachFileToolTextPartSchema = z
@@ -2209,6 +2223,13 @@ export const AgentSkillReadToolResultSchema = z.union([
   z.object({
     success: z.literal(true),
     skill: AgentSkillPackageSchema,
+    // Optional: results persisted before these fields existed lack them.
+    /** Absolute skill directory, valid where the workspace's bash runs. */
+    skillDir: z.string().optional(),
+    /** Agent Plugin skills only: absolute plugin root, valid where bash runs. */
+    pluginRoot: z.string().optional(),
+    /** Why `skillDir` is absent (built-in skill, or files not where bash runs). */
+    skillDirUnavailable: z.string().optional(),
   }),
   z.object({
     success: z.literal(false),
@@ -2217,17 +2238,20 @@ export const AgentSkillReadToolResultSchema = z.union([
 ]);
 
 /**
- * Agent Skill read_file tool result.
- * Uses the same shape/limits as file_read, plus the scope of the skill the
- * file belongs to: a referenced file of a PROJECT skill is repository-
- * controlled content, and the routed-request consent scan identifies it from
- * the persisted result alone (older rows without the tag count as project).
+ * agent_skill_read_file result: file_read's, plus the plugin sibling note
+ * (pluginSiblingNote.ts) for files of a plugin skill. The note is a separate
+ * field so `content` line numbers stay exact. Also carries the scope of the
+ * skill the file belongs to: a referenced file of a PROJECT skill is
+ * repository-controlled content, and the routed-request consent scan
+ * identifies it from the persisted result alone (older rows without the tag
+ * count as project).
  */
 export const AgentSkillReadFileToolResultSchema = z.union([
-  FileReadToolResultSchema.options[0].extend({
+  FileReadSuccessResultSchema.extend({
+    pluginSkillNote: z.string().optional(),
     skillScope: AgentSkillScopeSchema.optional(),
   }),
-  FileReadToolResultSchema.options[1],
+  FileReadErrorResultSchema,
 ]);
 
 /**
@@ -2815,10 +2839,10 @@ export const TOOL_DEFINITIONS = {
   agent_skill_read: {
     resultSchema: AgentSkillReadToolResultSchema,
     description:
-      "Load a skill's SKILL.md (frontmatter + body) by name; read its other files with agent_skill_read_file.",
+      "Load a skill's SKILL.md (frontmatter + body) by name; read its other files with agent_skill_read_file. skillDir in the result is the skill's absolute directory where bash runs (relative paths in the skill resolve against it); if absent, skillDirUnavailable says why.",
     schema: z
       .object({
-        name: SKILL_NAME_PARAM,
+        name: SKILL_LOOKUP_NAME_PARAM,
       })
       .strict(),
   },
@@ -2827,7 +2851,7 @@ export const TOOL_DEFINITIONS = {
     description: "Read a file in a skill directory, like file_read.",
     schema: z
       .object({
-        name: SKILL_NAME_PARAM,
+        name: SKILL_LOOKUP_NAME_PARAM,
         filePath: z
           .string()
           .min(1)
@@ -2852,7 +2876,7 @@ export const TOOL_DEFINITIONS = {
   },
   models_list: {
     description:
-      "List selectable (non-hidden) models with aliases and thinking levels; a config snapshot, not an availability probe. Pass an ID only for a requested override; else leave `task.model` unset.",
+      "List model suggestions with aliases and thinking levels; not exhaustive or an availability probe. Other provider:model IDs may work with a configured provider. Pass an ID only for a requested override; else leave `task.model` unset.",
     schema: z.object({}).strict(),
     resultSchema: ModelsListToolResultSchema,
   },
@@ -3524,16 +3548,16 @@ export function getToolSchemas(): Record<string, ToolSchema> {
 }
 
 /**
- * Google's mixed built-in + function tool path is currently supported for Gemini 3.
+ * Google's mixed built-in + function tool path is supported for Gemini 3 and Gemini 4 Argon.
  * Keep native Google tools gated here so the prompt allowlist matches the actual toolset.
  */
 export function supportsGoogleNativeToolsWithFunctionTools(modelId: string): boolean {
   const bareModelId = modelId.split("/").pop() ?? modelId;
-  const match = /^gemini-(\d+)(?:[.-]|$)/.exec(bareModelId);
-  if (!match) return false;
-  const major = Number.parseInt(match[1], 10);
-  // The installed @ai-sdk/google mixed native/function serialization path is Gemini 3-only.
-  return major === 3;
+  // Gemini 4 Argon documents Search grounding and URL context alongside function calling,
+  // and @ai-sdk/google gives every post-2.x Gemini ID the mixed native/function
+  // serialization (includeServerSideToolInvocations). Other Gemini 4 IDs stay off until
+  // their docs list the same tools.
+  return /^gemini-(?:3(?:[.-]|$)|4-argon)/.test(bareModelId);
 }
 
 /**

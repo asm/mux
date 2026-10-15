@@ -8,7 +8,7 @@ import { ThinkingLevelSchema } from "../../types/thinking";
 import { isValidModelFormat } from "@/common/utils/ai/models";
 import { AgentIdSchema } from "./agentDefinition";
 import { StreamErrorTypeSchema } from "./errors";
-import { AgentSkillScopeSchema, SkillNameSchema } from "./agentSkill";
+import { AgentSkillScopeSchema, SkillLookupNameSchema } from "./agentSkill";
 import { WorkflowRunIdSchema, WorkflowRunRecordSchema } from "./workflow";
 
 export const FilePartSchema = z.object({
@@ -97,6 +97,10 @@ export const DynamicToolPartPendingSchema = MuxToolPartBase.extend({
 const DynamicToolPartAvailableSchema = MuxToolPartBase.extend({
   state: z.literal("output-available"),
   output: z.unknown(),
+  // Model-only notes the in-turn result carried (`__mux_notifications`), kept out of `output`
+  // so the transcript never shows them. The request build attaches them again: see
+  // readModelOnlyToolNotifications.
+  modelOnlyNotifications: z.array(z.string()).optional().catch(undefined),
   nestedCalls: z.array(NestedToolCallSchema).optional(),
 });
 const DynamicToolPartRedactedSchema = MuxToolPartBase.extend({
@@ -239,8 +243,18 @@ export const MuxMessageSchema = z.object({
       // instead of failing whole-chat loading at the oRPC output boundary.
       modelFallback: ModelFallbackRecordSchema.optional().catch(undefined),
       autoModelRouting: AutoModelRoutingRecordSchema.optional().catch(undefined),
+      // Prompt-hook context (MuxMetadata.pluginHookContext); a malformed record degrades to none.
+      pluginHookContext: z
+        .array(z.object({ pluginId: z.string(), text: z.string() }))
+        .optional()
+        .catch(undefined),
       // Anthropic thinking-signature repair receipt (see MuxMetadata.anthropicThinkingReplay).
       anthropicThinkingReplay: z.literal("off").optional().catch(undefined),
+      // A corrupt point degrades to the strip-all receipt, which is always valid.
+      anthropicThinkingReplayFromStep: z
+        .union([z.number().int().nonnegative(), z.literal("end")])
+        .optional()
+        .catch(undefined),
       usage: z.any().optional(),
       contextUsage: z.any().optional(),
       providerMetadata: z.record(z.string(), z.unknown()).optional(),
@@ -285,7 +299,9 @@ export const MuxMessageSchema = z.object({
       // Ignore malformed snapshot metadata so one row cannot fail the whole history parse.
       agentSkillSnapshot: z
         .object({
-          skillName: SkillNameSchema,
+          // A lookup name: `<plugin>:<skill>` for a qualified invocation. Older
+          // builds drop only this metadata (.catch below), not the row.
+          skillName: SkillLookupNameSchema,
           scope: AgentSkillScopeSchema,
           sha256: z.string(),
           frontmatterYaml: z.string().optional(),

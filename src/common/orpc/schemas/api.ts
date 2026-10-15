@@ -78,7 +78,10 @@ import {
   McpAppToolCallRequestSchema,
   McpAppToolCallResultSchema,
   McpAppApproveDomainsRequestSchema,
+  McpAppEntrypointSchema,
   McpAppModelContextRequestSchema,
+  McpAppWidgetStateRequestSchema,
+  McpAppOpenEntrypointRequestSchema,
   McpAppViewDomainsSchema,
   McpAppResourceReadRequestSchema,
   McpAppViewRecordsRequestSchema,
@@ -159,7 +162,11 @@ import {
   WorkspaceHeartbeatSettingsSchema,
 } from "./workspace";
 import { WorkspaceAgentAISettingsSchema, WorkspaceAISettingsSchema } from "./workspaceAiSettings";
-import { AgentSkillListResultSchema, AgentSkillPackageSchema, SkillNameSchema } from "./agentSkill";
+import {
+  AgentSkillListResultSchema,
+  AgentSkillPackageSchema,
+  SkillLookupNameSchema,
+} from "./agentSkill";
 import {
   AvailableWorkflowSchema,
   WorkflowRunIdSchema,
@@ -182,8 +189,11 @@ import {
   MCPRemoveParamsSchema,
   MCPServerMapSchema,
   MCPSettingsReadInputSchema,
-  MCPSettingsSnapshotSchema,
+  MCPSettingsReadSnapshotSchema,
   MCPSettingsUpdateParamsSchema,
+  MCPSettingsRunToolParamsSchema,
+  MCPSettingsRunToolResultSchema,
+  MCPSettingsOpenAppResultSchema,
   MCPSetEnabledGlobalParamsSchema,
   MCPSetEnabledParamsSchema,
   MCPSetToolAllowlistGlobalParamsSchema,
@@ -200,6 +210,8 @@ import {
   AgentPluginInstallEntrySchema,
   AgentPluginInstallPreviewSchema,
   AgentPluginComponentsSchema,
+  AgentPluginComponentRefSchema,
+  AgentPluginHooksSchema,
   AgentPluginListItemSchema,
   AgentPluginUpdateCheckSchema,
   AgentPluginUpdateConsentSchema,
@@ -776,6 +788,8 @@ export const mcpOauth = {
         projectPath: z.string().optional(),
         serverName: z.string(),
         pendingServer: MCPOAuthPendingServerSchema.optional(),
+        // Caller-generated so Cancel can name the flow while the start runs (#6565).
+        flowId: z.string().optional(),
       })
       .strict(),
     output: ResultSchema(
@@ -806,6 +820,8 @@ export const mcpOauth = {
         projectPath: z.string().optional(),
         serverName: z.string(),
         pendingServer: MCPOAuthPendingServerSchema.optional(),
+        // Caller-generated so Cancel can name the flow while the start runs (#6565).
+        flowId: z.string().optional(),
       })
       .strict(),
     output: ResultSchema(
@@ -1013,6 +1029,7 @@ export const projects = {
           projectPath: z.string(),
           serverName: z.string(),
           pendingServer: MCPOAuthPendingServerSchema.optional(),
+          flowId: z.string().optional(),
         })
         .strict(),
       output: ResultSchema(
@@ -1043,6 +1060,7 @@ export const projects = {
           projectPath: z.string(),
           serverName: z.string(),
           pendingServer: MCPOAuthPendingServerSchema.optional(),
+          flowId: z.string().optional(),
         })
         .strict(),
       output: ResultSchema(
@@ -1150,7 +1168,7 @@ export const mcp = {
         z.string(),
         ResultSchema(
           z
-            .union([MCPSettingsSnapshotSchema, z.object({ notConnected: z.literal(true) })])
+            .union([MCPSettingsReadSnapshotSchema, z.object({ notConnected: z.literal(true) })])
             .nullable(),
           z.string()
         )
@@ -1158,7 +1176,18 @@ export const mcp = {
     },
     update: {
       input: MCPSettingsUpdateParamsSchema,
-      output: ResultSchema(MCPSettingsSnapshotSchema.shape.values, z.string()),
+      /** The snapshot the server shows after the update (its schema can change). */
+      output: ResultSchema(MCPSettingsReadSnapshotSchema, z.string()),
+    },
+    /** Run a layout tool action (a regular tool) and return its text result. */
+    runTool: {
+      input: MCPSettingsRunToolParamsSchema,
+      output: ResultSchema(MCPSettingsRunToolResultSchema, z.string()),
+    },
+    /** Open a layout tool action's MCP App: call the tool and store its view record. */
+    openApp: {
+      input: MCPSettingsRunToolParamsSchema,
+      output: ResultSchema(MCPSettingsOpenAppResultSchema, z.string()),
     },
   },
   configureDesign: {
@@ -1243,6 +1272,21 @@ export const agentPlugins = {
     input: z.object({ name: z.string() }),
     output: ResultSchema(AgentPluginComponentsSchema, z.string()),
   },
+  /** Codex-format hooks (hooks.json) of a managed plugin, with their trust review state. */
+  getHooks: {
+    input: z.object({ name: z.string() }),
+    output: ResultSchema(AgentPluginHooksSchema, z.string()),
+  },
+  /** Trust, turn off, or clear (null) one hook; refused when `hash` is no longer current. */
+  setHookTrust: {
+    input: z.object({
+      name: z.string(),
+      key: z.string(),
+      hash: z.string(),
+      state: z.enum(["trusted", "disabled"]).nullable(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
+  },
   setComponents: {
     input: z.object({
       name: z.string(),
@@ -1297,6 +1341,26 @@ export const agentPlugins = {
       consent: AgentPluginUpdateConsentSchema.nullish(),
     }),
     output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
+  },
+  /**
+   * Component review of the installed tree (#6498): every imported skill or MCP server whose
+   * current fingerprint the user has not reviewed, in the update review shape (fromSha = toSha).
+   */
+  previewComponentReview: {
+    input: z.object({ name: z.string() }),
+    output: ResultSchema(AgentPluginUpdateReviewSchema, z.string()),
+  },
+  /** Record consent for the reviewed components that still match the installed tree. */
+  confirmComponentReview: {
+    input: z.object({
+      name: z.string(),
+      expectedLockedSha: z.string(),
+      reviewed: z.array(AgentPluginComponentRefSchema),
+    }),
+    output: ResultSchema(
+      z.object({ entry: AgentPluginInstallEntrySchema, cleanupWarning: z.string().optional() }),
+      z.string()
+    ),
   },
 };
 
@@ -1528,18 +1592,49 @@ export const mcpApps = {
   },
   approveViewDomains: {
     input: McpAppApproveDomainsRequestSchema,
-    output: ResultSchema(z.object({ approvedDomains: z.array(z.string()) }), z.string()),
+    output: ResultSchema(
+      z.object({ approvedDomains: z.array(z.string()), revision: z.number() }),
+      z.string()
+    ),
   },
   listViewDomains: { input: z.void(), output: z.array(McpAppViewDomainsSchema) },
+  /**
+   * Every project's approvals with the revision of this read, newer than every list committed
+   * before it: the live follow of mounted views re-reads after each config change (#6181).
+   */
+  readViewDomains: {
+    input: z.void(),
+    output: z.object({ revision: z.number(), approvals: z.array(McpAppViewDomainsSchema) }),
+  },
   /** Mounted views of the server in this renderer reload under the narrower policy. */
   revokeViewDomains: {
     input: McpAppViewDomainsSchema.pick({ projectPath: true, serverName: true }),
-    output: z.void(),
+    output: z.object({ revision: z.number() }),
   },
   /** ui/update-model-context of a view; used by the workspace's next requests. */
   updateModelContext: {
     input: McpAppModelContextRequestSchema,
     output: ResultSchema(z.object({}), z.string()),
+  },
+  /** window.openai.setWidgetState of a view; kept in its result record (#6178). */
+  setWidgetState: {
+    input: McpAppWidgetStateRequestSchema,
+    output: ResultSchema(z.object({}), z.string()),
+  },
+  /** Entry points of the servers enabled in the workspace (starts them like prompt discovery). */
+  listEntrypoints: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: z.array(McpAppEntrypointSchema),
+  },
+  /** Ticks when a server of the workspace sends tools/list_changed: re-list entry points. */
+  onEntrypointsChanged: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: eventIterator(z.void()),
+  },
+  /** Call an entry point's tool with `{}` and store its view record (no chat row). */
+  openEntrypoint: {
+    input: McpAppOpenEntrypointRequestSchema,
+    output: ResultSchema(McpAppEntrypointSchema, z.string()),
   },
 };
 
@@ -1690,9 +1785,8 @@ export const workspace = {
     input: z.object({
       projectPath: z.string(),
       /**
-       * Workspace branch name. When omitted, the backend auto-generates a name
-       * based on the trunk branch (e.g., "main-1", "main-2"), similar to how
-       * /fork derives a name from the parent workspace.
+       * Workspace branch name. When omitted, the backend picks the next free
+       * "workspace-N" name (as /new does).
        */
       branchName: z.string().optional(),
       /** Trunk branch to fork from - only required for worktree/SSH runtimes, ignored for local */
@@ -1712,6 +1806,25 @@ export const workspace = {
        * rendered in the UI). Used by orchestration callers for stable identity.
        */
       tags: z.record(WorkspaceTagKeySchema, z.string()).optional(),
+      /**
+       * Name the workspace in the backend after it is announced, so creation does not wait for
+       * the naming model: it opens as "workspace-N", gets the generated title when it arrives,
+       * and its git branch is renamed before the init hook runs (the directory and workspace
+       * name stay). Worktree runtime only; omit `branchName` and `title`.
+       */
+      nameGeneration: z
+        .object({
+          /** The message to name the workspace after. */
+          message: z.string(),
+          /** Caller fallback models, as for nameGeneration.generate. */
+          candidates: z.array(z.string()),
+          /**
+           * The creation form's nameGeneration.generate request for this message, running or
+           * finished: its result names the workspace instead of a second model call.
+           */
+          draftNamingId: z.string().optional(),
+        })
+        .optional(),
     }),
     output: z.discriminatedUnion("success", [
       z.object({ success: z.literal(true), metadata: FrontendWorkspaceMetadataSchema }),
@@ -2685,6 +2798,9 @@ export const workspace = {
 };
 
 export type WorkspaceSendMessageOutput = z.infer<typeof workspace.sendMessage.output>;
+export type WorkspaceNameGenerationRequest = NonNullable<
+  z.infer<typeof workspace.create.input>["nameGeneration"]
+>;
 export type ArchiveLossyUntrackedFilesConfirmation = z.infer<
   typeof ArchiveLossyUntrackedFilesConfirmationSchema
 >;
@@ -2800,7 +2916,8 @@ export const agentSkills = {
     output: AgentSkillListResultSchema,
   },
   get: {
-    input: AgentDiscoveryInputSchema.and(z.object({ skillName: SkillNameSchema })),
+    // `<plugin>:<skill>` reaches a plugin skill shadowed by a higher-precedence one.
+    input: AgentDiscoveryInputSchema.and(z.object({ skillName: SkillLookupNameSchema })),
     output: AgentSkillPackageSchema,
   },
 };
@@ -2915,6 +3032,11 @@ export const nameGeneration = {
        * first, then these; gateway routing is resolved in createModel.
        */
       candidates: z.array(z.string()),
+      /**
+       * Set by the creation form, unique per request: a workspace.create that hands this request
+       * off (nameGeneration.draftNamingId) takes its result over.
+       */
+      draftNamingId: z.string().optional(),
     }),
     output: ResultSchema(
       z.object({
