@@ -82,12 +82,16 @@ import {
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "./discovery";
+import { listPluginWorkflowFiles } from "./workflowFiles";
 import { checkLogoImage } from "./imageHeader";
 import {
   consentForSelection,
   countUnreviewed,
   isComponentConsented,
   recordReviewedComponents,
+  isImportedComponent,
+  workflowConsentDetail,
+  workflowConsentFingerprint,
   serverConsentDetail,
   serverConsentFingerprint,
   skillConsentDetail,
@@ -384,8 +388,37 @@ function skillConsentFields(args: Parameters<typeof skillConsentFingerprint>[0])
  * review records the fingerprint, which covers fields the summary omits (a header, an OAuth scope,
  * a frontmatter key), so the user must see all of them to approve what is recorded.
  */
-function reviewText(item: { display: string; consentDetail: () => string }): string {
-  return `${item.display}\n\nReviewed fields: ${item.consentDetail()}`;
+interface ReviewTextSource {
+  display: string;
+  consentDetail: () => string;
+}
+
+function reviewText(item: ReviewTextSource): string {
+  return showInvisibleControls(`${item.display}\n\nReviewed fields: ${item.consentDetail()}`);
+}
+
+/**
+ * Characters that render invisibly, reorder text or break lines unseen (#6629): every Unicode
+ * default-ignorable code point (zero-width and joiner characters, variation selectors such as
+ * U+FE0F, U+034F, tags), the bidi controls, every control character except tab and LF, a CR not
+ * followed by LF, and U+2028/U+2029. Several are valid in JavaScript identifiers, so without a
+ * mark `safe` and `safe` + U+FE0F look the same. A lone CR, U+2028 and U+2029 end a `//` comment
+ * in JavaScript, but the browser draws them as nothing or a space, so code after one would read
+ * as comment text in the review while the fingerprint approves it.
+ */
+const REVIEW_TEXT_CONTROLS =
+  /[\p{Default_Ignorable_Code_Point}\u061c\u202a-\u202e\u2066-\u2069\u2028\u2029]|\r(?!\n)|(?![\t\n\r])\p{Cc}/gu;
+
+/**
+ * Review text as the user reads it: each such character becomes a visible `<U+XXXX>` mark. The
+ * mark is not a JavaScript escape, so a literal `\u202e` in the source still reads differently
+ * from the character itself.
+ */
+function showInvisibleControls(text: string): string {
+  return text.replace(
+    REVIEW_TEXT_CONTROLS,
+    (char) => `<U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}>`
+  );
 }
 
 /**
@@ -442,12 +475,19 @@ function consentAfterReview(
  */
 function unreviewedRows(
   entry: AgentPluginInstallEntry,
-  surface: { skills: Map<string, SurfaceSkill>; servers: Map<string, SurfaceServer> }
+  surface: {
+    skills: Map<string, SurfaceSkill>;
+    servers: Map<string, SurfaceServer>;
+    workflows: Map<string, SurfaceWorkflow>;
+  }
 ): AgentPluginCapabilityChange[] {
   return [
     ...[...surface.skills].flatMap(([name, item]) => unreviewedRow(entry, "skills", name, item)),
     ...[...surface.servers].flatMap(([name, item]) =>
       unreviewedRow(entry, "mcpServers", name, item)
+    ),
+    ...[...surface.workflows].flatMap(([name, item]) =>
+      unreviewedRow(entry, "workflows", name, item)
     ),
   ];
 }
@@ -455,6 +495,7 @@ function unreviewedRows(
 const COMPONENT_LABELS: Record<keyof ComponentConsent, string> = {
   skills: "Skill",
   mcpServers: "MCP server",
+  workflows: "Workflow",
 };
 
 function reviewedBefore(
@@ -469,21 +510,79 @@ function reviewedBefore(
 
 function unreviewedRow(
   entry: AgentPluginInstallEntry,
-  kind: "skills" | "mcpServers",
+  kind: keyof ComponentConsent,
   name: string,
-  item: SurfaceSkill | SurfaceServer
+  item: SurfaceSkill | SurfaceServer | SurfaceWorkflow
 ): AgentPluginCapabilityChange[] {
-  const imported = entry.importedComponents?.[kind].includes(name) ?? true;
+  const imported = isImportedComponent(entry.importedComponents, kind, name);
   const fingerprint = item.consentFingerprint;
   if (!imported || isComponentConsented(entry.componentConsent, kind, name, fingerprint)) return [];
   return [
     {
-      summary: `${COMPONENT_LABELS[kind]} '${name}' needs review`,
+      summary: `${COMPONENT_LABELS[kind]} '${showInvisibleControls(name)}' needs review`,
       before: reviewedBefore(entry.componentConsent, kind, name),
       after: reviewText(item),
       component: { kind, name, fingerprint },
     },
   ];
+}
+
+/**
+ * Update rows for workflow scripts (#6629). A script executes, so a new or changed one needs a
+ * review, and confirming the update records it. Removals apply without one.
+ */
+function workflowChanges(
+  staged: ReadonlyMap<string, SurfaceWorkflow>,
+  /** The installed tree's surface; absent when it is missing or invalid (all staged is new). */
+  current: { workflows: ReadonlyMap<string, SurfaceWorkflow> } | undefined
+): AgentPluginCapabilityChange[] {
+  return [...staged].flatMap(([file, workflow]) => {
+    const component = {
+      kind: "workflows" as const,
+      name: file,
+      fingerprint: workflow.consentFingerprint,
+    };
+    const before = current?.workflows.get(file);
+    if (before === undefined) {
+      return [
+        {
+          summary: `adds workflow '${showInvisibleControls(file)}'`,
+          after: reviewText(workflow),
+          component,
+        },
+      ];
+    }
+    if (before.consentFingerprint === workflow.consentFingerprint) return [];
+    return [
+      {
+        summary: `changes workflow '${showInvisibleControls(file)}'`,
+        before: reviewText(before),
+        after: reviewText(workflow),
+        component,
+      },
+    ];
+  });
+}
+
+/**
+ * The preview rows of the components that install records consent for besides skills and MCP
+ * servers (#6629), with the text a component review would show. Bounded like a review: over the
+ * bound, the preview fails closed.
+ */
+function reviewedComponentRows(
+  groups: ReadonlyArray<
+    readonly [AgentPluginComponentRef["kind"], ReadonlyArray<readonly [string, ReviewTextSource]>]
+  >
+): AgentPluginInstallPreview["reviewedComponents"] {
+  const rows = groups.flatMap(([kind, items]) =>
+    items.map(([name, item]) => ({
+      kind,
+      name: showInvisibleControls(name),
+      detail: reviewText(item),
+    }))
+  );
+  assertReviewFits(rows.map((row) => ({ summary: row.name, after: row.detail })));
+  return rows;
 }
 
 /** Every component of an inventory: what a legacy import-all entry (no selection) imports. */
@@ -922,6 +1021,13 @@ interface SurfaceSkill {
   consentFingerprint: string;
   display: string;
   /** Every fingerprinted field as text, built on demand for a review row (see reviewText). */
+  consentDetail: () => string;
+}
+
+/** A workflow script (#6629): its source is code, so the review shows all of it. */
+interface SurfaceWorkflow {
+  consentFingerprint: string;
+  display: string;
   consentDetail: () => string;
 }
 
@@ -2253,6 +2359,8 @@ export class AgentPluginInstallService {
      */
     skills: Map<string, SurfaceSkill>;
     agents: Map<string, string>;
+    /** file → consent view (#6629): any byte change of a script is a change. */
+    workflows: Map<string, SurfaceWorkflow>;
     components: Set<string>;
   }> {
     const hook = this.collectHook(plugin);
@@ -2269,8 +2377,10 @@ export class AgentPluginInstallService {
     for (const agent of await this.collectAgentFiles(plugin.agentsDir)) {
       agents.set(agent.name, agent.fingerprint);
     }
+    const workflows = new Map(
+      (await this.collectWorkflowScripts(plugin, warnings)).map((w) => [w.file, w] as const)
+    );
     const components = new Set<string>([
-      ...(await this.collectComponentFiles(plugin.workflowsDir, ".js")).map((f) => `workflow ${f}`),
       ...(plugin.manifest.contributes?.slashCommands ?? []).map(
         (command) => `slash command /${command.name}`
       ),
@@ -2310,7 +2420,7 @@ export class AgentPluginInstallService {
         });
       }
     }
-    return { hook, servers, skills, agents, components };
+    return { hook, servers, skills, agents, workflows, components };
   }
 
   /**
@@ -2480,6 +2590,7 @@ export class AgentPluginInstallService {
         });
       }
     }
+    changes.push(...workflowChanges(staged.workflows, current));
     // Consent covered a specific component set; additions need a new preview.
     for (const component of staged.components) {
       if (!(current?.components.has(component) ?? false)) {
@@ -2491,31 +2602,44 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * Executable workflow scripts (workflows/*.js) for the consent preview,
-   * mirroring the runtime lister (workflowScriptDiscovery: top-level files
-   * AND symlinks with the matching extension, sorted). These activate after
-   * install, so consent must name them.
+   * Executable workflow scripts (workflows/*.js), read as the runtime resolver reads them (the
+   * shared lister, the root-checked capped read) so the consent fingerprint matches what can run
+   * (#6629). A script the runtime cannot read or run is reported and skipped.
    */
-  private async collectComponentFiles(
-    dir: string | undefined,
-    extension: string
-  ): Promise<string[]> {
-    if (dir === undefined) {
-      return [];
+  private async collectWorkflowScripts(
+    plugin: AgentPluginInfo,
+    warnings: string[]
+  ): Promise<Array<SurfaceWorkflow & { file: string }>> {
+    const workflowsDir = plugin.workflowsDir;
+    if (workflowsDir === undefined) return [];
+    const scripts: Array<SurfaceWorkflow & { file: string }> = [];
+    for (const file of await listPluginWorkflowFiles(workflowsDir)) {
+      let source: string;
+      try {
+        source = (
+          await readPluginFileWithinRootCapped({
+            filePath: path.join(workflowsDir, file),
+            pluginRoot: plugin.rootPath,
+            maxBytes: MAX_FILE_SIZE,
+            label: "plugin workflow script",
+          })
+        ).content;
+      } catch (error) {
+        warnings.push(
+          `Workflow '${showInvisibleControls(file)}' cannot be read and will not run: ${getErrorMessage(error)}`
+        );
+        continue;
+      }
+      if (source.length === 0) continue;
+      const input = { file, source };
+      scripts.push({
+        file,
+        consentFingerprint: workflowConsentFingerprint(input),
+        display: `Workflow script workflows/${file}`,
+        consentDetail: () => workflowConsentDetail(input),
+      });
     }
-    try {
-      const entries = await fsPromises.readdir(dir, { withFileTypes: true });
-      return entries
-        .filter(
-          (entry) =>
-            (entry.isFile() || entry.isSymbolicLink()) &&
-            entry.name.toLowerCase().endsWith(extension)
-        )
-        .map((entry) => entry.name)
-        .sort((a, b) => a.localeCompare(b));
-    } catch {
-      return [];
-    }
+    return scripts;
   }
 
   /**
@@ -2934,7 +3058,16 @@ export class AgentPluginInstallService {
       warnings.push(...codexHooks.warnings);
       const openaiInterface = await interfaceSummary(plugin, warnings);
       const agents = (await this.collectAgentFiles(plugin.agentsDir)).map((agent) => agent.name);
-      const workflows = await this.collectComponentFiles(plugin.workflowsDir, ".js");
+      // Display only: the names a user reads before Install show invisible controls (#6629).
+      const workflows = (await listPluginWorkflowFiles(plugin.workflowsDir)).map(
+        showInvisibleControls
+      );
+      const reviewedComponents = reviewedComponentRows([
+        [
+          "workflows",
+          (await this.collectWorkflowScripts(plugin, warnings)).map((w) => [w.file, w]),
+        ],
+      ]);
       const slashCommands = (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
         name: command.name,
         ...(command.description !== undefined ? { description: command.description } : {}),
@@ -2968,6 +3101,7 @@ export class AgentPluginInstallService {
         agents,
         workflows,
         slashCommands,
+        reviewedComponents,
         warnings,
         targetPath: shortenHome(targetPath),
       };
@@ -3759,6 +3893,7 @@ export class AgentPluginInstallService {
   ) {
     const warnings: string[] = [];
     const skills = await this.collectSkillsFromRoots(plugin, warnings);
+    const workflows = await this.collectWorkflowScripts(plugin, warnings);
     const { previews: mcpServers, fingerprints } = await this.collectMcpServers(
       { ...plugin, importedComponents: undefined },
       finalTargetPath,
@@ -3776,6 +3911,9 @@ export class AgentPluginInstallService {
       fingerprints: {
         skills: Object.fromEntries(skills.map((skill) => [skill.name, skill.consentFingerprint])),
         mcpServers: fingerprints,
+        workflows: Object.fromEntries(
+          workflows.map((workflow) => [workflow.file, workflow.consentFingerprint])
+        ),
       } satisfies ComponentConsent,
     };
   }

@@ -46,6 +46,13 @@ import {
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { skillConsentFingerprint } from "./componentConsent";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
+import {
+  assertStoredPluginWorkflowReviewed,
+  resolveWorkflowScript,
+} from "@/node/services/workflows/workflowScriptResolver";
+import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
+import { WorkflowService } from "@/node/services/workflows/WorkflowService";
+import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 
 /**
  * Lifecycle tests against a real local git "remote". Local-path remotes go
@@ -970,6 +977,7 @@ describe("AgentPluginInstallService", () => {
           componentConsent: {
             skills: keep(installed.componentConsent?.skills, importedComponents.skills),
             mcpServers: keep(installed.componentConsent?.mcpServers, importedComponents.mcpServers),
+            workflows: {},
           },
         },
       });
@@ -1475,7 +1483,11 @@ describe("AgentPluginInstallService", () => {
       frontmatter: { name: "greet", description: "Greets people" },
       body: "\nSay hi.\n",
     });
-    expect(installed.componentConsent).toEqual({ skills: { greet }, mcpServers: {} });
+    expect(installed.componentConsent).toEqual({
+      skills: { greet },
+      mcpServers: {},
+      workflows: {},
+    });
     expect((await service.list())[0]).toMatchObject({ importedSkillCount: 1 });
     const stored = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
       plugins: Array<{ componentConsent?: unknown }>;
@@ -1557,7 +1569,7 @@ describe("AgentPluginInstallService", () => {
       expectedImportedComponents: null,
       importedComponents: { skills: ["greet"], mcpServers: [] },
     });
-    expect(saved.data.componentConsent).toEqual({ skills: {}, mcpServers: {} });
+    expect(saved.data.componentConsent).toEqual({ skills: {}, mcpServers: {}, workflows: {} });
   });
 
   test("a manifest that names the final install path literally keeps its consent (#6498)", async () => {
@@ -1686,6 +1698,210 @@ describe("AgentPluginInstallService", () => {
       reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
     });
     expect(await loaded()).toEqual({ skills: ["greet"], servers: ["echo"] });
+  });
+
+  test("a plugin workflow runs only while its exact script is reviewed (#6629)", async () => {
+    await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "workflows", "run.js"),
+      "export const meta = { name: 'run' }; // \u202e\nconst safe\ufe0f = 1;\n" +
+        "// comment\rEVIL();\n// comment\u2028EVIL();\n// comment\u2029EVIL();\n" +
+        "const crlf = 1;\r\n\tconst tab = 2;\n"
+    );
+    await commitAll(remoteDir, "add a workflow");
+    const preview = await service.preview({ input: remoteDir });
+    // The preview shows the script that install approves, with a bidi control made visible.
+    expect(preview.reviewedComponents).toHaveLength(1);
+    expect(preview.reviewedComponents[0]).toMatchObject({ kind: "workflows", name: "run.js" });
+    expect(preview.reviewedComponents[0]?.detail).toContain("name: 'run' }; // <U+202E>");
+    expect(preview.reviewedComponents[0]?.detail).not.toContain("\u202e");
+    // A variation selector is valid in an identifier and invisible, so it is marked too.
+    expect(preview.reviewedComponents[0]?.detail).toContain("const safe<U+FE0F> = 1;");
+    // A lone CR, U+2028 and U+2029 end a `//` comment in JavaScript but draw as nothing or a
+    // space, so the code after them is marked as code, not shown as comment text.
+    expect(preview.reviewedComponents[0]?.detail).toContain("// comment<U+000D>EVIL();");
+    expect(preview.reviewedComponents[0]?.detail).toContain("// comment<U+2028>EVIL();");
+    expect(preview.reviewedComponents[0]?.detail).toContain("// comment<U+2029>EVIL();");
+    // A CRLF line break and a tab stay as they are.
+    expect(preview.reviewedComponents[0]?.detail).toContain("const crlf = 1;\r\n\tconst tab = 2;");
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const resolve = () =>
+      resolveWorkflowScript({
+        scriptPath: "plugin://demo-plugin/run.js",
+        runtime: new LocalRuntime(muxRoot),
+        workspacePath: muxRoot,
+        projectTrusted: false,
+        roots: {
+          projectRoot: "",
+          globalRoot: path.join(muxRoot, "skills"),
+          universalRoot: "",
+          globalPluginRoots: [pluginsDir()],
+        },
+      });
+    const approveReview = async () => {
+      const review = await service.previewComponentReview({ name: "demo-plugin" });
+      await service.confirmComponentReview({
+        name: "demo-plugin",
+        expectedLockedSha: review.fromSha,
+        reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
+      });
+      return review;
+    };
+    // The install recorded the script its preview named.
+    expect((await resolve()).source).toContain("name: 'run'");
+
+    // A changed script under the same name does not run until its review.
+    const installedScript = path.join(pluginsDir(), "demo-plugin", "workflows", "run.js");
+    await fsPromises.writeFile(installedScript, "export const meta = { name: 'other' };\n");
+    await expect(resolve()).rejects.toThrow("has not been reviewed on this install");
+    expect((await service.list())[0].reviewRequiredCount).toBe(1);
+    const review = await approveReview();
+    expect(review.changes).toHaveLength(1);
+    expect(review.changes[0]).toMatchObject({
+      summary: "Workflow 'run.js' needs review",
+      before: "Changed since you reviewed it",
+      component: { kind: "workflows", name: "run.js" },
+    });
+    expect(review.changes[0]?.after).toContain("name: 'other'");
+    expect((await resolve()).source).toContain("name: 'other'");
+
+    // A record from before #6629 has no workflow entries: one review, and no backfill.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ componentConsent: Record<string, unknown> }>;
+    };
+    delete document.plugins[0].componentConsent.workflows;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    await expect(resolve()).rejects.toThrow("has not been reviewed on this install");
+    expect((await approveReview()).changes[0]?.before).toBe("Not reviewed on this install");
+    expect((await resolve()).source).toContain("name: 'other'");
+  });
+
+  test("a stored plugin workflow run resumes only while its snapshot is reviewed (#6629)", async () => {
+    const source = "export default function workflow() { return {}; }\n";
+    await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
+    await fsPromises.writeFile(path.join(remoteDir, "workflows", "run.js"), source);
+    await commitAll(remoteDir, "add a workflow");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(muxRoot, "workflow-runs") });
+    const createPluginRun = (id: string) =>
+      runStore.createRun({
+        id,
+        workspaceId: "workspace-1",
+        workflow: {
+          name: "run",
+          description: "Plugin workflow",
+          scope: "global",
+          sourcePath: "plugin://demo-plugin/run.js",
+          canonicalScriptPath: "plugin://demo-plugin/run.js",
+          sourceKind: "plugin",
+          executable: true,
+        },
+        source,
+        args: {},
+        now: "2026-10-15T00:00:00.000Z",
+      });
+    // A trusted project ships a plugin of the same name: it must not stand in for the managed one.
+    const projectPlugins = path.join(muxRoot, "project", ".xum", "plugins");
+    await fsPromises.mkdir(projectPlugins, { recursive: true });
+    await fsPromises.cp(
+      path.join(pluginsDir(), "demo-plugin"),
+      path.join(projectPlugins, "demo-plugin"),
+      {
+        recursive: true,
+      }
+    );
+    const workflows = new WorkflowService({
+      archiveAdmission: { getWorkflowArchiveRefusal: () => null },
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        runAgent() {
+          throw new Error("No agent steps expected");
+        },
+      },
+      assertStoredPluginWorkflowReviewed: (stored) =>
+        assertStoredPluginWorkflowReviewed({
+          ...stored,
+          runtime: new LocalRuntime(muxRoot),
+          workspacePath: muxRoot,
+          projectTrusted: true,
+          roots: {
+            projectRoot: "",
+            globalRoot: path.join(muxRoot, "skills"),
+            universalRoot: "",
+            projectPluginRoots: [projectPlugins],
+            globalPluginRoots: [pluginsDir()],
+          },
+        }),
+      runnerId: "runner-6629",
+    });
+    const resume = (runId: string) =>
+      workflows.resumeRun({ workspaceId: "workspace-1", runId, projectTrusted: false });
+
+    // The snapshot matches the reviewed script, so the run resumes.
+    await createPluginRun("wfr_reviewed");
+    expect((await resume("wfr_reviewed")).status).toBe("completed");
+
+    // A record from before #6629 has no workflow entries: the stored run fails closed, on an
+    // explicit resume and in crash recovery.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ componentConsent: Record<string, unknown> }>;
+    };
+    delete document.plugins[0].componentConsent.workflows;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    await createPluginRun("wfr_unreviewed");
+    await runStore.appendStatus("wfr_unreviewed", "running", "2026-10-15T00:00:01.000Z");
+    expect(
+      await workflows.resumeCrashedRuns({ workspaceId: "workspace-1", projectTrusted: false })
+    ).toEqual([]);
+    expect((await runStore.getRun("wfr_unreviewed")).status).toBe("running");
+    await runStore.appendStatus("wfr_unreviewed", "interrupted", "2026-10-15T00:00:02.000Z");
+    await expect(resume("wfr_unreviewed")).rejects.toThrow("has not been reviewed on this install");
+  });
+
+  test("review labels show a bidi control in a workflow file name; the identity stays raw (#6629)", async () => {
+    const file = "evil\u202esj.js";
+    await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
+    await fsPromises.writeFile(path.join(remoteDir, "workflows", file), "export default {};\n");
+    await commitAll(remoteDir, "add a workflow with a bidi control in its name");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.workflows).toEqual(["evil<U+202E>sj.js"]);
+    expect(preview.reviewedComponents.map((row) => row.name)).toEqual(["evil<U+202E>sj.js"]);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await fsPromises.writeFile(
+      path.join(pluginsDir(), "demo-plugin", "workflows", file),
+      "export default { changed: true };\n"
+    );
+    const review = await service.previewComponentReview({ name: "demo-plugin" });
+    expect(review.changes.map((change) => change.summary)).toEqual([
+      "Workflow 'evil<U+202E>sj.js' needs review",
+    ]);
+    // The consent record is keyed by the raw name the runtime resolves.
+    expect(review.changes[0]?.component?.name).toBe(file);
+  });
+
+  test("an update review lists a changed workflow script, and confirming records it (#6629)", async () => {
+    await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
+    const script = path.join(remoteDir, "workflows", "run.js");
+    await fsPromises.writeFile(script, "export const meta = { name: 'run' };\n");
+    await commitAll(remoteDir, "add a workflow");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await fsPromises.writeFile(script, "export const meta = { name: 'run' }; // changed\n");
+    await commitAll(remoteDir, "change the workflow");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const row = review.changes.find((change) => change.component?.kind === "workflows");
+    expect(row).toMatchObject({ summary: "changes workflow 'run.js'" });
+    assert(row?.component !== undefined, "the changed workflow row carries its component");
+    const updated = await service.update({
+      name: "demo-plugin",
+      consent: { fromSha: review.fromSha, toSha: review.toSha, reviewed: [row.component] },
+    });
+    expect(updated.componentConsent?.workflows).toEqual({ "run.js": row.component.fingerprint });
+    expect((await service.list())[0].reviewRequiredCount).toBe(0);
   });
 
   test("an update records consent only for the changes the user reviewed (#6498)", async () => {
@@ -3521,7 +3737,7 @@ describe("AgentPluginInstallService", () => {
     );
     await commitAll(remoteDir, "v2.1 adds a skill, agent, workflow, and slash command");
     await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
-      /adds skill 'sneak'.*adds agent evil\.md.*adds workflow run\.js.*adds slash command \/pwn/s
+      /adds skill 'sneak'.*adds agent evil\.md.*adds workflow 'run\.js'.*adds slash command \/pwn/s
     );
     // Rejected updates leave the install untouched.
     expect(((await registry())[0] as { lockedSha: string }).lockedSha).toBe(installedSha);

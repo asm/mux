@@ -13,11 +13,13 @@ import {
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "@/node/services/agentPlugins/discovery";
+import { isPluginWorkflowConsented } from "@/node/services/agentPlugins/componentConsent";
 import { isValidAgentPluginName } from "@/node/services/agentPlugins/manifest";
 import {
   getDefaultAgentSkillsRoots,
   readAgentSkill,
   type AgentSkillsRoots,
+  getPluginManagedHome,
 } from "@/node/services/agentSkills/agentSkillsService";
 import { readBuiltInSkillFile } from "@/node/services/agentSkills/builtInSkillDefinitions";
 import type {
@@ -256,7 +258,10 @@ export async function discoverWorkflowPlugins(input: {
   }
   await addContainers(roots.globalPluginRoots ?? [], "global");
 
-  const { plugins } = await discoverAgentPlugins(containers);
+  const { plugins } = await discoverAgentPlugins(
+    containers,
+    await managedHomeOption(localRuntime, roots)
+  );
 
   // Project plugin roots keep the repo-symlink posture: a committed
   // .xum/plugins/<name> symlink must not resolve outside the checkout.
@@ -272,6 +277,20 @@ export async function discoverWorkflowPlugins(input: {
     eligible.push(plugin);
   }
   return eligible;
+}
+
+/**
+ * The managed home names the registry, so managed plugins carry their consent records (#6629), as
+ * plugin skill discovery does.
+ */
+async function managedHomeOption(
+  localRuntime: LocalRuntime,
+  roots: AgentSkillsRoots
+): Promise<{ managedHome?: string }> {
+  const managedHome = getPluginManagedHome(roots);
+  return managedHome !== undefined
+    ? { managedHome: await localRuntime.resolvePath(managedHome) }
+    : {};
 }
 
 async function resolvePluginWorkflowScript(
@@ -328,6 +347,7 @@ async function resolvePluginWorkflowScript(
   } catch (error) {
     throw new Error(`Plugin workflow script not readable: ${getErrorMessage(error)}`);
   }
+  assertWorkflowReviewed(plugin, parsed.relativePath, source);
   return buildResolvedScript({
     requestedScriptPath: input.scriptPath,
     canonicalScriptPath: `${PLUGIN_SCRIPT_PATH_PREFIX}${plugin.name}/${parsed.relativePath}`,
@@ -338,6 +358,49 @@ async function resolvePluginWorkflowScript(
     relativePath: parsed.relativePath,
     resolvedPath,
   });
+}
+
+/**
+ * The consent gate for a stored plugin run (#6629). Resume, checkpoint retry and crash recovery
+ * run the source snapshotted in the run record and never reread the plugin file, so they check
+ * that snapshot against the plugin's current consent record. A run started before the upgrade, or
+ * on bytes whose review an update replaced, cannot resume. A plugin that is gone fails closed.
+ */
+export async function assertStoredPluginWorkflowReviewed(
+  input: ResolveWorkflowScriptInput & {
+    scriptPath: string;
+    source: string;
+    /** The discovery scope of the plugin the run started from (its descriptor's scope). */
+    scope: AgentPluginContainer["scope"];
+  }
+): Promise<void> {
+  const parsed = parsePluginWorkflowScriptPath(input.scriptPath);
+  const plugins = await discoverWorkflowPlugins(input);
+  // Bound to the scope the run started in: a project plugin of the same name must not stand in
+  // for a managed global one (project plugins carry no consent, so it would pass any snapshot).
+  const plugin = plugins.find(
+    (candidate) =>
+      candidate.name === parsed.pluginName &&
+      candidate.scope === input.scope &&
+      candidate.workflowsDir != null
+  );
+  if (plugin === undefined) {
+    throw new Error(
+      `Plugin '${parsed.pluginName}' is no longer installed, so its workflow run cannot resume.`
+    );
+  }
+  assertWorkflowReviewed(plugin, parsed.relativePath, input.source);
+}
+
+/**
+ * The consent gate (#6629): it checks the source the resolver is about to run, so a script changed
+ * after its review cannot run. Listing goes through the resolver too, so it hides the script.
+ */
+function assertWorkflowReviewed(plugin: AgentPluginInfo, file: string, source: string): void {
+  if (isPluginWorkflowConsented(plugin.componentConsent, { file, source })) return;
+  throw new Error(
+    `Plugin workflow '${file}' has not been reviewed on this install, so it does not run. Open Settings → Plugins and select Review on plugin '${plugin.name}'.`
+  );
 }
 
 function parsePluginWorkflowScriptPath(scriptPath: string): {

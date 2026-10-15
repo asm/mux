@@ -788,6 +788,8 @@ const AddPluginPanel: React.FC<{
             </div>
           )}
 
+          <ReviewedDefinitions items={preview.reviewedComponents} />
+
           {preview.codexHooks.length > 0 && (
             <div>
               <h4 className="text-foreground mb-1 text-xs font-medium">
@@ -944,11 +946,52 @@ const REVIEW_PANEL_COPY: Record<
   },
   components: {
     intro: () =>
-      "These skills and MCP servers have not been reviewed on this install. Review them before you approve them:",
+      "These plugin components have not been reviewed on this install. Review them before you approve them:",
     commits: (review) => review.fromSha.slice(0, 12),
     confirm: "Approve components",
     busy: "Approving…",
   },
+};
+
+const REVIEWED_KIND_LABEL: Record<AgentPluginComponentRef["kind"], string> = {
+  skills: "Skill",
+  mcpServers: "MCP server",
+  workflows: "Workflow",
+};
+
+/**
+ * The exact definitions install approves besides skills and MCP servers (#6629). The consent
+ * record covers these fields, so the preview must show them before Install.
+ */
+const ReviewedDefinitions: React.FC<{
+  items: AgentPluginInstallPreview["reviewedComponents"];
+}> = (props) => {
+  if (props.items.length === 0) return null;
+  return (
+    <div>
+      <h4 className="text-foreground mb-1 text-xs font-medium">
+        Reviewed definitions ({props.items.length})
+      </h4>
+      <p className="text-muted mb-1 text-xs">
+        Installing approves these exact definitions. If one changes later, it does not load until
+        you review it again.
+      </p>
+      <ul className="space-y-1">
+        {props.items.map((item) => (
+          <li key={`${item.kind}:${item.name}`} className="text-xs">
+            <details>
+              <summary className="text-foreground cursor-pointer break-all">
+                {REVIEWED_KIND_LABEL[item.kind]} <span className="font-mono">{item.name}</span>
+              </summary>
+              <pre className="bg-modal-bg border-border-medium mt-1 max-h-64 overflow-auto rounded border px-2 py-1 font-mono text-[11px] break-words whitespace-pre-wrap">
+                {item.detail}
+              </pre>
+            </details>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
 };
 
 const UpdateReviewPanel: React.FC<{
@@ -1114,10 +1157,11 @@ const ComponentReviewNotice: React.FC<{ items: AgentPluginListItem[] | null }> =
     >
       <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
       <span className="break-words">
-        Some plugins have skills or MCP servers that you have not reviewed on this install. Xum
-        loads a plugin component only after you approve its current version, so these do not load
-        until you review them. After an upgrade, each plugin needs this review once. Select Review
-        on each plugin marked &quot;needs review&quot; to approve them.
+        Some plugins have components (such as skills, MCP servers or workflow scripts) that you have
+        not reviewed on this install. Xum loads a plugin component only after you approve its
+        current version, so these do not load until you review them. After an upgrade, each plugin
+        needs this review once. Select Review on each plugin marked &quot;needs review&quot; to
+        approve them.
       </span>
     </div>
   );
