@@ -444,6 +444,17 @@ function showInvisibleControls(text: string): string {
  */
 const MAX_REVIEW_TEXT_CHARS = 1_000_000;
 
+/**
+ * The install preview and the component picker list every directive command, and install records
+ * consent for them, so the list is bounded like a review and never cut (#6766). Only responses
+ * that list the commands check it: one oversized plugin must not break the plugin list.
+ */
+function assertDirectivesFit(skills: ReadonlyArray<{ name: string; directives?: string[] }>): void {
+  assertReviewFits(
+    skills.map((skill) => ({ summary: skill.name, after: (skill.directives ?? []).join("\n") }))
+  );
+}
+
 function assertReviewFits(changes: readonly AgentPluginCapabilityChange[]): void {
   const size = changes.reduce(
     (total, change) =>
@@ -3060,6 +3071,7 @@ export class AgentPluginInstallService {
       await this.assertNoCollision(plugin.name);
 
       const skills = await this.collectSkillsFromRoots(plugin, warnings);
+      assertDirectivesFit(skills);
       const { previews: mcpServers } = await this.collectMcpServers(
         plugin,
         targetPath,
@@ -4091,6 +4103,7 @@ export class AgentPluginInstallService {
     const { fingerprints, ...inventory } = await this.readInstalledComponents(entry);
     assert(fingerprints !== undefined, "installed inventory carries consent fingerprints");
     if ((await gate.confirm()).length > 0) throw componentsChangedError();
+    assertDirectivesFit(inventory.skills);
     return inventory;
   }
 
