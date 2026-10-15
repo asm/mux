@@ -815,6 +815,87 @@ export const ThemedLogoLight: Story = {
   },
 };
 
+/** A post-update sign-out that failed: Settings names the servers and the last error (#6627). */
+const PENDING_SIGN_OUT_URL =
+  "https://mcp.example-identity-provider-with-a-long-host-name.com/tenants/acme-production/mcp";
+
+/**
+ * Pending sign-out (#6627) at phone width: the notice names the server and the last error, and
+ * the long URL wraps inside it. Out of Pixel snapshots (snapshot budget); the play checks it.
+ */
+export const PendingSignOutPhoneViewport: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell
+      options={{
+        agentPlugins: {
+          items: [MANAGED_ITEM],
+          pendingSignOuts: {
+            kind: "pending",
+            servers: [PENDING_SIGN_OUT_URL],
+            lastError: "Failed to write OAuth store: disk full",
+          },
+        },
+      }}
+    >
+      {/* Fixed phone width so the overflow check holds in the CI test-runner too (AGENTS.md). */}
+      <div style={{ width: 375 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const notice = await canvas.findByText(/Managed plugins are unavailable to agents until/);
+    await canvas.findByText(/Last attempt: Failed to write OAuth store: disk full/);
+    if (!notice.textContent?.includes(PENDING_SIGN_OUT_URL)) {
+      throw new Error("The notice must name the server to sign out of");
+    }
+    const box = notice.closest("[role='status']");
+    if (!(box instanceof HTMLElement) || box.scrollWidth > box.clientWidth + 1) {
+      throw new Error("The pending sign-out notice overflows at phone width");
+    }
+  },
+};
+
+/** The backend's reason for a broken record; the notice shows it as given. */
+const BROKEN_SIGN_OUT_REASON =
+  "The pending plugin sign-out record (~/.mux/plugin-sign-outs-pending.json) is corrupt or from another Xum version. Sign out of the plugin's MCP servers in Settings → MCP, then delete the file.";
+
+/** A corrupt record (#6627): only the user can clear it, so the notice gives the steps. */
+export const BrokenSignOutRecord: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell
+      options={{
+        agentPlugins: {
+          items: [MANAGED_ITEM],
+          pendingSignOuts: {
+            kind: "broken",
+            reason: BROKEN_SIGN_OUT_REASON,
+          },
+        },
+      }}
+    >
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    // The broken-record branch renders a status notice that carries the backend's reason as
+    // given (compared with the mock's value, not with copy).
+    await waitFor(
+      () => {
+        const notices = canvas.queryAllByRole("status");
+        if (!notices.some((notice) => notice.textContent?.includes(BROKEN_SIGN_OUT_REASON))) {
+          throw new Error("The broken sign-out notice must show the backend's reason");
+        }
+      },
+      { timeout: 5000 }
+    );
+  },
+};
+
 /** A plugin installed before #6498: its components have no consent records yet. */
 function componentReviewOptions(): MockORPCClientOptions {
   const item: AgentPluginListItem = { ...MANAGED_ITEM, reviewRequiredCount: 2 };

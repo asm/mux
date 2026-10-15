@@ -2740,6 +2740,81 @@ describe("AgentPluginInstallService", () => {
       await failing.dispose();
     });
 
+    test("Settings reads the pending, the failed and the corrupt record (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      // Before the sign-in service is wired, no pass ran: the record is pending without an error.
+      expect(await restarted.pendingSignOutStatus()).toEqual({
+        kind: "pending",
+        servers: [serverUrl],
+      });
+      let fail = true;
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService({
+        logout: (input: { serverUrl: string }) =>
+          fail ? Promise.resolve({ success: false, error: "offline" }) : oauth.logout(input),
+        credentialKey: (url: string) => oauth.credentialKey(url),
+      } as unknown as McpOauthService);
+      await restarted.list();
+      const internals = restarted as unknown as { settledSignOutPasses: () => Promise<void> };
+      await internals.settledSignOutPasses();
+      // The failed pass's reason is shown next to the record.
+      expect(await restarted.pendingSignOutStatus()).toEqual({
+        kind: "pending",
+        servers: [serverUrl],
+        lastError: "offline",
+      });
+
+      const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      const kept = await fsPromises.readFile(file, "utf-8");
+      await fsPromises.writeFile(file, "{ not json");
+      const broken = await restarted.pendingSignOutStatus();
+      expect(broken.kind).toBe("broken");
+      expect(broken.kind === "broken" && broken.reason).toMatch(
+        /corrupt or from another Xum version/
+      );
+
+      // An empty record still fences discovery, so Settings still shows it.
+      await fsPromises.writeFile(file, JSON.stringify({ version: 1, urls: [] }));
+      expect(await restarted.pendingSignOutStatus()).toMatchObject({
+        kind: "pending",
+        servers: [],
+      });
+      expect(await discovered()).toBe(0);
+
+      // A special file is reported without reading it (a FIFO would block the read).
+      if (process.platform !== "win32") {
+        await fsPromises.rm(file);
+        execFileSync("mkfifo", [file]);
+        const fifo = await restarted.pendingSignOutStatus();
+        expect(fifo.kind === "broken" && fifo.reason).toMatch(/not a regular file/);
+        await fsPromises.rm(file);
+      }
+
+      // A deleted record drops the old failure, so it cannot describe the next record.
+      await fsPromises.rm(file, { force: true });
+      expect(await restarted.pendingSignOutStatus()).toEqual({ kind: "none" });
+      await fsPromises.writeFile(file, kept);
+      const next = await restarted.pendingSignOutStatus();
+      expect(next).toEqual({ kind: "pending", servers: [serverUrl] });
+
+      // Reading the status retries like the discovery gate, so a fixed cause clears it.
+      fail = false;
+      await internals.settledSignOutPasses();
+      const later = spyOn(performance, "now").mockReturnValue(performance.now() + 31_000);
+      try {
+        // The read waits for the retry it started, so it already reports the cleared record.
+        expect(await restarted.pendingSignOutStatus()).toEqual({ kind: "none" });
+      } finally {
+        later.mockRestore();
+      }
+      await oauth.dispose();
+    });
+
     test("a later pass waits for a timed-out logout instead of starting a second one (#6627)", async () => {
       const { failing, result } = await updateWithFailingSignOut(stopStub);
       await result;
