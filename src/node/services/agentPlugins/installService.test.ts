@@ -1920,6 +1920,41 @@ describe("AgentPluginInstallService", () => {
     await expect(resume("wfr_unreviewed")).rejects.toThrow("has not been reviewed on this install");
   });
 
+  test("the preview lists only workflow names the resolver can run (#6777)", async () => {
+    await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
+    // The resolver refuses a name that starts with ~ and reads \ as a path separator, so a
+    // review row for either would approve a script that never runs.
+    const names = ["ok.js", "~run.js", ...(process.platform === "win32" ? [] : ["a\\b.js"])];
+    for (const name of names) {
+      await fsPromises.writeFile(path.join(remoteDir, "workflows", name), "1;\n");
+    }
+    await commitAll(remoteDir, "add workflows with names the resolver refuses");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.workflows).toEqual(["ok.js"]);
+    expect(preview.reviewedComponents.map((row) => row.name)).toEqual(["ok.js"]);
+
+    // The resolver checks the normalized path, so `./~run.js` is refused like `~run.js` and the
+    // lister and the resolver agree (Codex PRRT_kwDOPxxmWM6s5R_3).
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const resolve = (scriptPath: string) =>
+      resolveWorkflowScript({
+        scriptPath,
+        runtime: new LocalRuntime(muxRoot),
+        workspacePath: muxRoot,
+        projectTrusted: false,
+        roots: {
+          projectRoot: "",
+          globalRoot: path.join(muxRoot, "skills"),
+          universalRoot: "",
+          globalPluginRoots: [pluginsDir()],
+        },
+      });
+    for (const scriptPath of ["plugin://demo-plugin/~run.js", "plugin://demo-plugin/./~run.js"]) {
+      await expect(resolve(scriptPath)).rejects.toThrow("must be relative");
+    }
+    expect((await resolve("plugin://demo-plugin/./ok.js")).source).toBe("1;\n");
+  });
+
   test("a stored managed skill workflow run resumes only while its snapshot is reviewed (#6777)", async () => {
     const source = "export default function workflow() { return {}; }\n";
     await fsPromises.writeFile(path.join(remoteDir, "skills", "greet", "workflow.js"), source);
