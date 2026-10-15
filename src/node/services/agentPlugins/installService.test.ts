@@ -1478,6 +1478,51 @@ describe("AgentPluginInstallService", () => {
     });
   });
 
+  test("install refuses components that differ from the ones its preview showed (#6777)", async () => {
+    // Preview and install read separate clones. A script the preview could not read (no row)
+    // must not get a consent record because install could read it.
+    const first = await service.preview({ input: remoteDir });
+    await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
+    await fsPromises.writeFile(path.join(remoteDir, "workflows", "run.js"), "1;\n");
+    await commitAll(remoteDir, "add a workflow the first preview never showed");
+    const second = await service.preview({ input: remoteDir });
+    expect(second.consentDigest).not.toBe(first.consentDigest);
+
+    await expect(
+      service.install({
+        source: second.source,
+        expectedSha: second.lockedSha,
+        expectedConsentDigest: first.consentDigest,
+      })
+    ).rejects.toThrow("differ from the preview");
+    expect(await service.list()).toEqual([]);
+
+    await service.install({
+      source: second.source,
+      expectedSha: second.lockedSha,
+      expectedConsentDigest: second.consentDigest,
+    });
+    expect((await service.list()).map((item) => item.name)).toEqual(["demo-plugin"]);
+  });
+
+  test("install refuses an executable hook its preview did not show (#6777)", async () => {
+    // hooks.js loads on its own after install, so the digest must cover it (PRRT_kwDOPxxmWM6s3i_9).
+    const first = await service.preview({ input: remoteDir });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "hooks.js"),
+      "({ 'tool.execute.before': () => undefined })\n"
+    );
+    await commitAll(remoteDir, "add a hook the first preview never showed");
+    const second = await service.preview({ input: remoteDir });
+    await expect(
+      service.install({
+        source: second.source,
+        expectedSha: second.lockedSha,
+        expectedConsentDigest: first.consentDigest,
+      })
+    ).rejects.toThrow("differ from the preview");
+  });
+
   test("install records the reviewed fingerprint of each imported component (#6498)", async () => {
     const preview = await service.preview({ input: remoteDir });
     const installed = await service.install({
