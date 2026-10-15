@@ -958,6 +958,7 @@ const REVIEWED_KIND_LABEL: Record<AgentPluginComponentRef["kind"], string> = {
   mcpServers: "MCP server",
   workflows: "Workflow",
   agents: "Agent",
+  slashCommands: "Slash command",
 };
 
 /**

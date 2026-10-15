@@ -1181,6 +1181,7 @@ describe("createAgentPluginsMcpProvider", () => {
         mcpServers: { srv: "0".repeat(64) },
         workflows: {},
         agents: {},
+        slashCommands: {},
       });
       expect(await loaded()).toEqual(["free"]);
       await saveConsent(reviewed);

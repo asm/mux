@@ -151,6 +151,7 @@ export const AgentPluginComponentKindSchema = z.enum([
   "mcpServers",
   "workflows",
   "agents",
+  "slashCommands",
 ]);
 
 export const AgentPluginInstallPreviewSchema = z.object({

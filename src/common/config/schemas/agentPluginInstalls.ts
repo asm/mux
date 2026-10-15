@@ -74,6 +74,8 @@ export const AgentPluginComponentConsentSchema = z.object({
   workflows: z.record(z.string(), z.string()).default({}),
   // Agents by ID (#6629), with the same upgrade rules as workflows.
   agents: z.record(z.string(), z.string()).default({}),
+  // Slash commands by name (#6629), with the same upgrade rules as workflows.
+  slashCommands: z.record(z.string(), z.string()).default({}),
 });
 
 export const AgentPluginInstallEntrySchema = z.object({

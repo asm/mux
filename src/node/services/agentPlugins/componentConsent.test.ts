@@ -204,6 +204,7 @@ describe("isComponentConsented", () => {
       mcpServers: { echo: "bb" },
       workflows: {},
       agents: {},
+      slashCommands: {},
     };
     expect(isComponentConsented(consent, "skills", "foo", "aa")).toBe(true);
     expect(isComponentConsented(consent, "skills", "foo", "bb")).toBe(false);
@@ -220,6 +221,7 @@ describe("consentForSelection", () => {
     mcpServers: { s: "s2" },
     workflows: { "w.js": "w2" },
     agents: {},
+    slashCommands: {},
   };
 
   test("install records every selected component it showed, and every workflow", () => {
@@ -230,6 +232,7 @@ describe("consentForSelection", () => {
       mcpServers: { s: "s2" },
       workflows: { "w.js": "w2" },
       agents: {},
+      slashCommands: {},
     });
   });
 
@@ -245,6 +248,7 @@ describe("consentForSelection", () => {
           mcpServers: {},
           workflows: { "w.js": "w1" },
           agents: {},
+          slashCommands: {},
         },
       },
     });
@@ -255,6 +259,7 @@ describe("consentForSelection", () => {
       mcpServers: {},
       workflows: { "w.js": "w1" },
       agents: {},
+      slashCommands: {},
     });
   });
 
@@ -266,6 +271,7 @@ describe("consentForSelection", () => {
         mcpServers: Object.fromEntries([["__proto__", "p1"]]),
         workflows: {},
         agents: {},
+        slashCommands: {},
       },
     });
     expect(Object.hasOwn(consent.mcpServers, "__proto__")).toBe(true);
@@ -278,7 +284,13 @@ describe("consentForSelection", () => {
       shown,
       previous: { selection: { skills: ["a", "b"], mcpServers: ["s"] }, consent: undefined },
     });
-    expect(consent).toEqual({ skills: {}, mcpServers: {}, workflows: {}, agents: {} });
+    expect(consent).toEqual({
+      skills: {},
+      mcpServers: {},
+      workflows: {},
+      agents: {},
+      slashCommands: {},
+    });
   });
 });
 
@@ -290,6 +302,7 @@ describe("recordReviewedComponents", () => {
         mcpServers: {},
         workflows: { "old.js": "o1" },
         agents: {},
+        slashCommands: {},
       },
       current: [
         { kind: "skills", name: "a", fingerprint: "a2" },
@@ -311,6 +324,7 @@ describe("recordReviewedComponents", () => {
       mcpServers: {},
       workflows: { "old.js": "o1", "w.js": "w2" },
       agents: {},
+      slashCommands: {},
     });
   });
 });

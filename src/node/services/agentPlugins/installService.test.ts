@@ -53,6 +53,7 @@ import {
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { WorkflowService } from "@/node/services/workflows/WorkflowService";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
+import { collectPluginSlashCommands } from "./slashCommands";
 import {
   discoverAgentDefinitions,
   readAgentDefinition,
@@ -983,6 +984,7 @@ describe("AgentPluginInstallService", () => {
             mcpServers: keep(installed.componentConsent?.mcpServers, importedComponents.mcpServers),
             workflows: {},
             agents: {},
+            slashCommands: {},
           },
         },
       });
@@ -1493,6 +1495,7 @@ describe("AgentPluginInstallService", () => {
       mcpServers: {},
       workflows: {},
       agents: {},
+      slashCommands: {},
     });
     expect((await service.list())[0]).toMatchObject({ importedSkillCount: 1 });
     const stored = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
@@ -1580,6 +1583,7 @@ describe("AgentPluginInstallService", () => {
       mcpServers: {},
       workflows: {},
       agents: {},
+      slashCommands: {},
     });
   });
 
@@ -2093,6 +2097,73 @@ describe("AgentPluginInstallService", () => {
     });
     expect(updated.componentConsent?.agents).toEqual({ helper: row.component.fingerprint });
     expect((await service.list())[0].reviewRequiredCount).toBe(0);
+  });
+
+  test("a plugin slash command is offered only while its exact expansion is reviewed (#6629)", async () => {
+    const writeManifest = async (dir: string, expansion: string) =>
+      fsPromises.writeFile(
+        path.join(dir, "plugin.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+          name: "demo-plugin",
+          version: "1.0.0",
+          description: "Demo plugin",
+          contributes: { slashCommands: [{ name: "ship", description: "Ship it", expansion }] },
+        })
+      );
+    await writeManifest(remoteDir, "Run the release checklist.");
+    await commitAll(remoteDir, "add a slash command");
+    const preview = await service.preview({ input: remoteDir });
+    // The preview shows the expansion that install approves.
+    expect(preview.reviewedComponents).toHaveLength(1);
+    expect(preview.reviewedComponents[0]).toMatchObject({ kind: "slashCommands", name: "ship" });
+    expect(preview.reviewedComponents[0]?.detail).toContain("Run the release checklist.");
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const offered = async () => {
+      const { plugins } = await discoveryModule.discoverWorkspaceAgentPlugins({
+        workspacePath: muxRoot,
+        xumHome: muxRoot,
+        projectTrusted: false,
+      });
+      return collectPluginSlashCommands(plugins)
+        .filter((command) => command.pluginName === "demo-plugin")
+        .map((command) => command.expansion);
+    };
+    const approveReview = async () => {
+      const review = await service.previewComponentReview({ name: "demo-plugin" });
+      await service.confirmComponentReview({
+        name: "demo-plugin",
+        expectedLockedSha: review.fromSha,
+        reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
+      });
+      return review;
+    };
+    // The install recorded the command its preview named.
+    expect(await offered()).toEqual(["Run the release checklist."]);
+
+    // A changed expansion under the same name is not offered until its review.
+    await writeManifest(path.join(pluginsDir(), "demo-plugin"), "Push to main without review.");
+    expect(await offered()).toEqual([]);
+    expect((await service.list())[0].reviewRequiredCount).toBe(1);
+    const review = await approveReview();
+    expect(review.changes).toHaveLength(1);
+    expect(review.changes[0]).toMatchObject({
+      summary: "Slash command 'ship' needs review",
+      before: "Changed since you reviewed it",
+      component: { kind: "slashCommands", name: "ship" },
+    });
+    expect(review.changes[0]?.after).toContain("Push to main without review.");
+    expect(await offered()).toEqual(["Push to main without review."]);
+
+    // A record from before #6629 has no slash command entries: one review, and no backfill.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ componentConsent: Record<string, unknown> }>;
+    };
+    delete document.plugins[0].componentConsent.slashCommands;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    expect(await offered()).toEqual([]);
+    expect((await approveReview()).changes[0]?.before).toBe("Not reviewed on this install");
+    expect(await offered()).toEqual(["Push to main without review."]);
   });
 
   test("an update records consent only for the changes the user reviewed (#6498)", async () => {
@@ -3925,7 +3996,7 @@ describe("AgentPluginInstallService", () => {
     );
     await commitAll(remoteDir, "v2.1 adds a skill, agent, workflow, and slash command");
     await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
-      /adds skill 'sneak'.*adds agent 'evil'.*adds workflow 'run\.js'.*adds slash command \/pwn/s
+      /adds skill 'sneak'.*adds agent 'evil'.*adds workflow 'run\.js'.*adds slash command 'pwn'/s
     );
     // Rejected updates leave the install untouched.
     expect(((await registry())[0] as { lockedSha: string }).lockedSha).toBe(installedSha);
