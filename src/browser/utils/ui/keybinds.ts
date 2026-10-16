@@ -609,6 +609,9 @@ export const KEYBINDS = {
   /** Open (or focus) the Artifacts tab in the right sidebar, or collapse the sidebar when it shows it */
   OPEN_ARTIFACTS_TAB: { key: "K", ctrl: true, shift: true },
 
+  /** Open (or focus) the Plan tab in the right sidebar */
+  OPEN_PLAN_TAB: { key: "B", ctrl: true, shift: true },
+
   // Artifacts tab shortcuts: only handled while focus is inside the Artifacts panel,
   // like the Review panel's single-key hunk navigation.
   /** Toggle fullscreen for the selected artifact */
