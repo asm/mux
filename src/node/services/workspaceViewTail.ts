@@ -116,14 +116,18 @@ function toWorkspaceViewTailRow(message: MuxMessage): Omit<WorkspaceViewTailRow,
 
 /**
  * Null when there is nothing to draw: an unknown workspace (checked before any history read), a
- * stream in flight (the live transcript then ends in a row chat.jsonl lacks), a failed read, or a
- * tail not windowable within the caps (one turn or row larger than them).
+ * stream in flight (the live transcript then ends in a row chat.jsonl lacks), a failed read, a
+ * tail not windowable within the caps (one turn or row larger than them), or an interrupted
+ * stream's partial.json (#6832).
  */
 export async function readWorkspaceViewTail(
   deps: {
     config: Pick<Config, "getWorkspaceMetadataById">;
     aiService: Pick<AIService, "isStreaming">;
-    historyService: Pick<HistoryService, "getHistoryWindowFromLatestBoundary">;
+    historyService: Pick<
+      HistoryService,
+      "getHistoryWindowFromLatestBoundary" | "readBoundedPartial"
+    >;
     rowTreeClient?: Pick<RowTreeClient, "render">;
   },
   workspaceId: string
@@ -133,10 +137,16 @@ export async function readWorkspaceViewTail(
   const options = { probeCheckouts: false, persistMigrations: false } as const;
   const info = await deps.config.getWorkspaceMetadataById(workspaceId, options);
   if (!info || isMultiProject(info) || deps.aiService.isStreaming(workspaceId)) return null;
-  const window = await deps.historyService.getHistoryWindowFromLatestBoundary(
-    workspaceId,
-    WORKSPACE_VIEW_TAIL_CAPS
-  );
+  // #6832: after a restart isStreaming() is false, but the live replay still shows an interrupted
+  // stream's partial.json, and drops every row that shares its historySequence. So any readable
+  // partial (and an oversized one, never parsed) means no view. It is read before the window, as
+  // the replay reads it: a commit between the two reads then gives the committed rows, never a
+  // stale tail. A malformed partial is null here and in readPartial, so both show the rows.
+  const caps = WORKSPACE_VIEW_TAIL_CAPS;
+  if ((await deps.historyService.readBoundedPartial(workspaceId, caps.maxBytes)) !== null) {
+    return null;
+  }
+  const window = await deps.historyService.getHistoryWindowFromLatestBoundary(workspaceId, caps);
   if (!window.success || window.data.kind !== "window") return null;
   const rows = window.data.messages.map(toWorkspaceViewTailRow);
   return {
