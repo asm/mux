@@ -960,8 +960,7 @@ describe("useBoundedTranscriptReveal", () => {
         expect(slice.reveal().fromIndex).toBeLessThan(oldStart);
       });
 
-      // #6742 review (Codex's case). Main's fallback can still over-reach by the deleted mounted
-      // rows (#6669 round 7); that is tracked as a part 2b precondition (startRows).
+      // #6742 review (Codex's case); the random op 8 in the invariant test generalizes it.
       test("held, one update that deletes the start row and regroups the end keeps the survivors", () => {
         const slice = grouped();
         slice.atCap();
@@ -984,6 +983,44 @@ describe("useBoundedTranscriptReveal", () => {
         slice.set({}); // ... and the automatic reveal mounts older rows within the cap only.
         subset(before, slice.mounted());
         expect(slice.mounted().length).toBeLessThanOrEqual(CAP);
+      });
+
+      // #6757 review: a detached slice; one update replaces a mounted row, a later one deletes
+      // the start row. The replacement stays mounted. And with every mounted row gone, the slice
+      // does not jump forward to rows that were never mounted.
+      function detachedPastCap() {
+        const slice = grouped();
+        slice.atCap();
+        slice.set({ followsTail: false });
+        slice.append(15, () => false); // Past the cap: the slice detaches at the first new row.
+        expect(slice.reveal().isDetached).toBe(true);
+        return slice;
+      }
+
+      test("a replaced mounted row stays mounted when the start row goes later", () => {
+        const slice = detachedPastCap();
+        const before = slice.mounted();
+        const swapped = slice
+          .messages()
+          .map((row) => (row.id === before[1] ? { id: "swap" } : row));
+        slice.set({ messages: swapped }); // The row right after the start row is replaced, ...
+        slice.set({ messages: slice.messages().filter((row) => row.id !== before[0]) });
+        expect(slice.mounted()).toContain("swap"); // ... then the start row goes.
+        subset(before.slice(2), slice.mounted());
+      });
+
+      test("deleting every mounted row does not mount rows that were never mounted", () => {
+        const slice = detachedPastCap();
+        // Rows inside the slice go first: it gets shorter than the cap with the same start.
+        const inner = slice.mounted().slice(10, 110);
+        slice.set({ messages: slice.messages().filter((row) => !inner.includes(row.id)) });
+        const before = slice.mounted();
+        const unread = slice
+          .messages()
+          .slice(slice.reveal().toIndex)
+          .map((row) => row.id);
+        slice.set({ messages: slice.messages().filter((row) => !before.includes(row.id)) });
+        expect(slice.mounted().filter((row) => unread.includes(row))).toEqual([]);
       });
 
       test("held, deleting only the newest rows keeps the start; new rows replacing them restart", () => {
@@ -1013,7 +1050,8 @@ describe("useBoundedTranscriptReveal", () => {
 
       // Seeded random operations; after each one that is not a reader request, a checker that
       // reads only the hook's output asserts the cap rule.
-      test.each([1, 2, 3, 4])("invariant: seed %p", (seed) => {
+      // Seeds 28 and 29 reach check (d) with a held overshoot (they fail without keptPastCap).
+      test.each([1, 2, 3, 4, 28, 29])("invariant: seed %p", (seed) => {
         const slice = grouped();
         slice.set({});
         let state = seed;
@@ -1025,7 +1063,7 @@ describe("useBoundedTranscriptReveal", () => {
         for (let op = 0; op < 300; op += 1) {
           const before = slice.mounted();
           const held = slice.reveal().isDetached || !slice.followsTail();
-          const kind = pick(8);
+          const kind = pick(9);
           const all = slice.messages();
           if (kind === 0) slice.append(1 + pick(3), () => random() < 0.5);
           if (kind === 1) slice.append(TRANSCRIPT_REVEAL_CHUNK_ROWS + 5, () => random() < 0.5);
@@ -1044,10 +1082,25 @@ describe("useBoundedTranscriptReveal", () => {
             if (slice.joined.has(row)) slice.joined.delete(row);
             else slice.joined.add(row);
           }
+          if (kind === 8) {
+            // One update: the start row goes, and the end row plus 9 after it join the bundle
+            // before them (#6742 review; the vanished-start fallback uses startRows).
+            const { fromIndex: start, toIndex: end } = slice.reveal();
+            for (const row of all.slice(end, end + 10)) slice.joined.add(row.id);
+            slice.set({ messages: all.filter((_, i) => i !== start) });
+          }
           slice.set({});
           // Liveness (#6742 review): after the frames, fully revealed or paused, never stuck.
           const { fromIndex: start, isRevealPaused: paused } = slice.reveal();
           expect(slice.pending() || (start === 0 ? !paused : paused)).toBe(true);
+          // (d) Back at the bottom (following, attached, frames flushed), the slice fits the cap
+          // again, except one bundle larger than the cap that mounts alone (keptPastCap refit).
+          const { fromIndex: head, toIndex: tail, isDetached } = slice.reveal();
+          if (slice.followsTail() && !isDetached && tail - head > CAP) {
+            const now = slice.messages().map((row) => row.id);
+            const bundleHeads = now.slice(head + 1, tail).filter((row) => !slice.joined.has(row));
+            expect(bundleHeads).toEqual([]);
+          }
           if (kind === 5 || kind === 6) continue;
           const ids = slice.messages().map((row) => row.id);
           const { fromIndex: from, toIndex: to } = slice.reveal();
@@ -1061,11 +1114,16 @@ describe("useBoundedTranscriptReveal", () => {
           }
           expect(isHead(ids, from) && isHead(ids, to)).toBe(true);
           if (to - from > CAP) {
-            // At most one bundle (the first or the last) takes the slice past the cap.
+            // Past the cap, rows that mounted in this step lie only in the first or the last
+            // mounted bundle, and only one that was partly mounted before (it grew or regrouped
+            // at an edge). A held slice already past the cap stays there but mounts nothing else.
             const heads = [...after.keys()].filter((i) => isHead(ids, from + i));
-            const first = (heads[1] ?? after.length) - heads[0];
-            const last = after.length - heads[heads.length - 1];
-            expect(after.length - first <= CAP || after.length - last <= CAP).toBe(true);
+            const wasMounted = (bundle: string[]) => bundle.some((row) => before.includes(row));
+            const edges = [after.slice(0, heads[1] ?? 0), after.slice(heads.at(-1))]
+              .filter(wasMounted)
+              .flat();
+            const added = after.filter((row) => !before.includes(row));
+            expect(added.filter((row) => !edges.includes(row))).toEqual([]);
           }
         }
       });
