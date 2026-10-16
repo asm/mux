@@ -136,8 +136,6 @@ import {
   DraftEventSchema,
   DraftGetOutputSchema,
   DraftImportLegacyOutputSchema,
-  DraftListEntrySchema,
-  DraftListSchema,
   DraftResolveSendsInputSchema,
   DraftResolveSendsOutputSchema,
   DraftRevisionOutputSchema,
@@ -148,6 +146,12 @@ import {
   DraftUpdateInputSchema,
   DraftWriteOutputSchema,
   RemovedCreationDraftSchema,
+  CreationDraftImportLegacyInputSchema,
+  CreationDraftListSchema,
+  CreationDraftSchema,
+  CreationDraftScopeSchema,
+  CreationDraftSummarySchema,
+  CreationDraftUpdateInputSchema,
 } from "./drafts";
 import {
   AgentMessageDispatchModeSchema,
@@ -3849,23 +3853,27 @@ export const drafts = {
     input: DraftResolveSendsInputSchema,
     output: DraftResolveSendsOutputSchema,
   },
-  /**
-   * The creation draft list, strictly: rejects when it cannot be read (the subscription snapshot
-   * falls back to an empty list instead). For the renderer's storage GC.
-   */
-  getList: {
+  /** Creation draft rows (metadata kept in backend memory). */
+  listCreation: {
     input: z.void(),
-    output: DraftListSchema,
+    output: CreationDraftListSchema,
   },
-  /** Add a creation draft to the list, or update its sub-project. Output: the list revision. */
-  putListEntry: {
-    input: DraftListEntrySchema,
-    output: DraftRevisionOutputSchema,
+  /** One creation draft with payloads; null when it has no record. */
+  getCreation: {
+    input: z.object({ scope: CreationDraftScopeSchema }),
+    output: CreationDraftSchema.nullable(),
   },
-  /** One-way import of the legacy localStorage list (never clobbers). Output: the list revision. */
-  importLegacyList: {
-    input: z.object({ entries: z.array(DraftListEntrySchema) }),
-    output: DraftRevisionOutputSchema,
+  updateCreation: {
+    input: CreationDraftUpdateInputSchema,
+    output: CreationDraftSummarySchema,
+  },
+  deleteCreation: {
+    input: z.object({ scope: CreationDraftScopeSchema }),
+    output: z.void(),
+  },
+  importLegacyCreation: {
+    input: CreationDraftImportLegacyInputSchema,
+    output: z.void(),
   },
   subscribe: {
     input: z.void(),
