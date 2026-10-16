@@ -114,6 +114,7 @@ import { MuxGatewaySessionExpiredDialog } from "./components/MuxGatewaySessionEx
 import { SshPromptDialog } from "./components/SshPromptDialog/SshPromptDialog";
 import { TerminalDialog } from "./components/TerminalView/TerminalDialog";
 import { SplashScreenProvider } from "./features/SplashScreens/SplashScreenProvider";
+import { WorkspaceViewGuard } from "./features/StaticWorkspaceView/workspaceViewHandoff";
 import { TutorialProvider } from "./contexts/TutorialContext";
 import { PowerModeProvider } from "./contexts/PowerModeContext";
 import { TooltipProvider } from "./components/Tooltip/Tooltip";
@@ -1559,6 +1560,7 @@ function AppInner() {
         <div className="mobile-main-content flex min-w-0 flex-1 flex-col overflow-hidden">
           <WindowsToolchainBanner toggleBarSpacer={bannerToggleBarSpacer} />
           <RosettaBanner toggleBarSpacer={bannerToggleBarSpacer} />
+          <WorkspaceViewGuard />
           <PageArea
             pageKey={
               selectedWorkspace || currentWorkspaceId
