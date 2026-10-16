@@ -25,6 +25,8 @@ import { resolveInstallLayout } from "@/node/services/serverUpdate/installLayout
 import { appendServerCrashLogSync } from "./serverCrashLogging";
 import { shouldExposeLaunchProject } from "./launchProject";
 import { startMajorGcHeapFields } from "./memoryBreadcrumbs";
+import { OOM_HEAP_SNAPSHOT_STARTUP_WAIT_MS, prepareOomHeapSnapshots } from "./oomHeapSnapshot";
+import * as v8 from "node:v8";
 import {
   createRowTreeClient,
   defaultRowTreeWorkerPath,
@@ -140,6 +142,18 @@ async function main(): Promise<void> {
     console.error(`Use 'xum api' commands to interact with the running instance.`);
     process.exit(1);
   }
+  // Opt-in OOM diagnostics (<xum root>/heap-snapshots exists): arm one near-heap-limit snapshot
+  // unless one already exists. Runs only for the process that becomes the server; it never
+  // throws, and a slow filesystem holds startup for at most the bound.
+  await raceWithAbortAndTimeout(
+    prepareOomHeapSnapshots({
+      xumHome,
+      cwd: () => process.cwd(),
+      setHeapSnapshotNearHeapLimit: (limit) => v8.setHeapSnapshotNearHeapLimit(limit),
+      log,
+    }),
+    { timeoutMs: OOM_HEAP_SNAPSHOT_STARTUP_WAIT_MS }
+  );
 
   const stores = createConfigStores();
   const config = stores.config;
