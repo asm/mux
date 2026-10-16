@@ -39,6 +39,7 @@ import {
 } from "@/browser/utils/ui/keybinds";
 import { useRuntimeStatus, useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
+import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { Button } from "@/browser/components/Button/Button";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
@@ -65,6 +66,7 @@ import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceT
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 
 import { SkillIndicator } from "../SkillIndicator/SkillIndicator";
+import { BranchSelector } from "../BranchSelector/BranchSelector";
 import { LeftSidebarToggleBarSpacer } from "../SidebarCollapseButton/SidebarCollapseButton";
 import { WorkspaceLinks } from "../WorkspaceLinks/WorkspaceLinks";
 import { useLiveAPI } from "@/browser/contexts/API";
@@ -127,6 +129,29 @@ function getPhoneHeaderSnapshot(): boolean {
     typeof window !== "undefined" &&
     typeof window.matchMedia === "function" &&
     window.matchMedia(PHONE_HEADER_QUERY).matches
+  );
+}
+
+/**
+ * The full selector, not just the name: phones drop the footer's branch selector, so this is
+ * their only way to switch branches. Mounted like the footer's: for every repository workspace,
+ * because it loads its own branch (waking a stopped runtime when opened), and keyed by workspace
+ * so a header kept across a workspace switch never offers the previous workspace's branches.
+ */
+function WorkspaceDetailsBranch(props: {
+  workspaceId: string;
+  workspaceName: string;
+  hasRepository: boolean;
+}) {
+  if (!props.hasRepository) {
+    return null;
+  }
+  return (
+    <BranchSelector
+      key={props.workspaceId}
+      workspaceId={props.workspaceId}
+      workspaceName={props.workspaceName}
+    />
   );
 }
 
@@ -748,6 +773,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             <span className="font-mono">{projectLabel}</span>
             <span>{workspaceName}</span>
             <span className="text-muted">{namedWorkspacePath}</span>
+            <WorkspaceDetailsBranch
+              workspaceId={workspaceId}
+              workspaceName={workspaceName}
+              hasRepository={hasWorkspaceRepository(workspaceEntry)}
+            />
           </PopoverContent>
         </Popover>
         {isArchiving && (

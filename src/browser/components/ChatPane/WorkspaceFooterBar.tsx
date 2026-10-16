@@ -4,6 +4,8 @@ import { cn } from "@/common/lib/utils";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { ProjectConfig } from "@/common/types/project";
 import { getDevcontainerStatusChip } from "@/browser/utils/runtimeUi";
 import { formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
@@ -18,6 +20,7 @@ import {
   useWorkspaceUsage,
 } from "@/browser/stores/WorkspaceStore";
 import { useGitStatus } from "@/browser/stores/GitStatusStore";
+import { useNarrowViewport } from "@/browser/hooks/useNarrowViewport";
 import { useWorkspacePR } from "@/browser/stores/PRStatusStore";
 import { useRuntimeStatus } from "@/browser/stores/RuntimeStatusStore";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -52,6 +55,7 @@ function WorkspaceDriftIndicator(props: {
   projectPath: string;
   isWorking: boolean;
   showMultiProjectStatus: boolean;
+  isNarrow: boolean;
 }) {
   const gitStatus = useGitStatus(props.workspaceId);
 
@@ -64,26 +68,32 @@ function WorkspaceDriftIndicator(props: {
         workspaceId={props.workspaceId}
         tooltipPosition="bottom"
         isWorking={props.isWorking}
+        compact={props.isNarrow}
       />
     );
   }
 
   return (
     <div className="flex shrink-0 items-center gap-1.5">
-      <DriftModeToggle />
+      {/* Phones drop the label to save width; the diff numbers themselves toggle the mode. */}
+      <DriftModeToggle showLabel={!props.isNarrow} />
       <GitStatusIndicator
         gitStatus={gitStatus}
         workspaceId={props.workspaceId}
         projectPath={props.projectPath}
         tooltipPosition="bottom"
         isWorking={props.isWorking}
+        tapTogglesMode={props.isNarrow}
       />
     </div>
   );
 }
 
-/** Shares the divergence dialog's mode preference so both surfaces stay in sync. */
-function DriftModeToggle() {
+/**
+ * Shares the divergence dialog's mode preference so both surfaces stay in sync. Stays mounted
+ * without its label so the keyboard shortcut works at every width.
+ */
+function DriftModeToggle(props: { showLabel: boolean }) {
   const mode =
     useUserPreferences((preferences) => preferences.appearance?.gitStatusIndicatorMode) ??
     "line-delta";
@@ -103,6 +113,10 @@ function DriftModeToggle() {
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   });
+
+  if (!props.showLabel) {
+    return null;
+  }
 
   return (
     <Tooltip>
@@ -124,11 +138,20 @@ function DriftModeToggle() {
   );
 }
 
+type DevcontainerChip = ReturnType<typeof getDevcontainerStatusChip>;
+
 function WorkspaceBranchControls(props: {
   workspaceId: string;
   workspaceName: string;
-  devcontainerChip: ReturnType<typeof getDevcontainerStatusChip>;
+  devcontainerChip: DevcontainerChip;
+  isNarrow: boolean;
 }) {
+  // Phones show the branch in the header's workspace details instead, keeping only the
+  // devcontainer chip because it reports live runtime state.
+  if (props.isNarrow) {
+    return props.devcontainerChip && <FooterDevcontainerChip chip={props.devcontainerChip} />;
+  }
+
   // The branch is the one footer item that can shrink (its name truncates with an ellipsis), so a
   // long name no longer pushes the row wider than a phone screen (#5769).
   return (
@@ -139,17 +162,21 @@ function WorkspaceBranchControls(props: {
         workspaceName={props.workspaceName}
         className="min-w-0"
       />
-      {props.devcontainerChip && (
-        <span
-          className={cn(
-            "shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-tight font-medium",
-            props.devcontainerChip.className
-          )}
-        >
-          {props.devcontainerChip.label}
-        </span>
-      )}
+      {props.devcontainerChip && <FooterDevcontainerChip chip={props.devcontainerChip} />}
     </div>
+  );
+}
+
+function FooterDevcontainerChip(props: { chip: NonNullable<DevcontainerChip> }) {
+  return (
+    <span
+      className={cn(
+        "shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-tight font-medium",
+        props.chip.className
+      )}
+    >
+      {props.chip.label}
+    </span>
   );
 }
 
@@ -366,22 +393,28 @@ function FooterLastPrompt(props: { workspaceId: string }) {
   );
 }
 
+// Metadata uses the top-level project name, so include a known sub-project path to preserve
+// the workspace's full project context.
+function getFooterProjectLabel(
+  workspaceEntry: FrontendWorkspaceMetadata | undefined,
+  userProjects: Map<string, ProjectConfig>,
+  projectName: string
+): string {
+  if (workspaceEntry?.kind === "scratch") return SCRATCH_PROJECT_NAME;
+  const subProjectPath = workspaceEntry?.subProjectPath;
+  return subProjectPath && userProjects.has(subProjectPath)
+    ? formatProjectHierarchyLabel(subProjectPath, userProjects)
+    : projectName;
+}
+
 export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => {
   const { workspaceMetadata } = useWorkspaceContext();
   const workspaceEntry = workspaceMetadata.get(props.workspaceId);
   const hasRepository = hasWorkspaceRepository(workspaceEntry);
   const showMultiProjectStatus = workspaceEntry != null && isMultiProject(workspaceEntry);
 
-  // Metadata uses the top-level project name, so include a known sub-project path to preserve
-  // the workspace's full project context.
   const { userProjects } = useProjectContext();
-  const subProjectPath = workspaceEntry?.subProjectPath;
-  const projectLabel =
-    workspaceEntry?.kind === "scratch"
-      ? SCRATCH_PROJECT_NAME
-      : subProjectPath && userProjects.has(subProjectPath)
-        ? formatProjectHierarchyLabel(subProjectPath, userProjects)
-        : props.projectName;
+  const projectLabel = getFooterProjectLabel(workspaceEntry, userProjects, props.projectName);
 
   const { canInterrupt, isStarting, awaitingUserQuestion } = useWorkspaceSidebarState(
     props.workspaceId
@@ -392,6 +425,9 @@ export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => 
   const devcontainerChip = isDevcontainerRuntime(props.runtimeConfig)
     ? getDevcontainerStatusChip(runtimeStatus)
     : null;
+  // One JS source for the phone layout, so the hidden drift label and the tap-to-toggle diff
+  // numbers can never disagree about the width.
+  const isNarrow = useNarrowViewport();
 
   return (
     // Narrow layouts drop the app root's bottom inset, so this row owns it: a capped clearance for
@@ -424,18 +460,26 @@ export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => 
               projectPath={props.projectPath}
               isWorking={isWorking}
               showMultiProjectStatus={showMultiProjectStatus}
+              isNarrow={isNarrow}
             />
             <FooterRepositoryLabel workspaceId={props.workspaceId} projectLabel={projectLabel} />
             <WorkspaceBranchControls
               workspaceId={props.workspaceId}
               workspaceName={props.workspaceName}
               devcontainerChip={devcontainerChip}
+              isNarrow={isNarrow}
             />
           </>
         )}
         {!hasRepository && <FooterProjectLabel projectLabel={projectLabel} />}
-        <FooterUsageStats workspaceId={props.workspaceId} />
-        <FooterLastPrompt workspaceId={props.workspaceId} />
+        {/* Not mounted on phones, so the last-prompt shortcuts cannot open a popover anchored
+          to a hidden trigger. */}
+        {!isNarrow && (
+          <>
+            <FooterUsageStats workspaceId={props.workspaceId} />
+            <FooterLastPrompt workspaceId={props.workspaceId} />
+          </>
+        )}
       </div>
     </footer>
   );
