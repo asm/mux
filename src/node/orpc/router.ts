@@ -200,6 +200,7 @@ import {
   type MCPSettingsReadSnapshot,
 } from "@/common/utils/mcpSettings";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
+import { readWorkspaceViewTail } from "@/node/services/workspaceViewTail";
 
 /**
  * Transports mask plain errors as "Internal Server Error". The draft size refusal must reach the
@@ -2496,6 +2497,11 @@ export const router = (authToken?: string) => {
               windowed: input.windowed === true,
             })
           ),
+        // The static first view's read: bounded and cheap, no replay (see workspaceViewTail.ts).
+        tail: t
+          .input(schemas.workspace.history.tail.input)
+          .output(schemas.workspace.history.tail.output)
+          .handler(({ context, input }) => readWorkspaceViewTail(context, input.workspaceId)),
         lastUserPrompt: t
           .input(schemas.workspace.history.lastUserPrompt.input)
           .output(schemas.workspace.history.lastUserPrompt.output)
