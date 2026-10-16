@@ -50,10 +50,13 @@ def comment(body, author=BOT, created_at=AFTER, minimized=False):
     }
 
 
-def thread(body, author=BOT, resolved=False, created_at=AFTER, discussion="1"):
-    """`discussion` is the root comment ID that board links use (#discussion_r<id>)."""
+def thread(body, author=BOT, resolved=False, created_at=AFTER, discussion="1", commit=None):
+    """`discussion` is the root comment ID that board links use (#discussion_r<id>).
+    `commit` is the commit the root comment was written on."""
     root = comment(body, author, created_at)
     root["fullDatabaseId"] = discussion
+    if commit is not None:
+        root["originalCommit"] = {"oid": commit}
     return {
         "id": "thread",
         "isResolved": resolved,
@@ -265,6 +268,50 @@ else:
             for cached in (False, True):
                 with self.subTest(case=case, cached=cached):
                     data = snapshot([comment(changed)], head=head)
+                    self.assert_gate(expected, data, cache=data if cached else None)
+
+    def test_resolved_codex_threads_clear_unresolved_review_state(self):
+        # Codex keeps has_unresolved_findings true after its threads are resolved
+        # until it reviews again (seen on coder/xum#6786), like advisory bullets
+        # (coder/xum#5045). Only resolved Codex finding threads of the same review
+        # kind on the reviewed commit clear it; other evidence proves nothing.
+        clean = FIXTURES["review_state_summary"]["body"]
+        head = board_head(clean)
+        code = clean.replace('"has_unresolved_findings":false', '"has_unresolved_findings":true', 1)
+        security = clean.replace(
+            '"has_unresolved_findings":false,"status":"completed"}}',
+            '"has_unresolved_findings":true,"status":"completed"}}',
+        )
+        code_marker = "\n\n<!-- codex-code-review-finding:v1 -->"
+        security_marker = "<!-- codex-security-review-finding:v1 -->\n\n"
+        fixed = thread("[P2] Fixed" + code_marker, resolved=True, commit=head)
+        for case, body, threads, expected in (
+            ("resolved code thread", code, [fixed], 0),
+            ("unresolved Codex thread", code, [fixed, thread("[P2] Open" + code_marker, commit=head)], 1),
+            ("unresolved human thread", code, [fixed, thread("Nit", "human-reviewer")], 0),
+            ("thread on an older commit", code,
+             [thread("[P2] Fixed" + code_marker, resolved=True, commit="c" * 40)], 1),
+            ("thread without a commit", code, [thread("[P2] Fixed" + code_marker, resolved=True)], 1),
+            ("thread without a marker", code, [thread("[P2] Fixed", resolved=True, commit=head)], 1),
+            ("human thread with a marker", code,
+             [thread("[P2] Fixed" + code_marker, "human-reviewer", resolved=True, commit=head)], 1),
+            ("no threads", code, [], 1),
+            ("security flag, code thread", security, [fixed], 1),
+            ("security flag, security thread", security,
+             [thread(security_marker + "[P2] Fixed", resolved=True, commit=head)], 0),
+            # A marker counts only in its protocol position: code last, security first.
+            ("security flag, code thread quoting its marker", security,
+             [thread("[P2] Quotes " + security_marker + "Fixed" + code_marker, resolved=True, commit=head)], 1),
+            ("code flag, security thread quoting its marker", code,
+             [thread(security_marker + "[P2] Quotes " + code_marker + " here", resolved=True, commit=head)], 1),
+            ("marker sharing its line", code,
+             [thread("[P2] Fixed <!-- codex-code-review-finding:v1 -->", resolved=True, commit=head)], 1),
+            ("thread with both markers", security,
+             [thread(security_marker + "[P2] Fixed" + code_marker, resolved=True, commit=head)], 1),
+        ):
+            for cached in (False, True):
+                with self.subTest(case=case, cached=cached):
+                    data = snapshot([comment(body)], threads, head=head)
                     self.assert_gate(expected, data, cache=data if cached else None)
 
     def test_summary_completion_requires_metadata_and_every_review_row(self):
@@ -635,7 +682,7 @@ else:
                 + BOT
                 + '"; "'
                 + board_head(FIXTURES["summary"]["body"])
-                + '"; [])]',
+                + '"; []; {code_review: [], security_review: []})]',
             ],
             input=json.dumps(comments),
             text=True,
