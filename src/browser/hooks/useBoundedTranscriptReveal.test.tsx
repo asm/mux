@@ -1023,6 +1023,49 @@ describe("useBoundedTranscriptReveal", () => {
         expect(slice.mounted().filter((row) => unread.includes(row))).toEqual([]);
       });
 
+      // #6757 round 3: the same update also deletes the old end row, while older rows and later
+      // unread rows survive. The slice must not restart at those unread rows.
+      test("deleting every mounted row and the end row does not mount unread rows", () => {
+        const slice = detachedPastCap();
+        const { fromIndex: from, toIndex: to } = slice.reveal();
+        const gone = slice
+          .messages()
+          .slice(from, to + 1)
+          .map((row) => row.id);
+        const unread = slice
+          .messages()
+          .slice(to + 1)
+          .map((row) => row.id);
+        expect(unread.length).toBeGreaterThan(0);
+        slice.set({ messages: slice.messages().filter((row) => !gone.includes(row.id)) });
+        expect(slice.mounted().filter((row) => unread.includes(row))).toEqual([]);
+      });
+
+      // #6871 round 1: one mounted row survives, and the first surviving unmounted row joins its
+      // bundle in the same update. The end snaps back to that bundle's head; the row stays.
+      test("the last surviving mounted row stays when the end regroups into its bundle", () => {
+        const slice = detachedPastCap();
+        const { fromIndex: from, toIndex: to } = slice.reveal();
+        const all = slice.messages();
+        const kept = all[to - 1].id;
+        slice.joined.add(all[to + 1].id);
+        slice.set({ messages: all.filter((_, i) => i < from || i === to - 1 || i > to) });
+        expect(slice.mounted()).toContain(kept);
+      });
+
+      // #6871 round 1: with no mounted row left, an older bundle across the one-cap point must
+      // not add its older part on top of the cap.
+      test("with no mounted row left, an older bundle across the cap point does not pass the cap", () => {
+        const slice = detachedPastCap();
+        const { fromIndex: from, toIndex: to } = slice.reveal();
+        const all = slice.messages();
+        const point = from - CAP;
+        all.slice(point - 19, point + 20).forEach((row) => slice.joined.add(row.id));
+        slice.set({ messages: all.filter((_, i) => i < from || i > to) });
+        expect(slice.mounted().length).toBeGreaterThan(0);
+        expect(slice.mounted().length).toBeLessThanOrEqual(CAP);
+      });
+
       test("held, deleting only the newest rows keeps the start; new rows replacing them restart", () => {
         const slice = grouped();
         slice.atCap();
@@ -1063,7 +1106,7 @@ describe("useBoundedTranscriptReveal", () => {
         for (let op = 0; op < 300; op += 1) {
           const before = slice.mounted();
           const held = slice.reveal().isDetached || !slice.followsTail();
-          const kind = pick(9);
+          const kind = pick(10);
           const all = slice.messages();
           if (kind === 0) slice.append(1 + pick(3), () => random() < 0.5);
           if (kind === 1) slice.append(TRANSCRIPT_REVEAL_CHUNK_ROWS + 5, () => random() < 0.5);
@@ -1088,6 +1131,15 @@ describe("useBoundedTranscriptReveal", () => {
             const { fromIndex: start, toIndex: end } = slice.reveal();
             for (const row of all.slice(end, end + 10)) slice.joined.add(row.id);
             slice.set({ messages: all.filter((_, i) => i !== start) });
+          }
+          if (kind === 9 && slice.reveal().isDetached) {
+            // One update: every mounted row and the end row go; with an older row left, unread
+            // rows after them stay unmounted (#6757 round 3: compare with the resolved end).
+            const { fromIndex: start, toIndex: end } = slice.reveal();
+            const unread = all.slice(end + 1).map((row) => row.id);
+            slice.set({ messages: all.filter((_, i) => i < start || i > end) });
+            if (start > 0)
+              expect(slice.mounted().filter((row) => unread.includes(row))).toEqual([]);
           }
           slice.set({});
           // Liveness (#6742 review): after the frames, fully revealed or paused, never stuck.
