@@ -146,21 +146,19 @@ function WorkspaceBranchControls(props: {
   devcontainerChip: DevcontainerChip;
   isNarrow: boolean;
 }) {
-  // Phones show the branch in the header's workspace details instead, keeping only the
-  // devcontainer chip because it reports live runtime state.
-  if (props.isNarrow) {
-    return props.devcontainerChip && <FooterDevcontainerChip chip={props.devcontainerChip} />;
-  }
-
-  // The branch is the one footer item that can shrink (its name truncates with an ellipsis), so a
-  // long name no longer pushes the row wider than a phone screen (#5769).
+  // The branch truncates rather than push the row past a phone screen (#5769). Phones give it only
+  // the width the other items leave, so a short repo label stays whole, but never less than a touch
+  // target, so a full row truncates the repo label rather than clip the branch button. Phones also
+  // drop the copy button, whose touch target would take the name's room (the header's details
+  // popover still copies the branch), and the wrapper, so the devcontainer chip keeps its width.
   return (
-    <div className="flex min-w-0 items-center gap-1">
+    <div className={props.isNarrow ? "contents" : "flex min-w-0 items-center gap-1"}>
       <BranchSelector
         key={props.workspaceId}
         workspaceId={props.workspaceId}
         workspaceName={props.workspaceName}
-        className="min-w-0"
+        className={props.isNarrow ? "max-w-max min-w-11 grow basis-0" : "min-w-0"}
+        showCopyButton={!props.isNarrow}
       />
       {props.devcontainerChip && <FooterDevcontainerChip chip={props.devcontainerChip} />}
     </div>
@@ -180,7 +178,11 @@ function FooterDevcontainerChip(props: { chip: NonNullable<DevcontainerChip> }) 
   );
 }
 
-function FooterRepositoryLabel(props: { workspaceId: string; projectLabel: string }) {
+function FooterRepositoryLabel(props: {
+  workspaceId: string;
+  projectLabel: string;
+  isNarrow: boolean;
+}) {
   const workspacePR = useWorkspacePR(props.workspaceId);
 
   if (!workspacePR) {
@@ -198,7 +200,11 @@ function FooterRepositoryLabel(props: { workspaceId: string; projectLabel: strin
           target="_blank"
           rel="noopener noreferrer"
           data-testid="workspace-footer-repository"
-          className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-5 min-w-0 items-center gap-1 rounded-md px-1.5 transition-colors focus-visible:ring-1"
+          className={cn(
+            "text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-5 min-w-0 items-center gap-1 rounded-md px-1.5 transition-colors focus-visible:ring-1",
+            // Phones cap a long owner/repo like the project label, so the branch keeps some room.
+            props.isNarrow && "max-w-40"
+          )}
         >
           <Github className="h-3 w-3 shrink-0" aria-hidden="true" />
           {/* Truncates like the branch name, so a long owner/repo fits a phone screen (#5769). */}
@@ -462,7 +468,11 @@ export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => 
               showMultiProjectStatus={showMultiProjectStatus}
               isNarrow={isNarrow}
             />
-            <FooterRepositoryLabel workspaceId={props.workspaceId} projectLabel={projectLabel} />
+            <FooterRepositoryLabel
+              workspaceId={props.workspaceId}
+              projectLabel={projectLabel}
+              isNarrow={isNarrow}
+            />
             <WorkspaceBranchControls
               workspaceId={props.workspaceId}
               workspaceName={props.workspaceName}
