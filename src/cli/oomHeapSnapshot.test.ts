@@ -1,11 +1,14 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { log } from "@/node/services/log";
 import { prepareOomHeapSnapshots, type OomHeapSnapshotLogDetails } from "./oomHeapSnapshot";
 
 const dirs: string[] = [];
+const restores: Array<() => void> = [];
 afterEach(async () => {
+  for (const restore of restores.splice(0)) restore();
   for (const dir of dirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
 });
 
@@ -26,11 +29,16 @@ async function setup() {
     setHeapSnapshotNearHeapLimit: (limit: number) => armed.push(limit),
     log: {
       info: (message: string, meta: OomHeapSnapshotLogDetails) =>
-        logs.push(`info ${message} ${JSON.stringify(meta)}`),
+        logs.push(`logfile ${message} ${JSON.stringify(meta)}`),
       warn: (message: string, meta: OomHeapSnapshotLogDetails) =>
         logs.push(`warn ${message} ${JSON.stringify(meta)}`),
     },
   };
+  // Armed and not-armed lines are printed like the startup banner.
+  const out = spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+    logs.push(`info ${args.map(String).join(" ")}`);
+  });
+  restores.push(() => out.mockRestore());
   return { cwd, armed, logs, deps, snapshotDir: path.join(xumHome, "heap-snapshots") };
 }
 
@@ -51,6 +59,8 @@ describe("prepareOomHeapSnapshots", () => {
 
     expect(s.armed).toEqual([1]);
     expect(s.logs.some((line) => line.startsWith("info") && line.includes(s.cwd))).toBe(true);
+    // The logger keeps the record in mux.log too (it persists info even at the "error" level).
+    expect(s.logs.some((line) => line.startsWith("logfile") && line.includes(s.cwd))).toBe(true);
   });
 
   test.each(["cwd", "snapshot directory"] as const)(
@@ -85,4 +95,37 @@ describe("prepareOomHeapSnapshots", () => {
     expect(s.armed).toEqual([]);
     expect(s.logs.some((line) => line.startsWith("warn"))).toBe(true);
   });
+
+  // `xum server` (CLI mode) logs at "error" by default, so a log.info line never printed and the
+  // live server's log could not confirm arming (#6883 follow-up). Like the startup banner, the
+  // armed and not-armed lines must reach the console at that level.
+  test.each([
+    ["armed", false, "Armed"],
+    ["not armed", true, "Not armed"],
+  ] as const)(
+    "the %s line reaches the startup output at the default CLI log level",
+    async (_case, withSnapshot, expected) => {
+      const s = await setup();
+      await fs.mkdir(s.snapshotDir, { mode: 0o700 });
+      if (withSnapshot) await fs.writeFile(path.join(s.cwd, SNAPSHOT), "kept");
+      const previousLevel = log.getLevel();
+      log.setLevel("error");
+      const printed: string[] = [];
+      const capture = (...args: unknown[]) => {
+        printed.push(args.map(String).join(" "));
+      };
+      for (const restore of restores.splice(0)) restore();
+      const out = spyOn(console, "log").mockImplementation(capture);
+      const err = spyOn(console, "error").mockImplementation(capture);
+      try {
+        await prepareOomHeapSnapshots({ ...s.deps, log });
+      } finally {
+        out.mockRestore();
+        err.mockRestore();
+        log.setLevel(previousLevel);
+      }
+
+      expect(printed.some((line) => line.includes(`[heap-snapshot] ${expected}`))).toBe(true);
+    }
+  );
 });
