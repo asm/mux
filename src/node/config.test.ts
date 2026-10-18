@@ -1808,6 +1808,24 @@ describe("Config", () => {
           ] as unknown as StoredPair[],
       ],
       [
+        // #6869: the alias group's legacy check runs before the merge, but no id row in any alias
+        // shares the legacy row's path, so no legacy id is resolved.
+        "two aliases with a legacy row on its own path",
+        () =>
+          [
+            ["/home/u/repo", { workspaces: [row("ws-one")] }],
+            [
+              "/home/u/repo/",
+              {
+                workspaces: [
+                  row("ws-two"),
+                  { name: "legacy", path: path.join(config.srcDir, "repo", "legacy") },
+                ],
+              },
+            ],
+          ] as unknown as StoredPair[],
+      ],
+      [
         // #6717: the duplicate-id check runs over these ids and finds none.
         "one key with several rows and unique ids",
         () =>
@@ -2193,6 +2211,46 @@ describe("Config", () => {
           expect(await savedIdsOnCheckout(checkout)).toEqual([]);
           const saved = readSavedProjects()[0][1].workspaces;
           expect(saved.map((w) => [w.id, w.path])).toEqual([[id, elsewhere]]);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
+      // #6869: the alias merge keeps the copy on the other path, so the legacy row must be
+      // matched against every alias's rows before the merge. Else the id migration gives it the
+      // same id again: Xum saves config.json with two rows of one id, and the next load repairs
+      // it with a second backup.
+      it("drops a legacy copy of a repeated id before the alias merge keeps the copy on another path", async () => {
+        const checkout = checkoutPath();
+        const id = config.generateLegacyId("/home/u/repo", checkout);
+        const elsewhere = path.join(config.srcDir, "repo", "elsewhere");
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              [
+                "/home/u/repo/",
+                {
+                  workspaces: [
+                    { id, name: "x", path: checkout },
+                    { name: "x", path: checkout },
+                  ],
+                },
+              ],
+              ["/home/u/repo", { workspaces: [{ id, name: "x", path: elsewhere }] }],
+            ],
+          })
+        );
+        const original = fs.readFileSync(path.join(tempDir, "config.json"));
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          expect(await savedIdsOnCheckout(checkout)).toEqual([]);
+          const saved = readSavedProjects();
+          expect(saved).toHaveLength(1);
+          expect(saved[0][1].workspaces.map((w) => [w.id, w.path])).toEqual([[id, elsewhere]]);
+          const backups = aliasConflictBackups();
+          expect(backups).toHaveLength(1);
+          expect(fs.readFileSync(backups[0])).toEqual(original);
         } finally {
           errorSpy.mockRestore();
         }
