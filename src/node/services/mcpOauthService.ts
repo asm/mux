@@ -1,4 +1,5 @@
 import * as crypto from "crypto";
+import assert from "@/common/utils/assert";
 import { getOwn } from "@/common/utils/getOwn";
 import * as http from "http";
 import type { IncomingHttpHeaders } from "http";
@@ -283,6 +284,16 @@ function pluginClient(
   };
 }
 
+// Keyed by instance instead of a `#raw` field: Bun (through 1.4.3) emits a `#private` field
+// natively, and any class with one makes Bun's coverage read every line of this file as hit
+// (oven-sh/bun#41528). A WeakMap keeps the value off the object like the field did.
+const exactResourceHrefs = new WeakMap<ExactResourceURL, string>();
+function rawHref(url: ExactResourceURL): string {
+  const raw = exactResourceHrefs.get(url);
+  assert(raw !== undefined, "ExactResourceURL stores its href in the constructor");
+  return raw;
+}
+
 /**
  * A URL whose serialization is the configured string. The SDK sends `resource.href` in the
  * authorization, token and refresh requests, and `new URL("https://api.example.com").href`
@@ -290,19 +301,18 @@ function pluginClient(
  * that. The value is still validated as a URL by the constructor.
  */
 class ExactResourceURL extends URL {
-  readonly #raw: string;
   constructor(raw: string) {
     super(raw);
-    this.#raw = raw;
+    exactResourceHrefs.set(this, raw);
   }
   override get href(): string {
-    return this.#raw;
+    return rawHref(this);
   }
   override toString(): string {
-    return this.#raw;
+    return rawHref(this);
   }
   override toJSON(): string {
-    return this.#raw;
+    return rawHref(this);
   }
 }
 
