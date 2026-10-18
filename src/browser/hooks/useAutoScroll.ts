@@ -28,6 +28,78 @@ const TRANSCRIPT_SCROLL_INTENT_EXEMPT_SELECTOR = [
   '[data-scroll-intent="ignore"]',
 ].join(",");
 
+/** Transcript rows (MessageRenderer tags each with its history id). */
+export const TRANSCRIPT_ROW_SELECTOR = "[data-message-id]";
+
+/**
+ * The first row whose top is inside the scrollport, with that top. Rows are in document order,
+ * which is also top order, so a binary search reads O(log n) rects. Null when no row starts in
+ * view (one tall row fills it): native anchoring then keeps the position, as before #6773.
+ */
+function findReadingRow(
+  scrollport: HTMLElement,
+  sentinel: HTMLElement | null
+): { element: HTMLElement; top: number } | null {
+  const view = scrollport.getBoundingClientRect();
+  // A row that starts under the sticky composer dock (the sentinel's next sibling, see ChatPane)
+  // is not readable.
+  const dockTop = sentinel?.nextElementSibling?.getBoundingClientRect().top ?? view.bottom;
+  const viewBottom = Math.min(view.bottom, dockTop);
+  const rows = scrollport.querySelectorAll<HTMLElement>(TRANSCRIPT_ROW_SELECTOR);
+  let low = 0;
+  let high = rows.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (rows[middle].getBoundingClientRect().top < view.top) low = middle + 1;
+    else high = middle;
+  }
+  const element = rows[low] as HTMLElement | undefined;
+  if (!element) return null;
+  const top = element.getBoundingClientRect().top;
+  return top < viewBottom ? { element, top } : null;
+}
+
+/**
+ * A hidden chat (display: none, e.g. immersive review) has no layout box and reads every rect as
+ * 0, so the hold keeps its snapshot unchanged until the chat shows again.
+ */
+function isLaidOut(scrollport: HTMLElement | null): scrollport is HTMLElement {
+  return scrollport !== null && scrollport.clientHeight > 0;
+}
+
+/**
+ * Holds the row the reader sees first while the transcript is released (#6773, see useAutoScroll).
+ * `snapshotReadingRow` records it and its top. `holdReadingRow` moves `scrollTop` by however far
+ * that row moved since, then records again.
+ */
+function useReadingRowHold(
+  contentRef: { readonly current: HTMLDivElement | null },
+  sentinelRef: { readonly current: HTMLDivElement | null },
+  lastScrollTopRef: { current: number }
+) {
+  const readingRowRef = useRef<{ element: HTMLElement; top: number } | null>(null);
+  const snapshotReadingRow = useCallback(() => {
+    const scrollContainer = contentRef.current;
+    if (!isLaidOut(scrollContainer)) return;
+    readingRowRef.current = findReadingRow(scrollContainer, sentinelRef.current);
+  }, [contentRef, sentinelRef]);
+  const holdReadingRow = useCallback(() => {
+    const scrollContainer = contentRef.current;
+    const reading = readingRowRef.current;
+    if (!isLaidOut(scrollContainer)) return;
+    if (reading?.element.isConnected) {
+      const delta = reading.element.getBoundingClientRect().top - reading.top;
+      if (delta !== 0) {
+        scrollContainer.scrollTop += delta;
+        // Not a user scroll toward the bottom: keep handleScroll's direction check neutral.
+        lastScrollTopRef.current = scrollContainer.scrollTop;
+      }
+    }
+    snapshotReadingRow();
+  }, [contentRef, lastScrollTopRef, snapshotReadingRow]);
+  return { snapshotReadingRow, holdReadingRow };
+}
+
 function getMaxScrollTop(element: HTMLElement): number {
   return Math.max(0, element.scrollHeight - element.clientHeight);
 }
@@ -101,6 +173,13 @@ function isMouseDownExemptFromScrollIntent(
  * regain `overflow-anchor: auto`, and the browser preserves the user's reading
  * position when off-screen content above the fold settles.
  *
+ * Native anchoring misses one case (#6773): Chrome anchors to the visible part of a row whose
+ * top is above the view, so growth below that anchor inside the same row (KaTeX, Mermaid, a late
+ * image) pushed every row below it down. While released, the ResizeObserver below therefore
+ * holds the first row that starts inside the view at its on-screen top, before paint. When native
+ * anchoring or ChatPane's Load older/Show newer anchor already restored that row, it writes
+ * nothing. Growth inside or below the held row is normal top-down flow and is not compensated.
+ *
  * `setTranscriptDetached` (#4961 F20): while the transcript's newest rows are unmounted, the
  * scroll bottom is not the live tail. Reaching it never relocks: a relock would pin the bottom and
  * skip the rows a "Show newer messages" press mounts below the reader. Jump to bottom still locks.
@@ -127,6 +206,11 @@ export function useAutoScroll() {
   // what lets a slow wheel-up gesture release the lock on the first tick
   // without the relock heuristic snapping it back to the bottom mid-gesture.
   const lastScrollTopRef = useRef(0);
+  const { snapshotReadingRow, holdReadingRow } = useReadingRowHold(
+    contentRef,
+    sentinelRef,
+    lastScrollTopRef
+  );
 
   const setAutoScrollEnabled = useCallback((enabled: boolean) => {
     autoScrollRef.current = enabled;
@@ -179,7 +263,8 @@ export function useAutoScroll() {
     // baseline now to keep the next user-driven scroll event's direction
     // check honest.
     seedScrollDirectionBaseline();
-  }, [seedScrollDirectionBaseline, setAutoScrollEnabled]);
+    snapshotReadingRow();
+  }, [seedScrollDirectionBaseline, setAutoScrollEnabled, snapshotReadingRow]);
 
   const markUserScrollIntent = useCallback(() => {
     programmaticDisableRef.current = false;
@@ -261,7 +346,7 @@ export function useAutoScroll() {
     [markUserScrollIntent]
   );
 
-  const handleScroll = useCallback(
+  const updateLockOnScroll = useCallback(
     (e: UIEvent<HTMLDivElement>) => {
       const scrollContainer = e.currentTarget;
       const now = Date.now();
@@ -324,6 +409,15 @@ export function useAutoScroll() {
     [setAutoScrollEnabled, stickToBottom]
   );
 
+  const handleScroll = useCallback(
+    (e: UIEvent<HTMLDivElement>) => {
+      updateLockOnScroll(e);
+      // A scroll (the reader's, or a hold's own write) moves what the reader sees first.
+      if (!autoScrollRef.current) snapshotReadingRow();
+    },
+    [snapshotReadingRow, updateLockOnScroll]
+  );
+
   // Safety net behind native scroll anchoring. Anchoring (the sentinel) keeps us
   // pinned as content appends, but two layout changes are not an "append above
   // the anchor": a resize of the scrollport itself (window, sidebars, onscreen
@@ -333,15 +427,15 @@ export function useAutoScroll() {
   // ResizeObserver delivers before paint, so this is a single synchronous
   // pre-paint write per resize — NOT a per-frame loop — and cannot fight CSS
   // transitions or font swaps the way the old settle loop did.
+  // While released, the same pre-paint signal holds the reading row (#6773, see the doc comment).
   useEffect(() => {
-    if (!autoScroll) return;
     const scrollContainer = contentRef.current;
     const ResizeObserverCtor = typeof window !== "undefined" ? window.ResizeObserver : undefined;
     if (!scrollContainer || !ResizeObserverCtor) return;
 
     const observer = new ResizeObserverCtor(() => {
-      if (!autoScrollRef.current) return;
-      stickToBottom();
+      if (autoScrollRef.current) stickToBottom();
+      else holdReadingRow();
     });
     observer.observe(scrollContainer);
     for (const child of Array.from(scrollContainer.children)) {
@@ -349,7 +443,8 @@ export function useAutoScroll() {
     }
 
     return () => observer.disconnect();
-  }, [autoScroll, stickToBottom]);
+    // autoScroll: each lock change re-runs this, observing the scrollport's current children.
+  }, [autoScroll, holdReadingRow, stickToBottom]);
 
   return {
     contentRef,
