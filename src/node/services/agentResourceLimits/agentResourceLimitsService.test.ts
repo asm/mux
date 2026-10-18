@@ -12,6 +12,8 @@ import type { AgentCgroupHost } from "./agentCgroup";
 import { AgentResourceLimitsService } from "./agentResourceLimitsService";
 import { createFakeCgroupTree, type FakeCgroupTree } from "./testHelpers";
 
+const READY = { state: "ready", cgroup: "/xum" } as const;
+
 describe("AgentResourceLimitsService", () => {
   let rootDir: string;
   let config: Config;
@@ -57,6 +59,7 @@ describe("AgentResourceLimitsService", () => {
       enabled: true,
       limits: { cpuCores: 2 },
       status: { state: "active", cgroup: "/xum/xum-agents" },
+      support: READY,
     });
     expect(await cpuMax()).toBe("200000 100000");
     expect(agentCgroupEnrollmentLine()).toContain(procsFile());
@@ -80,6 +83,7 @@ describe("AgentResourceLimitsService", () => {
       enabled: false,
       limits: { cpuCores: 2 },
       status: { state: "off" },
+      support: READY,
     });
     expect(await cpuMax()).toBe("max 100000");
     expect(agentCgroupEnrollmentLine()).toBe("");
@@ -102,6 +106,7 @@ describe("AgentResourceLimitsService", () => {
       enabled: true,
       limits: { cpuCores: 4 },
       status: { state: "active", cgroup: "/xum/xum-agents" },
+      support: READY,
     });
   });
 
@@ -118,6 +123,109 @@ describe("AgentResourceLimitsService", () => {
     expect(tree.writes.length - writesAfterStart).toBe(1);
   });
 
+  it("delegates with sudo at start, but not while the limits are off", async () => {
+    // Root ignores file modes, so xum's cgroup cannot be root's there.
+    if (process.getuid?.() === 0) return;
+    await tree.dispose();
+    tree = await createFakeCgroupTree({
+      own: "/init.scope",
+      cgroups: { "init.scope": { controllers: "cpu memory", procs: [String(process.pid)] } },
+      sudoWorks: true,
+    });
+    await fs.chmod(path.join(tree.root, "init.scope", "cgroup.subtree_control"), 0o444);
+    await config.updateAgentResourceLimits({ cpuCores: 2 });
+    await config.updateAgentResourceLimitsEnabled(false);
+    service = new AgentResourceLimitsService(config, tree.host);
+
+    await service.start();
+
+    // Settings can tell before the limits are on that applying them takes sudo.
+    expect(await service.get()).toMatchObject({
+      status: { state: "off" },
+      support: { state: "sudo", cgroup: "/init.scope" },
+    });
+    expect(tree.sudoCalls).toEqual([]);
+
+    // xum restarts with the limits turned on.
+    service.dispose();
+    await config.updateAgentResourceLimitsEnabled(true);
+    service = new AgentResourceLimitsService(config, tree.host);
+    await service.start();
+
+    expect(await service.get()).toMatchObject({
+      status: { state: "active", cgroup: "/init.scope/xum-agents" },
+      support: { state: "ready", cgroup: "/init.scope" },
+    });
+    expect(tree.sudoCalls).toEqual(["init.scope"]);
+  });
+
+  it("runs sudo once per user action, and not for config writes that keep the limits", async () => {
+    // Root ignores file modes, so xum's cgroup cannot be root's there.
+    if (process.getuid?.() === 0) return;
+    await tree.dispose();
+    tree = await createFakeCgroupTree({
+      own: "/init.scope",
+      cgroups: { "init.scope": { controllers: "cpu memory", procs: [String(process.pid)] } },
+    });
+    await fs.chmod(path.join(tree.root, "init.scope", "cgroup.subtree_control"), 0o444);
+    service = new AgentResourceLimitsService(config, tree.host);
+    await service.start();
+
+    const state = await service.set({ cpuCores: 1, memoryGiB: 2 });
+    await config.updateBashAiProxyEnabled(true);
+    const afterUnrelatedWrite = await service.get();
+
+    const sudoFailed = "with sudo failed: sudo: a password is required";
+    expect(state.status).toHaveProperty("reason", expect.stringContaining(sudoFailed));
+    expect(afterUnrelatedWrite.status).toHaveProperty(
+      "reason",
+      expect.stringContaining(sudoFailed)
+    );
+    expect(tree.sudoCalls).toEqual(["init.scope"]);
+
+    // Try again saves the unchanged limits.
+    await service.set({ cpuCores: 1, memoryGiB: 2 });
+    expect(tree.sudoCalls).toEqual(["init.scope", "init.scope"]);
+    await service.setEnabled(false);
+    await service.setEnabled(true);
+    expect(tree.sudoCalls).toEqual(["init.scope", "init.scope", "init.scope"]);
+  });
+
+  it("delegates with sudo when another backend changes the limits", async () => {
+    // Root ignores file modes, so xum's cgroup cannot be root's there.
+    if (process.getuid?.() === 0) return;
+    await tree.dispose();
+    tree = await createFakeCgroupTree({
+      own: "/init.scope",
+      cgroups: { "init.scope": { controllers: "cpu memory", procs: [String(process.pid)] } },
+      sudoWorks: true,
+    });
+    await fs.chmod(path.join(tree.root, "init.scope", "cgroup.subtree_control"), 0o444);
+    service = new AgentResourceLimitsService(config, tree.host);
+    await service.start();
+
+    // Another backend's save reaches this backend only as a config change.
+    await config.updateAgentResourceLimits({ cpuCores: 1 });
+
+    expect((await service.get()).status).toEqual({
+      state: "active",
+      cgroup: "/init.scope/xum-agents",
+    });
+    expect(tree.sudoCalls).toEqual(["init.scope"]);
+  });
+
+  it("checks support for the saved limits, also while they are off", async () => {
+    await tree.dispose();
+    tree = await createFakeCgroupTree({ own: "/xum", cgroups: { xum: { controllers: "memory" } } });
+    await config.updateAgentResourceLimits({ memoryGiB: 2 });
+    await config.updateAgentResourceLimitsEnabled(false);
+    service = new AgentResourceLimitsService(config, tree.host);
+    await service.start();
+
+    // A memory limit needs no cpu controller, so Settings must not report one missing.
+    expect((await service.get()).support).toEqual({ state: "ready", cgroup: "/xum" });
+  });
+
   it("saves and applies the limits it is given", async () => {
     service = new AgentResourceLimitsService(config, tree.host);
     await service.start();
@@ -129,6 +237,7 @@ describe("AgentResourceLimitsService", () => {
       enabled: true,
       limits: { cpuCores: 1.5, memoryGiB: 2 },
       status: { state: "active", cgroup: "/xum/xum-agents" },
+      support: READY,
     });
     expect(new Config(rootDir).loadConfigOrDefault().agentResourceLimits).toEqual({
       cpuCores: 1.5,

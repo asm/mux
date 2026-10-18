@@ -1,9 +1,13 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
-import type { AgentResourceLimitsStatus } from "@/common/orpc/schemas/agentResourceLimits";
+import type {
+  AgentResourceLimitsStatus,
+  AgentResourceLimitsSupport,
+} from "@/common/orpc/schemas/agentResourceLimits";
 import { getErrorMessage } from "@/common/utils/errors";
 import { agentCgroupEnrollmentLine } from "@/node/runtime/agentCgroupEnrollment";
+import { log } from "@/node/services/log";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { getBashPath } from "@/node/utils/main/bashPath";
@@ -18,6 +22,14 @@ const AGENTS_CGROUP = "xum-agents";
 const APP_CGROUP = "xum-app";
 const MAX_ENABLE_ATTEMPTS = 5;
 const PROBE_TIMEOUT_MS = 10_000;
+/** The files that delegate a cgroup to a user, besides its directory (see the kernel's cgroup-v2.rst). */
+const DELEGATION_FILES = ["cgroup.procs", "cgroup.subtree_control", "cgroup.threads"];
+/**
+ * The error of each host's last failed sudo delegation. Applies that may not run sudo report it,
+ * so the status keeps the sudo error until an apply that may run sudo succeeds or fails again, or
+ * the limits are cleared, after which the old sudo error no longer describes them.
+ */
+const failedSudoDelegations = new WeakMap<AgentCgroupHost, string>();
 
 type Controller = "cpu" | "memory";
 
@@ -32,6 +44,12 @@ export interface AgentCgroupHost {
   writeFile: (file: string, value: string) => Promise<void>;
   /** Start a shell with the enrollment line for `procsFile`; returns its `/proc/self/cgroup`. */
   probeEnrollment: (procsFile: string) => Promise<string>;
+  /** The uid of the xum process, or undefined where the platform has none. */
+  uid: number | undefined;
+  /** Whether systemd manages the host's cgroup tree. */
+  isSystemdBooted: () => Promise<boolean>;
+  /** With `sudo -n`, give the cgroup at `cgroupDir` to xum's user, as the docs' sudo step does. */
+  delegateWithSudo: (cgroupDir: string) => Promise<void>;
 }
 
 export interface AgentCgroupResult {
@@ -52,6 +70,49 @@ export const linuxAgentCgroupHost: AgentCgroupHost = {
       { timeoutMs: PROBE_TIMEOUT_MS }
     );
     return (await probe.result).stdout;
+  },
+  uid: process.getuid?.(),
+  isSystemdBooted: async () => {
+    try {
+      await fs.access("/run/systemd/system");
+      return true;
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) {
+        return false;
+      }
+      throw error;
+    }
+  },
+  delegateWithSudo: async (cgroupDir) => {
+    const timeout = AbortSignal.timeout(PROBE_TIMEOUT_MS);
+    // The abort sends SIGTERM to sudo, which relays it to chown. No tree kill: a user cannot
+    // signal root's processes, and a SIGKILL that sudo cannot relay would leave chown running, so
+    // it could still give the cgroup away after the status reported a failure.
+    using sudo = execFileAsync(
+      "sudo",
+      [
+        "-n",
+        "chown",
+        String(linuxAgentCgroupHost.uid),
+        cgroupDir,
+        ...DELEGATION_FILES.map((name) => path.join(cgroupDir, name)),
+      ],
+      { signal: timeout }
+    );
+    // The result settles only once sudo's pipes close, and a root descendant that outlives the
+    // SIGTERM can hold them open, so the timeout also settles the call on its own.
+    const timedOut = new Promise<never>((_resolve, reject) => {
+      timeout.addEventListener("abort", () => reject(new Error("sudo timed out")), { once: true });
+    });
+    try {
+      await Promise.race([sudo.result, timedOut]);
+    } catch (error) {
+      if (timeout.aborted) {
+        log.debug("sudo was stopped after its timeout", { error: getErrorMessage(error) });
+        throw new Error(`sudo did not finish within ${PROBE_TIMEOUT_MS / 1000} seconds.`);
+      }
+      throw error;
+    }
   },
 };
 
@@ -76,16 +137,22 @@ export function parseSelfCgroup(contents: string): string | null {
 }
 
 /**
- * Apply `limits` to the `xum-agents` cgroup under xum's own cgroup, creating it when needed.
- * xum cannot create a delegated cgroup, so it works only when xum's own cgroup (or its parent,
- * after xum moved into `xum-app`) is writable by the user that runs xum.
+ * Apply `limits` to the `xum-agents` cgroup under the base cgroup, creating it when needed. The
+ * base cgroup is xum's own cgroup, or its parent once xum moved into `xum-app`, and the user that
+ * runs xum must be able to manage it, or xum must be able to give it to that user with sudo.
+ *
+ * `trySudo` is set only for applies a user asked for (startup, a save, the switch, Try again).
+ * Every config write re-applies limits that are not applied, and on a host where sudo needs a
+ * password each sudo call can add an auth-log entry or incident mail.
  */
 export async function applyAgentCgroupLimits(
   limits: AgentResourceLimits,
-  host: AgentCgroupHost
+  host: AgentCgroupHost,
+  options: { trySudo: boolean } = { trySudo: false }
 ): Promise<AgentCgroupResult> {
   const needed = neededControllers(limits);
   if (needed.length === 0) {
+    failedSudoDelegations.delete(host);
     try {
       await clearAgentCgroupLimits(host);
     } catch (error) {
@@ -97,21 +164,43 @@ export async function applyAgentCgroupLimits(
     return { status: { state: "off" }, enrollmentTarget: null };
   }
 
-  const base = await findBaseCgroup(host);
-  if (typeof base !== "string") {
-    return base;
+  const plan = await planAgentCgroup(needed, host);
+  if (plan.state === "unsupported" || plan.state === "unavailable") {
+    return unavailable(plan.reason);
   }
-  const baseDir = path.join(host.cgroupRoot, base);
-  const problem = await findSetupProblem(base, baseDir, needed);
-  if (problem !== null) {
-    return problem;
+  if (plan.state === "sudo") {
+    const problem = await delegateBaseWithSudo(plan, options.trySudo, host);
+    if (problem !== null) {
+      return problem;
+    }
   }
+  const baseDir = path.join(host.cgroupRoot, plan.base);
   try {
-    return await setUpAgentsCgroup(base, baseDir, limits, needed, host);
+    return await setUpAgentsCgroup(plan.base, baseDir, limits, needed, host);
   } catch (error) {
     return unavailable(
-      `Could not set up cgroup ${base}/${AGENTS_CGROUP}: ${getErrorMessage(error)}`
+      `Could not set up cgroup ${plan.base}/${AGENTS_CGROUP}: ${getErrorMessage(error)}`
     );
+  }
+}
+
+/**
+ * What applying `limits` takes where xum runs now. It changes nothing and runs no sudo, so
+ * Settings can show it before the limits are turned on. With no limit set, it checks both
+ * controllers, as for the limits a user would set.
+ */
+export async function checkAgentCgroupSupport(
+  limits: AgentResourceLimits,
+  host: AgentCgroupHost
+): Promise<AgentResourceLimitsSupport> {
+  const needed = neededControllers(limits);
+  try {
+    const plan = await planAgentCgroup(needed.length > 0 ? needed : ["cpu", "memory"], host);
+    return plan.state === "ready" || plan.state === "sudo"
+      ? { state: plan.state, cgroup: plan.base }
+      : plan;
+  } catch (error) {
+    return { state: "unavailable", reason: getErrorMessage(error) };
   }
 }
 
@@ -122,12 +211,90 @@ function neededControllers(limits: AgentResourceLimits): Controller[] {
   return needed;
 }
 
-/** Why the base cgroup cannot hold the agent cgroup, or null when it can. */
-async function findSetupProblem(
+type AgentCgroupFailure = Extract<
+  AgentResourceLimitsSupport,
+  { state: "unsupported" | "unavailable" }
+>;
+
+/** The base cgroup, and whether the user running xum must get it with sudo first. */
+type AgentCgroupPlan =
+  | AgentCgroupFailure
+  | { state: "ready"; base: string }
+  /** `reason` says why the user running xum cannot manage `base` until sudo gives it to them. */
+  | { state: "sudo"; base: string; reason: string };
+
+async function planAgentCgroup(
+  needed: Controller[],
+  host: AgentCgroupHost
+): Promise<AgentCgroupPlan> {
+  const found = await findBaseCgroup(host);
+  if ("state" in found) {
+    return found;
+  }
+  const baseDir = path.join(host.cgroupRoot, found.base);
+  const accessError = await findAccessError(baseDir);
+  let plan: AgentCgroupPlan = { state: "ready", base: found.base };
+  if (accessError !== null) {
+    const reason = cannotManageReason(found.base, accessError);
+    if (!(await mayDelegateWithSudo(found.own, found.base, host))) {
+      return { state: "unavailable", reason };
+    }
+    plan = { state: "sudo", base: found.base, reason };
+  }
+  // Checked before sudo, which would not help a cgroup that lacks a controller.
+  const missing = await findMissingControllers(found.base, baseDir, needed);
+  return missing === null ? plan : { state: "unavailable", reason: missing };
+}
+
+/**
+ * Whether xum may give its cgroup `base` to its user with sudo. Xum and its agents stay inside
+ * `base` then, so the limits that apply to `base` keep applying to them.
+ */
+async function mayDelegateWithSudo(
+  own: string,
   base: string,
-  baseDir: string,
-  needed: Controller[]
+  host: AgentCgroupHost
+): Promise<boolean> {
+  // xum must run in `base` itself: a base that already holds xum-app was set up by the user that
+  // owns it. A nested cgroup, such as /docker/<id> in a container without a cgroup namespace,
+  // belongs to the container manager outside.
+  if (host.uid === undefined || own !== base || path.posix.dirname(base) !== "/") {
+    return false;
+  }
+  // systemd owns the tree on its hosts; delegation there goes through systemd-run instead.
+  return !(await host.isSystemdBooted());
+}
+
+/**
+ * Give the base cgroup to the user running xum with sudo. Returns why that did not work, or null
+ * once the user can manage the base cgroup. Applies that may not run sudo report the last sudo
+ * error instead.
+ */
+async function delegateBaseWithSudo(
+  plan: { base: string; reason: string },
+  trySudo: boolean,
+  host: AgentCgroupHost
 ): Promise<AgentCgroupResult | null> {
+  if (!trySudo) {
+    const failed = failedSudoDelegations.get(host);
+    return unavailable(failed === undefined ? plan.reason : sudoFailedReason(plan, failed));
+  }
+  const baseDir = path.join(host.cgroupRoot, plan.base);
+  try {
+    await host.delegateWithSudo(baseDir);
+  } catch (error) {
+    const sudoError = getErrorMessage(error);
+    failedSudoDelegations.set(host, sudoError);
+    return unavailable(sudoFailedReason(plan, sudoError));
+  }
+  failedSudoDelegations.delete(host);
+  log.info("Gave xum's cgroup to its user with sudo", { cgroup: plan.base });
+  const accessError = await findAccessError(baseDir);
+  return accessError === null ? null : unavailable(cannotManageReason(plan.base, accessError));
+}
+
+/** Why the user running xum cannot manage the cgroup at `baseDir`, or null when it can. */
+async function findAccessError(baseDir: string): Promise<string | null> {
   for (const file of [
     baseDir,
     ...["cgroup.procs", "cgroup.subtree_control"].map((name) => path.join(baseDir, name)),
@@ -135,19 +302,31 @@ async function findSetupProblem(
     try {
       await fs.access(file, fs.constants.W_OK);
     } catch (error) {
-      return unavailable(
-        `xum runs in cgroup ${base}, which the user running xum cannot manage (${getErrorMessage(error)}). Start xum in a cgroup delegated to that user.`
-      );
+      return getErrorMessage(error);
     }
   }
+  return null;
+}
+
+function cannotManageReason(base: string, accessError: string): string {
+  return `xum runs in cgroup ${base}, which the user running xum cannot manage (${accessError}). Start xum in a cgroup delegated to that user.`;
+}
+
+function sudoFailedReason(plan: { base: string; reason: string }, sudoError: string): string {
+  return `${plan.reason} Delegating ${plan.base} with sudo failed: ${sudoError}`;
+}
+
+/** Why the base cgroup lacks a controller that the limits need, or null when it has them. */
+async function findMissingControllers(
+  base: string,
+  baseDir: string,
+  needed: Controller[]
+): Promise<string | null> {
   const controllers = await readWords(path.join(baseDir, "cgroup.controllers"));
   const missing = needed.filter((controller) => !controllers.includes(controller));
-  if (missing.length > 0) {
-    return unavailable(
-      `The ${missing.join(" and ")} controller is not available in cgroup ${base}. Enable it in the parent cgroup's cgroup.subtree_control.`
-    );
-  }
-  return null;
+  return missing.length === 0
+    ? null
+    : `The ${missing.join(" and ")} controller is not available in cgroup ${base}. Enable it in the parent cgroup's cgroup.subtree_control.`;
 }
 
 async function setUpAgentsCgroup(
@@ -175,11 +354,11 @@ async function clearAgentCgroupLimits(host: AgentCgroupHost): Promise<void> {
   if (host.platform !== "linux") {
     return;
   }
-  const base = await findBaseCgroup(host);
-  if (typeof base !== "string") {
+  const found = await findBaseCgroup(host);
+  if ("state" in found) {
     return;
   }
-  const baseDir = path.join(host.cgroupRoot, base);
+  const baseDir = path.join(host.cgroupRoot, found.base);
   try {
     await fs.access(path.join(baseDir, AGENTS_CGROUP));
   } catch (error) {
@@ -191,10 +370,12 @@ async function clearAgentCgroupLimits(host: AgentCgroupHost): Promise<void> {
   await writeLimits(baseDir, {}, host);
 }
 
-/** xum's cgroup, or its parent when xum already moved into `xum-app`. */
-async function findBaseCgroup(host: AgentCgroupHost): Promise<string | AgentCgroupResult> {
+/** xum's own cgroup, and the base cgroup: the same, or its parent once xum moved into `xum-app`. */
+async function findBaseCgroup(
+  host: AgentCgroupHost
+): Promise<{ own: string; base: string } | AgentCgroupFailure> {
   if (host.platform !== "linux") {
-    return unavailable("Agent resource limits need Linux with cgroup v2.");
+    return { state: "unsupported", reason: "Agent resource limits need Linux with cgroup v2." };
   }
   const own = parseSelfCgroup(await host.readSelfCgroup());
   try {
@@ -203,23 +384,30 @@ async function findBaseCgroup(host: AgentCgroupHost): Promise<string | AgentCgro
     if (!hasErrorCode(error, "ENOENT")) {
       throw error;
     }
-    return unavailable(`No cgroup v2 hierarchy is mounted at ${host.cgroupRoot}.`);
+    return {
+      state: "unsupported",
+      reason: `No cgroup v2 hierarchy is mounted at ${host.cgroupRoot}.`,
+    };
   }
   if (own === null) {
-    return unavailable("xum does not run in a cgroup v2 hierarchy.");
+    return { state: "unsupported", reason: "xum does not run in a cgroup v2 hierarchy." };
   }
   if (own === "/") {
     // Setting up here would move every process of the host or container into xum-app.
-    return unavailable("xum runs in the root cgroup. Start xum in a cgroup of its own.");
+    return {
+      state: "unavailable",
+      reason: "xum runs in the root cgroup. Start xum in a cgroup of its own.",
+    };
   }
   const name = path.posix.basename(own);
   if (name === AGENTS_CGROUP) {
     // Setting up here would move the outer xum's agent processes and break their enrollment.
-    return unavailable(
-      `xum runs in cgroup ${own}, the agent cgroup of another xum, whose limits already apply.`
-    );
+    return {
+      state: "unavailable",
+      reason: `xum runs in cgroup ${own}, the agent cgroup of another xum, whose limits already apply.`,
+    };
   }
-  return name === APP_CGROUP ? path.posix.dirname(own) : own;
+  return { own, base: name === APP_CGROUP ? path.posix.dirname(own) : own };
 }
 
 async function enableControllers(
