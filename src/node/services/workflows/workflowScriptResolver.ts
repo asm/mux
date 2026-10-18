@@ -14,6 +14,10 @@ import {
   type AgentPluginInfo,
 } from "@/node/services/agentPlugins/discovery";
 import { isPluginWorkflowConsented } from "@/node/services/agentPlugins/componentConsent";
+import {
+  consentedPluginWorkflowSource,
+  type ApprovedCopiesReads,
+} from "@/node/services/agentPlugins/approvedCopies";
 import { pluginSkillScriptKey } from "@/node/services/agentPlugins/workflowFiles";
 import { isValidAgentPluginName } from "@/node/services/agentPlugins/manifest";
 import {
@@ -64,6 +68,8 @@ export interface ResolveWorkflowScriptInput {
   containment?: ProjectSkillContainment;
   /** Separate skill I/O context when workflow files execute in another runtime. */
   skillStorageContext?: SkillStorageContext;
+  /** Shared by the resolutions of one listing: each install's approved copies are read once. */
+  approvedCopiesReads?: ApprovedCopiesReads;
 }
 
 const SKILL_SCRIPT_PATH_PREFIX = "skill://";
@@ -213,8 +219,12 @@ async function resolveSkillWorkflowScript(
     throw new Error(sizeValidation.error);
   }
 
-  const source = await readFileString(skillRuntime, resolvedPath);
-  assertSkillScriptReviewed(resolvedSkill, parsed.relativePath, source);
+  const source = await reviewedSkillScriptSource(
+    resolvedSkill,
+    parsed.relativePath,
+    await readFileString(skillRuntime, resolvedPath),
+    input.approvedCopiesReads
+  );
   return buildResolvedScript({
     requestedScriptPath: input.scriptPath,
     canonicalScriptPath: `${SKILL_SCRIPT_PATH_PREFIX}${parsed.skillName}/${parsed.relativePath}`,
@@ -352,9 +362,9 @@ async function resolvePluginWorkflowScript(
   // with an absolute symlink to an outside directory, and the containment
   // check above would then canonicalize root and file through the SAME link
   // and accept an outside file as executable workflow source.
-  let source: string;
+  let liveSource: string;
   try {
-    source = (
+    liveSource = (
       await readPluginFileWithinRootCapped({
         filePath: resolvedPath,
         pluginRoot: plugin.rootPath,
@@ -365,7 +375,12 @@ async function resolvePluginWorkflowScript(
   } catch (error) {
     throw new Error(`Plugin workflow script not readable: ${getErrorMessage(error)}`);
   }
-  assertWorkflowReviewed(plugin, parsed.relativePath, source);
+  const source = await reviewedWorkflowSource(
+    plugin,
+    parsed.relativePath,
+    liveSource,
+    input.approvedCopiesReads
+  );
   return buildResolvedScript({
     requestedScriptPath: input.scriptPath,
     canonicalScriptPath: `${PLUGIN_SCRIPT_PATH_PREFIX}${plugin.name}/${parsed.relativePath}`,
@@ -381,8 +396,9 @@ async function resolvePluginWorkflowScript(
 /**
  * The consent gate of a managed plugin skill's script (#6629). The skill's own consent (#6498)
  * covers its SKILL.md frontmatter, not the bytes `skill://` runs, so the script needs its own
- * record, keyed by its plugin-relative path. It checks the source about to run. Only the skill's
- * `workflow.js` can have a record (the install review lists no other script).
+ * record, keyed by its plugin-relative path. Only the skill's `workflow.js` can have a record
+ * (the install review lists no other script). This check is for a stored run's snapshot: it must
+ * itself match the record.
  */
 function assertSkillScriptReviewed(
   skill: Pick<ResolvedAgentSkill, "pluginConsent" | "pluginRoot" | "pluginName" | "skillDir">,
@@ -392,8 +408,36 @@ function assertSkillScriptReviewed(
   if (skill.pluginConsent === undefined || skill.pluginRoot === undefined) return;
   const file = pluginSkillScriptKey(skill.pluginRoot, path.join(skill.skillDir, relativePath));
   if (isPluginWorkflowConsented(skill.pluginConsent, { file, source })) return;
-  throw new Error(
-    `Plugin workflow '${file}' has not been reviewed on this install, so it does not run. Open Settings → Plugins and select Review on plugin '${skill.pluginName ?? "?"}'.`
+  throw unreviewedWorkflowError(file, skill.pluginName ?? "?");
+}
+
+/**
+ * The source a `skill://` script runs: the live source when its record matches, else the approved
+ * copy when it verifies (approvedCopies.ts). Otherwise the script does not run.
+ */
+async function reviewedSkillScriptSource(
+  skill: Pick<
+    ResolvedAgentSkill,
+    "pluginConsent" | "pluginApprovedCopies" | "pluginRoot" | "pluginName" | "skillDir"
+  >,
+  relativePath: string,
+  source: string,
+  reads: ApprovedCopiesReads | undefined
+): Promise<string> {
+  if (skill.pluginConsent === undefined || skill.pluginRoot === undefined) return source;
+  const file = pluginSkillScriptKey(skill.pluginRoot, path.join(skill.skillDir, relativePath));
+  const reviewed = await consentedPluginWorkflowSource(
+    { componentConsent: skill.pluginConsent, approvedCopies: skill.pluginApprovedCopies },
+    { file, source },
+    reads
+  );
+  if (reviewed !== undefined) return reviewed;
+  throw unreviewedWorkflowError(file, skill.pluginName ?? "?");
+}
+
+function unreviewedWorkflowError(file: string, pluginName: string): Error {
+  return new Error(
+    `Plugin workflow '${file}' has not been reviewed on this install, so it does not run. Open Settings → Plugins and select Review on plugin '${pluginName}'.`
   );
 }
 
@@ -457,15 +501,26 @@ async function assertStoredSkillWorkflowReviewed(
   assertSkillScriptReviewed(skill, parsed.relativePath, input.source);
 }
 
-/**
- * The consent gate (#6629): it checks the source the resolver is about to run, so a script changed
- * after its review cannot run. Listing goes through the resolver too, so it hides the script.
- */
+/** The stored-run consent gate (#6629): the snapshot itself must match the record. */
 function assertWorkflowReviewed(plugin: AgentPluginInfo, file: string, source: string): void {
   if (isPluginWorkflowConsented(plugin.componentConsent, { file, source })) return;
-  throw new Error(
-    `Plugin workflow '${file}' has not been reviewed on this install, so it does not run. Open Settings → Plugins and select Review on plugin '${plugin.name}'.`
-  );
+  throw unreviewedWorkflowError(file, plugin.name);
+}
+
+/**
+ * The consent gate (#6629) of the source the resolver is about to run: a script changed after its
+ * review does not run. Its approved copy runs instead when it verifies (approvedCopies.ts).
+ * Listing goes through the resolver too, so it hides a script with neither.
+ */
+async function reviewedWorkflowSource(
+  plugin: AgentPluginInfo,
+  file: string,
+  source: string,
+  reads: ApprovedCopiesReads | undefined
+): Promise<string> {
+  const reviewed = await consentedPluginWorkflowSource(plugin, { file, source }, reads);
+  if (reviewed !== undefined) return reviewed;
+  throw unreviewedWorkflowError(file, plugin.name);
 }
 
 function parsePluginWorkflowScriptPath(scriptPath: string): {
