@@ -334,9 +334,13 @@ describe("auth token changes clear the service worker caches (#6848)", () => {
   const otherScope = `${ORIGIN}/@u/other/apps/mux/`;
   let storage: MemoryCacheStorage;
 
-  /** A previous session's state: the shell and an asset here, a legacy cache, another scope. */
+  /**
+   * A previous session's state: the shell and an asset here, a legacy cache, another scope, and
+   * a newer generation of this scope (a worker that updated while this tab runs an older bundle).
+   */
   function seedPreviousSession() {
     storage.seed("mux-v2", [`${ORIGIN}/api/docs`]);
+    storage.seed(`mux-v4:${ROOT_SCOPE}`, [`${ORIGIN}/main-NewerGen.js`]);
     storage.seed(cacheNameFor(ROOT_SCOPE), [
       ROOT_SCOPE,
       `${ORIGIN}/index.html`,
@@ -347,10 +351,11 @@ describe("auth token changes clear the service worker caches (#6848)", () => {
 
   function expectCleared() {
     expect(storage.stores.has("mux-v2")).toBe(false);
-    // The shell holds no session data and stays the offline start.
+    // #6876: this scope's caches hold only static build output and stay the offline start.
     expect(storage.urlsIn(cacheNameFor(ROOT_SCOPE))).toEqual(
-      [ROOT_SCOPE, `${ORIGIN}/index.html`].sort()
+      [ROOT_SCOPE, `${ORIGIN}/index.html`, `${ORIGIN}/${HASHED_JS}`].sort()
     );
+    expect(storage.urlsIn(`mux-v4:${ROOT_SCOPE}`)).toEqual([`${ORIGIN}/main-NewerGen.js`]);
     expect(storage.urlsIn(cacheNameFor(otherScope))).toEqual([`${otherScope}${HASHED_JS}`]);
   }
 
@@ -371,10 +376,18 @@ describe("auth token changes clear the service worker caches (#6848)", () => {
     restoreDomGlobals();
   });
 
-  test("logout keeps this scope's shell and finishes before its promise settles", async () => {
+  test("logout keeps this scope's caches and finishes before its promise settles", async () => {
     seedPreviousSession();
+    // #6867: the cleanup must not grow with the cache, so it never opens a cache to walk it.
+    const view = storage.view(ROOT_SCOPE);
+    let opened = 0;
+    Object.defineProperty(globalThis, "caches", {
+      configurable: true,
+      value: { ...view, open: (name: string) => (opened++, view.open(name)) },
+    });
     await clearStoredAuthToken();
     expectCleared();
+    expect(opened).toBe(0);
   });
 
   test("a new token clears the previous session; the same token again does not", async () => {
@@ -382,16 +395,24 @@ describe("auth token changes clear the service worker caches (#6848)", () => {
     await setStoredAuthToken("token-a");
     expectCleared();
 
-    storage.seed(cacheNameFor(ROOT_SCOPE), [`${ORIGIN}/${HASHED_JS}`]);
+    storage.seed("mux-v2", [`${ORIGIN}/api/docs`]);
     await setStoredAuthToken("token-a");
-    expect(storage.urlsIn(cacheNameFor(ROOT_SCOPE))).toContain(`${ORIGIN}/${HASHED_JS}`);
+    expect(storage.stores.has("mux-v2")).toBe(true);
   });
 
-  test("after logout the worker still starts offline from the shell", async () => {
+  test("after logout the worker still starts offline with the shell and its assets", async () => {
     const worker = await startWorker({ storage });
+    worker.setNetwork(() =>
+      ok("app code", { "Cache-Control": "public, max-age=31536000, immutable" })
+    );
+    await worker.request(`${ORIGIN}/${HASHED_JS}`);
     await clearStoredAuthToken();
     worker.offline();
     const { response } = await worker.request(`${ORIGIN}/`, { mode: "navigate" });
     expect(await response?.text()).toBe("shell");
+    // #6876: the asset survives the logout, whatever the worker's cache generation is.
+    expect(await (await worker.request(`${ORIGIN}/${HASHED_JS}`)).response?.text()).toBe(
+      "app code"
+    );
   });
 });
