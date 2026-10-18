@@ -1744,6 +1744,17 @@ async function copyDirIfMissingBestEffort(params: {
   }
 }
 
+/**
+ * Index entries a rollup can merge: a non-empty task id and an object value. Self-healing: the
+ * index files are read without per-entry validation, and one malformed entry (e.g. null) would
+ * throw in the merge and drop every other entry of the rollup.
+ */
+function mergeableIndexEntries<T>(entries: Array<[string, T]>): Array<[string, T]> {
+  return entries.filter(
+    ([taskId, entry]) => taskId.length > 0 && entry != null && typeof entry === "object"
+  );
+}
+
 function coerceUpdatedAtMs(entry: { createdAtMs?: number; updatedAtMs?: number }): number {
   if (typeof entry.updatedAtMs === "number" && Number.isFinite(entry.updatedAtMs)) {
     return entry.updatedAtMs;
@@ -2139,9 +2150,11 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
         workspaceId: params.parentWorkspaceId,
         workspaceSessionDir: params.parentSessionDir,
         update: (parentFile) => {
-          for (const [taskId, childEntry] of childEntries) {
-            if (!taskId) continue;
-
+          // rollUpAncestorWorkspaceIds reads the array, so an entry without one is skipped too.
+          const mergeable = mergeableIndexEntries(childEntries).filter(([, entry]) =>
+            Array.isArray(entry.ancestorWorkspaceIds)
+          );
+          for (const [taskId, childEntry] of mergeable) {
             const existing = parentFile.artifactsByChildTaskId[taskId] ?? null;
             const childUpdated = coerceUpdatedAtMs(childEntry);
             const existingUpdated = existing ? coerceUpdatedAtMs(existing) : -1;
@@ -2220,9 +2233,7 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
         workspaceId: params.parentWorkspaceId,
         workspaceSessionDir: params.parentSessionDir,
         update: (parentFile) => {
-          for (const [taskId, childEntry] of childEntries) {
-            if (!taskId) continue;
-
+          for (const [taskId, childEntry] of mergeableIndexEntries(childEntries)) {
             const existing = parentFile.artifactsByChildTaskId[taskId] ?? null;
             const childUpdated = coerceUpdatedAtMs(childEntry);
             const existingUpdated = existing ? coerceUpdatedAtMs(existing) : -1;
