@@ -56,6 +56,9 @@ describe("AgentSession queued delivery", () => {
       },
     } as unknown as InitStateManager;
     const backgroundProcessManager: BackgroundProcessManager = {
+      // A queued tool-end message sends the turn's foreground processes to the background.
+      getForegroundToolCallIds: () => [],
+      sendToBackground: () => undefined,
       setMessageQueued: mock(() => undefined),
       cleanup: mock(() => Promise.resolve()),
     } as unknown as BackgroundProcessManager;

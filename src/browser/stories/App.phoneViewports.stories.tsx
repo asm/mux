@@ -6,7 +6,7 @@
  */
 
 import { wrapAsyncIterator } from "@orpc/shared";
-import { expect, fn, userEvent, within, waitFor } from "@storybook/test";
+import { expect, fn, userEvent, within, waitFor } from "storybook/test";
 import type { ComponentType } from "react";
 
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
@@ -463,11 +463,13 @@ export const IPhone17ProMaxTouchTargetRows: AppStory = {
       { label: "footer info row", el: footerRow },
       { label: "composer model pill", el: modelGroup },
     ];
-    for (const row of rows) {
-      if (row.el.querySelectorAll("button, a").length === 0) {
-        throw new Error(`${row.label} has no touch targets to size against`);
+    await waitFor(() => {
+      for (const row of rows) {
+        if (row.el.querySelectorAll("button, a").length === 0) {
+          throw new Error(`${row.label} has no touch targets to size against`);
+        }
       }
-    }
+    });
 
     const touchFloor = document.createElement("style");
     touchFloor.textContent = `[data-testid="workspace-footer-bar"] button, [data-testid="workspace-footer-bar"] a, [data-component="ModelSelectorGroup"] button { min-height: ${MOBILE_TOUCH_TARGET_PX}px; }`;

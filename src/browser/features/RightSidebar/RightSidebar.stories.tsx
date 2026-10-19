@@ -32,8 +32,9 @@ import { createAssistantMessage, createUserMessage } from "@/browser/stories/moc
 import type { MockSessionUsage } from "@/browser/stories/mocks/orpc";
 import { AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { createWorkspace } from "@/browser/stories/mocks/workspaces";
-import { blurActiveElement } from "@/browser/stories/storyPlayHelpers";
+import { blurActiveElement, openSidebarNewTab } from "@/browser/stories/storyPlayHelpers";
 import { setupSimpleChatStory, setupStreamingChatStory } from "@/browser/stories/helpers/chatSetup";
+import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
 import { setHunkFirstSeen } from "@/browser/stories/helpers/reviews";
 import { collapseLeftSidebar, expandRightSidebar } from "@/browser/stories/helpers/uiState";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -45,7 +46,7 @@ import {
   getRightSidebarLayoutKey,
 } from "@/common/constants/storage";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { ComponentType, CSSProperties, ReactNode } from "react";
 import { useEffect, useRef } from "react";
 import type { TabType } from "@/browser/types/rightSidebar";
@@ -205,7 +206,7 @@ function seedSidebarLayout(workspaceId: string, tabs: TabType[], activeTab: TabT
 
 /**
  * The selected tab lies fully inside its strip's scroll viewport (not cut off at an edge or
- * hidden behind "+"). Retries because labels grow after mount (cost badge, counts) and the
+ * hidden behind All tabs). Retries because labels grow after mount (cost badge, counts) and the
  * strip re-scrolls when they do. Stories using it fix the sidebar width themselves, so this
  * holds at any test-runner viewport size.
  */
@@ -1166,6 +1167,31 @@ export const ReviewTabWithFileFilter: Story = {
     });
     await expect(filterIndicator).toBeInTheDocument();
     await expect(filterIndicator).toHaveTextContent("Button.tsx");
+
+    // In the light themes, the warning "-N" counts and "M" letters were 1.54:1 on white, and every
+    // colored text on the selected file row was below WCAG AA, down to 1.16:1. The filter chip
+    // shares the row's tint, and its "✕" was 2.85:1 (#6935).
+    const tree = await canvas.findByTestId("review-file-tree");
+    const selectedName = await within(tree).findByText("Button.tsx");
+    // The selected row is the nearest ancestor that paints a background: the selection tint.
+    let selectedRow = selectedName.parentElement;
+    while (selectedRow && getComputedStyle(selectedRow).backgroundColor === "rgba(0, 0, 0, 0)") {
+      selectedRow = selectedRow.parentElement;
+    }
+    if (!selectedRow || !tree.contains(selectedRow)) throw new Error("No selected-row tint found");
+    const row = selectedRow;
+    // The file-type icon is aria-hidden: the file name next to it carries the same information.
+    const rowTexts = () =>
+      [...row.querySelectorAll<HTMLElement>("*")].filter(
+        (element) => !element.closest("[aria-hidden='true']") && element.childElementCount === 0
+      );
+    const deletionCounts = () => canvas.getAllByText(/^[-−]\d+$|^M$/);
+    await expect(
+      textsBelowAaInThemes(() => [
+        filterIndicator,
+        ...new Set([...rowTexts(), ...deletionCounts()]),
+      ]).join("\n")
+    ).toBe("");
   },
 };
 
@@ -1559,15 +1585,27 @@ export const NewTabLauncher: Story = {
           document.activeElement === tab || panel?.contains(document.activeElement)
         ).toBe(true);
       });
-      await userEvent.click(canvas.getByRole("button", { name: "New tab" }));
+      await openSidebarNewTab(canvasElement);
     }
+    // The New tab row hands focus to the launcher, which keeps it after the menu unmounts: Radix
+    // refocuses the menu button on a timer then if focus is still inside the menu.
+    const launcherHasFocus = () =>
+      canvasElement
+        .querySelector('[role="tabpanel"][id$="-panel-new"]')
+        ?.contains(document.activeElement) === true;
+    await waitFor(() => expect(launcherHasFocus()).toBe(true));
+    await waitFor(() =>
+      expect(within(document.body).queryByRole("dialog", { name: "All tabs" })).toBeNull()
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await expect(launcherHasFocus()).toBe(true);
   },
 };
 
 /**
  * The New tab launcher at the sidebar's minimum width (300px), next to more open tabs than fit:
  * launcher rows wrap their descriptions instead of overflowing, and the strip stays one row
- * that scrolls sideways (hidden scrollbar, faded edges) with "+" pinned at the end.
+ * that scrolls sideways (hidden scrollbar, faded edges) with All tabs pinned at the end.
  */
 export const NewTabLauncherNarrow: Story = {
   // Match Pixel's named desktop exactly; the global Storybook "desktop" is smaller.
@@ -1695,7 +1733,7 @@ export const ManyTabsSingleRow: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await canvas.findByRole("tab", { name: /^timeline/i, selected: true });
-    await canvas.findByRole("button", { name: "New tab" });
+    await canvas.findByRole("button", { name: "All tabs" });
     // Wait for the cost badge: it widens Stats after mount, pushing the selected tab right.
     await canvas.findByRole("tab", { name: /stats.*\$0\.34/i });
     await expectSelectedTabVisible(canvasElement);
@@ -1744,8 +1782,12 @@ export const TabsReachableUnderWideTitlebarInset: Story = {
     const stats = await canvas.findByRole("tab", { name: /^stats/i, selected: true });
     const review = await canvas.findByRole("tab", { name: /^review/i });
     await expectSelectedTabVisible(canvasElement);
+    // All tabs must stay clickable too: it reaches every tab and the New tab.
     await waitFor(() => {
       if (!isHitTarget(stats)) throw new Error("selected tab is not under the pointer");
+      if (!isHitTarget(canvas.getByRole("button", { name: "All tabs" }))) {
+        throw new Error("All tabs is not under the pointer");
+      }
     });
     // Like Playwright: bring the other tab into view, then it must take the click.
     review.scrollIntoView({ block: "nearest", inline: "nearest" });

@@ -15,7 +15,8 @@
 
 import type { ChildProcess } from "child_process";
 import * as path from "node:path";
-import { Readable } from "stream";
+import assert from "@/common/utils/assert";
+import { nodeReadableToWeb } from "@/node/utils/nodeReadableToWeb";
 import type {
   Runtime,
   ExecOptions,
@@ -38,6 +39,13 @@ import { attachStreamErrorHandler } from "@/node/utils/streamErrors";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { DisposableProcess } from "@/node/utils/disposableExec";
 import { shescape } from "./streamUtils";
+import {
+  createExecMarker,
+  PendingStops,
+  stopMarkedCommand,
+  withExecMarker,
+  withoutExecMarkerKey,
+} from "./remoteExecMarker";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import { buildGuardedCommand, buildShellExport, buildShellPathExport } from "./shellEnv";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
@@ -75,6 +83,9 @@ export interface SpawnResult {
  * Abstract base class for remote execution runtimes.
  */
 export abstract class RemoteRuntime implements Runtime {
+  /** Remote stops started by aborts and not finished yet (#6923). */
+  private readonly pendingStops = new PendingStops();
+
   /**
    * Spawn the external process for command execution.
    * SSH spawns `ssh`, Docker spawns `docker exec`.
@@ -130,11 +141,12 @@ export abstract class RemoteRuntime implements Runtime {
     parts.push(this.cdCommand(options.cwd));
 
     // Add environment variable exports (user env first, then non-interactive overrides)
-    const envVars = { ...options.env, ...NON_INTERACTIVE_ENV_VARS };
+    // The marker key is reserved: a caller's export would hide the command from an abort's stop.
+    const envVars = withoutExecMarkerKey({ ...options.env, ...NON_INTERACTIVE_ENV_VARS });
     for (const [key, value] of Object.entries(envVars)) {
       parts.push(buildShellExport(key, value, (envValue) => shescape.quote(envValue)));
     }
-    for (const [key, value] of Object.entries(options.pathEnv ?? {})) {
+    for (const [key, value] of Object.entries(withoutExecMarkerKey(options.pathEnv ?? {}))) {
       parts.push(buildShellPathExport(key, value, (envValue) => shescape.quote(envValue)));
     }
 
@@ -149,6 +161,10 @@ export abstract class RemoteRuntime implements Runtime {
       const remoteTimeout = Math.ceil(options.timeout) + 1;
       fullCommand = `timeout -s KILL ${remoteTimeout} ${fullCommand}`;
     }
+
+    // Every remote process of this exec carries the marker, so an abort can stop them (#6923).
+    const marker = createExecMarker();
+    fullCommand = withExecMarker(marker, fullCommand);
 
     // Spawn the remote process (SSH or Docker)
     const timeoutMs = options.timeout !== undefined ? options.timeout * 1000 : undefined;
@@ -174,7 +190,7 @@ export abstract class RemoteRuntime implements Runtime {
     let aborted = false;
 
     // Declared here so it's captured by the exitCode promise closure,
-    // but the data listener is added AFTER Readable.toWeb() to avoid
+    // but the data listener is added AFTER nodeReadableToWeb() to avoid
     // putting the stream in flowing mode prematurely.
     let stderrForErrorReporting = "";
 
@@ -239,6 +255,18 @@ export abstract class RemoteRuntime implements Runtime {
         } catch {
           // ignore
         }
+        // Killing the local client does not stop the remote command (docker exec passes no
+        // signal; an OpenSSH client's exit sends none), so stop it by its marker (#6923). The
+        // abort's result does not wait for this: the caller asked to stop, and a slow or broken
+        // remote must not delay that answer. Failures are logged inside stopMarkedCommand.
+        this.pendingStops.track(
+          stopMarkedCommand(
+            (script) => this.exec(script, { cwd: "/", timeout: 10 }),
+            marker,
+            this.commandPrefix
+          ),
+          this.commandPrefix
+        );
 
         const hardKillHandle = setTimeout(() => {
           const hasExited = childProcess.exitCode !== null || childProcess.signalCode !== null;
@@ -287,14 +315,15 @@ export abstract class RemoteRuntime implements Runtime {
       void exitCode.catch(() => undefined).finally(() => clearTimeout(timeoutHandle));
     }
 
-    // Convert Node.js streams to Web Streams
-    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    const stdout = Readable.toWeb(childProcess.stdout!) as unknown as ReadableStream<Uint8Array>; // eslint-disable-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    const stderr = Readable.toWeb(childProcess.stderr!) as unknown as ReadableStream<Uint8Array>; // eslint-disable-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+    // Convert Node.js streams to Web Streams. Not Readable.toWeb: on Bun 1.4.3 it can throw an
+    // uncaught error when the bash tool cancels a reader on output overflow (nodeReadableToWeb).
+    assert(childProcess.stdout, "spawned with piped stdout");
+    assert(childProcess.stderr, "spawned with piped stderr");
+    const stdout = nodeReadableToWeb(childProcess.stdout);
+    const stderr = nodeReadableToWeb(childProcess.stderr);
 
     // Capture stderr for error reporting (e.g., SSH exit code 255 failures).
-    // Must be AFTER Readable.toWeb() to avoid putting the stream in flowing mode prematurely.
+    // Must be AFTER nodeReadableToWeb() to avoid putting the stream in flowing mode prematurely.
     // Bounded: this side-buffer exists only for error diagnostics, and connection/launch
     // failures surface at the start of stderr. Without a cap, a command that floods stderr
     // (e.g. `yes >&2`) would grow this string without bound even when the caller reads the
@@ -378,6 +407,11 @@ export abstract class RemoteRuntime implements Runtime {
     log.debug(`${this.commandPrefix} command: ${fullCommand}`);
 
     return { stdout, stderr, stdin, exitCode, duration };
+  }
+
+  /** Resolves once every remote stop started by an abort so far has finished. */
+  awaitPendingStops(): Promise<void> {
+    return this.pendingStops.settled();
   }
 
   private async resolveFilePath(filePath: string, abortSignal?: AbortSignal): Promise<string> {

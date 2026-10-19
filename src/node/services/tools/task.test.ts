@@ -9,6 +9,7 @@ import {
   markBuiltInTaskTool,
   isBuiltInTaskTool,
   TASK_PROJECT_SKILL_CONTENT_WITHHELD_ERROR,
+  parseTaskAiOverrides,
 } from "./task";
 import { TASK_REPORT_WITHHELD_MESSAGE } from "./taskReportProvenance";
 import { createTaskAwaitTool } from "./task_await";
@@ -870,6 +871,67 @@ describe("task tool", () => {
       expect(caught.message).toMatch(/invalid model/i);
     }
     expect(create).not.toHaveBeenCalled();
+  });
+
+  describe("<model>-<effort>[-fast] slugs (pstack routing)", () => {
+    const opus = { model: KNOWN_MODELS.OPUS.id, aliases: ["opus"], thinkingLevels: [] };
+    const grok = { model: KNOWN_MODELS.GROK_47.id, aliases: ["grok"], thinkingLevels: [] };
+
+    it("maps a slug to its model plus thinking; an explicit thinking wins", () => {
+      const cases: Array<[{ model: string; thinking?: string }, object]> = [
+        [
+          { model: "claude-opus-5-5-xhigh" },
+          { modelString: KNOWN_MODELS.OPUS.id, thinkingLevel: "xhigh" },
+        ],
+        [
+          { model: "grok-4.7-xhigh-fast" },
+          { modelString: KNOWN_MODELS.GROK_47.id, thinkingLevel: "xhigh" },
+        ],
+        [{ model: "grok-4.7-fast" }, { modelString: KNOWN_MODELS.GROK_47.id }],
+        [{ model: "opus-max" }, { modelString: KNOWN_MODELS.OPUS.id, thinkingLevel: "max" }],
+        // A valid provider:model keeps its literal meaning even if it ends in a level.
+        [{ model: "openai:gpt-6-high" }, { modelString: "openai:gpt-6-high" }],
+        [
+          { model: "claude-opus-5-5-xhigh", thinking: "low" },
+          { modelString: KNOWN_MODELS.OPUS.id, thinkingLevel: "low" },
+        ],
+      ];
+      for (const [args, expected] of cases) {
+        expect(parseTaskAiOverrides(args, () => [opus, grok])).toEqual(expected);
+      }
+    });
+
+    it("rejects an unmappable or unconfigured slug with the configured models, before spawning", async () => {
+      using tempDir = new TestTempDir("test-task-tool-slug-rejected");
+      const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+      const create = mock(() =>
+        Ok({ taskId: "child-task", kind: "agent" as const, status: "queued" as const })
+      );
+      const tool = createTaskTool({
+        ...baseConfig,
+        taskService: { create } as unknown as TaskService,
+        // xAI is not configured here, so the grok slug maps but cannot run.
+        listAvailableModels: () => [opus],
+      });
+
+      for (const [model, reason] of [
+        ["grok-4.7-xhigh-fast", /unavailable model/],
+        ["nonexistent-model-xhigh", /invalid model/],
+      ] as const) {
+        const message = await Promise.resolve(
+          tool.execute!(
+            { agentId: "explore", prompt: "review", title: "Reviewer", model },
+            mockToolCallOptions
+          )
+        ).then(
+          () => "resolved",
+          (error: unknown) => (error instanceof Error ? error.message : String(error))
+        );
+        expect(message).toMatch(reason);
+        expect(message).toMatch(/Configured: opus \(see models_list\)/);
+      }
+      expect(create).not.toHaveBeenCalled();
+    });
   });
 
   it("spawns best-of-n background tasks with shared grouping metadata", async () => {

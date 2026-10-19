@@ -1,5 +1,6 @@
 import { estimatePdfAttachmentTokens } from "@/node/utils/pdfTokenEstimate";
 import type { CompactionHistoryDeletion } from "./compactionCancellation";
+import { getSendProviderOptions } from "@/common/utils/ai/chatServiceTier";
 import { resolvePlanFileLocation } from "@/node/utils/runtime/planLocation";
 import type { ContinuousCompactionPublication } from "./continuousCompactionJournal";
 import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
@@ -123,6 +124,11 @@ import type {
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { COMPACTION_RETRY_INPUT_BUDGET_SCALE } from "@/constants/continuousCompaction";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
+import {
+  mergeTurnStopContinuation,
+  needsTodoTurnEndNudge,
+  type TurnStopContinuation,
+} from "@/node/services/agentNotifications/todoTurnEndNudge";
 import { readAssistedReviewForSessionDir } from "@/node/services/reviewPane/assistedReviewStorage";
 import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview";
 import {
@@ -365,7 +371,7 @@ import {
   stringifyAgentSkillFrontmatter,
 } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import {
-  skillBodyHasArgumentPlaceholders,
+  createSkillArgumentSubstituter,
   substituteSkillArguments,
 } from "@/node/services/agentSkills/skillArguments";
 import {
@@ -373,13 +379,14 @@ import {
   prependSkillDirectoryNote,
   resolveSkillDirectory,
   skillDirectoryEnv,
-  substituteSkillDirectoryPlaceholdersOutsideDirectives,
+  substituteSkillDirectoryPlaceholders,
 } from "@/node/services/agentSkills/skillDirectory";
 import {
   injectSkillDynamicContext,
   SKILL_DYNAMIC_COMMAND_TIMEOUT_MS,
   SKILL_DYNAMIC_OUTPUT_CAP_BYTES,
-  hasSkillDynamicDirective,
+  skillDynamicDirectiveCommands,
+  substituteSkillBodyForDirectives,
 } from "@/node/services/agentSkills/skillDynamicContext";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import {
@@ -2577,8 +2584,11 @@ export class AgentSession {
       try {
         this.coordinator.dispose();
       } finally {
-        // Release Node's async-context registration only after late replay events
-        // are suppressed; disabling while merely closing could broadcast them live.
+        // disable() hides the replay store from code that runs after it. A replay
+        // continuation that was already waiting still sees its store on Node 24 (Electron 44)
+        // and Bun 1.4.2+, so emitChatEvent's early return after dispose is what drops late
+        // replay events. Disable only after that latch: disabling while merely closing
+        // could broadcast them live.
         if (this.coordinator.disposed) this.replayPublication.disable();
       }
     });
@@ -2633,7 +2643,11 @@ export class AgentSession {
     assert(typeof listener === "function", "listener must be a function");
 
     const unsubscribe = this.onChatEvent(listener);
-    await this.replayHistory(listener);
+    // The caller never gets `unsubscribe` when the replay rejects, so release the listener here.
+    await this.replayHistory(listener).catch((error: unknown) => {
+      unsubscribe();
+      throw error;
+    });
 
     this.scheduleStartupRecovery();
 
@@ -5275,6 +5289,12 @@ export class AgentSession {
         this.activePreparations--;
         // Last: a failed attempt's ids moved to held input above, so they stay pending.
         this.activeSendAttempts.delete(attempt);
+        // Every pre-stream failure settlement for this attempt ran inside `run` or above, so
+        // the callback has no later reader. The attempt itself can outlive the turn: a started
+        // stream's request closures capture it, and a finished background command can keep
+        // those alive. Dropping the callback cuts that chain to the caller's whole send scope
+        // (WorkspaceService's onAcceptedPreStreamFailure, F29 heap snapshot).
+        attempt.onFailure = undefined;
         assert(this.activePreparations >= 0, "turn preparations released more than entered");
         // A preparation that failed before the turn left idle never publishes idle again.
         this.releaseTurnUseLeaseIfIdle();
@@ -8446,7 +8466,8 @@ export class AgentSession {
     const skillChars =
       skillBody == null
         ? 0
-        : skillBodyHasArgumentPlaceholders(skillBody) || hasSkillDynamicDirective(skillBody)
+        : substituteSkillArguments(skillBody, "").substituted ||
+            skillDynamicDirectiveCommands(skillBody).length > 0
           ? MAX_AGENT_SKILL_SNAPSHOT_CHARS
           : Math.min(skillBody.length, MAX_AGENT_SKILL_SNAPSHOT_CHARS);
     const chars =
@@ -8961,7 +8982,7 @@ export class AgentSession {
         additionalSystemContext: options?.additionalSystemContext,
         additionalSystemInstructions: options?.additionalSystemInstructions,
         maxOutputTokens: options?.maxOutputTokens,
-        muxProviderOptions: this.getSendProviderOptions(options),
+        muxProviderOptions: getSendProviderOptions(options),
         agentInitiated,
         agentId: options?.agentId,
         acpPromptId:
@@ -10056,16 +10077,6 @@ export class AgentSession {
     };
   }
 
-  private getSendProviderOptions(options: SendMessageOptions | undefined) {
-    // The chat's explicit Standard/Fast choice must win over provider-wide defaults.
-    return options?.serviceTier == null
-      ? options?.providerOptions
-      : {
-          ...options.providerOptions,
-          openai: { ...options.providerOptions?.openai, serviceTier: options.serviceTier },
-        };
-  }
-
   private normalizeGatewaySendOptions<T extends SendMessageOptions>(options: T): T {
     const normalizeModelSelection = (modelString: string): string => {
       const trimmedModelString = modelString.trim();
@@ -11065,7 +11076,7 @@ export class AgentSession {
         additionalSystemContext: options?.additionalSystemContext,
         additionalSystemInstructions: options?.additionalSystemInstructions,
         maxOutputTokens: options?.maxOutputTokens,
-        muxProviderOptions: this.getSendProviderOptions(options),
+        muxProviderOptions: getSendProviderOptions(options),
         agentInitiated,
         agentId: options?.agentId,
         acpPromptId,
@@ -12566,8 +12577,6 @@ export class AgentSession {
         this.midStreamCompactionPending || this.contextController.isApplying();
       if (this.coordinator.editBlocked() || continuousApplyPending) {
         this.queuedProviderToolEndAbortInFlight = false;
-        // Clear the queued-message signal while the edit flow owns the next dispatch.
-        this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
         // Do not dispatch stream-end follow-ups while the edit flow is waiting
         // for IDLE; truncation must run before any synthetic turn resumes.
       } else {
@@ -12686,7 +12695,8 @@ export class AgentSession {
   /**
    * Run the turn.stop prompt hooks (Codex Stop) for a turn that ended normally. A continuation
    * (Codex `decision: "block"`) queues its prompt as a new synthetic user row, at most
-   * MAX_STOP_HOOK_CONTINUATIONS times per user turn. Sub-agent turns skip the hooks: TaskService
+   * MAX_STOP_HOOK_CONTINUATIONS times per user turn. Xum's own todo nudge (needsTodoTurnEndNudge)
+   * rides the same continuation and gates. Sub-agent turns skip the hooks: TaskService
    * owns their stream end (Codex has SubagentStop for them). A delegated workspace turn
    * (`workspace-turn-task`) skips them for the same reason: WorkspaceTurnManager settles its
    * handle from this stream end, and can remove a disposable workspace, while a slow hook still
@@ -12697,7 +12707,6 @@ export class AgentSession {
     options: SendMessageOptions | undefined,
     provenance: StopContinuationProvenance
   ): Promise<void> {
-    if (this.aiService.runTurnStopHooks == null) return;
     if (this.config.findWorkspace(this.workspaceId)?.parentWorkspaceId != null) return;
     if (provenance.delegatedWorkspaceTurn) return;
     // Input queued during the turn is its next turn: the turn has not stopped, so Stop does
@@ -12715,13 +12724,8 @@ export class AgentSession {
     // stream to supersede and clears the queue before the hook returns. Its epoch fences the
     // continuation instead (rechecked below, after the last await).
     const stopEpochAtHook = this.getStopEpoch();
-    const outcome = await this.aiService.runTurnStopHooks(this.workspaceId, {
-      messageId: payload.messageId,
-      lastAssistantMessage: lastAssistantText(payload.parts),
-      stopHookActive: this.stopHookContinuations > 0,
-      model: stopHookModel(payload, provenance),
-    });
-    if (outcome.kind === "none" || options == null) {
+    const continuation = await this.readTurnStopContinuation(payload, options, provenance);
+    if (continuation == null || options == null) {
       this.stopHookContinuations = 0;
       return;
     }
@@ -12771,7 +12775,11 @@ export class AgentSession {
       return;
     }
     this.stopHookContinuations++;
-    this.queueMessage(outcome.prompt, this.stopContinuationOptions(options, provenance), {
+    const continuationOptions = {
+      ...this.stopContinuationOptions(options, provenance),
+      ...continuation.optionOverrides,
+    };
+    this.queueMessage(continuation.prompt, continuationOptions, {
       acceptanceOrigin: "automatic",
       synthetic: true,
       ...(provenance.agentInitiated === true ? { agentInitiated: true } : {}),
@@ -12783,6 +12791,50 @@ export class AgentSession {
       // Codex runs no UserPromptSubmit hook for a Stop continuation (see skipPromptHooks).
       skipPromptHooks: true,
     });
+  }
+
+  /**
+   * The turn.stop continuation: the plugin hooks' reasons plus Xum's todo nudge, or null when
+   * nothing continues. One todo nudge per user turn: only before any continuation (so never after
+   * the nudge itself), never against a plugin's halt, and never in Plan mode, where the list is
+   * the plan. A nudge alone may only call todo_write (TODO_TURN_END_NUDGE_TOOL_POLICY).
+   */
+  private async readTurnStopContinuation(
+    payload: StreamEndEvent,
+    options: SendMessageOptions | undefined,
+    provenance: StopContinuationProvenance
+  ): Promise<TurnStopContinuation | null> {
+    const hookOutcome: TurnStopHookOutcome = (await this.aiService.runTurnStopHooks?.(
+      this.workspaceId,
+      {
+        messageId: payload.messageId,
+        lastAssistantMessage: lastAssistantText(payload.parts),
+        stopHookActive: this.stopHookContinuations > 0,
+        model: stopHookModel(payload, provenance),
+      }
+    )) ?? { kind: "none" };
+    return mergeTurnStopContinuation({
+      hookPrompt: hookOutcome.kind === "continue" ? hookOutcome.prompt : null,
+      todoNudge: await this.needsTodoNudge(hookOutcome, options, payload),
+      callerToolPolicy: options?.toolPolicy,
+    });
+  }
+
+  private async needsTodoNudge(
+    hookOutcome: TurnStopHookOutcome,
+    options: SendMessageOptions | undefined,
+    payload: StreamEndEvent
+  ): Promise<boolean> {
+    return (
+      hookOutcome.kind !== "halted" &&
+      this.stopHookContinuations === 0 &&
+      options != null &&
+      options.agentId !== "plan" &&
+      (await needsTodoTurnEndNudge({
+        sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
+        parts: payload.parts,
+      }))
+    );
   }
 
   /** The ending stream's provenance for a turn.stop continuation (read before its reset). */
@@ -13384,14 +13436,8 @@ export class AgentSession {
     // A newly authored manual turn replaces a resume still waiting on preflight I/O.
     if ((internal?.acceptanceOrigin ?? "manual") === "manual") this.pendingResumeIntent?.abort();
     this.emitQueuedMessageChanged();
-    // Signal to bash_output that it should return early to process queued messages
-    // only for tool-end dispatches. Return the same mode so the caller's foreground
-    // task waits follow the entry that will actually run, not a withdrawn FIFO head.
+    // Foreground task waits follow the entry that can actually run, not a withdrawn head.
     const nextDispatchableMode = this.messageQueue.getNextDispatchableMode();
-    this.backgroundProcessManager.setMessageQueued(
-      this.workspaceId,
-      nextDispatchableMode === "tool-end"
-    );
     // Undefined only if the entry just added is itself withdrawn; WorkspaceService.sendMessage
     // refuses those before enqueue, so null keeps its "nothing pending was queued" meaning.
     return nextDispatchableMode ?? null;
@@ -13403,7 +13449,6 @@ export class AgentSession {
     const callbackSets = this.messageQueue.getClearCallbacks();
     this.messageQueue.clear();
     this.emitQueuedMessageChanged();
-    this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
     for (const callbacks of callbackSets) {
       this.notifyQueuedMessageCleared(callbacks, cancelReason);
     }
@@ -13417,12 +13462,6 @@ export class AgentSession {
     }
 
     this.emitQueuedMessageChanged();
-    // Only the FIFO head can dispatch next; later hidden entries must not pull an earlier
-    // user-authored turn-end entry forward to a step boundary.
-    this.backgroundProcessManager.setMessageQueued(
-      this.workspaceId,
-      this.messageQueue.getNextDispatchableMode() === "tool-end"
-    );
     return true;
   }
 
@@ -13462,10 +13501,6 @@ export class AgentSession {
       return 0;
     }
     this.emitQueuedMessageChanged();
-    this.backgroundProcessManager.setMessageQueued(
-      this.workspaceId,
-      this.messageQueue.getNextDispatchableMode() === "tool-end"
-    );
     // Supersession is not withdrawal: a sub-agent progress report dropped because its child's
     // terminal outcome arrived carries workspace-turn continuation callbacks that would settle
     // this session's still-active delegated turn as interrupted (see
@@ -13498,10 +13533,6 @@ export class AgentSession {
       return false;
     }
     this.emitQueuedMessageChanged();
-    this.backgroundProcessManager.setMessageQueued(
-      this.workspaceId,
-      this.messageQueue.getNextDispatchableMode() === "tool-end"
-    );
     this.notifyQueuedMessageCleared(callbacks, cancelReason);
     return true;
   }
@@ -13633,8 +13664,23 @@ export class AgentSession {
   }
 
   hasQueuedMessages(dispatchMode?: "tool-end" | "turn-end"): boolean {
-    const nextMode = this.messageQueue.getNextDispatchableMode();
-    return nextMode != null && (dispatchMode == null || nextMode === dispatchMode);
+    // Input ownership survives admission refusal until the drain moves it to held input.
+    if (dispatchMode == null) {
+      return this.messageQueue.hasManualUserInput() || this.messageQueue.hasDispatchableEntries();
+    }
+    return (
+      !this.queueDispatchBlocked() && this.messageQueue.getNextDispatchableMode() === dispatchMode
+    );
+  }
+
+  /** Edit/compaction/Stop own the next dispatch; tools and queue drains share those barriers. */
+  private queueDispatchBlocked(): boolean {
+    return (
+      this.coordinator.closing ||
+      this.coordinator.editBlocked() ||
+      this.midStreamCompactionPending ||
+      this.isStopInProgress()
+    );
   }
 
   /** Queued intra-tree agent peer messages awaiting dispatch (peer-message queue cap input). */
@@ -13674,17 +13720,12 @@ export class AgentSession {
       if (continuationMetadata == null) {
         return true;
       }
-      return options?.promoteAheadOfHiddenTurnEnd === true
-        ? !this.messageQueue.hasAllWorkspaceTurnContinuationsAheadOfPromotedToolEnd(
-            continuationMetadata.taskHandleId,
-            continuationMetadata.ownerWorkspaceId,
-            continuationMetadata.turnId
-          )
-        : !this.messageQueue.hasAllWorkspaceTurnContinuations(
-            continuationMetadata.taskHandleId,
-            continuationMetadata.ownerWorkspaceId,
-            continuationMetadata.turnId
-          );
+      return !this.messageQueue.hasAllWorkspaceTurnContinuations(
+        continuationMetadata.taskHandleId,
+        continuationMetadata.ownerWorkspaceId,
+        continuationMetadata.turnId,
+        options
+      );
     }
 
     return false;
@@ -14223,6 +14264,14 @@ export class AgentSession {
     // Every queue mutation publishes here, so successor withdrawal is recorded before observers
     // (TaskService deferral reconciliation) read the receipt for this notification.
     this.settleWithdrawnQueueCutReceipts();
+    // Human and agent input share delivery, even without a mounted renderer.
+    if (this.hasQueuedMessages("tool-end")) {
+      for (const toolCallId of this.backgroundProcessManager.getForegroundToolCallIds(
+        this.workspaceId
+      )) {
+        this.backgroundProcessManager.sendToBackground(toolCallId);
+      }
+    }
     this.emitChatEvent(this.queuedMessageChangedEvent());
     // A queue mutation may remove the last blocker of goal advancement: a withdrawn, refused
     // or removed entry never streams, so its turn end never re-evaluates.
@@ -14288,19 +14337,12 @@ export class AgentSession {
     trigger: QueueDrainTrigger = "terminal",
     stopAdmission?: CompactionStopAdmission
   ): void {
-    if (
-      this.coordinator.closing ||
-      this.coordinator.editBlocked() ||
-      this.midStreamCompactionPending
-    )
-      return;
     // Stop-cascade barrier: hold queued entries (do not dequeue or consume them) while the
     // workspace's stop latch is held; the cascade's single clearQueue owns their removal.
-    if (this.isStopInProgress()) return;
+    if (this.queueDispatchBlocked()) return;
     using _dispatch = this.coordinator.enterExecution();
     const candidate = this.messageQueue.peekNext();
     if (candidate == null) {
-      this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
       return;
     }
     // Report-decision hold: the stream that just ended may still be deciding whether it carried
@@ -14415,10 +14457,6 @@ export class AgentSession {
           internal?.refreshCompactionAdmission?.(admission, fresh.data);
         }
       }
-      this.backgroundProcessManager.setMessageQueued(
-        this.workspaceId,
-        this.messageQueue.getNextDispatchableMode() === "tool-end"
-      );
       return this.sendMessage(message, options, {
         acceptanceOrigin: attempt.acceptanceOrigin,
         ...internal,
@@ -16843,10 +16881,6 @@ export class AgentSession {
         muxMetadata.skillName === ref.skillName
           ? (muxMetadata.arguments ?? "")
           : null;
-      const argumentBody =
-        slashArgumentText != null
-          ? substituteSkillArguments(skill.body, slashArgumentText).body
-          : skill.body;
       // ${CLAUDE_SKILL_DIR}/${CLAUDE_PLUGIN_ROOT} next: after arguments (Claude Code's
       // order), before dynamic context. Directive lines keep the placeholders and get
       // the values as env vars, so !`sh "${CLAUDE_SKILL_DIR}/x.sh"` runs the bundled
@@ -16854,10 +16888,16 @@ export class AgentSession {
       const skillDirectory = resolveSkillDirectory(resolved, runtime, {
         discoveredOutsideWorkspace: skillDiscoveryPath !== workspacePath,
       });
-      const substitutedBody = substituteSkillDirectoryPlaceholdersOutsideDirectives(
-        argumentBody,
-        skillDirectory
-      );
+      // Line by line, so only the raw body's directive lines can run (#6766): the plugin
+      // consent fingerprint covers those, and a slash argument with a newline must not add one.
+      const substituted = substituteSkillBodyForDirectives({
+        rawBody: skill.body,
+        substituteArguments:
+          slashArgumentText != null
+            ? createSkillArgumentSubstituter(slashArgumentText)
+            : (line) => line,
+        substituteText: (text) => substituteSkillDirectoryPlaceholders(text, skillDirectory),
+      });
 
       // Dynamic context injection (default-off experiment): replace whole-line
       // !`command` directives with their output. Ordering matters: it runs after
@@ -16869,7 +16909,8 @@ export class AgentSession {
       // path and never runs directives (it only substitutes skill directories).
       const injectedBody = await this.maybeInjectSkillDynamicContext({
         skillName: skill.frontmatter.name,
-        body: substitutedBody,
+        body: substituted.body,
+        runnableLines: substituted.runnableLines,
         runtime,
         workspacePath,
         env: skillDirectoryEnv(skillDirectory),
@@ -16975,6 +17016,8 @@ export class AgentSession {
   private async maybeInjectSkillDynamicContext(args: {
     skillName: string;
     body: string;
+    /** Lines that may run as directives (substituteSkillBodyForDirectives). */
+    runnableLines: ReadonlySet<number>;
     runtime: Runtime;
     workspacePath: string;
     /** Skill-directory variables for directive commands (skillDirectoryEnv). */
@@ -16987,6 +17030,7 @@ export class AgentSession {
     try {
       const result = await injectSkillDynamicContext({
         body: args.body,
+        runnableLines: args.runnableLines,
         // SECURITY AUDIT: this sink executes shell commands sourced from SKILL.md
         // bodies, which are repo-controlled and therefore attacker-controlled input
         // (any cloned repo can ship arbitrary skills). It is acceptable only because:

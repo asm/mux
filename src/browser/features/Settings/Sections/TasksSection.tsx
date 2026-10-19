@@ -51,6 +51,7 @@ import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { FALLBACK_AGENTS, deriveTasksSectionAgentGroups } from "./TasksSection.agents";
+import { AgentResourceLimitsSettings } from "./AgentResourceLimitsSettings";
 
 const INHERIT = "__inherit__";
 /** Shown while an autosave waits for the connection. */
@@ -195,7 +196,7 @@ function renderPolicySummary(agent: AgentDefinitionDescriptor): React.ReactNode 
             <ul className="mt-1 space-y-0.5">
               {toolAdd.map((pattern) => (
                 <li key={`add:${pattern}`}>
-                  <span className="text-green-500">+</span> <code>{pattern}</code>
+                  <span className="text-success-text">+</span> <code>{pattern}</code>
                 </li>
               ))}
               {toolRemove.map((pattern) => (
@@ -1145,9 +1146,7 @@ export function TasksSection() {
           <div className="flex items-center justify-between gap-4">
             <div className="flex-1">
               <div className="text-foreground text-sm">Default new-workspace agent</div>
-              <div className="text-muted text-xs">
-                Applies when a project does not have its own agent preference yet.
-              </div>
+              <div className="text-muted text-xs">New chats start with this agent.</div>
             </div>
             <Select
               value={newWorkspaceDefaultAgentId}
@@ -1228,6 +1227,8 @@ export function TasksSection() {
 
         {saveError ? <div className="text-danger-light mt-4 text-xs">{saveError}</div> : null}
       </div>
+
+      <AgentResourceLimitsSettings />
 
       <div>
         <h3 className="text-foreground mb-1 text-sm font-medium">Agent Defaults</h3>

@@ -1,4 +1,4 @@
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
@@ -351,7 +351,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         historySequence: 2,
         startTime: STABLE_TIMESTAMP,
       });
-      await expect(await canvas.findByText(/streaming\.\.\./)).toBeVisible();
+      await expect(await canvas.findByText(/ streaming$/)).toBeVisible();
       await checkTranscriptLayout(canvasElement);
       await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       emitChat(history);

@@ -1628,10 +1628,9 @@ export class ProjectService {
   }
 
   /**
-   * Creation drafts are keyed by the owning project; delete them server-side so a removal from
-   * any client (or none mounted) leaves no draft files behind. Best-effort like the secrets
-   * cleanup: the startup GC removes whatever this misses. Returns the deleted drafts, whose
-   * localStorage keys the removing renderer cleans up (its own list may not have hydrated yet).
+   * Delete the creation drafts whose project field is a removed project, server-side, so a
+   * removal from any client (or none mounted) leaves none behind. Best-effort like the secrets
+   * cleanup: a record this misses stays as an orphan file. Returns the deleted drafts.
    */
   private async deleteCreationDrafts(projectPaths: string[]): Promise<RemovedCreationDraft[]> {
     const removed: RemovedCreationDraft[] = [];
@@ -1802,6 +1801,11 @@ export class ProjectService {
           "user.name=mux",
           "-c",
           "user.email=mux@localhost",
+          // No `git maintenance run --auto --detach` after the commit: a repository with one
+          // empty commit needs none, and a failed create deletes this directory right after
+          // the commit, while that detached git would still be using it.
+          "-c",
+          "maintenance.auto=false",
           "commit",
           "--allow-empty",
           "-m",
@@ -2091,6 +2095,18 @@ export class ProjectService {
         throw new Error(`Project not found: ${normalizedPath}`);
       }
       project.color = color ?? undefined;
+      return config;
+    });
+  }
+
+  async setIcon(projectPath: string, icon: string | null | undefined): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      project.icon = icon ?? undefined;
       return config;
     });
   }

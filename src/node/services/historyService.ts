@@ -620,6 +620,16 @@ function verifyHistoryEditPrecondition(
  */
 class TruncateRecoveryError extends Error {}
 
+/** Size of each chunk when scanning the file in reverse (256KB covers typical post-compaction content). */
+const REVERSE_READ_CHUNK_SIZE = 256 * 1024;
+
+/** String-search needles for context boundary lines. */
+const BOUNDARY_NEEDLES = [
+  // Shared with the provider scanner so rotation and provider reads recognize the same rows.
+  SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE,
+  `"contextBoundaryKind":"${CONTEXT_BOUNDARY_KINDS.RESET}"`,
+] as const;
+
 export class HistoryService {
   private getAppendProvenance(workspaceId: string): HistoryAppendProvenance {
     return new HistoryAppendProvenance(this.getSessionDir(workspaceId));
@@ -1880,15 +1890,6 @@ export class HistoryService {
   // These helpers take a file path so they work on both chat.jsonl and
   // chat-archive.jsonl.
 
-  /** Size of each chunk when scanning the file in reverse (256KB covers typical post-compaction content). */
-  private static readonly REVERSE_READ_CHUNK_SIZE = 256 * 1024;
-  /** String-search needles for context boundary lines. */
-  private static readonly BOUNDARY_NEEDLES = [
-    // Shared with the provider scanner so rotation and provider reads recognize the same rows.
-    SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE,
-    `"contextBoundaryKind":"${CONTEXT_BOUNDARY_KINDS.RESET}"`,
-  ] as const;
-
   /**
    * Scan a history file in reverse to find the byte offset of a durable compaction boundary.
    * Returns `null` when no (matching) boundary exists.
@@ -1920,7 +1921,7 @@ export class HistoryService {
       let skipped = 0;
 
       while (readEnd > 0) {
-        const readStart = Math.max(0, readEnd - HistoryService.REVERSE_READ_CHUNK_SIZE);
+        const readStart = Math.max(0, readEnd - REVERSE_READ_CHUNK_SIZE);
         const chunkSize = readEnd - readStart;
         const rawChunk = Buffer.alloc(chunkSize);
         await fh.read(rawChunk, 0, chunkSize, readStart);
@@ -1959,7 +1960,7 @@ export class HistoryService {
           if (lineEnd <= lineStart) continue; // empty line
 
           const line = buffer.subarray(lineStart, lineEnd).toString("utf-8");
-          if (HistoryService.BOUNDARY_NEEDLES.some((needle) => line.includes(needle))) {
+          if (BOUNDARY_NEEDLES.some((needle) => line.includes(needle))) {
             try {
               const msg = JSON.parse(line) as MuxMessage;
               if (isDurableContextBoundaryMarker(msg)) {
@@ -1981,7 +1982,7 @@ export class HistoryService {
       // Check the very first line (accumulated in carryover)
       if (carryoverBytes.length > 0) {
         const line = carryoverBytes.toString("utf-8");
-        if (HistoryService.BOUNDARY_NEEDLES.some((needle) => line.includes(needle))) {
+        if (BOUNDARY_NEEDLES.some((needle) => line.includes(needle))) {
           try {
             const msg = JSON.parse(line) as MuxMessage;
             if (isDurableContextBoundaryMarker(msg)) {
@@ -2058,7 +2059,7 @@ export class HistoryService {
       let carryoverBytes = Buffer.alloc(0);
 
       while (readEnd > 0 && collected.length < n) {
-        const readStart = Math.max(0, readEnd - HistoryService.REVERSE_READ_CHUNK_SIZE);
+        const readStart = Math.max(0, readEnd - REVERSE_READ_CHUNK_SIZE);
         const chunkSize = readEnd - readStart;
         const rawChunk = Buffer.alloc(chunkSize);
         await fh.read(rawChunk, 0, chunkSize, readStart);
@@ -2197,7 +2198,7 @@ export class HistoryService {
 
       while (readPos < fileSize) {
         const remaining = fileSize - readPos;
-        const toRead = Math.min(HistoryService.REVERSE_READ_CHUNK_SIZE, remaining);
+        const toRead = Math.min(REVERSE_READ_CHUNK_SIZE, remaining);
         const allocation = Buffer.alloc(toRead);
         const { bytesRead } = await fh.read(allocation, 0, toRead, readPos);
         if (bytesRead === 0) throw new Error("History ended before its captured size");
@@ -2299,7 +2300,7 @@ export class HistoryService {
       let carryoverBytes = Buffer.alloc(0);
 
       while (readEnd > 0) {
-        const readStart = Math.max(0, readEnd - HistoryService.REVERSE_READ_CHUNK_SIZE);
+        const readStart = Math.max(0, readEnd - REVERSE_READ_CHUNK_SIZE);
         const chunkSize = readEnd - readStart;
         const rawChunk = Buffer.alloc(chunkSize);
         await fh.read(rawChunk, 0, chunkSize, readStart);
@@ -3262,6 +3263,36 @@ export class HistoryService {
    */
   async readStatusPartial(workspaceId: string): Promise<MuxMessage | null> {
     return this.readPartialFile(workspaceId, { status: true });
+  }
+
+  /**
+   * The static workspace view's partial read (workspace.history.tail, #6832): at most `maxBytes` + 1
+   * bytes, so a large partial never costs a full read and parse. "oversized" past `maxBytes`; null
+   * when absent, unreadable or malformed, as readPartial treats those.
+   */
+  async readBoundedPartial(
+    workspaceId: string,
+    maxBytes: number
+  ): Promise<MuxMessage | null | "oversized"> {
+    let handle: fs.FileHandle | undefined;
+    try {
+      handle = await fs.open(this.getPartialPath(workspaceId), "r");
+      const buffer = Buffer.allocUnsafe(maxBytes + 1);
+      let length = 0;
+      // A positioned read can return fewer bytes than asked before EOF (some network filesystems).
+      while (length < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+        if (bytesRead === 0) break;
+        length += bytesRead;
+      }
+      if (length > maxBytes) return "oversized";
+      const message: unknown = JSON.parse(buffer.toString("utf8", 0, length));
+      return isReadableHistoryMessage(message) ? normalizePersistedMessage(message) : null;
+    } catch {
+      return null;
+    } finally {
+      await handle?.close();
+    }
   }
 
   private async readPartialFile(

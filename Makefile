@@ -98,7 +98,7 @@ include fmt.mk
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
-.PHONY: benchmark-terminal bench bench-compare first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e
+.PHONY: benchmark-terminal bench bench-compare first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e test-stories generate-phone-chrome check-phone-chrome
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
 
@@ -254,7 +254,7 @@ bug-bash-sandbox-check: build-main build-renderer build-static ## Check the bug-
 # The repros of fixed bugs through the sandbox launcher, all on the mock app AI (the launcher gives
 # exact-step runs no model). CI's bugbash-sandbox job runs this.
 test-bugbash-repros-sandbox: build-main build-renderer build-static ## Bug-bash repros of fixed bugs in the bug-bash sandbox, mock app AI (no key, no model)
-	@cd tests/bugbash && BUGBASH_AI=mock BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="sandbox repros" bun sandbox/launch.ts -- run --config e2e.config.ts --exclude-tag known-failure --output .e2e/repros-sandbox-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(BUGBASH_REPRO_ARGS)
+	@cd tests/bugbash && BUGBASH_AI=mock BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="sandbox repros" bun sandbox/launch.ts -- run --config e2e.config.ts --exclude-tag known-failure --exclude-tag agent --output .e2e/repros-sandbox-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(BUGBASH_REPRO_ARGS)
 
 # Every sandbox launch lists the job containers that crashed launches of this checkout left
 # (#5882). This removes the ones whose launcher is gone, by ID, and lists the rest.
@@ -262,7 +262,8 @@ bug-bash-sandbox-recover: ## Remove bug-bash sandbox containers of this checkout
 	@cd tests/bugbash && bun sandbox/launch.ts --recover
 
 # Bug-bash repro tests (tests/bugbash/repros/*.e2e.ts): exact UI steps, no model calls, against a
-# seeded `xum server` (tests/bugbash/startApp.ts). e2e needs Node.js 22.22.3+ or 24.8+ (E2E_NODE)
+# seeded `xum server` (tests/bugbash/startApp.ts). Repros tagged `agent` use agent.* steps, so
+# every run here passes --exclude-tag agent: only a model-driven sandbox job can run them. e2e needs Node.js 22.22.3+ or 24.8+ (E2E_NODE)
 # and its own Chromium: `node_modules/.bin/e2e-web install chromium`.
 E2E_NODE ?= node
 BUGBASH_REPRO_RUN = cd tests/bugbash && E2E_TELEMETRY_DISABLED=1 PATH="$$(dirname "$$(command -v $(E2E_NODE))"):$$PATH" $(E2E_NODE) ../../node_modules/.bin/e2e run --config e2e.config.ts
@@ -274,13 +275,13 @@ test-bugbash-repros: build-main build-renderer build-static ## Bug-bash repro te
 	@rm -rf tests/bugbash/.e2e/repros-mock tests/bugbash/.e2e/repros
 	@# [mock:...] prompts and terminals only work against the mock AI, so repros tagged mock-only pin it. Export
 	@# it: a `VAR=x cd ... && e2e` prefix would set it for `cd` only.
-	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="mock-only repros"; $(BUGBASH_REPRO_RUN) --tag mock-only --exclude-tag known-failure --pass-with-no-tests --output .e2e/repros-mock $(BUGBASH_REPRO_ARGS)
+	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="mock-only repros"; $(BUGBASH_REPRO_RUN) --tag mock-only --exclude-tag known-failure --exclude-tag agent --pass-with-no-tests --output .e2e/repros-mock $(BUGBASH_REPRO_ARGS)
 	@# The other repros run on the app AI that BUGBASH_AI picks (default auto: real with a working key).
-	@ai="$$(bun tests/bugbash/aiMode.ts)" || exit 2; eval "$$ai"; $(BUGBASH_REPRO_RUN) --exclude-tag mock-only --exclude-tag known-failure --pass-with-no-tests --output .e2e/repros $(BUGBASH_REPRO_ARGS)
+	@ai="$$(bun tests/bugbash/aiMode.ts)" || exit 2; eval "$$ai"; $(BUGBASH_REPRO_RUN) --exclude-tag mock-only --exclude-tag known-failure --exclude-tag agent --pass-with-no-tests --output .e2e/repros $(BUGBASH_REPRO_ARGS)
 	@bun tests/bugbash/reproSelection.ts tests/bugbash/.e2e/repros-mock/report.json tests/bugbash/.e2e/repros/report.json
 
 test-bugbash-known-failures: build-main build-renderer build-static ## Bug-bash repros of open bugs: each fails until its issue is fixed
-	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="known-failure repros"; $(BUGBASH_REPRO_RUN) --tag known-failure --output .e2e/repros-known $(BUGBASH_REPRO_ARGS)
+	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="known-failure repros"; $(BUGBASH_REPRO_RUN) --tag known-failure --exclude-tag agent --output .e2e/repros-known $(BUGBASH_REPRO_ARGS)
 
 # The MCP Apps suite runs only in the bug-bash sandbox (tests/bugbash/sandbox/launch.ts, #5714).
 # agent.act steps reach BUGBASH_MODEL through a provider proxy for the job, so the host needs
@@ -295,14 +296,50 @@ mcp-apps-e2e: ## MCP Apps e2e suite in the bug-bash sandbox (needs BUGBASH_BUDGE
 	@# keeps two runs that start in the same second apart (their output and proxy record).
 	@$(MCP_APPS_LAUNCH) -- run --config e2e.mcpapps.config.ts --output .e2e/mcp-apps-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(MCP_APPS_E2E_ARGS)
 
+# The story suite (tests/stories, agent.* steps), the Electron stories (tests/stories/electron)
+# and the agent-tagged repros run only in the bug-bash sandbox (tests/bugbash/sandbox/launch.ts,
+# #5714), each as its own job with its own 30-minute deadline and budget. Their agents
+# reach BUGBASH_MODEL (default Sonnet 5.5) through a provider proxy for the job, so the host needs
+# BUGBASH_BUDGET_USD (a list-price cap per job) and ANTHROPIC_API_KEY plus ANTHROPIC_BASE_URL. The
+# app AI stays the mock. No agent repro exists yet, so that job may select none. As in
+# mcp-apps-e2e, the checks run before the build, and no build goal may share its make command line.
+STORIES_ENV = BUGBASH_AI=mock BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="story tests"
+STORIES_LAUNCH = cd tests/stories && $(STORIES_ENV) bun ../bugbash/sandbox/launch.ts
+AGENT_REPROS_LAUNCH = cd tests/bugbash && $(STORIES_ENV) bun sandbox/launch.ts
+STORIES_RUN = run --config e2e.config.ts --exclude-tag known-failure
+AGENT_REPROS_RUN = run --config e2e.config.ts --tag agent --exclude-tag known-failure --pass-with-no-tests
+STORIES_ELECTRON_RUN = run --config e2e.electron.config.ts --exclude-tag known-failure
+# The Electron binary of node_modules/electron: its postinstall downloads it, and a bun install
+# that skipped it leaves none. The Electron stories mount node_modules read-only, so the host
+# fetches it (launch.ts refuses an Electron job without it). A no-op once it is there.
+.PHONY: electron-binary
+electron-binary: ## Download the Electron binary into node_modules/electron (the Electron stories need it)
+	@node node_modules/electron/install.js
+test-stories: electron-binary ## Story tests, Electron stories and agent-tagged repros in the bug-bash sandbox (needs BUGBASH_BUDGET_USD)
+	@$(STORIES_LAUNCH) --preflight -- $(STORIES_RUN) --output .e2e/stories-preflight $(STORIES_ARGS)
+	@$(STORIES_LAUNCH) --preflight -- $(STORIES_ELECTRON_RUN) --output .e2e/stories-electron-preflight $(STORIES_ARGS)
+	@$(AGENT_REPROS_LAUNCH) --preflight -- $(AGENT_REPROS_RUN) --output .e2e/agent-repros-preflight $(STORIES_ARGS)
+	@# build-preload: Xum Electron's windows load dist/preload.js.
+	@$(MAKE) --no-print-directory build-main build-preload build-renderer build-static
+	@# The shell PID keeps two runs that start in the same second apart (their output and proxy record).
+	@$(STORIES_LAUNCH) -- $(STORIES_RUN) --output .e2e/stories-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(STORIES_ARGS)
+	@$(AGENT_REPROS_LAUNCH) -- $(AGENT_REPROS_RUN) --output .e2e/agent-repros-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(STORIES_ARGS)
+	@# Last: make stops at the first failed job, so a failed Electron job skips no other job.
+	@$(STORIES_LAUNCH) -- $(STORIES_ELECTRON_RUN) --output .e2e/stories-electron-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(STORIES_ARGS)
+
 rlm-eval: ## Run the RLM lever eval against a running dev-server sandbox (see scripts/rlm-eval/run.ts header)
 	@bun run scripts/rlm-eval/run.ts $(RLM_EVAL_ARGS)
 
 start: node_modules/.installed build-main build-preload build-static ## Build and start Electron app
 	@NODE_ENV=development XUM_PROFILE_REACT=$(XUM_PROFILE_REACT) bunx electron --remote-debugging-port=9222 .
 
+# #6867: the shipped worker must carry a build id, or every release shares one cache again.
+SERVICE_WORKER_STAMP_CHECK = grep -Eq '^const BUILD_ID = "[0-9a-f]{12}";$$' dist/service-worker.js || \
+	{ echo "dist/service-worker.js has no build id (scripts/stamp-service-worker.ts did not run)"; exit 1; }
+
 ## Build targets (can run in parallel)
 build: node_modules/.installed src/version.ts build-renderer build-main build-preload build-icons build-static ## Build all targets
+	@$(SERVICE_WORKER_STAMP_CHECK)
 
 .PHONY: update-models
 update-models: node_modules/.installed ## Fetch latest LiteLLM model data, validate it, update models.json if changed
@@ -318,7 +355,7 @@ build: update-models
 build-renderer dist/cli/index.js dist/cli/api.mjs: update-models
 endif
 
-build-main: node_modules/.installed dist/cli/index.js dist/cli/api.mjs ## Build main process
+build-main: node_modules/.installed dist/cli/index.js dist/cli/api.mjs dist/workers/staticRowTree.worker.js ## Build main process
 
 BUILTIN_AGENTS_GENERATED := src/node/services/agentDefinitions/builtInAgentContent.generated.ts
 BUILTIN_SKILLS_GENERATED := src/node/services/agentSkills/builtInSkillContent.generated.ts
@@ -351,6 +388,11 @@ dist/cli/api.mjs: src/cli/api.ts src/cli/proxifyOrpc.ts $(TS_SOURCES) node_modul
 	@echo "Building API CLI (ESM)..."
 	@$(ESBUILD_BIN) src/cli/api.ts $(ESBUILD_CLI_FLAGS)
 
+# Node worker of `xum server` for the static workspace view (see scripts/build-row-tree-worker.ts).
+dist/workers/staticRowTree.worker.js: scripts/build-row-tree-worker.ts $(TS_SOURCES) node_modules/.installed
+	@echo "Building static view row-tree worker..."
+	@bun scripts/build-row-tree-worker.ts $@
+
 build-preload: node_modules/.installed dist/preload.js ## Build preload script
 
 dist/preload.js: src/desktop/preload.ts $(TS_SOURCES)
@@ -366,12 +408,15 @@ build-renderer: node_modules/.installed src/version.ts ## Build renderer process
 	@echo "Building renderer..."
 	@bun x vite build
 	@bun scripts/precompress-static.ts dist
+	@# #6867: one service worker cache per build (needs the built index.html and the .br files).
+	@bun scripts/stamp-service-worker.ts dist
 
 build-static: ## Copy static assets to dist
 	@echo "Copying static assets..."
 	@mkdir -p dist
 	@cp static/splash.html dist/splash.html
-	@cp -r public/* dist/
+	@# Not public/service-worker.js: build-renderer's Vite copy is stamped with the build (#6867).
+	@find public -mindepth 1 -maxdepth 1 ! -name service-worker.js -exec cp -r {} dist/ \;
 	@# Copy TypeScript lib files for PTC runtime type validation (es5 through es2023).
 	@# electron-builder ignores .d.ts files by default and this cannot be overridden:
 	@# https://github.com/electron-userland/electron-builder/issues/5064
@@ -393,6 +438,7 @@ build-static: ## Copy static assets to dist
 build-docker-runtime: build-main build-renderer build-static dist/runtime/server-bundle.js dist/runtime/tokenizer.worker.js dist/runtime/mcpIconDecode.js dist/runtime/analyticsWorker.js dist/static/.copied ## Build Docker runtime artifacts
 
 verify-docker-runtime-artifacts: build-docker-runtime ## Verify required Docker runtime artifacts exist
+	@$(SERVICE_WORKER_STAMP_CHECK)
 	@test -f dist/runtime/server-bundle.js
 	@test -f dist/runtime/tokenizer.worker.js
 	@for e in $(TOKENIZER_ENCODINGS); do \
@@ -401,6 +447,7 @@ verify-docker-runtime-artifacts: build-docker-runtime ## Verify required Docker 
 	done
 	@test -f dist/runtime/mcpIconDecode.js
 	@test -f dist/runtime/analyticsWorker.js
+	@test -f dist/workers/staticRowTree.worker.js
 	@test -f dist/static/splash.html
 	@test -f dist/typescript-lib/lib.es2023.d.ts.txt
 
@@ -845,6 +892,12 @@ page-timing: node_modules/.installed ## Paired mobile UCS/IR timing of two built
 
 first-run-view-parity: node_modules/.installed ## Static vs live first-run view boxes and screenshots, 4 widths x 2 themes (FIRST_RUN_VIEW_PARITY_ARGS; see scripts/perf/firstRunViewParity.ts)
 	@node --import tsx scripts/perf/firstRunViewParity.ts $(FIRST_RUN_VIEW_PARITY_ARGS)
+
+generate-phone-chrome: build-main build-renderer build-static ## Capture the phone skeleton of the static workspace view from the live page (see scripts/perf/generatePhoneChrome.ts)
+	@bun scripts/perf/generatePhoneChrome.ts $(PHONE_CHROME_ARGS)
+
+check-phone-chrome: node_modules/.installed ## Fail when the built live phone workspace page (run `make build` first) drifted from the checked-in skeleton
+	@bun scripts/perf/generatePhoneChrome.ts --check $(PHONE_CHROME_ARGS)
 
 benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE/TB_HARBOR_DAYTONA_PACKAGE/TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)
 	@# Pin Harbor with the Daytona extra so scheduled ingestion does not break on future CLI or adapter API drift.

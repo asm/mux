@@ -11,7 +11,7 @@ import { ORPCError } from "@orpc/server";
 import type { SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import { SshPromptService } from "@/node/services/sshPromptService";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
-import { DraftService } from "./draftService";
+import { CreationDraftService } from "./creationDraftService";
 import { ProjectService, type CloneEvent } from "./projectService";
 import {
   projectRegistrationLockFilePath,
@@ -2293,6 +2293,26 @@ exit 1
       expect(branchResult.recommendedTrunk).toBe("main");
     });
 
+    // A failed create removes the directory right after the initial commit. A detached
+    // `git maintenance run --auto` from that commit was still using the repository then, and
+    // Bun's recursive fs.rm can stop early without an error when an entry it listed is
+    // removed meanwhile, so the "fails initGit create without leaving .git" test saw the
+    // directory survive about 1 run in 40 with git 2.55.
+    it("starts no background git maintenance that outlives the initial commit", async () => {
+      const testDir = path.join(tempDir, "no-maintenance");
+      await fs.mkdir(testDir);
+      const tracePath = path.join(tempDir, "git-trace2.json");
+
+      const result = await withEnv({ GIT_TRACE2_EVENT: tracePath }, () => service.gitInit(testDir));
+
+      expect(result.success).toBe(true);
+      // The commit writes the child_start event for a maintenance child before it exits, so
+      // the child shows up here even if it detached and has not run yet.
+      const trace = await fs.readFile(tracePath, "utf-8");
+      expect(trace).toContain('"hierarchy":"commit"');
+      expect(trace).not.toContain('"maintenance"');
+    });
+
     it("succeeds for unborn git repo (git init but no commits)", async () => {
       const testDir = path.join(tempDir, "unborn-git");
       await fs.mkdir(testDir);
@@ -2401,6 +2421,26 @@ exit 1
           { projectPath: childPath, trusted: true },
         ],
       ]);
+    });
+
+    it("setIcon stores an icon name and null clears it", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await config.editConfig((current) => {
+        current.projects.set(projectPath, { workspaces: [] });
+        return current;
+      });
+
+      await service.setIcon(projectPath, "rocket");
+      expect(new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.icon).toBe(
+        "rocket"
+      );
+
+      await service.setIcon(projectPath, null);
+      const [listed] = service.list().filter(([listedPath]) => listedPath === projectPath);
+      expect(listed?.[1]).not.toHaveProperty("icon");
+      expect(
+        new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)
+      ).not.toHaveProperty("icon");
     });
 
     it("validates, writes, and clears code workspace sync paths", async () => {
@@ -2880,11 +2920,10 @@ exit 1
       const cfg = config.loadConfigOrDefault();
       cfg.projects.set(projectPath, { workspaces: [] });
       await config.editConfig(() => cfg);
-      const draftService = new DraftService(config);
+      const draftService = new CreationDraftService(config);
       service.setDraftCleaner(draftService);
-      const draftScope = { kind: "creation" as const, projectPath, draftId: "draft-1" };
-      await draftService.update({ scope: draftScope, text: "unsent" });
-      await draftService.putListEntry({ ...draftScope, subProjectPath: null, createdAt: 1 });
+      const scope = { kind: "creation" as const, draftId: "draft-1" };
+      await draftService.update({ scope, projectPath, text: "unsent" });
 
       const result = await service.remove(projectPath);
 
@@ -2896,8 +2935,8 @@ exit 1
       const after = config.loadConfigOrDefault();
       expect(after.projects.has(projectPath)).toBe(false);
       // Removal cleans the draft files server-side, whichever client (if any) removed it.
-      expect(await fs.readdir(path.join(config.rootDir, "drafts"))).toEqual(["list.json"]);
-      expect((await draftService.getList()).entries).toEqual([]);
+      expect(await fs.readdir(path.join(config.rootDir, "creation-drafts"))).toEqual([]);
+      expect((await draftService.list()).drafts).toEqual([]);
     });
 
     it.each([
@@ -2910,19 +2949,18 @@ exit 1
       cfg.projects.set(parentPath, { workspaces: [] });
       cfg.projects.set(childPath, { workspaces: [], parentProjectPath: parentPath });
       await config.editConfig(() => cfg);
-      const draftService = new DraftService(config);
+      const draftService = new CreationDraftService(config);
       service.setDraftCleaner(draftService);
-      const draftScope = { kind: "creation" as const, projectPath: childPath, draftId: "draft-1" };
-      await draftService.update({ scope: draftScope, text: "unsent" });
-      await draftService.putListEntry({ ...draftScope, subProjectPath: null, createdAt: 1 });
+      const scope = { kind: "creation" as const, draftId: "draft-1" };
+      await draftService.update({ scope, projectPath: childPath, text: "unsent" });
 
       const result = await service.remove(removedPath);
 
       expect(result.success && result.data.removedCreationDrafts).toEqual([
         { projectPath: childPath, draftId: "draft-1" },
       ]);
-      expect(await fs.readdir(path.join(config.rootDir, "drafts"))).toEqual(["list.json"]);
-      expect((await draftService.getList()).entries).toEqual([]);
+      expect(await fs.readdir(path.join(config.rootDir, "creation-drafts"))).toEqual([]);
+      expect((await draftService.list()).drafts).toEqual([]);
     });
 
     it("returns project_not_found for unknown project", async () => {

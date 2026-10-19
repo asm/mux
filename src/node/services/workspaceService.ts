@@ -1,5 +1,6 @@
 import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { messagesCarryProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
+import { humanId } from "human-id";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import { removeRuntimeScratchDir } from "@/node/runtime/runtimeScratchDir";
 import type { ContextManagementService } from "./contextManagement/contextManagementService";
@@ -71,6 +72,7 @@ import { codexPluginHookService } from "@/node/services/agentPlugins/codexHookSe
 import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
+import type { ExtensionAgentStatus } from "@/node/utils/extensionMetadata";
 import {
   AgentSession,
   clearProviderConfigFixableAbandonMarkers,
@@ -297,8 +299,12 @@ import type {
   WorkspaceRemovalDescendant,
   WorkspaceRemoveWarning,
 } from "@/common/types/workspace";
-import { isDynamicToolPart } from "@/common/types/toolParts";
-import { buildAskUserQuestionSummary } from "@/common/utils/tools/askUserQuestionSummary";
+import { type DynamicToolPart, isDynamicToolPart } from "@/common/types/toolParts";
+import {
+  ASK_USER_QUESTION_NOT_WAITING_MESSAGE,
+  buildAskUserQuestionSummary,
+  isAsyncAskUserQuestionOutput,
+} from "@/common/utils/tools/askUserQuestionSummary";
 import {
   AskUserQuestionToolArgsSchema,
   AskUserQuestionToolResultSchema,
@@ -425,6 +431,7 @@ import {
   type AgentMessageDispatchMode,
   getValidAgentMessageDispatchMode,
   getValidUnrelatedWorkspaceConsent,
+  normalizeMessagingTag,
 } from "@/common/orpc/schemas/workspace";
 import type {
   ArchiveLossyUntrackedFilesConfirmation,
@@ -668,11 +675,23 @@ interface ActiveWorkflowRunIdsOptions {
 }
 
 /**
- * Base name used when /new auto-generates a branch name. Numbered suffixes
- * (`workspace-1`, `workspace-2`, ...) come from {@link generateForkBranchName}
- * so the existing fork-style numbering helpers stay the single source of truth.
+ * Random draws before an auto-generated name falls back to a numbered suffix. The pool holds
+ * millions of names, so a collision past the first draw means the generator is stubbed.
  */
-const AUTO_NEW_WORKSPACE_BASE_NAME = "workspace";
+const AUTO_WORKSPACE_NAME_ATTEMPTS = 10;
+
+/**
+ * Docker-style provisional names ("calm-otters-sing") read better than "workspace-N" while
+ * auto-naming runs, and do not look like a numbered sequence the user has to manage.
+ */
+export function generateAutoWorkspaceName(existingNames: ReadonlySet<string>): string {
+  let candidate = "";
+  for (let attempt = 0; attempt < AUTO_WORKSPACE_NAME_ATTEMPTS; attempt++) {
+    candidate = humanId({ separator: "-", capitalize: false });
+    if (!existingNames.has(candidate)) return candidate;
+  }
+  return generateForkBranchName(candidate, [...existingNames]);
+}
 
 // Keep short to feel instant, but debounce bursts of file_edit_* tool calls.
 
@@ -1043,11 +1062,6 @@ function withEffectiveHeartbeatInterval(
   return { ...settings, intervalMs: settings.intervalMs ?? defaultIntervalMs };
 }
 
-interface WorkspaceAgentStatus {
-  emoji: string;
-  message: string;
-  url?: string;
-}
 type WorkspaceRuntimeStatus = "running" | "stopped" | "unknown" | "unsupported";
 
 /** Narrow DevTools cleanup surface used on archive/remove and by the startup sweep. */
@@ -1728,7 +1742,7 @@ async function copyDirIfMissingBestEffort(params: {
       }
     }
 
-    await fsPromises.mkdir(path.dirname(params.destDir), { recursive: true });
+    // fs.cp creates missing parent folders of destDir itself (Node and Bun).
     await fsPromises.cp(params.srcDir, params.destDir, { recursive: true });
   } catch (error: unknown) {
     if (isErrnoWithCode(error, "ENOENT")) {
@@ -1742,6 +1756,17 @@ async function copyDirIfMissingBestEffort(params: {
       error: getErrorMessage(error),
     });
   }
+}
+
+/**
+ * Index entries a rollup can merge: a non-empty task id and an object value. Self-healing: the
+ * index files are read without per-entry validation, and one malformed entry (e.g. null) would
+ * throw in the merge and drop every other entry of the rollup.
+ */
+function mergeableIndexEntries<T>(entries: Array<[string, T]>): Array<[string, T]> {
+  return entries.filter(
+    ([taskId, entry]) => taskId.length > 0 && entry != null && typeof entry === "object"
+  );
 }
 
 function coerceUpdatedAtMs(entry: { createdAtMs?: number; updatedAtMs?: number }): number {
@@ -2139,9 +2164,11 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
         workspaceId: params.parentWorkspaceId,
         workspaceSessionDir: params.parentSessionDir,
         update: (parentFile) => {
-          for (const [taskId, childEntry] of childEntries) {
-            if (!taskId) continue;
-
+          // rollUpAncestorWorkspaceIds reads the array, so an entry without one is skipped too.
+          const mergeable = mergeableIndexEntries(childEntries).filter(([, entry]) =>
+            Array.isArray(entry.ancestorWorkspaceIds)
+          );
+          for (const [taskId, childEntry] of mergeable) {
             const existing = parentFile.artifactsByChildTaskId[taskId] ?? null;
             const childUpdated = coerceUpdatedAtMs(childEntry);
             const existingUpdated = existing ? coerceUpdatedAtMs(existing) : -1;
@@ -2220,9 +2247,7 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
         workspaceId: params.parentWorkspaceId,
         workspaceSessionDir: params.parentSessionDir,
         update: (parentFile) => {
-          for (const [taskId, childEntry] of childEntries) {
-            if (!taskId) continue;
-
+          for (const [taskId, childEntry] of mergeableIndexEntries(childEntries)) {
             const existing = parentFile.artifactsByChildTaskId[taskId] ?? null;
             const childUpdated = coerceUpdatedAtMs(childEntry);
             const existingUpdated = existing ? coerceUpdatedAtMs(existing) : -1;
@@ -2444,6 +2469,73 @@ function aliasesProjectMetadataDir(projectName: string): boolean {
   return PROJECT_METADATA_DIR_NAMES.some((dirName) => dirName === folded);
 }
 
+/**
+ * Why an entry may not carry a messaging tag, or null when it may (see setMessagingTag).
+ * Root chats only: a side chat is discarded with its main chat, and a sub-agent child's
+ * parent owns its messaging — tagging either would create a link that outlives its meaning.
+ */
+function messagingTagRootRefusal(
+  entry: Pick<Workspace, "parentWorkspaceId" | "sideChatParentWorkspaceId">
+): string | null {
+  if (entry.sideChatParentWorkspaceId != null) {
+    return "Messaging tags can only be set on a root chat, not a side chat.";
+  }
+  if (entry.parentWorkspaceId != null) {
+    return "Messaging tags can only be set on a root chat, not a sub-agent chat.";
+  }
+  return null;
+}
+
+/**
+ * Applies a tag write to a fresh entry. Re-mints the revocation generation only on a
+ * real change (mirroring consent's repeat-on rule): a clear/re-tag cycle must fence
+ * tag-linked sends admitted under the previous link, while a no-op write fences nothing.
+ */
+function applyMessagingTag(
+  entry: Pick<Workspace, "messagingTag" | "messagingTagGeneration">,
+  normalizedTag: string | null
+): void {
+  if ((entry.messagingTag ?? null) === normalizedTag) {
+    return;
+  }
+  if (normalizedTag === null) {
+    delete entry.messagingTag;
+  } else {
+    entry.messagingTag = normalizedTag;
+  }
+  entry.messagingTagGeneration = crypto.randomUUID();
+}
+
+/** Root-only refusal first, then tag validation: the value a tag write may persist. */
+function messagingTagWriteValue(
+  entry: Pick<Workspace, "parentWorkspaceId" | "sideChatParentWorkspaceId">,
+  tag: string | null
+): Result<string | null, string> {
+  const refusal = messagingTagRootRefusal(entry);
+  if (refusal != null) {
+    return Err(refusal);
+  }
+  return resolveMessagingTagValue(tag);
+}
+
+/**
+ * Resolves user tag input to the value to persist: null clears (null/empty input), a
+ * normalized tag sets, and anything else is an error the caller returns before any write.
+ */
+function resolveMessagingTagValue(tag: string | null): Result<string | null, string> {
+  if (tag === null || tag.trim() === "") {
+    return Ok(null);
+  }
+  const normalized = normalizeMessagingTag(tag);
+  if (normalized === null) {
+    return Err(
+      "Invalid messaging tag: use 1-32 characters, starting with a letter or digit, " +
+        "followed by letters, digits, hyphens, or underscores (an optional leading @ is allowed)."
+    );
+  }
+  return Ok(normalized);
+}
+
 function mintUnrelatedWorkspaceConsent(): string {
   const generation = crypto.randomUUID();
   assert(
@@ -2452,6 +2544,77 @@ function mintUnrelatedWorkspaceConsent(): string {
   );
   return generation;
 }
+
+type MuxMessagePart = MuxMessage["parts"][number];
+
+/** Finalizes one ask_user_question tool part with `answers` (already answered is idempotent). */
+function finalizeAskUserQuestionPart(
+  part: DynamicToolPart,
+  answers: Record<string, string>
+): Result<{ part: MuxMessagePart; output: AskUserQuestionToolSuccessResult }> {
+  if (part.toolName !== "ask_user_question") {
+    return Err(
+      `toolCallId=${part.toolCallId} is toolName=${part.toolName}, expected ask_user_question`
+    );
+  }
+
+  if (part.state === "output-available") {
+    // A non-blocking question completed without answers; its answers are a chat message, so this
+    // path must not report them as delivered.
+    if (isAsyncAskUserQuestionOutput(part.output)) {
+      return Err(ASK_USER_QUESTION_NOT_WAITING_MESSAGE);
+    }
+    // Already answered - treat as idempotent.
+    const parsedOutput = AskUserQuestionToolResultSchema.safeParse(part.output);
+    return parsedOutput.success
+      ? Ok({ part, output: parsedOutput.data })
+      : Err(`ask_user_question output validation failed: ${parsedOutput.error.message}`);
+  }
+
+  const parsedArgs = AskUserQuestionToolArgsSchema.safeParse(part.input);
+  if (!parsedArgs.success) {
+    return Err(`ask_user_question input validation failed: ${parsedArgs.error.message}`);
+  }
+
+  const output: AskUserQuestionToolSuccessResult = {
+    summary: buildAskUserQuestionSummary(answers),
+    ui_only: {
+      ask_user_question: {
+        questions: parsedArgs.data.questions,
+        answers,
+      },
+    },
+  };
+  return Ok({ part: { ...part, state: "output-available" as const, output }, output });
+}
+
+/**
+ * Restart fallback of answerAskUserQuestion: finalizes the ask_user_question tool call in `msg`
+ * with `answers`, or reports why it cannot.
+ */
+function finalizeAskUserQuestionMessage(
+  msg: MuxMessage,
+  toolCallId: string,
+  answers: Record<string, string>
+): Result<{ updated: MuxMessage; output: AskUserQuestionToolSuccessResult }> {
+  const index = msg.parts.findIndex(
+    (part) => isDynamicToolPart(part) && part.toolCallId === toolCallId
+  );
+  const part = msg.parts[index];
+  if (!isDynamicToolPart(part)) {
+    return Err("ask_user_question toolCallId not found in message");
+  }
+  const finalized = finalizeAskUserQuestionPart(part, answers);
+  if (!finalized.success) {
+    return Err(finalized.error);
+  }
+  return Ok({
+    updated: { ...msg, parts: msg.parts.with(index, finalized.data.part) },
+    output: finalized.data.output,
+  });
+}
+
+const EXTERNAL_EDITOR_ROLLBACK_TOMBSTONE_CAP = 1024;
 
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export class WorkspaceService
@@ -5167,7 +5330,7 @@ export class WorkspaceService
 
   public async updateAgentStatus(
     workspaceId: string,
-    agentStatus: WorkspaceAgentStatus | null
+    agentStatus: ExtensionAgentStatus | null
   ): Promise<void> {
     await this.emitWorkspaceActivityUpdate(workspaceId, "update workspace agent status", () =>
       this.extensionMetadata.setAgentStatus(workspaceId, agentStatus)
@@ -6542,7 +6705,8 @@ export class WorkspaceService
                   ownerWorkspaceId: delegatedCreation.ownerWorkspaceId,
                 },
               }
-            : {}),
+            : // #5569: born without delegation, so no workspace turn can ever target it.
+              { bornWithoutDelegation: true as const }),
         });
         config.projects.set(SCRATCH_PROJECT_CONFIG_KEY, scratchProject);
         return config;
@@ -6568,7 +6732,7 @@ export class WorkspaceService
     }
   }
 
-  /** The next free "workspace-N" name, as /new and backend-named creations use. */
+  /** A free random name, as /new and backend-named creations use. */
   private async nextAutoWorkspaceBranchName(
     owningProjectPath: string,
     projectConfig: ProjectConfig,
@@ -6590,7 +6754,7 @@ export class WorkspaceService
         error: getErrorMessage(error),
       });
     }
-    return generateForkBranchName(AUTO_NEW_WORKSPACE_BASE_NAME, [...existingNamesSet]);
+    return generateAutoWorkspaceName(existingNamesSet);
   }
 
   async create(
@@ -6624,7 +6788,7 @@ export class WorkspaceService
       delegatedCreation?: { handleId: string; ownerWorkspaceId: string };
       /**
        * Name the workspace after announcing it (see startCreationNaming): it opens under the
-       * provisional "workspace-N" name, and its branch is renamed before the init hook runs.
+       * provisional random name, and its branch is renamed before the init hook runs.
        */
       nameGeneration?: WorkspaceNameGenerationRequest;
     }
@@ -6707,8 +6871,8 @@ export class WorkspaceService
     }
 
     // Auto-generate a branch name when the caller omits one (used by /new to
-    // mirror /fork's seamless creation flow). Mirrors fork's auto-naming: scan
-    // existing workspace names AND local git branches so numbering is stable.
+    // mirror /fork's seamless creation flow). Scan existing workspace names AND
+    // local git branches so the random name never collides.
     // Branches/worktrees are owned by the parent project, so always read from
     // owningProjectPath even when a sub-project initiated creation.
     const resolvedBranchName =
@@ -6903,8 +7067,9 @@ export class WorkspaceService
         }
       }
 
-      const projectName =
-        owningProjectPath.split("/").pop() ?? owningProjectPath.split("\\").pop() ?? "unknown";
+      // The same name as the plan-directory checks above (getProjectName, process.platform aware):
+      // it names plans/<projectName>/ (#6714).
+      const projectName = getProjectName(owningProjectPath);
 
       const metadata = {
         id: workspaceId,
@@ -7022,7 +7187,8 @@ export class WorkspaceService
                     ownerWorkspaceId: delegatedCreation.ownerWorkspaceId,
                   },
                 }
-              : {}),
+              : // #5569: the same birth fact as createScratch's stamp.
+                { bornWithoutDelegation: true as const }),
           });
           return config;
         });
@@ -9311,6 +9477,7 @@ export class WorkspaceService
       | "setHeartbeatSettings"
       | "unsetHeartbeatSettings"
       | "setUnrelatedWorkspaceConsent"
+      | "setMessagingTag"
       | "setAgentMessageDispatchMode"
       | "executeHeartbeat"
   ): Result<HeartbeatWorkspaceConfigEntry, string> {
@@ -9567,6 +9734,64 @@ export class WorkspaceService
       return Ok(undefined);
     } catch (error) {
       return Err(`Failed to update unrelated workspace consent: ${getErrorMessage(error)}`);
+    }
+  }
+
+  /**
+   * User-only messaging tag for a root chat: chats sharing a tag may message each other
+   * (TaskService resolves that relation). Only user API clients call this — no agent tool may
+   * set a tag, and it is never routed through the generic `tags` map. `null`/empty clears the
+   * tag (absent is the only untagged representation); an invalid tag is rejected before any
+   * write. Side chats and sub-agent children are refused: tagging is root-chat only. This
+   * never mints or changes unrelated-workspace consent. Like the consent switch, Ok means
+   * committed to config AND published on the metadata channel; recency is not bumped.
+   */
+  async setMessagingTag(workspaceId: string, tag: string | null): Promise<Result<void, string>> {
+    try {
+      const resolved = this.resolveHeartbeatWorkspaceEntry(workspaceId, "setMessagingTag");
+      if (!resolved.success) {
+        return Err(resolved.error);
+      }
+      const { normalizedWorkspaceId, projectPath, workspacePath, workspaceEntry } = resolved.data;
+      // Root-only, then validate before any write: an invalid tag must not persist or publish.
+      const tagValue = messagingTagWriteValue(workspaceEntry, tag);
+      if (!tagValue.success) {
+        return Err(tagValue.error);
+      }
+      const normalizedTag = tagValue.data;
+
+      // Mutate inside the serialized editConfig transform against the FRESH entry (see
+      // findFreshWorkspaceEntry): a stale snapshot write could resurrect a removed workspace.
+      let outcome: Result<void, string> = Err(this.workspaceNotFoundError());
+      await this.config.editConfig((freshConfig) => {
+        const entry = this.findFreshWorkspaceEntry(freshConfig, {
+          projectPath,
+          workspaceId: normalizedWorkspaceId,
+          workspacePath,
+        });
+        if (!entry) {
+          outcome = Err(this.workspaceNotFoundError());
+          return freshConfig;
+        }
+        // Re-check on the fresh entry: it may have become a child/side chat since resolution.
+        const freshRefusal = messagingTagRootRefusal(entry);
+        if (freshRefusal != null) {
+          outcome = Err(freshRefusal);
+          return freshConfig;
+        }
+        outcome = Ok(undefined);
+        applyMessagingTag(entry, normalizedTag);
+        return freshConfig;
+      });
+      if (!outcome.success) {
+        return Err(outcome.error);
+      }
+      // Publish after every successful write, including no-ops (same reason as consent above):
+      // Ok means committed AND published, so clients observe the tag once this acks.
+      await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
+      return Ok(undefined);
+    } catch (error) {
+      return Err(`Failed to update messaging tag: ${getErrorMessage(error)}`);
     }
   }
 
@@ -10945,7 +11170,7 @@ export class WorkspaceService
   }
 
   /**
-   * Start naming a workspace that create() opens under its provisional "workspace-N" name, while
+   * Start naming a workspace that create() opens under its provisional random name, while
    * its checkout runs. The title applies as soon as it arrives (unless the user titled the
    * workspace meanwhile); a failure keeps pendingAutoTitle so a later message titles it. The
    * auto-title claim, taken before the workspace is announced, keeps the first message from
@@ -11795,8 +12020,6 @@ export class WorkspaceService
    */
   private readonly externalEditorRollbackTombstones = new Map<string, string>();
 
-  private static readonly EXTERNAL_EDITOR_ROLLBACK_TOMBSTONE_CAP = 1024;
-
   /**
    * Record that the user is opening this workspace in an external editor. Refuses while an
    * agent-driven archive is gating the workspace: the check shares the synchronous block with
@@ -11851,10 +12074,7 @@ export class WorkspaceService
       // (see externalEditorRollbackTombstones). Already-redeemed or never-recorded tokens
       // leave an unredeemable tombstone the FIFO cap eventually evicts.
       this.externalEditorRollbackTombstones.set(launchToken, workspaceId);
-      if (
-        this.externalEditorRollbackTombstones.size >
-        WorkspaceService.EXTERNAL_EDITOR_ROLLBACK_TOMBSTONE_CAP
-      ) {
+      if (this.externalEditorRollbackTombstones.size > EXTERNAL_EDITOR_ROLLBACK_TOMBSTONE_CAP) {
         const oldest = this.externalEditorRollbackTombstones.keys().next().value;
         if (oldest != null) {
           this.externalEditorRollbackTombstones.delete(oldest);
@@ -14919,12 +15139,7 @@ export class WorkspaceService
         const allMetadataUpdated = await this.config.getAllWorkspaceMetadata();
         const updatedMetadata = allMetadataUpdated.find((m) => m.id === sourceWorkspaceId) ?? null;
         const enrichedMetadata = this.enrichMaybeFrontendMetadata(updatedMetadata);
-        const sourceSession = this.sessions.get(sourceWorkspaceId);
-        if (sourceSession) {
-          sourceSession.emitMetadata(enrichedMetadata);
-        } else {
-          this.emit("metadata", { workspaceId: sourceWorkspaceId, metadata: enrichedMetadata });
-        }
+        this.publishWorkspaceMetadata(sourceWorkspaceId, enrichedMetadata);
       };
 
       // The fork's registration also marked its source as sharing the Coder workspace (#5114).
@@ -18271,75 +18486,15 @@ export class WorkspaceService
       //
       // In that case we persist the tool result into partial.json or chat.jsonl,
       // then emit a synthetic tool-call-end so the renderer updates immediately.
+      //
+      // A live stream owns its partial (it rewrites it from memory), so an unregistered question
+      // while streaming is not a restart leftover: it is a non-blocking (Exec) question whose
+      // immediate result has not reached the renderer yet. Finalizing it here would lose the
+      // answer, so refuse; once the result lands the card answers it with a chat message.
+      if (this.aiService.isStreaming(workspaceId)) {
+        return Err(ASK_USER_QUESTION_NOT_WAITING_MESSAGE);
+      }
       try {
-        // Helper: update a message in-place if it contains this ask_user_question tool call.
-        const tryFinalizeMessage = (
-          msg: MuxMessage
-        ): Result<{ updated: MuxMessage; output: AskUserQuestionToolSuccessResult }> => {
-          let foundToolCall = false;
-          let output: AskUserQuestionToolSuccessResult | null = null;
-          let errorMessage: string | null = null;
-
-          const updatedParts = msg.parts.map((part) => {
-            if (!isDynamicToolPart(part) || part.toolCallId !== toolCallId) {
-              return part;
-            }
-
-            foundToolCall = true;
-
-            if (part.toolName !== "ask_user_question") {
-              errorMessage = `toolCallId=${toolCallId} is toolName=${part.toolName}, expected ask_user_question`;
-              return part;
-            }
-
-            // Already answered - treat as idempotent.
-            if (part.state === "output-available") {
-              const parsedOutput = AskUserQuestionToolResultSchema.safeParse(part.output);
-              if (!parsedOutput.success) {
-                errorMessage = `ask_user_question output validation failed: ${parsedOutput.error.message}`;
-                return part;
-              }
-              output = parsedOutput.data;
-              return part;
-            }
-
-            const parsedArgs = AskUserQuestionToolArgsSchema.safeParse(part.input);
-            if (!parsedArgs.success) {
-              errorMessage = `ask_user_question input validation failed: ${parsedArgs.error.message}`;
-              return part;
-            }
-
-            const nextOutput: AskUserQuestionToolSuccessResult = {
-              summary: buildAskUserQuestionSummary(answers),
-              ui_only: {
-                ask_user_question: {
-                  questions: parsedArgs.data.questions,
-                  answers,
-                },
-              },
-            };
-            output = nextOutput;
-
-            return {
-              ...part,
-              state: "output-available" as const,
-              output: nextOutput,
-            };
-          });
-
-          if (errorMessage) {
-            return Err(errorMessage);
-          }
-          if (!foundToolCall) {
-            return Err("ask_user_question toolCallId not found in message");
-          }
-          if (!output) {
-            return Err("ask_user_question output missing after update");
-          }
-
-          return Ok({ updated: { ...msg, parts: updatedParts }, output });
-        };
-
         // 1) Prefer partial.json (most common after restart while waiting)
         const partial = await this.historyService.readPartial(workspaceId);
         if (partial) {
@@ -18352,7 +18507,7 @@ export class WorkspaceService
             workspaceId,
             partial.id,
             (current) => {
-              const finalized = tryFinalizeMessage(current);
+              const finalized = finalizeAskUserQuestionMessage(current, toolCallId, answers);
               if (!finalized.success) return null;
               output = finalized.data.output;
               return finalized.data.updated;
@@ -18421,7 +18576,7 @@ export class WorkspaceService
           );
         }
 
-        const finalized = tryFinalizeMessage(best);
+        const finalized = finalizeAskUserQuestionMessage(best, toolCallId, answers);
         if (!finalized.success) {
           return Err(finalized.error);
         }

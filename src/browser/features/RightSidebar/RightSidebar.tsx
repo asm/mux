@@ -1,4 +1,5 @@
 import { RIGHT_SIDEBAR_DEFAULT_COLLAPSED } from "@/constants/layout";
+import { addWindowListenerWhile } from "@/browser/utils/events";
 import React from "react";
 import { X } from "lucide-react";
 import {
@@ -128,7 +129,12 @@ import {
   type TerminalSessionCreateOptions,
 } from "@/browser/utils/terminal";
 import { SideChatTabTitle } from "./Tabs/TabLabels";
-import { AppViewTabLabel, AppViewTabPanel, AppViewTabTooltip } from "./AppViewTab/AppViewTab";
+import {
+  AppViewTabLabel,
+  AppViewTabPanel,
+  AppViewTabTooltip,
+  findOwnMaximizedAppPanel,
+} from "./AppViewTab/AppViewTab";
 import {
   appViewTabToolCallId,
   liveAppViewTabs,
@@ -255,9 +261,14 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
               // (0.75rem), so it sits evenly in the corner.
               isDesktop ? "top-12" : "top-11",
             ]
-          : // No width transition: expanding swaps the floating card for the docked panel, and
-            // animating the width between those two layouts reads as the card stretching.
-            "bg-surface-primary flex-shrink-0 overflow-hidden border-l"
+          : [
+              // No width transition: expanding swaps the floating card for the docked panel, and
+              // animating the width between those two layouts reads as the card stretching.
+              "bg-surface-primary flex-shrink-0 overflow-hidden border-l",
+              // On coarse pointers the resize handle is a wider strip that draws the divider line
+              // on its right edge, where the tab strip's bottom border meets it.
+              "[@media(pointer:coarse)]:has-[[data-sidebar-resize-handle]]:border-l-0",
+            ]
       )}
       style={collapsed ? undefined : { width, maxWidth: "100%" }}
       role={role}
@@ -282,7 +293,7 @@ interface RightSidebarProps {
   /** Custom width in pixels (persisted per-tab, provided by AIView) */
   width?: number;
   /** Drag start handler for resize */
-  onStartResize?: (e: React.MouseEvent) => void;
+  onStartResize?: (e: React.PointerEvent) => void;
   /** Whether currently resizing */
   isResizing?: boolean;
   /** Callback when user adds a review note from Code Review tab */
@@ -304,6 +315,11 @@ interface RightSidebarProps {
   onCloseFullscreen?: () => void;
   /** Sidebar shortcuts while the narrow layout hides the sidebar: show it full-screen. */
   onRequestFullscreen?: () => void;
+  /**
+   * The lowest authoritative active workflow-run count WorkspaceShell saw while this lazy chunk
+   * loaded (#6208), or null. A run that started meanwhile still switches to the Workflows tab.
+   */
+  workflowRunBaseline?: number | null;
 }
 
 /**
@@ -371,7 +387,7 @@ interface RightSidebarTabsetNodeProps {
   setLayout: (updater: (prev: RightSidebarLayoutState) => RightSidebarLayoutState) => void;
   /** Handler to pop out a terminal tab to a separate window */
   onPopOutTerminal: (tab: TabType) => void;
-  /** Handler for the strip's "+" button: open (or show) this tabset's New tab */
+  /** The strip's New tab row (All tabs menu): open (or show) this tabset's New tab */
   onAddNewTab: (tabsetId: string) => void;
   /** Set only for the tabset whose strip shows the sidebar's collapse button */
   onCollapseSidebar?: () => void;
@@ -387,7 +403,7 @@ interface RightSidebarTabsetNodeProps {
   isOnlyTabset: boolean;
   /** Tools the New tab launcher offers, in order (already filtered for availability) */
   launcherTools: BaseTabType[];
-  /** Tabset whose New tab launcher should take focus once shown (after "+" or the shortcut) */
+  /** Tabset whose New tab launcher should take focus once shown (after its row or the shortcut) */
   launcherAutoFocusTabsetId: string | null;
   onLauncherAutoFocusConsumed: () => void;
   /** Handler to close a terminal tab */
@@ -578,6 +594,8 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
     // with index + close/pop-out actions) — see `tabRegistry.tsx` for why
     // terminals stay outside the static registry.
     let label: React.ReactNode;
+    // The All tabs menu shows `label` unless it holds buttons (a menu row cannot nest them).
+    let menuLabel: React.ReactNode | undefined;
     if (isNewTab(tab)) {
       label = <NewTabLabel />;
     } else if (isBaseTabId(tab)) {
@@ -585,14 +603,16 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
       label = <Label workspaceId={props.workspaceId} reviewStats={props.reviewStats} />;
     } else if (isTerminal) {
       const terminalIndex = props.terminalTabOrder.get(tab) ?? 0;
+      const dynamicTitle = props.terminalTitles.get(tab);
       label = (
         <TerminalTabLabel
-          dynamicTitle={props.terminalTitles.get(tab)}
+          dynamicTitle={dynamicTitle}
           terminalIndex={terminalIndex}
           onPopOut={() => props.onPopOutTerminal(tab)}
           onClose={() => props.onCloseTerminal(tab)}
         />
       );
+      menuLabel = <TerminalTabLabel dynamicTitle={dynamicTitle} terminalIndex={terminalIndex} />;
     } else if (getAppViewTabKey(tab) != null) {
       label = (
         <AppViewTabLabel workspaceId={props.workspaceId} toolCallId={appViewTabToolCallId(tab)} />
@@ -604,6 +624,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
           onClose={() => props.onCloseSideChat(tab)}
         />
       );
+      menuLabel = <SideChatTabLabel workspaceId={sideChatWorkspaceId} />;
     } else {
       label = tab;
     }
@@ -615,6 +636,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
         selected: props.node.activeTab === tab,
         onSelect: () => selectTab(tab),
         label,
+        menuLabel,
         tooltip,
         tab,
         // Every tab is closeable; terminal and side chat labels render their own X (closing
@@ -1080,6 +1102,27 @@ export function useDesktopAvailable(
   return desktopAvailable;
 }
 
+/**
+ * Where Cmd/Ctrl+W closes a tab: the maximized app panel's pane; else the pane holding keyboard
+ * focus, when focus is in this sidebar; else (tabsetId undefined) the focused pane. Null when an
+ * open modal keeps the keys. A maximized app tab is a modal dialog, but it is this sidebar's tab,
+ * so the shortcut closes it (#6181).
+ */
+function closeTabTarget(
+  container: HTMLElement | null,
+  eventTarget: EventTarget | null
+): { tabsetId: string | undefined } | null {
+  const maximizedPanel = findOwnMaximizedAppPanel(container);
+  if (isDialogOpen() && maximizedPanel == null) return null;
+  const keyTarget = maximizedPanel ?? eventTarget;
+  const inSidebar = keyTarget instanceof Element && container?.contains(keyTarget) === true;
+  return {
+    tabsetId: inSidebar
+      ? keyTarget.closest<HTMLElement>("[data-tabset-id]")?.dataset.tabsetId
+      : undefined,
+  };
+}
+
 const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   workspaceId,
   workspacePath,
@@ -1094,6 +1137,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   fullscreen = false,
   onCloseFullscreen,
   onRequestFullscreen,
+  workflowRunBaseline = null,
 }) => {
   // Trigger for focusing Review panel (preserves hunk selection)
   const [focusTrigger, _setFocusTrigger] = React.useState(0);
@@ -1118,7 +1162,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     setReviewPanelStats(stats ? { total: stats.total, read: stats.read } : null);
   }, []);
 
-  // Tabset whose New tab launcher should focus its first row once shown ("+" or the shortcut).
+  // Tabset whose New tab launcher should focus its first row once shown (its strip's New tab row
+  // or the shortcut).
   const [launcherAutoFocusTabsetId, setLauncherAutoFocusTabsetId] = React.useState<string | null>(
     null
   );
@@ -1157,6 +1202,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const liveApi = liveClientOf(apiState);
   const desktopExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
   const artifactsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const mcpAppsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MCP_APPS);
   const browserExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_BROWSER);
   const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   // Child task workspaces own a goal (pause/resume/complete), but goal-board and
@@ -1344,14 +1390,14 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   );
   const layout = React.useMemo(() => {
     let next = canReviewDiffs ? parsedLayout : removeTabEverywhere(parsedLayout, "review");
-    // App tabs exist only behind the artifacts experiment, like MCP Apps themselves.
-    if (!artifactsExperimentEnabled) {
+    // App tabs exist only behind the mcp-apps experiment, like MCP Apps themselves.
+    if (!mcpAppsExperimentEnabled) {
       for (const tab of collectAllTabs(next.root)) {
         if (getAppViewTabKey(tab) != null) next = removeTabEverywhere(next, tab);
       }
     }
     return next;
-  }, [artifactsExperimentEnabled, canReviewDiffs, parsedLayout]);
+  }, [mcpAppsExperimentEnabled, canReviewDiffs, parsedLayout]);
 
   const hasReviewPanelMounted = React.useMemo(
     () => !collapsed && hasMountedReviewPanel(layout.root),
@@ -1547,8 +1593,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // asks for the view's own app tab, focusing it when it is already open. On small viewports
   // WorkspaceMenuBar shows the tab in the full-screen sidebar instead; these handlers then stay
   // out, so one event never acts twice.
+  // Each event listens only while its own experiment is on (MCP Apps are independent, #6760).
   React.useEffect(() => {
-    if (!artifactsExperimentEnabled) return;
     const shown = () => {
       const container = sidebarContainerRef.current;
       return container == null || !isRightSidebarResponsivelyHidden(container);
@@ -1565,13 +1611,21 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       setCollapsed(false);
       setLayout((prev) => withAppViewTab(prev, detail.toolCallId));
     };
-    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handleOpenAppViewTab);
-    window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handleOpenArtifactsTab);
+    const removeAppView = addWindowListenerWhile(
+      mcpAppsExperimentEnabled,
+      CUSTOM_EVENTS.OPEN_MCP_APP_VIEW,
+      handleOpenAppViewTab
+    );
+    const removeArtifact = addWindowListenerWhile(
+      artifactsExperimentEnabled,
+      CUSTOM_EVENTS.OPEN_ARTIFACT,
+      handleOpenArtifactsTab
+    );
     return () => {
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handleOpenAppViewTab);
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handleOpenArtifactsTab);
+      removeAppView();
+      removeArtifact();
     };
-  }, [artifactsExperimentEnabled, setCollapsed, setLayout, workspaceId]);
+  }, [artifactsExperimentEnabled, mcpAppsExperimentEnabled, setCollapsed, setLayout, workspaceId]);
 
   // Global shortcut: open (and un-collapse) the Artifacts tab. Works from the chat input
   // too, because Ctrl+Shift+K inserts nothing there. While the narrow layout hides the
@@ -1608,7 +1662,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // un-collapse a collapsed sidebar.
   const activeWorkflowRunCount = sidebarState?.activeWorkflowRunCount ?? 0;
   const activityAuthoritative = useWorkspaceActivityAuthoritative();
-  const previousActiveWorkflowRunCountRef = React.useRef<number | null>(null);
+  // Starts from WorkspaceShell's count from while this chunk loaded, if it saw one (#6208).
+  const previousActiveWorkflowRunCountRef = React.useRef(workflowRunBaseline);
   React.useEffect(() => {
     // Before an AUTHORITATIVE activity snapshot the store reports 0 for every
     // workspace — both pre-hydration and after a failure-path self-heal (which marks
@@ -1917,14 +1972,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       if (!matchesKeybind(e, KEYBINDS.CLOSE_TAB)) return;
       // Always prevent platform default (Cmd/Ctrl+W closes window), even during dialogs.
       e.preventDefault();
-      if (isDialogOpen()) return;
-
-      // The pane holding keyboard focus, when focus is in this sidebar; else the focused pane.
       const container = sidebarContainerRef.current;
-      const targetTabsetId =
-        e.target instanceof Element && container?.contains(e.target)
-          ? e.target.closest<HTMLElement>("[data-tabset-id]")?.dataset.tabsetId
-          : undefined;
+      const target = closeTabTarget(container, e.target);
+      if (target == null) return;
+      const targetTabsetId = target.tabsetId;
       const focusedTabset = findTabset(layout.root, targetTabsetId ?? layout.focusedTabsetId);
       if (focusedTabset?.type !== "tabset") return;
 
@@ -2120,8 +2171,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     [setLayout]
   );
 
-  // "+" in a strip (tabsetId) or the shortcut (focused tabset): show that tabset's New tab and
-  // move focus into its launcher.
+  // A strip's New tab row (tabsetId) or the shortcut (focused tabset): show that tabset's New
+  // tab and move focus into its launcher.
   const handleAddNewTab = React.useCallback(
     (tabsetId?: string) => {
       const targetId = tabsetId ?? getBaseLayout().focusedTabsetId;
@@ -2576,13 +2627,29 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             {/* Resize handle (left edge); full-screen mode has nothing to resize. */}
             {onStartResize && !fullscreen && (
               <div
+                data-sidebar-resize-handle=""
                 className={cn(
-                  "w-0.5 flex-shrink-0 z-10 transition-[background] duration-150 cursor-col-resize",
-                  isResizing ? "bg-accent" : "bg-border-light hover:bg-accent"
+                  // touch-none: a touch drag on the handle resizes instead of panning the page.
+                  "group/resize z-10 flex w-0.5 flex-shrink-0 cursor-col-resize touch-none justify-center",
+                  // A 2px line is too thin to grab with a finger, and iPads report a coarse
+                  // pointer even with a trackpad: coarse pointers get a wider strip with a grip.
+                  // The sidebar's divider line moves to the strip's right edge (SidebarContainer
+                  // drops its own), so the tab strip's bottom border still meets it.
+                  "[@media(pointer:coarse)]:border-border-light [@media(pointer:coarse)]:w-3 [@media(pointer:coarse)]:border-r"
                 )}
-                // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-                onMouseDown={(e) => onStartResize(e as unknown as React.MouseEvent)}
-              />
+                onPointerDown={onStartResize}
+              >
+                <span
+                  aria-hidden="true"
+                  className={cn(
+                    "w-full transition-[background] duration-150",
+                    "[@media(pointer:coarse)]:my-auto [@media(pointer:coarse)]:h-10 [@media(pointer:coarse)]:w-1 [@media(pointer:coarse)]:rounded-full",
+                    isResizing
+                      ? "bg-accent"
+                      : "bg-border-light group-hover/resize:bg-accent [@media(pointer:coarse)]:bg-border-darker"
+                  )}
+                />
+              </div>
             )}
 
             <div className="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -2602,6 +2669,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             onNewSideChat={canStartSideChat ? () => handleStartSideChat() : undefined}
             creatingSideChat={creatingSideChat}
             artifactsEnabled={artifactsExperimentEnabled}
+            mcpAppsEnabled={mcpAppsExperimentEnabled}
             unreadAssisted={unreadAssisted}
           />
         )}

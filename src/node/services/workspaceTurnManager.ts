@@ -1358,8 +1358,17 @@ export class WorkspaceTurnManager {
       (record) => record.ownerWorkspaceId === ownerWorkspaceId
     );
     const activeAgentCount = this.taskHost.countActiveAgentTasks(cfg);
+    // Closures in this function share one scope, and callbacks handed to sendMessage (onCanceled)
+    // can outlive the turn. Capturing allWorkspaceTurns pinned every owner's records, ~82 MB per
+    // copy in a long-lived server (F29). Capture only the records with an active status: the
+    // count skips every other record before its first await, so the result is the same.
+    const statusActiveWorkspaceTurns = allWorkspaceTurns.filter((record) =>
+      isActiveWorkspaceTurnTaskStatus(record.status)
+    );
     const ensureParallelSlot = async (): Promise<Result<void, string>> => {
-      const activeWorkspaceTurnCount = await this.countActiveWorkspaceTurns(allWorkspaceTurns);
+      const activeWorkspaceTurnCount = await this.countActiveWorkspaceTurns(
+        statusActiveWorkspaceTurns
+      );
       const activeCount = activeAgentCount + activeWorkspaceTurnCount;
       if (activeCount >= taskSettings.maxParallelAgentTasks) {
         return Err(
@@ -1703,6 +1712,8 @@ export class WorkspaceTurnManager {
         return Err(`Task.createWorkspaceTurn: workspace create failed (${createResult.error})`);
       }
       targetWorkspaceId = createResult.data.metadata.id;
+      // The only creating record (#5569): create() just wrote this row with its mark, never with
+      // the bornWithoutDelegation stamp that lets the active-turn lookup skip all owner dirs.
       createdWorkspace = true;
       createdTargetBranch = createResult.data.createdBranch === true;
       if (args.workspace?.disposable !== true) this.creationConsentFinalizers.add(handleId);
@@ -5742,6 +5753,7 @@ export class WorkspaceTurnManager {
 
     // #5569: a root's confirmed creator, or an agent task's config ancestors, hold every record
     // of the target (see workspaceTurnOwners.ts), so read those directories instead of every owner's.
+    // A root stamped at birth without delegation has no records at all.
     const fromOwners = await this.findActiveWorkspaceTurnInOwnerDirs(workspaceId);
     if (fromOwners.kind === "found") return fromOwners.record;
     log.debug("Active workspace-turn lookup fell back to a global scan", {
@@ -5763,33 +5775,12 @@ export class WorkspaceTurnManager {
   > {
     const owners = resolveWorkspaceTurnOwners(this.config.loadConfigOrDefault(), workspaceId);
     if (owners.kind === "fallback") return owners;
+    if (owners.kind === "none") return { kind: "found", record: null };
     if (owners.kind === "ancestors") {
-      let lists: WorkspaceTurnTaskHandleRecord[][];
-      try {
-        lists = await Promise.all(
-          owners.ownerWorkspaceIds.map((owner) =>
-            this.taskHandleStore.listWorkspaceTurns(owner, { statuses: ["starting", "running"] })
-          )
-        );
-      } catch (error) {
-        return { kind: "fallback", reason: `ancestor listing failed: ${getErrorMessage(error)}` };
-      }
-      // The global scan's comparator, and its stable sort keeps each owner's own order.
-      const forTarget = lists
-        .flat()
-        .filter((record) => record.workspaceId === workspaceId)
-        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-      const newest = forTarget.at(-1);
-      if (newest == null) return { kind: "found", record: null };
-      // Across owners the global scan breaks a createdAt tie by the readdir order of sessions/,
-      // which only that scan reproduces.
-      const tiedAcrossOwners = forTarget.some(
-        (record) =>
-          record.ownerWorkspaceId !== newest.ownerWorkspaceId &&
-          record.createdAt.localeCompare(newest.createdAt) === 0
+      return await this.findActiveWorkspaceTurnInAncestorDirs(
+        workspaceId,
+        owners.ownerWorkspaceIds
       );
-      if (tiedAcrossOwners) return { kind: "fallback", reason: "createdAt tie across owners" };
-      return { kind: "found", record: newest };
     }
     let records: WorkspaceTurnTaskHandleRecord[];
     try {
@@ -5807,6 +5798,41 @@ export class WorkspaceTurnManager {
       (candidate) => candidate.status === "starting" || candidate.status === "running"
     );
     return { kind: "found", record: record ?? null };
+  }
+
+  private async findActiveWorkspaceTurnInAncestorDirs(
+    workspaceId: string,
+    ownerWorkspaceIds: string[]
+  ): Promise<
+    | { kind: "found"; record: WorkspaceTurnTaskHandleRecord | null }
+    | { kind: "fallback"; reason: string }
+  > {
+    let lists: WorkspaceTurnTaskHandleRecord[][];
+    try {
+      lists = await Promise.all(
+        ownerWorkspaceIds.map((owner) =>
+          this.taskHandleStore.listWorkspaceTurns(owner, { statuses: ["starting", "running"] })
+        )
+      );
+    } catch (error) {
+      return { kind: "fallback", reason: `ancestor listing failed: ${getErrorMessage(error)}` };
+    }
+    // The global scan's comparator, and its stable sort keeps each owner's own order.
+    const forTarget = lists
+      .flat()
+      .filter((record) => record.workspaceId === workspaceId)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    const newest = forTarget.at(-1);
+    if (newest == null) return { kind: "found", record: null };
+    // Across owners the global scan breaks a createdAt tie by the readdir order of sessions/,
+    // which only that scan reproduces.
+    const tiedAcrossOwners = forTarget.some(
+      (record) =>
+        record.ownerWorkspaceId !== newest.ownerWorkspaceId &&
+        record.createdAt.localeCompare(newest.createdAt) === 0
+    );
+    if (tiedAcrossOwners) return { kind: "fallback", reason: "createdAt tie across owners" };
+    return { kind: "found", record: newest };
   }
 
   async getActiveWorkspaceTurnMuxMetadataForWorkspace(
@@ -6086,14 +6112,7 @@ export class WorkspaceTurnManager {
           await this.persistRecoveredTerminalExecutionMirror(task.id, task, normalized);
         }
         if (isActiveWorkspaceTurnTaskStatus(normalized.status)) {
-          this.activeWorkspaceTurnHandleByWorkspaceId.set(task.id, {
-            handleId: normalized.handleId,
-            ownerWorkspaceId: normalized.ownerWorkspaceId,
-            // Fail closed: the restart killed any live stream, so this recovered registration
-            // exists for settlement ownership, not peer admission. A revival or a fresh
-            // acceptance re-marks the entry accepted.
-            accepted: false,
-          });
+          this.registerRecoveredWorkspaceTurn(task.id, normalized);
         }
       } catch (error: unknown) {
         // Startup recovery is best-effort: one read-only/corrupt child must not prevent Xum startup
@@ -6105,6 +6124,31 @@ export class WorkspaceTurnManager {
         });
       }
     }
+  }
+
+  /**
+   * Startup reconciliation's registration for an active handle. Fail closed: the restart killed any
+   * live stream, so a recovered registration exists for settlement ownership, not peer admission.
+   * A revival or a fresh acceptance re-marks it accepted. The exception is the same turn already
+   * accepted in this process: a reawakening that lands between the pass's config read and its
+   * handle scan puts its live handle in the scan, and downgrading it would make peers refuse the
+   * running child. Startup ordering keeps clients out of that window today; this guards any later
+   * caller that runs the pass while clients are connected.
+   */
+  private registerRecoveredWorkspaceTurn(
+    workspaceId: string,
+    record: WorkspaceTurnTaskHandleRecord
+  ): void {
+    const existing = this.activeWorkspaceTurnHandleByWorkspaceId.get(workspaceId);
+    const acceptedInThisProcess =
+      existing?.handleId === record.handleId &&
+      existing.ownerWorkspaceId === record.ownerWorkspaceId &&
+      existing.accepted;
+    this.activeWorkspaceTurnHandleByWorkspaceId.set(workspaceId, {
+      handleId: record.handleId,
+      ownerWorkspaceId: record.ownerWorkspaceId,
+      accepted: acceptedInThisProcess,
+    });
   }
 
   /**

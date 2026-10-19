@@ -51,7 +51,11 @@ import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 import type { SendMessageError } from "@/common/types/errors";
 import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
-import type { MuxMessage, MuxMessageMetadata } from "@/common/types/message";
+import type {
+  MuxMessage,
+  MuxMessageMetadata,
+  VolatileSystemTailRecord,
+} from "@/common/types/message";
 import type { PreDispatchConsentGate } from "@/node/services/streamManager";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import { createMuxMessage } from "@/common/types/message";
@@ -198,6 +202,7 @@ import {
   rebuildToolSearchState,
   seedToolSearchActivationsFromMessages,
   TOOL_SEARCH_TOOL_NAME,
+  type ToolCatalogOverviewMemo,
   type ToolSearchRuntime,
 } from "@/common/utils/tools/toolCatalog";
 import {
@@ -215,7 +220,10 @@ import type { PTCEventWithParent } from "@/node/services/tools/code_execution";
 import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import type { WorkflowArchiveAdmissionGuard } from "@/node/services/workflows/workflowArchiveAdmission";
-import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
+import {
+  assertStoredPluginWorkflowReviewed,
+  resolveWorkflowScript,
+} from "@/node/services/workflows/workflowScriptResolver";
 import {
   WorkflowService,
   type WorkflowRunStatusChangedEvent,
@@ -237,9 +245,10 @@ import {
   buildContextWindowSection,
   buildStreamSystemContext,
   formatMcpWarningSection,
-  measureVolatileSystemSuffix,
+  measureWholeVolatileSystemSuffix,
   prepareProviderRequestMessages,
   removeIntuitionGuidance,
+  type PromptPayload,
   selectActiveContextMessages,
 } from "./turnContextAssembler";
 import { resolveContextWindowIds } from "./contextWindowRollover";
@@ -587,7 +596,7 @@ async function retryBudgetFromHistory(
 /**
  * Shared assembly path for primary, fallback, and thinking-rebuild provider attempts.
  * `contextBudgetEstimate` is the full estimate the check enforced (undefined when the budget is
- * off or the limit is unknown). `measureOnly` returns that estimate instead of throwing.
+ * off or the limit is unknown).
  */
 export async function assembleBudgetCheckedPromptPayload(
   options: Parameters<typeof assemblePromptPayload>[0],
@@ -595,7 +604,6 @@ export async function assembleBudgetCheckedPromptPayload(
     enabled: boolean;
     providerOptions?: MuxProviderOptions;
     activeTools?: readonly string[];
-    measureOnly?: boolean;
   }
 ): Promise<
   Awaited<ReturnType<typeof assemblePromptPayload>> & {
@@ -633,11 +641,50 @@ export async function assembleBudgetCheckedPromptPayload(
       activeTools: budget.activeTools,
     });
     contextBudgetEstimate = measured?.estimate;
-    if (measured?.exceeded && !budget.measureOnly) {
+    if (measured?.exceeded) {
       throw new ContextBudgetExceededError(measured.exceeded);
     }
   }
   return { ...payload, contextBudgetLimit, contextBudgetEstimate };
+}
+
+/**
+ * The sent system content (PromptPayload.sentSystem) with its token count. The tail rows exist
+ * only in the request, so their text counts as system: history sizing (continuous compaction,
+ * context estimates) adds this count to the rows it sizes itself.
+ */
+async function measureSentSystem(
+  sentSystem: PromptPayload["sentSystem"],
+  liveSystem: string,
+  liveTokens: number,
+  tokenizerFor: () => ReturnType<typeof getTokenizerForModel>
+): Promise<{ system: string; volatileLength: number; tokens: number }> {
+  const { message, volatileSuffixLength, rowsText } = sentSystem;
+  if (message === liveSystem && rowsText === "") {
+    return { system: message, volatileLength: volatileSuffixLength, tokens: liveTokens };
+  }
+  const tokenizer = await tokenizerFor();
+  const tokens = await tokenizer.countTokens(message + rowsText);
+  return { system: message, volatileLength: volatileSuffixLength, tokens };
+}
+
+/**
+ * The tail record for the turn's assistant row: what this request sent, or, when a refusal
+ * fallback continues this turn's row and sends nothing new, the record the row already holds
+ * (the rows of its earlier request stay in place before it).
+ */
+function rowVolatileSystemTail(
+  payload: { volatileSystemTail?: VolatileSystemTailRecord },
+  continuation: MuxMessage | undefined
+): VolatileSystemTailRecord | undefined {
+  return payload.volatileSystemTail ?? continuation?.metadata?.volatileSystemTail;
+}
+
+/** The assistant row's tail record (MuxMetadata.volatileSystemTail); absent records nothing. */
+function volatileSystemTailMetadata(record: VolatileSystemTailRecord | undefined): {
+  volatileSystemTail?: VolatileSystemTailRecord;
+} {
+  return record != null ? { volatileSystemTail: record } : {};
 }
 
 function derivePromptCacheScope(metadata: WorkspaceMetadata): string {
@@ -754,7 +801,10 @@ interface TurnRequestBuilderDependencies {
   sessionUsageService?: SessionUsageService;
   devToolsService?: DevToolsService;
   experimentsService?: Pick<ExperimentsService, "isExperimentEnabled">;
-  lastLlmRequestByWorkspace: Map<string, DebugLlmRequestSnapshot>;
+  /** Only written here; AIService owns the bounded store and its reads. */
+  lastLlmRequestByWorkspace: {
+    set(workspaceId: string, snapshot: DebugLlmRequestSnapshot): unknown;
+  };
   bindings: TurnRequestBuilderBindings;
   emit: (event: string, ...args: unknown[]) => boolean;
   createAbortedTurnHandle: (messageId: string, signal?: AbortSignal) => TurnStreamHandle;
@@ -823,11 +873,57 @@ interface PreparedModelAttempt {
   rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel;
 }
 
+/**
+ * Models per workspace that keep their own catalog overview (a primary plus a few fallbacks or
+ * switches). Past it, the least recently used model's overview is rebuilt on its next use.
+ */
+const MAX_TOOL_CATALOG_OVERVIEW_MODELS_PER_WORKSPACE = 4;
+
 export class TurnRequestBuilder {
   /** Remote scratch dirs per workspace and runtime config (see RemoteScratchDirCache). */
   private readonly remoteScratchDirs = new RemoteScratchDirCache();
+  /**
+   * The last deferred-tool catalog overview per workspace and model (ToolCatalogOverviewMemo).
+   * Per model because request.assemble hooks, policies and fallbacks can give each model its own
+   * catalog, and the prompt cache is per model too: one shared memo would let a model with fewer
+   * tools replace the overview another model's cache still holds. In memory only: a restart
+   * builds one fresh overview per model, which costs one cache rewrite. forgetWorkspace drops a
+   * removed or archived workspace's entry.
+   */
+  private readonly toolCatalogOverviews = new Map<string, Map<string, ToolCatalogOverviewMemo>>();
 
   constructor(private readonly dependencies: TurnRequestBuilderDependencies) {}
+
+  /** Drop a removed or archived workspace's in-memory request state, so it does not grow the map. */
+  forgetWorkspace(workspaceId: string): void {
+    this.toolCatalogOverviews.delete(workspaceId);
+  }
+
+  /**
+   * Keyed by the effective model string (the routed wire model), not the selected one: the
+   * prompt cache is per route and wire model, so two selections that reach the same wire model
+   * (an explicit gateway string and a direct string routed through that gateway) share one cache
+   * and must share one overview, or alternating between them rewrites that cache.
+   */
+  private toolCatalogOverviewMemo(
+    workspaceId: string,
+    modelString: string
+  ): ToolCatalogOverviewMemo {
+    let byModel = this.toolCatalogOverviews.get(workspaceId);
+    if (byModel === undefined) {
+      byModel = new Map();
+      this.toolCatalogOverviews.set(workspaceId, byModel);
+    }
+    const memo = byModel.get(modelString) ?? {};
+    // Least recently used goes first: re-insert on every use, evict from the front.
+    byModel.delete(modelString);
+    byModel.set(modelString, memo);
+    for (const model of byModel.keys()) {
+      if (byModel.size <= MAX_TOOL_CATALOG_OVERVIEW_MODELS_PER_WORKSPACE) break;
+      byModel.delete(model);
+    }
+    return memo;
+  }
 
   private resolveOverridesIdentity(
     rawModelString: string,
@@ -2353,6 +2449,7 @@ export class TurnRequestBuilder {
     const getWorkflowProjectTrusted = () =>
       isWorkspaceProjectTrusted(this.dependencies.config, metadata);
 
+    const workflowProjectSearchRoot = projectCheckoutRoot ?? workspacePath;
     const workflowService =
       this.dependencies.bindings.taskService != null
         ? new WorkflowService({
@@ -2408,7 +2505,16 @@ export class TurnRequestBuilder {
                 scriptPath,
                 runtime,
                 workspacePath,
-                projectSearchRoot: projectCheckoutRoot ?? workspacePath,
+                projectSearchRoot: workflowProjectSearchRoot,
+                projectTrusted: getWorkflowProjectTrusted(),
+                skillStorageContext: workflowSkillStorageContext,
+              }),
+            assertStoredPluginWorkflowReviewed: (stored) =>
+              assertStoredPluginWorkflowReviewed({
+                ...stored,
+                runtime,
+                workspacePath,
+                projectSearchRoot: workflowProjectSearchRoot,
                 projectTrusted: getWorkflowProjectTrusted(),
                 skillStorageContext: workflowSkillStorageContext,
               }),
@@ -2586,6 +2692,7 @@ export class TurnRequestBuilder {
       xaiNativeToolsEnabled: routeProvider === "xai",
       xaiSearchParameters: effectiveMuxProviderOptions.xai?.searchParameters,
       backgroundProcessManager: this.dependencies.backgroundProcessManager,
+      hasQueuedMessages,
       // Plan agent configuration for plan file access.
       // - read: plan file is readable in all agents (useful context)
       // - write: allowed in all agents; plan agents still lock other edits to the exact plan path
@@ -2958,6 +3065,10 @@ export class TurnRequestBuilder {
           supportsAnthropicToolSearch(seed.capabilityModelString.split(":")[1] ?? "") &&
           resolveProviderOptionsNamespaceKey(seed.wireProviderName, seed.routeProvider) ===
             "anthropic";
+        const toolCatalogOverviewMemo = this.toolCatalogOverviewMemo(
+          workspaceId,
+          seed.effectiveModelString
+        );
         if (toolSearchRuntime) {
           if (options.initializeToolSearch) {
             const preparedSearch = prepareToolSearch({
@@ -2967,6 +3078,7 @@ export class TurnRequestBuilder {
               toolPolicy: toolSearchPolicy,
               ptcEnabled,
               promptCacheActive: toolSearchPromptCacheActive,
+              overviewMemo: toolCatalogOverviewMemo,
             });
             attemptTools = preparedSearch.tools;
             if (preparedSearch.state) {
@@ -2980,6 +3092,7 @@ export class TurnRequestBuilder {
               toolPolicy: toolSearchPolicy,
               ptcEnabled,
               promptCacheActive: toolSearchPromptCacheActive,
+              overviewMemo: toolCatalogOverviewMemo,
             }).tools;
           } else if (!(mcpTools && TOOL_SEARCH_TOOL_NAME in mcpTools)) {
             const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = attemptTools;
@@ -3043,6 +3156,7 @@ export class TurnRequestBuilder {
               toolPolicy: toolSearchPolicy,
               ptcEnabled,
               promptCacheActive: toolSearchPromptCacheActive,
+              overviewMemo: toolCatalogOverviewMemo,
             }).tools;
           }
           // Middleware may filter tools too, but must not restore policy-denied
@@ -3096,8 +3210,9 @@ export class TurnRequestBuilder {
             );
             attemptSystemTokens += await tokenizer.countTokens(section);
           }
-          // Re-measured on every render: the window section can change length.
-          attemptVolatileSystemSuffixLength = measureVolatileSystemSuffix(attemptSystem, [
+          // Re-measured on every render: the window section can change length. A tail that
+          // middleware edited is not split at all (no rows either, see planSystemPrompt).
+          attemptVolatileSystemSuffixLength = measureWholeVolatileSystemSuffix(attemptSystem, [
             systemContext.hotMemoriesSection,
             mcpWarningSection,
             section,
@@ -3169,10 +3284,17 @@ export class TurnRequestBuilder {
           compactionInputBudgetScale,
           compactionContextRetryAvailable === true
         );
+        // What the latest assembly sent as system content (prompt-cache mechanism 10: a frozen
+        // tail plus tail rows). The envelope, debug views and stored token count describe it.
+        let sent = {
+          system: attemptSystem,
+          volatileLength: attemptVolatileSystemSuffixLength,
+          tokens: attemptSystemTokens,
+        };
         // Shared by the initial build and thinking rebuilds so their assembly
         // inputs cannot drift apart mid-turn.
-        const assemblePayloadForThinkingLevel = (level: ThinkingLevel) =>
-          assembleBudgetCheckedPromptPayload(
+        const assemblePayloadForThinkingLevel = async (level: ThinkingLevel) => {
+          const payload = await assembleBudgetCheckedPromptPayload(
             {
               history: options.sourceMessages,
               systemMessage: attemptSystem,
@@ -3204,6 +3326,14 @@ export class TurnRequestBuilder {
                 : (computeLoadedToolNames(toolSearchRuntime?.state) ?? [...firstStepToolNames]),
             }
           );
+          sent = await measureSentSystem(
+            payload.sentSystem,
+            attemptSystem,
+            attemptSystemTokens,
+            () => getTokenizerForModel(seed.rawModelString, seed.capabilityModelString)
+          );
+          return payload;
+        };
         const prepareMessagesForProviderStartedAt = Date.now();
         const attemptPayload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
         if (options.recordTimings) {
@@ -3220,8 +3350,8 @@ export class TurnRequestBuilder {
           await emitTurnEnvelope({
             journal: this.dependencies.durableEventJournalFor(workspaceId),
             workspaceId,
-            systemMessage: attemptSystem,
-            systemVolatileSuffixLength: attemptVolatileSystemSuffixLength,
+            systemMessage: sent.system,
+            systemVolatileSuffixLength: sent.volatileLength,
             tools: Object.fromEntries(
               Object.entries(attemptTools).filter(([name]) => firstStepToolNames.has(name))
             ),
@@ -3239,29 +3369,42 @@ export class TurnRequestBuilder {
             mcpAppModelContextMessage: mcpAppContextMessage,
           });
         };
+        // The level decides which reasoning-only rows are sent, and with them the tail rows:
+        // a rebuild returns its own tail record for the turn's row.
         const rebuildMessagesForThinkingLevel = async (level: ThinkingLevel) => {
           const rebuiltPayload = await assemblePayloadForThinkingLevel(level);
-          return rebuiltPayload.messages;
+          return {
+            messages: rebuiltPayload.messages,
+            systemMessageTokens: sent.tokens,
+            volatileSystemTail: rowVolatileSystemTail(
+              rebuiltPayload,
+              options.partialContinuationMessage
+            ),
+          };
         };
         const rebuildFirstStepForThinkingLevel: RebuildFirstStepForThinkingLevel = async (
           level,
           providerOptionsForEnvelope
         ) => {
-          const rebuiltMessages = await rebuildMessagesForThinkingLevel(level);
+          const rebuilt = await rebuildMessagesForThinkingLevel(level);
           await emitEnvelopeWith(level, providerOptionsForEnvelope);
-          return rebuiltMessages;
+          return rebuilt;
         };
 
         return {
           ...seed,
           providerRequestMessages: attemptProviderRequestMessages,
           messages: finalMessages,
-          system: attemptSystem,
+          system: sent.system,
           engineSystem: attemptPayload.system,
+          volatileSystemTail: rowVolatileSystemTail(
+            attemptPayload,
+            options.partialContinuationMessage
+          ),
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
           contextBudgetEstimate: attemptPayload.contextBudgetEstimate,
           ...compactionInputBudget,
-          systemMessageTokens: attemptSystemTokens,
+          systemMessageTokens: sent.tokens,
           tools: attemptTools,
           engineTools: attemptPayload.tools ?? attemptTools,
           toolNamesForSentinel,
@@ -3282,9 +3425,13 @@ export class TurnRequestBuilder {
             await renderContextWindowSection();
             const payload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
             return {
-              system: attemptSystem,
-              systemMessageTokens: attemptSystemTokens,
+              system: sent.system,
+              systemMessageTokens: sent.tokens,
               engineSystem: payload.system,
+              volatileSystemTail: rowVolatileSystemTail(
+                payload,
+                options.partialContinuationMessage
+              ),
               messages: payload.messages,
               contextBudgetLimit: payload.contextBudgetLimit,
               contextBudgetEstimate: payload.contextBudgetEstimate,
@@ -3688,6 +3835,8 @@ export class TurnRequestBuilder {
                       ? { routeProvider: nextRequest.routeProvider }
                       : {}),
                     systemMessageTokens: nextRequest.systemMessageTokens,
+                    // Exact: the fallback's request decides what the row recorded.
+                    volatileSystemTail: nextRequest.volatileSystemTail,
                   },
                 });
               },
@@ -3711,6 +3860,7 @@ export class TurnRequestBuilder {
       let streamThinkingLevel = effectiveThinkingLevel;
       let streamProviderOptions = mergedProviderOptions;
       let streamFinalMessages = finalMessages;
+      let streamVolatileSystemTail = primaryRequest.volatileSystemTail;
       while (activeTurnThinkingOverride?.pending != null) {
         const pendingPreparingLevel = activeTurnThinkingOverride.pending;
         activeTurnThinkingOverride.pending = undefined;
@@ -3725,9 +3875,11 @@ export class TurnRequestBuilder {
           continue;
         }
         try {
-          streamFinalMessages = await primaryRequest.rebuildMessagesForThinkingLevel(
-            folded.effectiveLevel
-          );
+          ({
+            messages: streamFinalMessages,
+            volatileSystemTail: streamVolatileSystemTail,
+            systemMessageTokens,
+          } = await primaryRequest.rebuildMessagesForThinkingLevel(folded.effectiveLevel));
         } catch (error) {
           if (error instanceof ContextBudgetExceededError) {
             runLanguageModelCleanup(modelResult.data.model);
@@ -3783,6 +3935,8 @@ export class TurnRequestBuilder {
           systemMessageTokens,
           timestamp: Date.now(),
           agentId: effectiveAgentId,
+          // Where this request sent the volatile system tail, so the next rebuild repeats it.
+          ...volatileSystemTailMetadata(streamVolatileSystemTail),
           ...(legacyModeForMetadata != null ? { mode: legacyModeForMetadata } : {}),
           routedThroughGateway,
           ...(routeProvider != null ? { routeProvider } : {}),

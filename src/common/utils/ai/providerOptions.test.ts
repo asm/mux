@@ -109,6 +109,16 @@ describe("resolveProviderOptionsNamespaceKey", () => {
     expect(resolveProviderOptionsNamespaceKey("meta", "openrouter")).toBe("openrouter");
   });
 
+  test("merges Google Vertex AI extras into the namespace its thinking options use", () => {
+    // Saved provider extras merge under this key; a Vertex model reads `googleVertex`
+    // before `google`, so a split namespace would drop the thinking options or the extras.
+    const thinkingOptions = buildProviderOptions("google-vertex:gemini-2.5-pro", "medium");
+    expect(Object.keys(thinkingOptions)).toEqual([
+      resolveProviderOptionsNamespaceKey("google-vertex"),
+    ]);
+    expect(resolveProviderOptionsNamespaceKey("google-vertex")).toBe("googleVertex");
+  });
+
   test("returns the canonical provider for direct routing", () => {
     expect(resolveProviderOptionsNamespaceKey("openai")).toBe("openai");
   });
@@ -527,6 +537,107 @@ describe("buildProviderOptions - Anthropic", () => {
           config: directConfig({ baseUrl: "https://api.anthropic.com/v1" }),
         })
       ).toMatchObject({ blockBinding: dropBlock });
+    });
+
+    test("drops invalidated blocks on an anthropic-typed Coder AI Gateway instance", () => {
+      // The Coder AI Gateway forwards the beta header and block_binding to the
+      // Anthropic API (and converts both for Bedrock). Without drop_block, every
+      // prefix change (an app restart reconnecting MCP servers, a plugin update)
+      // costs one 400 plus a full retry per conversation.
+      const coderInstance = (
+        name: string,
+        type: string,
+        extra: Record<string, unknown> = {}
+      ): ProvidersConfigMap =>
+        ({
+          coder: {
+            apiKeySet: false,
+            isEnabled: true,
+            isConfigured: true,
+            discoveredProviders: [{ name, type }],
+            ...extra,
+          },
+        }) as unknown as ProvidersConfigMap;
+      const eligible: Array<[string, string, ProvidersConfigMap]> = [
+        [
+          "gateway-scoped id",
+          "coder:anthropic/claude-opus-5-5",
+          coderInstance("anthropic", "anthropic"),
+        ],
+        [
+          "canonical id routed to a custom-named instance",
+          "anthropic:claude-opus-5-5",
+          coderInstance("claude-aws-us-east-2", "anthropic", {
+            canonicalRoutes: { anthropic: "claude-aws-us-east-2" },
+          }),
+        ],
+      ];
+      for (const [label, model, config] of eligible) {
+        expect({ label, thinking: thinkingFor(model, { config, route: "coder" }) }).toEqual({
+          label,
+          thinking: { type: "adaptive", display: "summarized", blockBinding: dropBlock },
+        });
+      }
+
+      const ineligible: Array<[string, string, Parameters<typeof thinkingFor>[1]]> = [
+        [
+          "bedrock-typed instance",
+          "coder:bedrock/anthropic.claude-opus-5-5",
+          { config: coderInstance("bedrock", "bedrock"), route: "coder" },
+        ],
+        [
+          "canonical id routed to a bedrock-typed instance",
+          "anthropic:claude-opus-5-5",
+          { config: coderInstance("anthropic", "bedrock"), route: "coder" },
+        ],
+        [
+          "request beta opt-out",
+          "coder:anthropic/claude-opus-5-5",
+          {
+            config: coderInstance("anthropic", "anthropic"),
+            route: "coder",
+            disableBetaFeatures: true,
+          },
+        ],
+      ];
+      for (const [label, model, options] of ineligible) {
+        expect({ label, thinking: thinkingFor(model, options) }).toEqual({
+          label,
+          thinking: { type: "adaptive", display: "summarized" },
+        });
+      }
+
+      // The backend's `providers.anthropic.disableBetaFeatures` (ZDR) is
+      // authoritative for Coder Anthropic instances too: persisted request
+      // options that say `false` must not re-enable the beta.
+      const zdrConfig = {
+        ...coderInstance("anthropic", "anthropic"),
+        anthropic: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: false,
+          disableBetaFeatures: true,
+        },
+      } as unknown as ProvidersConfigMap;
+      for (const model of ["coder:anthropic/claude-opus-5-5", "anthropic:claude-opus-5-5"]) {
+        const thinking = anthropicProviderOptions(
+          buildProviderOptions(
+            model,
+            "high",
+            undefined,
+            undefined,
+            { anthropic: { disableBetaFeatures: false } },
+            undefined,
+            undefined,
+            zdrConfig,
+            "coder"
+          )
+        ).thinking;
+        expect({ model, thinking }).toEqual({
+          model,
+          thinking: { type: "adaptive", display: "summarized" },
+        });
+      }
     });
 
     test("leaves models that do not bind thinking to the prefix unchanged", () => {

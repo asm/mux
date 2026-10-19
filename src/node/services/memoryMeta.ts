@@ -400,13 +400,21 @@ export class MemoryMetaService {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return this.writeLock.withPermit(
-      Effect.tryPromise({
-        try: () => self.mutateLocked(update),
-        catch: (cause) =>
-          cause instanceof MemoryMetaWriteError
-            ? cause
-            : new MemoryMetaWriteError({ metaPath: self.metaPath, reason: getErrorMessage(cause) }),
-      })
+      // The lock, the re-read and the atomic write cannot be cancelled once started: a fiber
+      // interrupted meanwhile (a client abort) still waits for them, so no later read races a
+      // write that is still landing and sees the two views disagree.
+      Effect.uninterruptible(
+        Effect.tryPromise({
+          try: () => self.mutateLocked(update),
+          catch: (cause) =>
+            cause instanceof MemoryMetaWriteError
+              ? cause
+              : new MemoryMetaWriteError({
+                  metaPath: self.metaPath,
+                  reason: getErrorMessage(cause),
+                }),
+        })
+      )
     );
   }
 

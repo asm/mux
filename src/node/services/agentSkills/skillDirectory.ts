@@ -6,7 +6,6 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import { toPosixPath } from "@/node/utils/paths";
 
 import type { ResolvedAgentSkill } from "./agentSkillsService";
-import { isSkillDynamicDirectiveLine } from "./skillDynamicContext";
 
 /**
  * Where a skill's bundled files live, as seen by `bash` in the workspace.
@@ -103,14 +102,15 @@ function formatSkillDirectoryLine(dir: Extract<SkillDirectory, { available: true
 }
 
 /**
- * Prepend the skill-directory line to a user-invoked (slash/inline) skill
- * snapshot body. agent_skill_read returns the same facts as skillDir or
- * skillDirUnavailable, but a snapshot reaches the model without any tool
- * result: without the path, models searched the filesystem for the skill (and
- * read another checkout's copy). Same rule as agent_skill_read: the path only
- * when bash can use it, the off-host note when the files are on the Xum host
- * while bash runs elsewhere, and nothing for built-in and other-checkout
- * skills (agent_skill_read_file and agent_skill_read cover those).
+ * Prepend the skill-directory line to a skill snapshot body: user-invoked
+ * (slash/inline) snapshots, and snapshots re-injected after compaction from
+ * agent_skill_read results (their skillDir or skillDirUnavailable). A snapshot
+ * reaches the model without any tool result: without the path, models searched
+ * the filesystem for the skill (and read another checkout's copy). Same rule
+ * as agent_skill_read: the path only when bash can use it, the off-host note
+ * when the files are on the Xum host while bash runs elsewhere, and nothing
+ * for built-in and other-checkout skills (agent_skill_read_file and
+ * agent_skill_read cover those).
  * The line lives in the body, so it is in the snapshot hash and survives
  * post-compaction re-injection without a new persisted field.
  */
@@ -169,25 +169,6 @@ export function substituteSkillDirectoryPlaceholders(body: string, dir: SkillDir
     if (name === "CLAUDE_SKILL_DIR") return dir.skillDir;
     return dir.pluginRoot ?? match;
   });
-}
-
-/**
- * Substitute the placeholders everywhere except whole-line !`command`
- * directives. A directive is shell code: a spliced path containing `$()`,
- * backticks or quotes would be reparsed as shell syntax. Directives get the
- * values as environment variables instead (see skillDirectoryEnv), so the
- * shell expands `"${CLAUDE_SKILL_DIR}"` itself and the path stays one word.
- */
-export function substituteSkillDirectoryPlaceholdersOutsideDirectives(
-  body: string,
-  dir: SkillDirectory
-): string {
-  return body
-    .split("\n")
-    .map((line) =>
-      isSkillDynamicDirectiveLine(line) ? line : substituteSkillDirectoryPlaceholders(line, dir)
-    )
-    .join("\n");
 }
 
 /** Environment for directive commands: the placeholder names with their values. */

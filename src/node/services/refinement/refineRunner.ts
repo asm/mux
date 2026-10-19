@@ -237,6 +237,8 @@ export async function runRefinePass(args: {
     usage: LanguageModelV2Usage,
     providerMetadata?: Record<string, unknown>
   ) => Promise<void>;
+  /** Pricing identity of `model`; its long-context threshold sets each step's tier. */
+  pricingModel?: string;
 }): Promise<RefinePassResult> {
   assert(args.transcript.trim().length > 0, "refine pass requires a non-empty transcript");
 
@@ -505,7 +507,7 @@ export async function runRefinePass(args: {
         if (effectiveUsage.inputTokens !== undefined || effectiveUsage.outputTokens !== undefined) {
           const recordPromise = args.recordUsage?.(
             effectiveUsage,
-            accumulateStepsProviderMetadata(steps)
+            accumulateStepsProviderMetadata(steps, args.pricingModel)
           );
           if (recordPromise !== undefined) {
             // Detachment safety: if the race below abandons the write, a

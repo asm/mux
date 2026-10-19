@@ -10,12 +10,15 @@ import {
   type ModelMessage,
   type Tool,
 } from "ai";
+import type { GoogleVertexProviderSettings } from "@ai-sdk/google-vertex";
 import type { Experimental_EvaluationModelV4 } from "@ai-sdk/provider";
 import { xai } from "@ai-sdk/xai";
 import { z } from "zod";
 import { Cause, Effect, Exit, Option } from "effect";
 import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
-import { writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { generateKeyPairSync } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -34,6 +37,7 @@ import {
 import { Ok } from "@/common/types/result";
 import { TOOL_PAYLOAD_DEPTH_REJECTION } from "@/common/utils/tools/toolPayloadDepth";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import { MAX_CREDENTIAL_FILE_BYTES } from "@/node/utils/providerRequirements";
 import {
   ProviderModelFactory,
   buildAIProviderRequestHeaders,
@@ -1511,6 +1515,223 @@ describe("ProviderModelFactory Meta", () => {
   });
 });
 
+describe("ProviderModelFactory Google Vertex AI", () => {
+  unsetEnvForEachTest(
+    "GOOGLE_VERTEX_API_KEY",
+    "GOOGLE_VERTEX_PROJECT",
+    "GOOGLE_VERTEX_LOCATION",
+    "GOOGLE_APPLICATION_CREDENTIALS"
+  );
+
+  const sendOnce = async (
+    factory: ProviderModelFactory,
+    modelString: string
+  ): Promise<CapturedFetchCall[]> => {
+    const options = buildProviderOptions(modelString, "medium");
+    if (!("googleVertex" in options)) throw new Error("Vertex must use the googleVertex namespace");
+    const { calls, fakeFetch } = createCapturingFetch();
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+    try {
+      const result = await factory.createModel(modelString);
+      if (!result.success) throw new Error(result.error.type);
+      await generateText({
+        model: result.data,
+        prompt: "hello",
+        providerOptions: { googleVertex: options.googleVertex },
+        maxRetries: 0,
+      }).catch(() => undefined);
+      return calls;
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  };
+
+  it("sends express mode requests to the Vertex publisher path with the API key", async () => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({
+        "google-vertex": { apiKey: "vertex-key", project: "ignored-project" },
+      });
+
+      const calls = await sendOnce(factory, "google-vertex:gemini-2.5-flash");
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url).toBe(
+        "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-flash:generateContent"
+      );
+      expect(new Headers(calls[0].init.headers).get("x-goog-api-key")).toBe("vertex-key");
+      // Thinking options must land in the namespace the Vertex model reads.
+      expect(parseSentBody(calls[0])).toMatchObject({
+        generationConfig: { thinkingConfig: { includeThoughts: true } },
+      });
+    });
+  });
+
+  it.each([
+    { name: "the saved key file", source: "config" },
+    { name: "the GOOGLE_APPLICATION_CREDENTIALS key file", source: "env" },
+  ] as const)(
+    "uses ADC with the project, the default global location, and $name",
+    async ({ source }) => {
+      await withTempConfig(async (config, factory, _oauth, store) => {
+        const keyFilename = path.join(config.rootDir, "sa.json");
+        // A real private key, so the up-front key file check must accept it.
+        const { privateKey } = generateKeyPairSync("rsa", {
+          modulusLength: 2048,
+          publicKeyEncoding: { type: "spki", format: "pem" },
+          privateKeyEncoding: { type: "pkcs8", format: "pem" },
+        });
+        await writeFile(
+          keyFilename,
+          JSON.stringify({
+            type: "service_account",
+            client_email: "xum@my-project.iam.gserviceaccount.com",
+            private_key: privateKey,
+          })
+        );
+        if (source === "env") {
+          process.env.GOOGLE_APPLICATION_CREDENTIALS = keyFilename;
+        }
+        store.saveProvidersConfig({
+          "google-vertex": { project: "my-project", ...(source === "config" && { keyFilename }) },
+        });
+        const originalRegistry = PROVIDER_REGISTRY["google-vertex"];
+        let authOptions: GoogleVertexProviderSettings["googleAuthOptions"];
+        PROVIDER_REGISTRY["google-vertex"] = async () => {
+          const module = await originalRegistry();
+          return {
+            ...module,
+            createVertex: (options?: GoogleVertexProviderSettings) => {
+              authOptions = options?.googleAuthOptions;
+              // Stand in for Google's credential lookup so no metadata server is contacted.
+              const authClient = {
+                getAccessToken: () => Promise.resolve({ token: "adc-token" }),
+              } as unknown as NonNullable<
+                GoogleVertexProviderSettings["googleAuthOptions"]
+              >["authClient"];
+              return module.createVertex({
+                ...options,
+                googleAuthOptions: { ...options?.googleAuthOptions, authClient },
+              });
+            },
+          };
+        };
+
+        try {
+          const calls = await sendOnce(factory, "google-vertex:gemini-2.5-flash");
+
+          // The env key file stays with Google's own ADC lookup (see the factory).
+          expect(authOptions).toEqual(source === "config" ? { keyFilename } : undefined);
+          expect(calls).toHaveLength(1);
+          expect(calls[0].url).toBe(
+            "https://aiplatform.googleapis.com/v1beta1/projects/my-project/locations/global/publishers/google/models/gemini-2.5-flash:generateContent"
+          );
+          const headers = new Headers(calls[0].init.headers);
+          expect(headers.get("authorization")).toBe("Bearer adc-token");
+          expect(headers.get("x-goog-api-key")).toBeNull();
+        } finally {
+          PROVIDER_REGISTRY["google-vertex"] = originalRegistry;
+        }
+      });
+    }
+  );
+
+  it.each([
+    { name: "missing", prepare: (_keyFilename: string) => Promise.resolve() },
+    { name: "a directory", prepare: (keyFilename: string) => mkdir(keyFilename) },
+    { name: "not JSON", prepare: (keyFilename: string) => writeFile(keyFilename, "-----BEGIN") },
+    { name: "a JSON array", prepare: (keyFilename: string) => writeFile(keyFilename, "[]") },
+    { name: "JSON null", prepare: (keyFilename: string) => writeFile(keyFilename, "null") },
+    { name: "a JSON string", prepare: (keyFilename: string) => writeFile(keyFilename, '"key"') },
+    {
+      name: "a JSON object with a private_key that is not a key",
+      prepare: (keyFilename: string) =>
+        writeFile(
+          keyFilename,
+          JSON.stringify({
+            client_email: "xum@my-project.iam.gserviceaccount.com",
+            private_key: "not-a-pem",
+          })
+        ),
+    },
+    // A JSON object, so only the size check rejects it.
+    {
+      name: "over the size cap",
+      prepare: (keyFilename: string) =>
+        writeFile(keyFilename, JSON.stringify({ padding: "x".repeat(MAX_CREDENTIAL_FILE_BYTES) })),
+    },
+    // POSIX only: Windows has no mkfifo. Reading a FIFO with no writer blocks forever.
+    ...(process.platform === "win32"
+      ? []
+      : [
+          {
+            name: "a FIFO",
+            prepare: (keyFilename: string) => {
+              execFileSync("mkfifo", [keyFilename]);
+              return Promise.resolve();
+            },
+          },
+        ]),
+  ])(
+    "fails a service account key file that is $name before sending a request",
+    async ({ prepare }) => {
+      await withTempConfig(async (config, factory, _oauth, store) => {
+        const keyFilename = path.join(config.rootDir, "sa.json");
+        await prepare(keyFilename);
+        store.saveProvidersConfig({ "google-vertex": { project: "my-project", keyFilename } });
+
+        // A non-retryable configuration error, not a request-time auth error that
+        // auto-retry repeats and that echoes the path or file contents into the chat.
+        expect(await factory.createModel("google-vertex:gemini-2.5-flash")).toEqual({
+          success: false,
+          error: { type: "api_key_not_found", provider: "google-vertex" },
+        });
+      });
+    }
+  );
+
+  it("fails a missing GOOGLE_APPLICATION_CREDENTIALS key file before sending a request", async () => {
+    await withTempConfig(async (config, factory, _oauth, store) => {
+      process.env.GOOGLE_APPLICATION_CREDENTIALS = path.join(config.rootDir, "missing.json");
+      store.saveProvidersConfig({ "google-vertex": { project: "my-project" } });
+
+      expect(await factory.createModel("google-vertex:gemini-2.5-flash")).toEqual({
+        success: false,
+        error: { type: "api_key_not_found", provider: "google-vertex" },
+      });
+    });
+  });
+
+  it("ignores a missing GOOGLE_APPLICATION_CREDENTIALS key file in express mode", async () => {
+    await withTempConfig(async (config, factory, _oauth, store) => {
+      process.env.GOOGLE_APPLICATION_CREDENTIALS = path.join(config.rootDir, "missing.json");
+      store.saveProvidersConfig({ "google-vertex": { apiKey: "vertex-key" } });
+
+      const result = await factory.createModel("google-vertex:gemini-2.5-flash");
+
+      expect(result.success).toBe(true);
+    });
+  });
+
+  it("reports a tuned model with an express mode API key as an invalid model", async () => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ "google-vertex": { apiKey: "vertex-key" } });
+
+      const result = await factory.createModel("google-vertex:endpoints/1234567890");
+
+      expect(result).toMatchObject({ success: false, error: { type: "invalid_model_string" } });
+    });
+  });
+
+  it("reports an unconfigured provider without a project or API key", async () => {
+    await withTempConfig(async (_config, factory) => {
+      expect(await factory.createModel("google-vertex:gemini-2.5-flash")).toEqual({
+        success: false,
+        error: { type: "api_key_not_found", provider: "google-vertex" },
+      });
+    });
+  });
+});
+
 describe("ProviderModelFactory native OpenAI alias tiers", () => {
   it.each(["responses", "chatCompletions"] as const)(
     "retains SDK tier gating for unmapped native models over %s",
@@ -2923,7 +3144,8 @@ describe("ProviderModelFactory Anthropic Fast mode", () => {
   unsetEnvForEachTest("ANTHROPIC_BASE_URL");
   const sendOnce = async (
     anthropicConfig: Record<string, unknown>,
-    modelString: string
+    modelString: string,
+    chatServiceTier?: ServiceTier
   ): Promise<CapturedFetchCall> => {
     let captured: CapturedFetchCall | undefined;
     await withTempConfig(async (_config, factory, _oauth, store) => {
@@ -2931,7 +3153,10 @@ describe("ProviderModelFactory Anthropic Fast mode", () => {
       const { calls, fakeFetch } = createCapturingFetch();
       const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
       try {
-        const result = await factory.createModel(modelString);
+        const result = await factory.createModel(
+          modelString,
+          chatServiceTier != null ? { openai: { serviceTier: chatServiceTier } } : undefined
+        );
         if (!result.success) throw new Error(result.error.type);
         await generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
           () => undefined
@@ -2967,6 +3192,106 @@ describe("ProviderModelFactory Anthropic Fast mode", () => {
     const call = await sendOnce(anthropicConfig, modelString);
     expect(parseSentBody(call)).not.toHaveProperty("speed");
     expect(betaHeader(call)).not.toContain("fast-mode-2026-02-01");
+  });
+
+  // Speed is the chat's choice, like reasoning: it follows the chat across models.
+  it("lets the chat's speed pick override the provider preference", async () => {
+    const fast = await sendOnce({}, "anthropic:claude-opus-5-5", "priority");
+    expect(parseSentBody(fast)).toMatchObject({ speed: "fast" });
+    expect(betaHeader(fast)).toContain("fast-mode-2026-02-01");
+
+    const standard = await sendOnce({ speed: "fast" }, "anthropic:claude-opus-5-5", "default");
+    expect(parseSentBody(standard)).not.toHaveProperty("speed");
+
+    const unsupported = await sendOnce({}, "anthropic:claude-opus-4-7", "priority");
+    expect(parseSentBody(unsupported)).not.toHaveProperty("speed");
+  });
+
+  it("applies a mid-turn chat speed change to the next call", async () => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ anthropic: { apiKey: "test-key" } });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      const chat: { serviceTier?: ServiceTier } = {};
+      try {
+        const result = await factory.createModel("anthropic:claude-opus-5-5", undefined, {
+          getServiceTierOverride: () => chat.serviceTier,
+        });
+        if (!result.success) throw new Error(result.error.type);
+        const send = () =>
+          generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
+            () => undefined
+          );
+        await send();
+        chat.serviceTier = "priority";
+        await send();
+        chat.serviceTier = "default";
+        await send();
+        expect(calls.map((call) => parseSentBody(call).speed)).toEqual([
+          undefined,
+          "fast",
+          undefined,
+        ]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+});
+
+describe("ProviderModelFactory xAI chat speed", () => {
+  const sentTiers = async (
+    xaiConfig: Record<string, unknown>,
+    modelString: string,
+    tiers: Array<ServiceTier | undefined>,
+    requestTier?: "default" | "priority"
+  ): Promise<unknown[]> => {
+    let sent: unknown[] = [];
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ xai: { apiKey: "test-key", ...xaiConfig } });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      const chat: { serviceTier?: ServiceTier } = { serviceTier: tiers[0] };
+      try {
+        const result = await factory.createModel(
+          modelString,
+          requestTier != null ? { xai: { serviceTier: requestTier } } : undefined,
+          { getServiceTierOverride: () => chat.serviceTier }
+        );
+        if (!result.success) throw new Error(result.error.type);
+        for (const tier of tiers) {
+          chat.serviceTier = tier;
+          await generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
+            () => undefined
+          );
+        }
+        sent = calls.map((call) => parseSentBody(call).service_tier);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+    return sent;
+  };
+
+  it("follows the chat's pick per request over the provider tier", async () => {
+    expect(
+      await sentTiers({ serviceTier: "priority" }, "xai:grok-4.7", [
+        undefined,
+        "default",
+        "priority",
+        "ultrafast",
+      ])
+    ).toEqual(["priority", "default", "priority", "default"]);
+  });
+
+  it("keeps an explicit xAI request tier over live chat changes", async () => {
+    expect(
+      await sentTiers({}, "xai:grok-4.7", ["priority", "default", "priority"], "default")
+    ).toEqual(["default", "default", "default"]);
+  });
+
+  it("keeps non-frontier Grok on the provider tier", async () => {
+    expect(await sentTiers({}, "xai:grok-code-fast-1", ["priority"])).toEqual([undefined]);
   });
 });
 

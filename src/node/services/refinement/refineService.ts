@@ -1089,6 +1089,7 @@ export class RefineService {
       if (!preDispatch.success) return preDispatch;
       const result = await runRefinePass({
         model: modelResult.data.model,
+        pricingModel: modelResult.data.metadataModel,
         memoryService: this.memoryService,
         metaService: this.metaService,
         ctx,

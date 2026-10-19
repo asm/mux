@@ -15,6 +15,7 @@ import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFi
 import { isMutationEpochUnreadable, readContainerMutationState } from "./journals";
 import { PLUGIN_REGISTRY_FILE_NAME, readPluginComponentImports } from "./registry";
 import { noComponentConsent, type ComponentConsent } from "./componentConsent";
+import type { ApprovedCopiesSource } from "./approvedCopies";
 import {
   isPlainObject,
   isValidAgentPluginName,
@@ -228,6 +229,11 @@ export interface AgentPluginInfo {
    * an install without records gets empty ones, so nothing of it loads until reviewed.
    */
   componentConsent?: ComponentConsent;
+  /**
+   * Managed plugins only: where the install keeps the approved copies a changed skill or workflow
+   * script falls back to (approvedCopies.ts). Set with componentConsent.
+   */
+  approvedCopies?: ApprovedCopiesSource;
   name: string;
   scope: AgentPluginScope;
   /** Canonical (realpath) plugin root directory. */
@@ -804,24 +810,66 @@ async function resolveAgentPluginContainerPath(containerPath: string): Promise<s
 function managedPluginFields(
   entryName: string,
   imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined,
-  registryPath: string | undefined
-): Pick<AgentPluginInfo, "componentPolicy" | "componentConsent" | "importedComponents"> {
-  if (imports === null) return { importedComponents: { skills: [], mcpServers: [] } };
+  registryPath: string | undefined,
+  /** The lexical `<container>/<entryName>` of the reading view (logicalPluginView renames it). */
+  instancePath: string
+): Pick<
+  AgentPluginInfo,
+  "componentPolicy" | "componentConsent" | "approvedCopies" | "importedComponents"
+> {
+  // A corrupt registry, or an unidentified row that can own the directory: nothing loads, also
+  // nothing the picker does not select (workflows, #6629).
+  const nothing = {
+    importedComponents: { skills: [], mcpServers: [] },
+    componentConsent: noComponentConsent(),
+  };
+  if (imports === null) return nothing;
   if (imports === undefined) return {};
-  if (!imports.byName.has(entryName)) {
-    return imports.hasUnidentifiedEntries
-      ? { importedComponents: { skills: [], mcpServers: [] } }
-      : {};
-  }
+  if (!imports.byName.has(entryName)) return imports.hasUnidentifiedEntries ? nothing : {};
   return {
     importedComponents: imports.byName.get(entryName),
     ...(registryPath !== undefined
       ? {
           componentPolicy: { registryPath, name: entryName },
           componentConsent: imports.consentByName.get(entryName) ?? noComponentConsent(),
+          ...approvedCopiesField(
+            registryPath,
+            instancePath,
+            imports.installedAtByName.get(entryName)
+          ),
         }
       : {}),
   };
+}
+
+/**
+ * One container's view of a physical plugin (read once, then shared by its views). Its approved
+ * copies are named by the view's lexical `<container>/<entryName>`, like the MCP server keys and
+ * hook trust: the install service names the install by the configured home, which can be a
+ * symlink to the registry's realpath, and another alias of the directory gets its own identity
+ * (without copies, so a changed component stays blocked there).
+ */
+function logicalPluginView(
+  plugin: AgentPluginInfo,
+  container: AgentPluginContainer,
+  instancePath: string
+): AgentPluginInfo {
+  const view = { ...plugin, containerPath: container.path, scope: container.scope };
+  if (plugin.approvedCopies !== undefined) {
+    view.approvedCopies = { ...plugin.approvedCopies, instancePath };
+  }
+  return view;
+}
+
+/** The copies location of a managed install; none for a row without a readable install time. */
+function approvedCopiesField(
+  registryPath: string,
+  instancePath: string,
+  installedAt: string | undefined
+): Pick<AgentPluginInfo, "approvedCopies"> {
+  return installedAt !== undefined
+    ? { approvedCopies: { xumHome: path.dirname(registryPath), instancePath, installedAt } }
+    : {};
 }
 
 export async function discoverAgentPlugins(
@@ -1071,6 +1119,7 @@ export async function discoverAgentPlugins(
     for (const entryName of snapshot.entryNames) {
       if (projectMetadataIndex === 0) canonicalProjectPluginNames.add(entryName);
       else if (projectMetadataIndex === 1 && canonicalProjectPluginNames.has(entryName)) continue;
+      const instancePath = path.join(container.path, entryName);
       let plugin = snapshot.plugins.get(entryName);
       if (plugin === undefined) {
         plugin = await discoverPluginAt({
@@ -1087,13 +1136,13 @@ export async function discoverAgentPlugins(
             managedPluginFields(
               entryName,
               snapshot.imports,
-              groups.get(canonicalPath)?.registryPath
+              groups.get(canonicalPath)?.registryPath,
+              instancePath
             )
           );
         }
       }
-      if (plugin)
-        plugins.push({ ...plugin, containerPath: container.path, scope: container.scope });
+      if (plugin) plugins.push(logicalPluginView(plugin, container, instancePath));
     }
   }
 

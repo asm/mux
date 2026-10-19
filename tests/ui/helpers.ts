@@ -5,7 +5,7 @@
 import { cleanup, fireEvent, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { FrontendWorkspaceMetadata, GitStatus } from "@/common/types/workspace";
-import { getDraftStore } from "@/browser/stores/DraftStore";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import type { RenderedApp } from "./renderReviewPanel";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { useGitStatusStoreRaw } from "@/browser/stores/GitStatusStore";
@@ -25,6 +25,16 @@ export async function openAnalyticsDialog(container: HTMLElement): Promise<HTMLE
   fireEvent.click(await within(container).findByTestId("analytics-button"));
   const body = container.ownerDocument.body;
   return within(body).findByRole("dialog", { name: "Analytics" }, { timeout: 30000 });
+}
+
+/**
+ * Open (or show) the New tab of the right sidebar pane inside `scope`: its strip offers it only
+ * as the last row of the All tabs menu, which renders in a portal outside `scope`.
+ */
+export async function openSidebarNewTab(scope: HTMLElement): Promise<void> {
+  fireEvent.click(await within(scope).findByRole("button", { name: "All tabs" }));
+  const menu = await within(scope.ownerDocument.body).findByRole("dialog", { name: "All tabs" });
+  fireEvent.click(within(menu).getByRole("button", { name: "New tab" }));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -294,32 +304,29 @@ export async function addProjectViaUI(view: RenderedApp, projectPath: string): P
 }
 
 export function getWorkspaceDraftIds(projectPath: string): string[] {
-  const draftsForProject = getDraftStore().getCreationDraftsByProject()[projectPath] ?? [];
+  const draftsForProject = getCreationDraftStore().getDraftsByProject()[projectPath] ?? [];
   return draftsForProject.map((draft) => draft.draftId);
 }
 
-/** Delete every listed creation draft of a project (the list lives on the backend). */
+/** Delete every listed creation draft of a project (records live on the backend). */
 export async function clearWorkspaceDrafts(projectPath: string): Promise<void> {
-  await getDraftStore().whenReady();
   await Promise.all(
-    getWorkspaceDraftIds(projectPath).map((draftId) =>
-      getDraftStore().deleteDraft({ kind: "creation", projectPath, draftId })
-    )
+    getWorkspaceDraftIds(projectPath).map((draftId) => getCreationDraftStore().delete(draftId))
   );
 }
 
-export async function waitForLatestDraftId(
-  projectPath: string,
-  timeoutMs = 5_000
-): Promise<string> {
+/**
+ * The creation draft the open project page shows (its `draft` route parameter). A new draft is
+ * not listed until it has content, so the route is the only place to read its id from.
+ */
+export async function waitForOpenDraftId(timeoutMs = 5_000): Promise<string> {
   return waitFor(
     () => {
-      const drafts = getWorkspaceDraftIds(projectPath);
-      const latestDraft = drafts[drafts.length - 1];
-      if (!latestDraft) {
-        throw new Error("Draft not registered yet");
+      const draftId = new URLSearchParams(window.location.search).get("draft");
+      if (!draftId) {
+        throw new Error("No draft in the route yet");
       }
-      return latestDraft;
+      return draftId;
     },
     { timeout: timeoutMs }
   );

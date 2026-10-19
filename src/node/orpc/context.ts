@@ -1,4 +1,5 @@
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
+import type { RowTreeClient } from "@/node/orpc/staticWorkspaceView/rowTreeClient";
 import type { IncomingHttpHeaders } from "http";
 import type {
   Config,
@@ -32,6 +33,7 @@ import type { McpOauthService } from "@/node/services/mcpOauthService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import type { FlightRecorder } from "@/node/services/perf/flightRecorder";
 import type { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
+import type { AgentResourceLimitsService } from "@/node/services/agentResourceLimits/agentResourceLimitsService";
 import type { PerfReportService } from "@/node/services/perf/perfReportService";
 import type { SessionTapeFolderService } from "@/node/services/sessionTapes/sessionTapeFolderService";
 import type { MemoryService } from "@/node/services/memoryService";
@@ -74,6 +76,8 @@ import type { OrpcEffectServices } from "@/node/orpc/effectContext";
  * service context, `ServiceContainer.runtime.context`).
  */
 export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
+  /** Only `xum server` sets it: the static workspace view's row trees (workspace.history.tail). */
+  rowTreeClient?: RowTreeClient;
   config: Config;
   sessionLocator: WorkspaceSessionLocator;
   providersConfigStore: ProvidersConfigStore;
@@ -111,6 +115,7 @@ export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
   experimentsService: ExperimentsService;
   perfFlightRecorder: FlightRecorder;
   perfCaptures: PerfCaptureService;
+  agentResourceLimits: AgentResourceLimitsService;
   perfReports: PerfReportService;
   sessionTapes: SessionTapeFolderService;
   memoryService: MemoryService;

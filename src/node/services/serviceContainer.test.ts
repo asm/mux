@@ -106,20 +106,23 @@ import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflow
  * Independent field → tag listing for every DI-built ORPC context field (the
  * production mapping lives in the Layer files); `Record<keyof …>` keeps it
  * exhaustive, so a field added to `ORPCContext` without a tag fails to compile
- * here. `perfFlightRecorder`, `perfCaptures`, `perfReports` and `sessionTapes` are
- * container-owned (constructed directly by ServiceContainer, outside the DI graph) and are
- * checked separately below.
+ * here. `perfFlightRecorder`, `perfCaptures`, `perfReports`, `sessionTapes` and
+ * `agentResourceLimits` are container-owned (constructed directly by ServiceContainer, outside
+ * the DI graph) and are checked separately below. `rowTreeClient` is added by `xum server` only
+ * (src/cli/server.ts).
  */
 const ORPC_FIELD_TAGS: Record<
   keyof Omit<
     ORPCContext,
     | "headers"
+    | "rowTreeClient"
     | "effect/context"
     | "effect/wrap"
     | "perfFlightRecorder"
     | "perfCaptures"
     | "perfReports"
     | "sessionTapes"
+    | "agentResourceLimits"
   >,
   Context.Key<AppTags, unknown>
 > = {
@@ -586,6 +589,16 @@ describe("ServiceContainer", () => {
     await disposal;
   });
 
+  it("hands workspace metadata events to AIService, so removal drops its request caches", () => {
+    services = new ServiceContainer(stores);
+    const handleWorkspaceMetadata = spyOn(services.aiService, "handleWorkspaceMetadata");
+    const event = { workspaceId: "removed-workspace", metadata: null };
+
+    services.workspaceService.emit("metadata", event);
+
+    expect(handleWorkspaceMetadata).toHaveBeenCalledWith(event);
+  });
+
   it("attributes multi-project stream-end analytics to the primary project path", async () => {
     const primaryProjectPath = "/fake/project-a";
     const secondaryProjectPath = "/fake/project-b";
@@ -912,6 +925,7 @@ describe("ServiceContainer", () => {
     "coderOauthService.separateDiscoveredModels",
     "experimentsService.initialize",
     "bashAiProxy.restore",
+    "agentResourceLimits.start",
     "taskService.recoverInterruptedTasks",
   ];
 
@@ -1203,7 +1217,7 @@ describe("ServiceContainer", () => {
     expect(recoverTasks).not.toHaveBeenCalled();
   });
 
-  it("initializeCore records the six core steps and re-runs them when called again", async () => {
+  it("initializeCore records the seven core steps and re-runs them when called again", async () => {
     services = new ServiceContainer(stores);
     const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(
       undefined
@@ -1672,6 +1686,7 @@ describe("ServiceContainer", () => {
     expect(orpcContext.perfCaptures).toBe(services.perfCaptures);
     expect(orpcContext.perfReports).toBe(services.perfReports);
     expect(orpcContext.sessionTapes).toBe(services.sessionTapes);
+    expect(orpcContext.agentResourceLimits).toBe(services.agentResourceLimits);
     expect(services.runtime.get(IdleDispatcherTag)).toBe(services.idleDispatcher);
     expect(services.runtime.get(StreamManagerTag).effectRunner).toBe(
       services.runtime.get(EffectRunnerTag)

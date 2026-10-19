@@ -28,12 +28,14 @@ import {
   type MCPGetPromptResult,
   type MCPPrompt,
   type MCPRawCallToolResult,
+  PROMPT_LIST_TIMEOUT_MS,
 } from "@/node/services/mcpClient";
 import {
   MCP_SETTINGS_WORKSPACE_META_KEY,
   boundMCPSettingsToolResult,
   MAX_MCP_SETTINGS_TOOL_RESULT,
   filterMCPSettingValues,
+  MCP_SETTINGS_READ_TIMEOUT_MS,
   parseMCPSettingsReadResult,
   validateMCPSettingValue,
   type MCPSettingValue,
@@ -87,6 +89,7 @@ import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import type { AgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import { isMutationEpochUnreadable } from "@/node/services/agentPlugins/journals";
+import { envNameKey } from "@/node/services/agentPlugins/openaiMcpAuth";
 import { SecretsStore, type Config } from "@/node/config";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import { secretsToRecord } from "@/common/types/secrets";
@@ -462,7 +465,7 @@ export function wrapMCPTools(
       icons?: { registry: MCPIconRegistry; owner: MCPIconOwner };
     };
     /**
-     * MCP Apps (artifacts experiment): host-only store for the raw results of tools that
+     * MCP Apps (mcp-apps experiment): host-only store for the raw results of tools that
      * declare a view. Omitted when the experiment was off at connect time.
      */
     appResults?: { serverName: string; store: McpAppResultStore };
@@ -608,6 +611,11 @@ type ResolvedTransport = "stdio" | "http" | "sse";
 
 /** How long a served tool call waits for a publication's enablement repair before failing closed. */
 const PENDING_REPAIR_WAIT_MS = 10_000;
+/**
+ * Bounds one send's wait for first prompt lists (awaitFirstPromptLists): two prompts/list
+ * timeouts, the worst case of the earlier two-round wait.
+ */
+export const FIRST_PROMPT_LIST_WAIT_MS = 2 * PROMPT_LIST_TIMEOUT_MS;
 /**
  * ONE deadline for a served tool call's complete authorization gate: every
  * wait in it (repair waits, disk re-reads, re-serves, lock acquisition, epoch
@@ -993,9 +1001,12 @@ function withForwardedHostEnv(
 ): Record<string, string> | undefined {
   // Own properties only: `constructor` would read an inherited function. Object.fromEntries
   // keeps a host variable named `__proto__`, which an assignment would drop.
+  // A configured key wins: on Windows names compare without case, so drop a forwarded name that
+  // matches one there, or both keys would reach the same variable (#6713).
+  const configured = new Set(Object.keys(env ?? {}).map(envNameKey));
   const forwarded = (forwardEnv ?? []).flatMap((name): Array<[string, string]> => {
     const value = Object.hasOwn(process.env, name) ? process.env[name] : undefined;
-    return typeof value === "string" ? [[name, value]] : [];
+    return typeof value === "string" && !configured.has(envNameKey(name)) ? [[name, value]] : [];
   });
   return forwarded.length > 0 ? { ...Object.fromEntries(forwarded), ...env } : env;
 }
@@ -1437,7 +1448,7 @@ interface MCPServerInstance {
   /** Codex plugin hooks (see MCPServerManager.callToolForPluginHook). */
   callToolForHook: MCPClientHandle["callToolForHook"];
   /**
-   * MCP Apps (artifacts experiment): present only when the connection announced the
+   * MCP Apps (mcp-apps experiment): present only when the connection announced the
    * extension. Tool metadata includes tools hidden from the model.
    */
   apps?: Pick<
@@ -1831,7 +1842,7 @@ export class MCPServerManager {
 
   private mcpApps: { isEnabled: () => boolean; store: McpAppResultStore } | null = null;
 
-  /** MCP Apps host support, gated by the artifacts experiment (read at each connect). */
+  /** MCP Apps host support, gated by the mcp-apps experiment (read at each connect). */
   setMcpApps(apps: { isEnabled: () => boolean; store: McpAppResultStore }): void {
     this.mcpApps = apps;
   }
@@ -2606,9 +2617,19 @@ export class MCPServerManager {
     const inFlight = this.toolRefreshesInFlight.get(instance);
     if (inFlight !== undefined) return inFlight;
     if (instance.isClosed || !instance.refreshTools) return Promise.resolve(true);
+    const previousToolCount = Object.keys(instance.tools).length;
     const refresh = instance
       .refreshTools()
-      .then(() => true)
+      .then(() => {
+        // Counts per refetch show whether a remote server's tool list drifts between
+        // fetches (which used to change the tool_catalog_search overview).
+        log.debug("[MCP] Refreshed tool catalog", {
+          name: instance.name,
+          previousToolCount,
+          toolCount: Object.keys(instance.tools).length,
+        });
+        return true;
+      })
       .catch((error: unknown) => {
         log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
           name: instance.name,
@@ -2627,9 +2648,11 @@ export class MCPServerManager {
 
   /**
    * Send-path prompt freshness is stale-while-revalidate: prompts/list can
-   * hang for its full timeout on servers that ignore prompt requests, and a
-   * message send must never wait on it. Streams serve the cached catalog and
-   * the refreshed one lands for the next stream.
+   * hang for its full timeout on servers that ignore prompt requests, so a
+   * send does not wait on a refresh of a listed catalog. Streams serve the
+   * cached catalog and the refreshed one lands for the next stream. The one
+   * exception is an instance that never listed: the send waits for its first
+   * list, bounded and abortable (see awaitFirstPromptLists).
    */
   private refreshInstancePromptsInBackground(entry: WorkspaceServers): void {
     if (entry.promptRefreshInFlight !== undefined) {
@@ -2736,7 +2759,7 @@ export class MCPServerManager {
   /**
    * Wait for the first prompts/list of the workspace's served instances. Returns true when the
    * serve that just ran used a catalog that was never listed (`unlistedAtServe`, or found now),
-   * so the caller must serve again.
+   * so the caller must serve again, unless `signal` (the send's Stop) aborted.
    *
    * Sends serve a cached entry's prompts stale-while-revalidate. An entry started without a
    * prompt list (an MCP App entry point warm-up, a prompt dispatch) has an empty catalog, which
@@ -2746,20 +2769,49 @@ export class MCPServerManager {
    */
   private async awaitFirstPromptLists(
     workspaceId: string,
-    unlistedAtServe: boolean
+    unlistedAtServe: boolean,
+    signal: AbortSignal | undefined
   ): Promise<boolean> {
     // The serve's own background refresh can settle before this check runs.
     if (!unlistedAtServe && !this.hasUnlistedPromptInstances(workspaceId)) return false;
-    // Share the entry's deduped background refresh with every concurrent send. A refresh that
-    // was already in flight covers only the instances it started with, so a second round lists
-    // an instance added since then.
-    for (let round = 0; round < 2 && this.hasUnlistedPromptInstances(workspaceId); round++) {
-      const entry = this.workspaceServers.get(workspaceId);
-      if (entry === undefined) break;
-      this.refreshInstancePromptsInBackground(entry);
-      await entry.promptRefreshInFlight;
+    // A deadline, not a round count: overlapping warm-ups can keep adding unlisted instances
+    // (#6599). Stop ends the wait too.
+    const deadline = Date.now() + FIRST_PROMPT_LIST_WAIT_MS;
+    const attempted = new Set<MCPServerInstance>();
+    for (
+      let round = this.joinFirstPromptListRound(workspaceId, attempted, deadline);
+      round !== undefined;
+      round = this.joinFirstPromptListRound(workspaceId, attempted, deadline)
+    ) {
+      const timeoutMs = deadline - Date.now();
+      if ((await raceWithAbortAndTimeout(round, { signal, timeoutMs })).kind === "aborted") break;
     }
-    return true;
+    // A stopped send needs no second serve.
+    return signal?.aborted !== true;
+  }
+
+  /**
+   * Share the entry's deduped background refresh with every concurrent send, and return it, or
+   * undefined when no instance is left to wait for or `deadline` passed. A refresh that was
+   * already in flight covers only the instances it started with, so the next round lists an
+   * instance added since then. An instance that a refresh this send started did not list (it
+   * closed or cannot list) is not waited for again, so rounds cannot spin.
+   */
+  private joinFirstPromptListRound(
+    workspaceId: string,
+    attempted: Set<MCPServerInstance>,
+    deadline: number
+  ): Promise<void> | undefined {
+    const entry = this.workspaceServers.get(workspaceId);
+    if (entry === undefined || Date.now() >= deadline) return undefined;
+    const eligible = [...this.promptEligibleInstances(entry).values()];
+    const waiting = eligible.filter((instance) => !this.promptListSettledInstances.has(instance));
+    if (waiting.every((instance) => attempted.has(instance))) return undefined;
+    if (entry.promptRefreshInFlight === undefined) {
+      for (const instance of eligible) attempted.add(instance);
+    }
+    this.refreshInstancePromptsInBackground(entry);
+    return entry.promptRefreshInFlight;
   }
 
   /**
@@ -3238,20 +3290,24 @@ export class MCPServerManager {
     options: MCPWorkspaceRequestOptions,
     readSignal?: AbortSignal
   ): Promise<MCPToolsForWorkspaceResult> {
-    return this.serveWithFirstPromptLists(options.workspaceId, () =>
-      this.runWithStablePluginEpoch(() => this.ensureWorkspaceServers(options, true, readSignal))
+    return this.serveWithFirstPromptLists(
+      options.workspaceId,
+      () =>
+        this.runWithStablePluginEpoch(() => this.ensureWorkspaceServers(options, true, readSignal)),
+      readSignal
     );
   }
 
   /** Run `serve`, and again after awaitFirstPromptLists waited, so the result has the catalog. */
   private async serveWithFirstPromptLists(
     workspaceId: string,
-    serve: () => Promise<MCPToolsForWorkspaceResult>
+    serve: () => Promise<MCPToolsForWorkspaceResult>,
+    signal: AbortSignal | undefined
   ): Promise<MCPToolsForWorkspaceResult> {
     const unlistedAtServe = this.hasUnlistedPromptInstances(workspaceId);
     const stopEpoch = this.workspaceStopEpochs.get(workspaceId) ?? 0;
     const result = await serve();
-    if (!(await this.awaitFirstPromptLists(workspaceId, unlistedAtServe))) return result;
+    if (!(await this.awaitFirstPromptLists(workspaceId, unlistedAtServe, signal))) return result;
     // A removal-style stop since the first serve began owns the workspace: never start its
     // servers again. Return what the first serve returned, as before the wait existed.
     if ((this.workspaceStopEpochs.get(workspaceId) ?? 0) !== stopEpoch) return result;
@@ -5228,6 +5284,8 @@ export class MCPServerManager {
     /** `noStart`: read only a running instance; never start or restart the server. */
     options?: { signal?: AbortSignal; timeoutMs?: number; noStart?: boolean }
   ): Promise<MCPSettingsReadSnapshot | null> {
+    // The catalog refresh after the read shares the read's deadline (#6611).
+    const startedAt = Date.now();
     const noSettings = Symbol("no settings");
     let source: { instance: MCPServerInstance; requestId: number } | undefined;
     const snapshot = await this.invokeServerOperation(
@@ -5262,42 +5320,62 @@ export class MCPServerManager {
         workspaceId,
         serverName,
         snapshot.layout,
-        options
+        options,
+        startedAt
       ),
     };
     // The hash covers what this read returns (its layout carries the tool actions), the same
     // object a save's fresh read is compared with (runSettingsSave).
-    this.rememberSettingsSchema(workspaceId, serverName, instanceToken, read);
-    return { ...read, instanceToken };
+    this.rememberSettingsSchema(workspaceId, serverName, instanceToken, read, source.requestId);
+    const readId = this.rememberSettingsReadTools(
+      crypto.randomUUID(),
+      workspaceId,
+      serverName,
+      instanceToken,
+      read
+    );
+    return { ...read, instanceToken, readId };
   }
 
   /**
    * The layout with each tool item's action (see settingsToolAction). The catalog is refreshed
-   * first (bounded, as for MCP App entry points): after tools/list_changed the held catalog
-   * would show a new tool as unavailable and keep a removed one runnable.
+   * first, as before a dispatch (refreshSettingsActionTools, so a legacy catalog is re-listed
+   * too): after tools/list_changed the held catalog would show a new tool as unavailable and
+   * keep a removed one runnable. Bounded by the read's own deadline (#6611, see
+   * settingsCatalogRefreshBudgetMs). Unlike a dispatch, a refresh that fails or times out keeps
+   * the held catalog: the dispatch refreshes again and refuses on a stale one. Its actions then
+   * ask for a confirmation (knownWritability): a held "read-only" flag can be stale.
    */
   private async withSettingsToolActions(
     instance: MCPServerInstance,
     workspaceId: string,
     serverName: string,
     layout: MCPSettingsGroup[],
-    options: { signal?: AbortSignal } | undefined
+    options: { signal?: AbortSignal; timeoutMs?: number } | undefined,
+    readStartedAt: number
   ): Promise<MCPSettingsGroup[]> {
-    if (layout.some((group) => group.items.some((item) => item.kind === "tool")))
-      await this.refreshAppCatalogs([{ instance }], options?.signal);
+    const refreshed =
+      !layout.some((group) => group.items.some((item) => item.kind === "tool")) ||
+      (await this.refreshSettingsActionToolsWithin(
+        instance,
+        options?.signal,
+        settingsCatalogRefreshBudgetMs(readStartedAt, options)
+      ));
     return layout.map((group) => ({
       ...group,
       items: group.items.map((item) => {
         if (item.kind !== "tool") return item;
         const action = this.settingsToolAction(instance, workspaceId, serverName, item.tool);
-        return action === undefined ? item : { ...item, action };
+        return action === undefined
+          ? item
+          : { ...item, action: knownWritability(action, refreshed) };
       }),
     }));
   }
 
   /**
    * A layout tool item's action: a tool the server lists and the tool allowlist allows. An MCP
-   * App tool needs MCP Apps (the artifacts experiment and an apps connection): without them it
+   * App tool needs MCP Apps (the mcp-apps experiment and an apps connection): without them it
    * has no action, so it is never run as a regular tool without its view.
    */
   private settingsToolAction(
@@ -5350,12 +5428,25 @@ export class MCPServerManager {
   ): Promise<void> {
     const instance = this.workspaceServers.get(workspaceId)?.instances.get(serverName);
     if (instance === undefined || instance.isClosed) return;
+    const refreshed = await this.refreshSettingsActionToolsWithin(
+      instance,
+      signal,
+      MCP_APP_CATALOG_REFRESH_TIMEOUT_MS
+    );
+    if (!refreshed) throw new Error(`Could not refresh ${serverName}'s tools; try again`);
+  }
+
+  /** refreshSettingsActionTools, bounded: false when it failed, timed out or was aborted. */
+  private async refreshSettingsActionToolsWithin(
+    instance: MCPServerInstance,
+    signal: AbortSignal | undefined,
+    timeoutMs: number
+  ): Promise<boolean> {
     const refreshed = await raceWithAbortAndTimeout(this.refreshSettingsActionTools(instance), {
       ...(signal !== undefined ? { signal } : {}),
-      timeoutMs: MCP_APP_CATALOG_REFRESH_TIMEOUT_MS,
+      timeoutMs,
     });
-    if (refreshed.kind !== "ok" || !refreshed.value)
-      throw new Error(`Could not refresh ${serverName}'s tools; try again`);
+    return refreshed.kind === "ok" && refreshed.value;
   }
 
   /**
@@ -5368,7 +5459,8 @@ export class MCPServerManager {
     workspaceId: string,
     serverName: string,
     toolName: string,
-    instanceToken: string,
+    /** The dialog's read: its server instance, and the read whose layout offered the tool. */
+    read: SettingsActionRead,
     options: { confirmed: boolean; signal?: AbortSignal }
   ): Promise<{ text: string; isError: boolean }> {
     // A tool that tools/list_changed removed since the dialog read is refused.
@@ -5382,7 +5474,7 @@ export class MCPServerManager {
       (instance) => {
         if (dispatched !== null) return dispatched;
         const refusal = this.settingsToolRefusal(instance, workspaceId, serverName, toolName, {
-          instanceToken,
+          read,
           confirmed: options.confirmed,
           opensApp: false,
         });
@@ -5410,11 +5502,16 @@ export class MCPServerManager {
     workspaceId: string,
     serverName: string,
     toolName: string,
-    request: { instanceToken: string; confirmed: boolean; opensApp: boolean }
+    request: { read: SettingsActionRead; confirmed: boolean; opensApp: boolean }
   ): Error | null {
-    const currentToken = this.settingsInstanceToken(instance);
-    if (!this.isSettingsTokenAccepted(workspaceId, serverName, currentToken, request.instanceToken))
-      return staleSettingsInstanceError(serverName);
+    const unread = this.settingsReadRefusal(
+      instance,
+      workspaceId,
+      serverName,
+      toolName,
+      request.read
+    );
+    if (unread !== null) return unread;
     const action = this.settingsToolAction(instance, workspaceId, serverName, toolName);
     if (action === undefined) return new Error(`'${serverName}' has no tool named '${toolName}'`);
     if (action.opensApp !== request.opensApp)
@@ -5426,13 +5523,40 @@ export class MCPServerManager {
     return null;
   }
 
+  /**
+   * Why a tool action fails the dialog's read: the read is unknown, foreign, or named with
+   * another read's instance token; the instance is not the one read and does not show that very
+   * read's schema (a restart); or that read's layout does not offer the tool (#6611). A crafted
+   * renderer call must not run a listed, allowed tool the settings never showed, and a second
+   * window's newer read must not widen what the first window's read may run.
+   */
+  private settingsReadRefusal(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    read: SettingsActionRead
+  ): Error | null {
+    const offered = this.settingsReadTools.get(read.readId);
+    // A forgotten (bounded), foreign or mismatched read: the dialog must read again.
+    if (
+      offered?.key !== settingsSaveKey(workspaceId, serverName) ||
+      offered.instanceToken !== read.instanceToken ||
+      !this.isSettingsReadCurrent(workspaceId, serverName, instance, offered)
+    )
+      return staleSettingsInstanceError(serverName);
+    return offered.tools.has(toolName)
+      ? null
+      : new Error(`'${serverName}' settings do not offer '${toolName}'`);
+  }
+
   /** settingsToolRefusal for an app open, then the entry point budget (an open calls the tool). */
   private settingsAppRefusal(
     instance: MCPServerInstance,
     workspaceId: string,
     serverName: string,
     toolName: string,
-    request: { instanceToken: string; confirmed: boolean }
+    request: { read: SettingsActionRead; confirmed: boolean }
   ): Error | null {
     const refusal = this.settingsToolRefusal(instance, workspaceId, serverName, toolName, {
       ...request,
@@ -5454,7 +5578,8 @@ export class MCPServerManager {
     workspaceId: string,
     serverName: string,
     toolName: string,
-    instanceToken: string,
+    /** The dialog's read (runSettingsTool). */
+    read: SettingsActionRead,
     options: { confirmed: boolean; signal?: AbortSignal }
   ): Promise<MCPSettingsAppView> {
     assert(this.mcpApps, "MCP Apps support is not configured");
@@ -5470,7 +5595,7 @@ export class MCPServerManager {
       (instance): Promise<MCPSettingsAppView> => {
         if (dispatched !== null) return dispatched;
         const refusal = this.settingsAppRefusal(instance, workspaceId, serverName, toolName, {
-          instanceToken,
+          read,
           confirmed: options.confirmed,
         });
         if (refusal !== null) return Promise.reject(refusal);
@@ -5549,6 +5674,34 @@ export class MCPServerManager {
    * and its save is refused.
    */
   private readonly settingsSchemaHashes = new Map<string, string>();
+  /**
+   * The request ID of the read each settingsSchemaHashes entry came from (same keys and bound),
+   * so an older read that settles last does not replace a newer read's hash.
+   */
+  private readonly settingsSchemaRequestIds = new Map<string, number>();
+  /**
+   * The tools each read's layout offered, by the read's readId (settingsReadRefusal), with its
+   * workspace and server key. Bounded like settingsSchemaHashes: the oldest read goes first.
+   */
+  private readonly settingsReadTools = new Map<string, SettingsReadRecord>();
+
+  /**
+   * Whether the read still applies to `instance`: the same instance, or a restarted one whose
+   * latest read showed this very read's schema (not another window's later read, #6611).
+   */
+  private isSettingsReadCurrent(
+    workspaceId: string,
+    serverName: string,
+    instance: MCPServerInstance,
+    read: SettingsReadRecord
+  ): boolean {
+    const currentToken = this.settingsInstanceToken(instance);
+    if (currentToken === read.instanceToken) return true;
+    const current = this.settingsSchemaHashes.get(
+      settingsSchemaKey(workspaceId, serverName, currentToken)
+    );
+    return current === read.schemaHash;
+  }
 
   /**
    * Whether a request that names `requestToken` (the dialog's read) may act on this workspace
@@ -5575,17 +5728,48 @@ export class MCPServerManager {
     workspaceId: string,
     serverName: string,
     instanceToken: string,
-    snapshot: MCPSettingsSnapshot
+    snapshot: MCPSettingsSnapshot,
+    requestId: number
   ): void {
     const key = settingsSchemaKey(workspaceId, serverName, instanceToken);
-    // Each read overwrites its token's hash: the latest schema of an instance is the one a save
-    // validated against (the dialog shows that read).
+    // Each newer read overwrites its token's hash and tools together: the latest schema of an
+    // instance is the one a save validated against (the dialog shows that read). An older read
+    // that settles last changes neither (#6611), so both always describe the same read.
+    if (isNewerSettingsRead(this.settingsSchemaRequestIds.get(key), requestId)) return;
     this.settingsSchemaHashes.delete(key);
     this.settingsSchemaHashes.set(key, settingsSchemaHash(snapshot));
-    if (this.settingsSchemaHashes.size > MAX_REMEMBERED_SETTINGS_SCHEMAS) {
-      const oldest = this.settingsSchemaHashes.keys().next().value;
-      if (oldest !== undefined) this.settingsSchemaHashes.delete(oldest);
+    this.settingsSchemaRequestIds.set(key, requestId);
+    this.forgetOldestSettingsReadPastBound();
+  }
+
+  /** Bounds settingsSchemaHashes (and settingsSchemaRequestIds with it): the oldest goes first. */
+  private forgetOldestSettingsReadPastBound(): void {
+    if (this.settingsSchemaHashes.size <= MAX_REMEMBERED_SETTINGS_SCHEMAS) return;
+    const oldest = this.settingsSchemaHashes.keys().next().value;
+    if (oldest === undefined) return;
+    this.settingsSchemaHashes.delete(oldest);
+    this.settingsSchemaRequestIds.delete(oldest);
+  }
+
+  /** Remember read `readId` for its tool actions (settingsReadRefusal); returns `readId`. */
+  private rememberSettingsReadTools(
+    readId: string,
+    workspaceId: string,
+    serverName: string,
+    instanceToken: string,
+    snapshot: MCPSettingsSnapshot
+  ): string {
+    this.settingsReadTools.set(readId, {
+      key: settingsSaveKey(workspaceId, serverName),
+      instanceToken,
+      schemaHash: settingsSchemaHash(snapshot),
+      tools: settingsLayoutToolNames(snapshot.layout),
+    });
+    if (this.settingsReadTools.size > MAX_REMEMBERED_SETTINGS_SCHEMAS) {
+      const oldest = this.settingsReadTools.keys().next().value;
+      if (oldest !== undefined) this.settingsReadTools.delete(oldest);
     }
+    return readId;
   }
 
   /**
@@ -5621,8 +5805,10 @@ export class MCPServerManager {
     instanceToken: string,
     options?: { signal?: AbortSignal }
   ): Promise<MCPSettingsReadSnapshot> {
-    // Validate against a fresh read: the renderer's schema can be stale.
-    const prior = await this.readSettings(workspaceId, serverName, options);
+    // Validate against a fresh read: the renderer's schema can be stale. Each read has the
+    // dialog's read deadline (#6611), so a hung server fails the save instead of holding it.
+    const readOptions = { ...options, timeoutMs: MCP_SETTINGS_READ_TIMEOUT_MS };
+    const prior = await this.readSettings(workspaceId, serverName, readOptions);
     if (prior === null) throw new Error(`MCP server '${serverName}' has no settings`);
     // Another instance (restarted or replaced since the dialog read): the save still lands when
     // it shows the schema the dialog validated against, else the user must reopen.
@@ -5636,7 +5822,7 @@ export class MCPServerManager {
       prior.instanceToken
     );
     try {
-      const after = await this.readSettings(workspaceId, serverName, options);
+      const after = await this.readSettings(workspaceId, serverName, readOptions);
       if (after !== null) return after;
     } catch (error) {
       // The update landed: report it as saved with the schema from before.
@@ -6028,8 +6214,14 @@ export class MCPServerManager {
   private readonly entrypointCallWindows = new Map<string, { start: number; count: number }>();
   /** Entry point opens dispatched so far: orders overlapping opens of one entry point. */
   private entrypointOpenCount = 0;
-  /** The newest open whose result was stored, by workspace and entry point view key. */
-  private readonly entrypointStoredOpens = new Map<string, number>();
+  /**
+   * The newest open that started storing its result, and that write's outcome, by workspace and
+   * entry point view key.
+   */
+  private readonly entrypointStoredOpens = new Map<
+    string,
+    { order: number; stored: Promise<boolean> }
+  >();
 
   /** Entry point budgets of a stopped workspace would otherwise outlive it. */
   private dropEntrypointBudgets(workspaceId: string): void {
@@ -6050,10 +6242,14 @@ export class MCPServerManager {
     record: Parameters<McpAppResultStore["record"]>[1]
   ): Promise<boolean> {
     const key = `${workspaceId}\0${record.toolCallId}`;
-    // A newer open's result is stored: this view shows it, which counts as stored.
-    if ((this.entrypointStoredOpens.get(key) ?? 0) > order) return true;
-    this.entrypointStoredOpens.set(key, order);
-    return store.record(workspaceId, record);
+    // A newer open's result is stored: this view shows it, so this open shares that write's
+    // outcome (#6611). A failed newer write fails this open too: the key may still hold a record
+    // older than both opens.
+    const newest = this.entrypointStoredOpens.get(key);
+    if (newest !== undefined && newest.order > order) return newest.stored;
+    const stored = store.record(workspaceId, record);
+    this.entrypointStoredOpens.set(key, { order, stored });
+    return stored;
   }
 
   /** The view tool-call budget (mcpAppHost), applied per workspace and server. */
@@ -8127,6 +8323,18 @@ export class MCPServerManager {
     }
   }
 
+  /** A refused tool call keeps the tokens and asks for a sign-in in Settings (#6622). */
+  private insufficientScopeOption(
+    serverUrl: string,
+    authProvider: unknown
+  ): { onInsufficientScope?: (scopes: string[]) => void } {
+    const oauthService = this.mcpOauthService;
+    if (authProvider === undefined || oauthService == null) return {};
+    return {
+      onInsufficientScope: (scopes) => oauthService.recordInsufficientScope({ serverUrl, scopes }),
+    };
+  }
+
   /**
    * Connect an HTTP/SSE MCP server (with auto http→sse fallback and one
    * stale-modern-verdict retry). Returns null when aborted.
@@ -8181,6 +8389,7 @@ export class MCPServerManager {
           url: info.url,
           headers,
           ...(authProvider ? { authProvider } : {}),
+          ...this.insufficientScopeOption(info.url, authProvider),
         };
 
     const verdictKey = JSON.stringify(["remote", name, info.transport, info.url, headers ?? null]);
@@ -8443,6 +8652,32 @@ export class MCPServerManager {
   }
 }
 
+/**
+ * A settings action as the dialog shows it. When the catalog refresh did not finish, the held
+ * flag can be stale (a tool that became writable still reads as read-only), so the action asks
+ * for a confirmation (#6611). The dispatch refreshes again either way.
+ */
+function knownWritability(
+  action: MCPSettingsToolAction,
+  refreshed: boolean
+): MCPSettingsToolAction {
+  return refreshed ? action : { ...action, readOnly: false };
+}
+
+/**
+ * How long a settings read's catalog refresh may take: MCP_APP_CATALOG_REFRESH_TIMEOUT_MS, and
+ * no longer than the read's own deadline leaves (at least 1 ms), so a read near its limit does
+ * not run about 2 s past it (#6611).
+ */
+function settingsCatalogRefreshBudgetMs(
+  readStartedAt: number,
+  options: { timeoutMs?: number } | undefined
+): number {
+  if (options?.timeoutMs === undefined) return MCP_APP_CATALOG_REFRESH_TIMEOUT_MS;
+  const left = Math.max(1, readStartedAt + options.timeoutMs - Date.now());
+  return Math.min(MCP_APP_CATALOG_REFRESH_TIMEOUT_MS, left);
+}
+
 function assertSettingsAppStored(stored: boolean, title: string): void {
   if (!stored) throw new Error(`Xum could not keep the result of '${title}'. Try again.`);
 }
@@ -8492,6 +8727,31 @@ async function raceUntilAborted(work: Promise<unknown>, signals: AbortSignal[]):
 
 function settingsSchemaKey(workspaceId: string, serverName: string, token: string): string {
   return `${settingsSaveKey(workspaceId, serverName)}\0${token}`;
+}
+
+/** One settings read, for its tool actions: its server, instance, schema and offered tools. */
+interface SettingsReadRecord {
+  key: string;
+  instanceToken: string;
+  schemaHash: string;
+  tools: ReadonlySet<string>;
+}
+
+/** What a settings tool action names of the dialog's read (MCPSettingsReadSnapshot). */
+type SettingsActionRead = Pick<MCPSettingsReadSnapshot, "instanceToken" | "readId">;
+
+/** Whether `known` (a request ID) is newer than `requestId` (so its entry stays). */
+function isNewerSettingsRead(known: number | undefined, requestId: number): boolean {
+  return known !== undefined && known > requestId;
+}
+
+/** The tools a settings layout offers (its tool items). */
+function settingsLayoutToolNames(layout: MCPSettingsGroup[]): ReadonlySet<string> {
+  return new Set(
+    layout.flatMap((group) =>
+      group.items.flatMap((item) => (item.kind === "tool" ? [item.tool] : []))
+    )
+  );
 }
 
 /**

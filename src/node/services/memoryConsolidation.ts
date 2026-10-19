@@ -403,6 +403,8 @@ export async function runMemoryConsolidation(args: {
    * ends the run with a retryable stream error before the request.
    */
   beforeDispatch?: () => Promise<boolean>;
+  /** Pricing identity of `model`; its long-context threshold sets each step's tier. */
+  pricingModel?: string;
 }): Promise<MemoryConsolidationResult> {
   assert(args.agentBody.trim().length > 0, "dream agent body must not be empty");
   const journal: MemoryConsolidationOp[] = [];
@@ -494,7 +496,10 @@ export async function runMemoryConsolidation(args: {
         inputTokens: totalUsage.inputTokens ?? 0,
         outputTokens: totalUsage.outputTokens ?? 0,
       };
-      await args.recordUsage?.(totalUsage, accumulateStepsProviderMetadata(await stream.steps));
+      await args.recordUsage?.(
+        totalUsage,
+        accumulateStepsProviderMetadata(await stream.steps, args.pricingModel)
+      );
     } catch {
       usage = undefined;
     }

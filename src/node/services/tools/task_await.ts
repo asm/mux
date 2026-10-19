@@ -546,7 +546,8 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             timeoutSecsForBash,
             taskSignal,
             workspaceId,
-            "task_await"
+            "task_await",
+            config.hasQueuedMessages
           );
 
           if (!outputResult.success) {

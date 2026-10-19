@@ -39,6 +39,10 @@ import {
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
 import { PREVIOUS_TASK_SETTINGS_DEFAULTS } from "@/common/config/schemas/taskSettings";
 import {
+  normalizeAgentResourceLimits,
+  type AgentResourceLimits,
+} from "@/common/config/schemas/agentResourceLimits";
+import {
   getDefaultAutoModelRoutingConfig,
   normalizeAutoModelRoutingConfig,
   type AutoModelRoutingConfigInput,
@@ -86,6 +90,8 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 import { PlatformPaths } from "@/common/utils/paths";
+// process.platform-based: the common helper reads navigator, which Node 20 lacks (#6485).
+import { PlatformPaths as NodePlatformPaths } from "@/node/utils/paths.main";
 import { sharesPlanDirectory } from "@/common/utils/planStorage";
 import { stableStringify } from "@/common/utils/stableStringify";
 import type { RuntimeConfig } from "@/common/types/runtime";
@@ -96,6 +102,7 @@ import {
 } from "@/common/schemas/project";
 import {
   getValidAgentMessageDispatchMode,
+  getValidMessagingTag,
   getValidUnrelatedWorkspaceConsent,
 } from "@/common/orpc/schemas/workspace";
 import {
@@ -900,6 +907,27 @@ function normalizePersistedWorkspace(
   return nextWorkspace;
 }
 
+/**
+ * #5569: only `true` on a row without a creation mark is a birth stamp. Anything else (hand edit,
+ * corruption) reads as absent, so the active-turn lookup falls back to its global scan. Runs before
+ * normalizePersistedWorkspace, so a malformed mark (dropped there) still cancels the stamp.
+ */
+function normalizeBirthStamp(
+  workspace: ProjectConfig["workspaces"][number]
+): ProjectConfig["workspaces"][number] {
+  const stamp: unknown = workspace.bornWithoutDelegation;
+  if (!Object.hasOwn(workspace, "bornWithoutDelegation")) return workspace;
+  if (stamp === true && workspace.delegatedCreation === undefined) return workspace;
+  const { bornWithoutDelegation: _dropped, ...rest } = workspace;
+  return rest;
+}
+
+const HAND_EDITABLE_STRING_PROJECT_FIELDS = [
+  "customInstructions",
+  "codeWorkspaceSyncPath",
+  "icon",
+] as const;
+
 function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectConfig {
   // Per-project runtime overrides are optional; keep config.json sparse by persisting only explicit
   // overrides (false enablement + explicit default runtime selections).
@@ -914,6 +942,7 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
     projectKind?: unknown;
     customInstructions?: unknown;
     codeWorkspaceSyncPath?: unknown;
+    icon?: unknown;
   };
   const runtimeEnablement = normalizeRuntimeEnablementOverrides(record.runtimeEnablement);
   const defaultRuntime = normalizeRuntimeEnablementId(record.defaultRuntime);
@@ -940,7 +969,9 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
   }
 
   const workspaces = Array.isArray(record.workspaces) ? record.workspaces : [];
-  next.workspaces = workspaces.map(normalizePersistedWorkspace);
+  next.workspaces = workspaces.map((workspace) =>
+    normalizePersistedWorkspace(normalizeBirthStamp(workspace))
+  );
 
   const projectKind = normalizeProjectKind(record.projectKind);
   if (projectKind !== undefined) {
@@ -949,20 +980,18 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
     delete next.projectKind;
   }
 
-  // config.json is hand-editable: a non-string customInstructions would fail
+  // config.json is hand-editable: a non-string value in these fields would fail
   // the projects.list output schema (z.string()) and brick the whole project
   // list, so discard malformed values here where both load and save pass.
-  if (typeof record.customInstructions === "string" && record.customInstructions.trim()) {
-    next.customInstructions = record.customInstructions;
-  } else {
-    delete next.customInstructions;
-  }
-
-  // Same hand-edit hazard as customInstructions above.
-  if (typeof record.codeWorkspaceSyncPath === "string" && record.codeWorkspaceSyncPath.trim()) {
-    next.codeWorkspaceSyncPath = record.codeWorkspaceSyncPath;
-  } else {
-    delete next.codeWorkspaceSyncPath;
+  // Unknown icon names are kept so a newer version's icon survives a downgrade;
+  // the sidebar shows the initial for them.
+  for (const field of HAND_EDITABLE_STRING_PROJECT_FIELDS) {
+    const value = record[field];
+    if (typeof value === "string" && value.trim()) {
+      next[field] = value;
+    } else {
+      delete next[field];
+    }
   }
 
   // Legacy named workflow schedules are intentionally dropped while workflow
@@ -1059,9 +1088,9 @@ function idRowIdsByPath(workspaces: ProjectConfig["workspaces"]): Map<string, st
  */
 function dropLegacyDuplicateRows(
   workspaces: ProjectConfig["workspaces"],
-  resolveLegacyId: (workspace: Workspace) => string | undefined
+  resolveLegacyId: (workspace: Workspace) => string | undefined,
+  idsByPath = idRowIdsByPath(workspaces)
 ): string[] {
-  const idsByPath = idRowIdsByPath(workspaces);
   const dropped: string[] = [];
   for (let index = workspaces.length - 1; index >= 0; index--) {
     const workspace = workspaces[index];
@@ -1090,7 +1119,94 @@ function readLegacyMetadataId(file: string): string | null | undefined {
   }
 }
 
-/** An alias group whose merge kept one of two different rows for the same workspace. */
+/**
+ * One stored key can also hold an id-less legacy row next to its migrated copy (a hand edit or
+ * another tool; Xum's own migration fills in the id on the same row). Drop the legacy copy the
+ * same way as in an alias group (#6595). Gated on an id-less row with a string path, so a
+ * migrated project pays one in-memory pass on a cold load and no file access.
+ */
+function dropSingleKeyLegacyCopies(
+  key: string,
+  entry: StoredProjectEntry,
+  conflicts: ProjectAliasConflict[],
+  resolveLegacyId: (projectPath: string, workspace: Workspace) => string | undefined
+): void {
+  const workspaces = entry.config.workspaces;
+  if (!workspaces.some((workspace) => !workspace.id && typeof workspace.path === "string")) return;
+  const conflictingIds = dropLegacyDuplicateRows(workspaces, (workspace) =>
+    resolveLegacyId(key, workspace)
+  );
+  if (conflictingIds.length > 0) {
+    conflicts.push({ path: key, storedKeys: [entry.storedKey], conflictingIds });
+  }
+}
+
+/**
+ * True when two rows share a workspace id. Allocates nothing for 0 or 1 rows, and stops at the
+ * first duplicate.
+ */
+function hasDuplicateRowId(workspaces: ProjectConfig["workspaces"]): boolean {
+  if (workspaces.length < 2) return false;
+  const seen = new Set<string>();
+  for (const workspace of workspaces) {
+    if (!workspace.id) continue;
+    if (seen.has(workspace.id)) return true;
+    seen.add(workspace.id);
+  }
+  return false;
+}
+
+/** The ids that more than one row holds, each once, in one pass. */
+function duplicateRowIds(workspaces: ProjectConfig["workspaces"]): string[] {
+  const seen = new Set<string>();
+  const duplicated = new Set<string>();
+  for (const workspace of workspaces) {
+    if (!workspace.id) continue;
+    if (seen.has(workspace.id)) duplicated.add(workspace.id);
+    else seen.add(workspace.id);
+  }
+  return [...duplicated];
+}
+
+/**
+ * The ids that one alias entry holds in more than one row. The alias merge keeps an identical
+ * copy once without a conflict, so without this list a save would drop the copy with no backup.
+ */
+function aliasEntryDuplicateIds(group: StoredProjectEntry[]): string[] {
+  return group.flatMap((entry) =>
+    hasDuplicateRowId(entry.config.workspaces) ? duplicateRowIds(entry.config.workspaces) : []
+  );
+}
+
+/**
+ * One stored key can already hold two rows with one workspace id: an earlier build saved them, and
+ * no merge repairs them, because neither row is an alias or a legacy copy (#6717). Keep the first
+ * row for each id: the row lookups and the task index already resolve a repeated id to its first
+ * row (#4550), so the user sees the same workspace and parent as before. Record a conflict for every repair, an identical copy
+ * included, so the original bytes are backed up before any save drops a row. All copies share the
+ * id's session folder, so no session history is lost. A copy on another checkout path loses only
+ * its config row: its checkout stays on disk and its row stays in the backup.
+ */
+function healSingleKeyDuplicateIds(
+  key: string,
+  entry: StoredProjectEntry,
+  conflicts: ProjectAliasConflict[]
+): ProjectConfig {
+  if (!hasDuplicateRowId(entry.config.workspaces)) return entry.config;
+  const duplicatedIds = duplicateRowIds(entry.config.workspaces);
+  const keptIds = new Set<string>();
+  // The rows only: settings and trust stay exactly as stored for a single key.
+  entry.config.workspaces = entry.config.workspaces.filter((workspace) => {
+    if (!workspace.id) return true;
+    if (keptIds.has(workspace.id)) return false;
+    keptIds.add(workspace.id);
+    return true;
+  });
+  conflicts.push({ path: key, storedKeys: [entry.storedKey], conflictingIds: duplicatedIds });
+  return entry.config;
+}
+
+/** A stored project whose rows needed a repair that a save would persist (see the callers). */
 interface ProjectAliasConflict {
   path: string;
   storedKeys: string[];
@@ -1119,16 +1235,27 @@ function buildProjectsFromStoredEntries(
   const projects = new Map<string, ProjectConfig>();
   for (const [key, group] of groups) {
     if (group.length === 1) {
-      projects.set(key, group[0].config);
+      // Legacy copies first: the heal can drop the only id row on a legacy row's path, and the
+      // id migration would then give that legacy row the same id again.
+      dropSingleKeyLegacyCopies(key, group[0], conflicts, resolveLegacyId);
+      projects.set(key, healSingleKeyDuplicateIds(key, group[0], conflicts));
       continue;
     }
     const storedKeys = group.map((entry) => entry.storedKey);
+    // Legacy copies first, against the id rows of every alias (#6869): the merge can drop the
+    // only id row on a legacy row's path, and the id migration would then give that legacy row
+    // the same id again.
+    const idsByPath = idRowIdsByPath(group.flatMap((entry) => entry.config.workspaces));
+    const legacyIds = group.flatMap((entry) =>
+      dropLegacyDuplicateRows(
+        entry.config.workspaces,
+        (workspace) => resolveLegacyId(key, workspace),
+        idsByPath
+      )
+    );
     const merged = mergeProjectAliases(group);
     const conflictingIds = [
-      ...merged.conflictingIds,
-      ...dropLegacyDuplicateRows(merged.config.workspaces, (workspace) =>
-        resolveLegacyId(key, workspace)
-      ),
+      ...new Set([...merged.conflictingIds, ...aliasEntryDuplicateIds(group), ...legacyIds]),
     ];
     if (conflictingIds.length > 0) {
       conflicts.push({ path: key, storedKeys, conflictingIds });
@@ -1787,9 +1914,11 @@ export class Config {
       log.debug("Config dir not created for the config file watcher", { error });
     }
     this.startConfigFileWatchers();
-    // Without a watch, writeConfigFileTracked retries after this process's next save.
-    if (this.configFileWatchers.length === 0) return;
+    // Set without a watch too: the read that starts one later then reports the edits since.
     this.notifiedConfigFileStamp = baseline;
+    // Without a watch, the next read of a changed config.json or this process's next save
+    // retries.
+    if (this.configFileWatchers.length === 0) return;
     // Relink-aware: the link can also change between the realpath read and the root watch.
     this.handleConfigFileEventWithRelink();
   }
@@ -1801,7 +1930,8 @@ export class Config {
       if (watcher) this.configFileWatchers.push(watcher);
       else complete = false;
     }
-    // A dir whose watch failed to start is retried by the next relink check (the next event).
+    // A dir whose watch failed to start is retried by the next relink check (the next event)
+    // or by the next read of a changed config.json (retryIncompleteConfigFileWatch).
     this.watchedConfigFileDirsKey = complete ? configFileWatchDirsKey(dirs) : null;
   }
 
@@ -1831,11 +1961,9 @@ export class Config {
   private watchConfigDir(dir: string, fileNames: ReadonlySet<string>): fs.FSWatcher | null {
     let watcher: fs.FSWatcher;
     try {
-      watcher = fs.watch(dir, { persistent: false }, (_event, filename) => {
-        // Some platforms omit the filename; treat that as a possible config.json change.
-        if (filename != null && !fileNames.has(filename)) return;
-        this.handleConfigFileEventWithRelink();
-      });
+      watcher = fs.watch(dir, { persistent: false }, (_event, filename) =>
+        this.handleConfigDirEvent(dir, fileNames, filename)
+      );
     } catch (error) {
       log.debug("Config file watcher not started", { dir, error });
       return null;
@@ -1847,9 +1975,61 @@ export class Config {
       // each dir that still resolves (a vanished dir moves to an existing ancestor), and
       // the stamp check after it reports an edit made while the watch was down.
       this.watchedConfigFileDirsKey = null;
-      this.handleConfigFileEventWithRelink();
+      this.configFileWatchErrorDir = dir;
+      this.retryIncompleteConfigFileWatch("error");
     });
     return watcher;
+  }
+
+  /**
+   * The config.json stamp of the last retry each trigger started. Separate per trigger: a
+   * read that repaired the set must not hold back the rebuild for a later watcher error.
+   */
+  private readonly configFileWatchRetryStamps: Record<"read" | "error", string | null> = {
+    read: null,
+    error: null,
+  };
+  /** The dir of the last watch that raised an error (see the watch callback). */
+  private configFileWatchErrorDir: string | null = null;
+
+  /**
+   * Rebuilds a watch set with a failed watch, at most once per config.json stamp and trigger.
+   * A read retries a watch that failed to start, so the retry needs no event from another
+   * watch. The error bound stops an error that every new watch raises from rebuilding the set
+   * at the pace of the OS errors: the next rebuild waits for a watch event or a changed stamp.
+   * No timer: until the stamp changes, a retry would see no new edit to report.
+   */
+  private retryIncompleteConfigFileWatch(trigger: "read" | "error"): void {
+    if (!this.configFileWatchIncomplete()) return;
+    const stamp = this.configFileStamp();
+    if (stamp === this.configFileWatchRetryStamps[trigger]) return;
+    this.configFileWatchRetryStamps[trigger] = stamp;
+    this.handleConfigFileEventWithRelink();
+  }
+
+  /**
+   * A listener needs a watch that is missing: one failed to start or raised an error. An
+   * empty set with listeners counts too: every watch failed to start.
+   */
+  private configFileWatchIncomplete(): boolean {
+    if (this.configFileWatchStopped || this.emitter.listenerCount("configChanged") === 0) {
+      return false;
+    }
+    return this.configFileWatchers.length === 0 || this.watchedConfigFileDirsKey === null;
+  }
+
+  /** An event from the watch on `dir`, which covers the entries in `fileNames`. */
+  private handleConfigDirEvent(
+    dir: string,
+    fileNames: ReadonlySet<string>,
+    filename: string | null
+  ): void {
+    // An event from the replacement of the failed watch shows it works, so its next error
+    // may rebuild again. An event from another dir proves nothing about it.
+    if (dir === this.configFileWatchErrorDir) this.configFileWatchRetryStamps.error = null;
+    // Some platforms omit the filename; treat that as a possible config.json change.
+    if (filename != null && !fileNames.has(filename)) return;
+    this.handleConfigFileEventWithRelink();
   }
 
   private closeConfigFileWatcher(): void {
@@ -1920,7 +2100,7 @@ export class Config {
   }
 
   /**
-   * A batch with an own edit notifies as an own save does. A batch with only foreign edits
+   * A batch with only own edits notifies as an own save does. A batch with a foreign edit
    * keeps the listener guard of notifyConfigChangedByAnotherProcess.
    */
   private flushDeferredChangeNotification(): void {
@@ -1928,8 +2108,9 @@ export class Config {
     const foreign = this.foreignChangeNotificationPending;
     this.changeNotificationPending = false;
     this.foreignChangeNotificationPending = false;
-    if (own) this.notifyConfigChanged();
-    else if (foreign) this.notifyConfigChangedByAnotherProcess();
+    // A foreign edit has no caller to throw to, so it keeps the guard even next to an own edit.
+    if (foreign) this.notifyConfigChangedByAnotherProcess();
+    else if (own) this.notifyConfigChanged();
   }
 
   private notifyConfigChanged(): void {
@@ -2208,7 +2389,7 @@ export class Config {
       // A reused sidecar means an earlier load already logged this content.
       if (!sidecar.reused) {
         log.error(
-          `Project config entries share a path and hold conflicting rows for the same workspace. Xum keeps one row per workspace. The original config.json bytes, with every row, were backed up to ${sidecar.path}.`,
+          `config.json holds more than one row for the same workspace. Xum keeps one row per workspace. The original config.json bytes, with every row, were backed up to ${sidecar.path}.`,
           { conflicts }
         );
       }
@@ -2230,7 +2411,7 @@ export class Config {
     const signature = `${sha256Hex(rawBytes)}:${(error as NodeJS.ErrnoException).code ?? message}`;
     if (rememberAliasBackupFailure(this.configFile, signature)) {
       log.error(
-        `Project config entries share a path and hold conflicting rows for the same workspace, and the backup of ${this.configFile} failed (${message}). Settings changes will not overwrite config.json until a backup succeeds.`,
+        `config.json holds more than one row for the same workspace, and the backup of ${this.configFile} failed (${message}). Settings changes will not overwrite config.json until a backup succeeds.`,
         { conflicts }
       );
     }
@@ -2246,8 +2427,7 @@ export class Config {
   }
 
   /** The beforeRename check for a save, or undefined when the save has no read to compare. */
-  private unchangedConfigCheck(expectedStatKey: string | undefined) {
-    if (expectedStatKey === undefined) return undefined;
+  private unchangedConfigCheck(expectedStatKey: string): () => void {
     return () => this.assertConfigFileUnchanged(expectedStatKey);
   }
 
@@ -2326,12 +2506,19 @@ export class Config {
   }
 
   // File-backed snapshots are shared and read-only; mutations must use editConfig's fresh read.
+  // A read can have side effects (#6699): a read that sees a changed file retries a failed
+  // config.json watch, and that retry can notify onConfigChanged listeners synchronously,
+  // before this call returns. A listener that reads config again gets this read's snapshot.
   loadConfigOrDefault(options?: { throwOnError?: boolean }): ProjectsConfig {
     const key = this.readConfigStatKey();
     if (key !== undefined && this.configSnapshot?.key === key) {
       return this.configSnapshot.config;
     }
-    return this.readConfigOrDefault(options, key);
+    const config = this.readConfigOrDefault(options, key);
+    // A changed file: retry a failed watch after the read, so a listener it notifies reads
+    // the snapshot this read stored.
+    this.retryIncompleteConfigFileWatch("read");
+    return config;
   }
 
   private readConfigOrDefault(
@@ -2517,9 +2704,9 @@ export class Config {
    */
   private resolveLegacyRowId(projectPath: string, workspace: Workspace): string | undefined {
     const legacyId = this.generateLegacyId(projectPath, workspace.path);
-    // The same basename expression as buildWorkspaceMetadata (#6485 tracks its Windows gap).
-    const basename =
-      workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+    // The same basename as buildWorkspaceMetadata and findWorkspace; PlatformPaths also splits on
+    // "\\" on Windows, where checkout paths use backslashes (#6485).
+    const basename = NodePlatformPaths.basename(workspace.path) ?? "unknown";
     const ids = new Set<string | undefined>();
     for (const candidate of basename === legacyId ? [legacyId] : [legacyId, basename]) {
       const id = readLegacyMetadataId(path.join(this.sessionsDir, candidate, "metadata.json"));
@@ -2981,6 +3168,8 @@ export class Config {
       heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs(
         parsed.heartbeatDefaultIntervalMs
       ),
+      agentResourceLimits: normalizeAgentResourceLimits(parsed.agentResourceLimits),
+      agentResourceLimitsEnabled: parseOptionalBoolean(parsed.agentResourceLimitsEnabled),
       goalDefaults: normalizeGoalDefaults(parsed.goalDefaults),
       evaluationDefaults: normalizeEvaluationDefaults(parsed.evaluationDefaults),
       muxGatewayModels,
@@ -3054,9 +3243,10 @@ export class Config {
    */
   /**
    * `expectedStatKey`: the stat key of the bytes the edit read. The save then fails without
-   * writing when config.json no longer has it. Undefined skips the check.
+   * writing when config.json no longer has it. Required, so no save path can skip the check
+   * (#6595).
    */
-  private saveConfig(config: ProjectsConfig, expectedStatKey?: string): Promise<void> {
+  private saveConfig(config: ProjectsConfig, expectedStatKey: string): Promise<void> {
     return Effect.runPromise(this.saveConfigEffect(config, expectedStatKey));
   }
 
@@ -3067,7 +3257,7 @@ export class Config {
    */
   private saveConfigEffect(
     config: LegacyAdvisorProjectsConfig,
-    expectedStatKey?: string
+    expectedStatKey: string
   ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -3148,6 +3338,10 @@ export class Config {
       if (heartbeatDefaultIntervalMs !== undefined) {
         data.heartbeatDefaultIntervalMs = heartbeatDefaultIntervalMs;
       }
+
+      // Undefined (no limit set, or the limits are off) leaves the key out of the JSON.
+      data.agentResourceLimits = normalizeAgentResourceLimits(config.agentResourceLimits);
+      data.agentResourceLimitsEnabled = parseOptionalBoolean(config.agentResourceLimitsEnabled);
 
       if (config.goalDefaults) {
         data.goalDefaults = normalizeGoalDefaults(config.goalDefaults);
@@ -3641,6 +3835,23 @@ export class Config {
     });
   }
 
+  async updateAgentResourceLimits(limits: AgentResourceLimits): Promise<void> {
+    await this.editConfig((config) => {
+      const normalized = normalizeAgentResourceLimits(limits);
+      if (normalized) config.agentResourceLimits = normalized;
+      else delete config.agentResourceLimits;
+      return config;
+    });
+  }
+
+  async updateAgentResourceLimitsEnabled(enabled: boolean): Promise<void> {
+    await this.editConfig((config) => {
+      if (enabled) config.agentResourceLimitsEnabled = true;
+      else delete config.agentResourceLimitsEnabled;
+      return config;
+    });
+  }
+
   async updateGoalDefaults(
     goalDefaults: Parameters<typeof normalizeGoalDefaults>[0]
   ): Promise<void> {
@@ -3963,8 +4174,11 @@ export class Config {
       // Route through the saveConfig Promise facade (not saveConfigEffect) so test
       // spies on saveConfig keep intercepting the serialized write. A failed save rejects
       // the edit and skips the change notification below (#4444).
+      // transform() always runs before write and records the key.
+      const expectedStatKey = readStatKey;
+      assert(expectedStatKey !== undefined, "config edit saved without a fresh read");
       yield* Effect.tryPromise({
-        try: () => self.saveConfig(newConfig, readStatKey),
+        try: () => self.saveConfig(newConfig, expectedStatKey),
         catch: (error) => error,
       });
       // Backend-initiated config edits (for example gateway auth changes) use this signal
@@ -4416,8 +4630,7 @@ export class Config {
       // LEGACY FORMAT: Fall back to metadata.json and legacy ID for unmigrated workspaces
       if (!workspace.id) {
         // Extract workspace basename (could be stable ID or legacy name)
-        const workspaceBasename =
-          workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+        const workspaceBasename = NodePlatformPaths.basename(workspace.path) ?? "unknown";
 
         // Try loading metadata with basename as ID (works for old workspaces)
         const metadataPath = path.join(
@@ -4710,8 +4923,7 @@ export class Config {
           tags: storedWorkspace.tags ? { ...storedWorkspace.tags } : undefined,
         };
         // Extract workspace basename from path (could be stable ID or legacy name)
-        const workspaceBasename =
-          workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+        const workspaceBasename = NodePlatformPaths.basename(workspace.path) ?? "unknown";
 
         // Captured BEFORE any in-memory migration mutates workspace.id: the queued
         // replay must retarget by persisted identity, never by path alone — paths are
@@ -4762,6 +4974,8 @@ export class Config {
               unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
                 workspace.unrelatedWorkspaceConsent
               ),
+              // Fail closed: a corrupted/invalid tag publishes as absent (untagged).
+              messagingTag: getValidMessagingTag(workspace.messagingTag),
               agentMessageDispatchMode: getValidAgentMessageDispatchMode(
                 workspace.agentMessageDispatchMode
               ),
@@ -5044,7 +5258,12 @@ export class Config {
               });
             }
 
-            workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path));
+            // The messaging tag lives only in config (legacy metadata.json predates it), so
+            // overlay the validated config value or a tag write would publish stale metadata.
+            workspaceMetadata.push({
+              ...this.addPathsToMetadata(metadata, workspace.path),
+              messagingTag: getValidMessagingTag(workspace.messagingTag),
+            });
             metadataFound = true;
           }
 
@@ -5071,6 +5290,8 @@ export class Config {
               unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
                 workspace.unrelatedWorkspaceConsent
               ),
+              // Fail closed: a corrupted/invalid tag publishes as absent (untagged).
+              messagingTag: getValidMessagingTag(workspace.messagingTag),
               agentMessageDispatchMode: getValidAgentMessageDispatchMode(
                 workspace.agentMessageDispatchMode
               ),
@@ -5155,6 +5376,7 @@ export class Config {
             unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
               workspace.unrelatedWorkspaceConsent
             ),
+            messagingTag: getValidMessagingTag(workspace.messagingTag),
             agentMessageDispatchMode: getValidAgentMessageDispatchMode(
               workspace.agentMessageDispatchMode
             ),
@@ -5389,6 +5611,7 @@ export class Config {
         unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
           metadata.unrelatedWorkspaceConsent
         ),
+        messagingTag: getValidMessagingTag(metadata.messagingTag),
         agentMessageDispatchMode: getValidAgentMessageDispatchMode(
           metadata.agentMessageDispatchMode
         ),
@@ -5436,7 +5659,12 @@ export class Config {
           pendingRemoval: existing.pendingRemoval,
           pendingArchive: existing.pendingArchive,
           unrelatedWorkspaceConsentPending: existing.unrelatedWorkspaceConsentPending,
+          // Server-owned and unpublished on metadata: a round trip must not drop it,
+          // or in-flight tagged sends would read a spurious revocation.
+          messagingTagGeneration: existing.messagingTagGeneration,
           delegatedCreation: existing.delegatedCreation,
+          // Written only at birth (#5569): kept from the row, never taken from metadata.
+          bornWithoutDelegation: existing.bornWithoutDelegation,
           // Monotone (#5174): a metadata round trip never un-marks a migrated plan.
           remotePlanMigrated: existing.remotePlanMigrated,
         };

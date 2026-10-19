@@ -1,4 +1,5 @@
 import type { QueuedInputStopCause, StreamStopCause } from "@/common/types/streamStopCause";
+import { randomUUID } from "crypto";
 import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget";
 import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./contextBudgetError";
 import {
@@ -57,7 +58,12 @@ import type {
 } from "@/common/types/stream";
 
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
-import type { MuxMetadata, MuxMessage, PersistedToolModelUsage } from "@/common/types/message";
+import type {
+  MuxMetadata,
+  MuxMessage,
+  PersistedToolModelUsage,
+  VolatileSystemTailRecord,
+} from "@/common/types/message";
 import { hasTokenUsage, MODEL_FALLBACK_REFUSAL_TOOL_NAME } from "@/common/types/message";
 import {
   findFirstReasoningPartIndexInTrailingRun,
@@ -102,8 +108,10 @@ import { hasCommitWorthyParts, type HistoryService } from "./historyService";
 import {
   addUsage,
   accumulateProviderMetadata,
+  accumulateStepsProviderMetadata,
   normalizeUsage,
   withCacheWriteMetadata,
+  withLongContextTokens,
   type AiSdkUsageLike,
 } from "@/common/utils/tokens/usageHelpers";
 import { linkAbortSignal } from "@/node/utils/abort";
@@ -305,8 +313,6 @@ export interface SettledStepBudget {
    * preflight will compute it. Absent when no context budget applies.
    */
   nextRequestTokens?: number;
-  /** The appended-message part of `nextRequestTokens`; absent when it was a full count. */
-  nextRequestDeltaTokens?: number;
   sessionHistoryAvailable: boolean;
   /** The step's request advertised `new_context`, so the final prompt can be acted on. */
   newContextAvailable: boolean;
@@ -510,7 +516,24 @@ interface StepMessageTracker {
   anthropicThinkingStripStep?: number;
   /** True once this turn holds the Anthropic thinking-repair receipt (reads initialMetadata). */
   hasAnthropicReplayReceipt?: () => boolean;
+  /** After a step-0 rebuild: the row's tail record and system token count follow it. */
+  recordVolatileSystemTail: (rebuilt: {
+    volatileSystemTail?: VolatileSystemTailRecord;
+    systemMessageTokens?: number;
+  }) => void;
 }
+/** The row metadata after a step-0 rebuild: its tail record and system token count follow it. */
+function withRebuiltSystemMetadata(
+  metadata: Partial<MuxMetadata> | undefined,
+  rebuilt: { volatileSystemTail?: VolatileSystemTailRecord; systemMessageTokens?: number }
+): Partial<MuxMetadata> {
+  return {
+    ...metadata,
+    volatileSystemTail: rebuilt.volatileSystemTail,
+    systemMessageTokens: rebuilt.systemMessageTokens ?? metadata?.systemMessageTokens,
+  };
+}
+
 interface StreamRequestConfig {
   stopCause?: StreamStopCause;
   cacheEnabled?: boolean;
@@ -696,6 +719,11 @@ function isStreamTruncatedMessage(message: string): boolean {
     lowerMessage.includes("stream closed unexpectedly before the response completed")
   );
 }
+
+// Lowercased prefix that google-auth-library puts on every failure to read or parse
+// the GOOGLE_APPLICATION_CREDENTIALS file.
+const GOOGLE_ADC_ENV_FILE_ERROR_PREFIX =
+  "unable to read the credential file specified by the google_application_credentials environment variable";
 
 // OpenAI rejections of Cyber mode's access_programs.cyber value
 // (https://developers.openai.com/api/docs/guides/daybreak). OpenAI's own
@@ -1013,6 +1041,9 @@ interface WorkspaceStreamInfo {
   // Track if a previousResponseId retry happened after a step completed so
   // stream-end uses cumulative usage instead of the retried step's totalUsage.
   didRetryPreviousResponseIdAtStep: boolean;
+  // Key of this attempt's in-flight usage file (SessionUsageService.recordInFlightUsage);
+  // set by the first finished step, cleared when the attempt settles or is discarded.
+  inFlightUsageKey?: string;
   // Track when Xum restarted the stream after an empty-output completion so
   // stream-end prefers cumulative usage across attempts instead of the final
   // attempt's totalUsage only.
@@ -1199,6 +1230,60 @@ export type StreamManagerTokenTracker = Pick<StreamingTokenTracker, "setModel" |
 export interface StreamManagerOptions {
   streamText?: typeof streamText;
   tokenTracker?: StreamManagerTokenTracker;
+}
+
+/** `{ error: { type } }`, the error body shape of Anthropic's API. */
+function hasErrorType(data: unknown): data is { error: { type?: string } } {
+  return (
+    typeof data === "object" &&
+    data !== null &&
+    "error" in data &&
+    typeof data.error === "object" &&
+    data.error !== null
+  );
+}
+
+/**
+ * The error type of an Anthropic error body embedded in a generic stream error's text. A proxy
+ * in front of Anthropic can wrap the provider's error event in a generic one (`type: "error"`),
+ * as in `unknown stream error: received error while streaming: {"type":"error","error":{...}}`.
+ * Only that wrapper counts: a typed error (an invalid_request_error) can echo request text,
+ * such as a tool description, that holds an overload body.
+ */
+function wrappedAnthropicErrorType(error: StreamProviderError): string | undefined {
+  if (error.type !== "error") return undefined;
+  const message = error.message;
+  const start = message.indexOf("{");
+  if (start < 0) return undefined;
+  try {
+    const body: unknown = JSON.parse(message.slice(start));
+    return hasErrorType(body) ? body.error.type : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isOverloadedApiCallError(error: APICallError): boolean {
+  return (
+    error.statusCode === 529 ||
+    (hasErrorType(error.data) && error.data.error.type === "overloaded_error")
+  );
+}
+
+/** An Anthropic overload (HTTP 529 / overloaded_error), before the request or mid-stream. */
+function isAnthropicOverloadError(error: unknown): boolean {
+  if (APICallError.isInstance(error)) return isOverloadedApiCallError(error);
+  if (RetryError.isInstance(error)) {
+    return APICallError.isInstance(error.lastError) && isOverloadedApiCallError(error.lastError);
+  }
+  if (StreamProviderError.isInstance(error)) {
+    return (
+      error.statusCode === 529 ||
+      error.type === "overloaded_error" ||
+      wrappedAnthropicErrorType(error) === "overloaded_error"
+    );
+  }
+  return false;
 }
 
 export class StreamManager {
@@ -1866,17 +1951,24 @@ export class StreamManager {
     };
   }
 
+  /**
+   * A retry that restarted the SDK stream but kept the earlier attempt's billed usage: the
+   * new stream's totals and steps cover only the retried call.
+   */
+  private restartedWithPreservedUsage(streamInfo: WorkspaceStreamInfo): boolean {
+    return (
+      streamInfo.didRetryPreviousResponseIdAtStep ||
+      streamInfo.didRetryAfterEmptyOutput === true ||
+      streamInfo.didRetryReasoningReplayAtStep === true
+    );
+  }
+
   private resolveTotalUsageForStreamEnd(
     streamInfo: WorkspaceStreamInfo,
     totalUsage: LanguageModelV2Usage | undefined
   ): LanguageModelV2Usage | undefined {
     const cumulativeUsage = streamInfo.cumulativeUsage;
-    if (
-      (streamInfo.didRetryPreviousResponseIdAtStep ||
-        streamInfo.didRetryAfterEmptyOutput ||
-        streamInfo.didRetryReasoningReplayAtStep) &&
-      hasTokenUsage(cumulativeUsage)
-    ) {
+    if (this.restartedWithPreservedUsage(streamInfo) && hasTokenUsage(cumulativeUsage)) {
       return cumulativeUsage;
     }
 
@@ -1952,6 +2044,21 @@ export class StreamManager {
   }
 
   /**
+   * Provider metadata for the usage resolveTotalUsageForStreamEnd picks: after a retry that
+   * kept the earlier attempt's usage, only the live accumulation also covers the steps before
+   * the retry (their cache writes and long-context shares).
+   */
+  private async resolveProviderMetadataForStreamEnd(
+    streamInfo: WorkspaceStreamInfo
+  ): Promise<Record<string, unknown> | undefined> {
+    const cumulative = streamInfo.cumulativeProviderMetadata;
+    if (this.restartedWithPreservedUsage(streamInfo) && cumulative) {
+      return { ...cumulative };
+    }
+    return this.getAggregatedProviderMetadata(streamInfo);
+  }
+
+  /**
    * Aggregate provider metadata across all steps.
    *
    * CRITICAL: For multi-step tool calls, cache creation tokens are reported per-step.
@@ -1969,24 +2076,18 @@ export class StreamManager {
       ]);
 
       if (!steps || steps.length === 0) {
-        // Fall back to the final step's provider metadata; AI SDK 7 reports
-        // cache writes on usage, so re-inject them for downstream pricing.
+        // The live per-step accumulation covers every step; without one, fall back to the
+        // final step's provider metadata.
+        if (streamInfo.cumulativeProviderMetadata) {
+          return { ...streamInfo.cumulativeProviderMetadata };
+        }
         const finalStep = await streamInfo.streamResult.finalStep;
-        return withCacheWriteMetadata(finalStep.providerMetadata, finalStep.usage);
+        return accumulateStepsProviderMetadata([finalStep], streamInfo.metadataModel);
       }
 
-      // Aggregate cache creation tokens across all steps. AI SDK 7 moved
-      // per-step cache-write tokens from providerMetadata.anthropic to
-      // step.usage.inputTokenDetails, so inject them back per step before
-      // accumulating (accumulateProviderMetadata sums across steps).
-      let accumulated: Record<string, unknown> | undefined;
-      for (const step of steps) {
-        accumulated = accumulateProviderMetadata(
-          accumulated,
-          withCacheWriteMetadata(step.providerMetadata, step.usage)
-        );
-      }
-      return accumulated;
+      // Aggregate cache creation tokens and long-context shares across all steps
+      // (accumulateStepsProviderMetadata re-injects AI SDK 7's per-step cache writes).
+      return accumulateStepsProviderMetadata(steps, streamInfo.metadataModel);
     } catch (error) {
       log.debug("Could not aggregate provider metadata:", error);
       return undefined;
@@ -2535,14 +2636,13 @@ export class StreamManager {
 
       // Record session usage for aborted streams (mirrors stream-end path)
       // This ensures tokens consumed before abort are tracked for cost display
-      await this.recordSessionUsage(
+      await this.settleSessionUsage(
         workspaceId,
-        streamInfo.model,
+        streamInfo,
         usage,
         providerMetadata,
         "Failed to record session usage on abort",
-        "error",
-        streamInfo
+        "error"
       );
 
       // Stamp the aborted turn's usage onto the partial message BEFORE committing
@@ -2712,10 +2812,11 @@ export class StreamManager {
     providerMetadata: Record<string, unknown> | undefined,
     logMessage: string,
     logLevel: "warn" | "error",
-    streamInfo?: Pick<WorkspaceStreamInfo, "workspaceName" | "metadataModel">
-  ): Promise<void> {
+    streamInfo?: Pick<WorkspaceStreamInfo, "workspaceName" | "metadataModel">,
+    settlesInFlightKey?: string
+  ): Promise<"recorded" | "skipped" | "failed"> {
     if (!this.sessionUsageService || !usage) {
-      return;
+      return "skipped";
     }
     const messageUsage = createDisplayUsage(
       usage,
@@ -2724,14 +2825,146 @@ export class StreamManager {
       streamInfo?.metadataModel
     );
     if (!messageUsage) {
-      return;
+      return "skipped";
     }
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
     const ledgerModel = this.usageAttributionModel(model, streamInfo?.metadataModel);
     try {
-      await this.sessionUsageService.recordUsage(workspaceId as string, ledgerModel, messageUsage);
+      await this.sessionUsageService.recordUsage(
+        workspaceId as string,
+        ledgerModel,
+        messageUsage,
+        settlesInFlightKey !== undefined ? { settlesInFlightKey } : undefined
+      );
+      return "recorded";
     } catch (error) {
       (logLevel === "error" ? workspaceLog.error : workspaceLog.warn)(logMessage, { error });
+      return "failed";
+    }
+  }
+
+  /**
+   * After each finished step, write the attempt's priced cumulative usage to its own
+   * in-flight file, so a Xum restart mid-turn loses at most the unfinished step. Priced like
+   * the abort path. One write per finished step, never per token.
+   */
+  private async recordInFlightSessionUsage(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo
+  ): Promise<void> {
+    if (!this.sessionUsageService || !hasTokenUsage(streamInfo.cumulativeUsage)) {
+      return;
+    }
+    const usage = createDisplayUsage(
+      streamInfo.cumulativeUsage,
+      streamInfo.model,
+      markProviderMetadataCostsIncluded(
+        streamInfo.cumulativeProviderMetadata,
+        streamInfo.initialMetadata?.costsIncluded
+      ),
+      streamInfo.metadataModel
+    );
+    if (!usage) {
+      return;
+    }
+    const key = streamInfo.inFlightUsageKey ?? randomUUID();
+    try {
+      await this.sessionUsageService.recordInFlightUsage(
+        workspaceId as string,
+        key,
+        streamInfo.messageId,
+        this.usageAttributionModel(streamInfo.model, streamInfo.metadataModel),
+        usage
+      );
+      streamInfo.inFlightUsageKey = key;
+    } catch (error) {
+      this.getWorkspaceLogger(workspaceId, streamInfo).warn(
+        "Failed to record in-flight session usage",
+        { error }
+      );
+    }
+  }
+
+  /**
+   * Record the attempt's final usage. The same ledger write marks its in-flight file settled
+   * (then the file is deleted), so a crash at any point counts the attempt once.
+   */
+  private async settleSessionUsage(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    usage: LanguageModelV2Usage | undefined,
+    providerMetadata: Record<string, unknown> | undefined,
+    logMessage: string,
+    logLevel: "warn" | "error",
+    model: string = streamInfo.model
+  ): Promise<void> {
+    const key = streamInfo.inFlightUsageKey;
+    // Cleared first: a later step (a fallback after a refusal) starts a new in-flight file.
+    streamInfo.inFlightUsageKey = undefined;
+    const result = await this.recordSessionUsage(
+      workspaceId,
+      model,
+      usage,
+      providerMetadata,
+      logMessage,
+      logLevel,
+      streamInfo,
+      key
+    );
+    if (key === undefined) {
+      return;
+    }
+    if (result === "skipped") {
+      await this.discardInFlightKey(workspaceId, streamInfo, key);
+    } else if (result === "failed") {
+      // The file is the only durable record of the finished steps: keep it, and let the
+      // next ledger read fold it.
+      this.sessionUsageService?.releaseInFlightUsage(workspaceId as string, key);
+    }
+  }
+
+  /**
+   * The attempt ends without usage to record (its usage is dropped, or recorded through
+   * another path): delete its in-flight file. Totals match those before in-flight files.
+   */
+  private async discardInFlightSessionUsage(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo
+  ): Promise<void> {
+    const key = streamInfo.inFlightUsageKey;
+    if (key === undefined) {
+      return;
+    }
+    streamInfo.inFlightUsageKey = undefined;
+    await this.discardInFlightKey(workspaceId, streamInfo, key);
+  }
+
+  /**
+   * A terminal path that recorded no usage (e.g. a completion with no parts) leaves no
+   * in-flight file. An abort is not terminal yet here: cleanupAbortedStream settles it after
+   * processing ends, and until then the file is its only durable record.
+   */
+  private async discardUnsettledSessionUsage(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo
+  ): Promise<void> {
+    if (streamInfo.terminalCompletion != null) {
+      await this.discardInFlightSessionUsage(workspaceId, streamInfo);
+    }
+  }
+
+  private async discardInFlightKey(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    key: string
+  ): Promise<void> {
+    try {
+      await this.sessionUsageService?.discardInFlightUsage(workspaceId as string, key);
+    } catch (error) {
+      this.getWorkspaceLogger(workspaceId, streamInfo).warn(
+        "Failed to discard in-flight session usage",
+        { error }
+      );
     }
   }
 
@@ -2957,7 +3190,6 @@ export class StreamManager {
                   createContextBudgetAnchor(stepTracker?.contextBudgetRequest, step)
                 );
           const nextRequestTokens = nextRequest?.estimate;
-          const nextRequestDeltaTokens = nextRequest?.delta;
           const { decision, continuationEntryId } = await request.onStepSettled({
             model: request.modelString,
             usage: normalizeUsage(step.usage),
@@ -2965,7 +3197,6 @@ export class StreamManager {
             ...size,
             toolResultTokens,
             ...(nextRequestTokens != null ? { nextRequestTokens } : {}),
-            ...(nextRequestDeltaTokens != null ? { nextRequestDeltaTokens } : {}),
             sessionHistoryAvailable: request.tools?.session_history != null,
             newContextAvailable: request.tools?.new_context != null,
             newContextRequested: step.toolResults.some(
@@ -3313,10 +3544,8 @@ export class StreamManager {
           appliedLevel != null
         ) {
           try {
-            const rebuilt = await request.rebuildFirstStepForThinkingLevel(
-              appliedLevel,
-              thinkingOverride
-            );
+            const { messages: rebuilt, ...rebuiltSystem } =
+              await request.rebuildFirstStepForThinkingLevel(appliedLevel, thinkingOverride);
             const receiptApplied = applyTurnReplayReceipt(stepTracker, rebuilt);
             // A retry's step 0 can rebuild this row's earlier steps too: what it stripped
             // is gone from here on, so the receipt's point moves to this step.
@@ -3329,6 +3558,9 @@ export class StreamManager {
             );
             if (stepTracker) {
               stepTracker.latestMessages = rebuiltFirstStepMessages;
+              // The rebuilt request decides which volatile-tail rows the row recorded, and
+              // what its system content (tail rows included) costs.
+              stepTracker.recordVolatileSystemTail(rebuiltSystem);
             }
             // onStepMessages fired above with the pre-rebuild transcript;
             // re-notify so consumers track the
@@ -3372,7 +3604,8 @@ export class StreamManager {
         // replay reasoning again. Blocks produced after it are bound to the new prefix and
         // keep replaying (#5279). This applies to every Anthropic Messages thinking mode,
         // not only `between_tools` (which cannot carry blockBinding): only the direct API
-        // route sends `drop_block`, so adaptive/enabled thinking on other routes would 400.
+        // route and anthropic-typed Coder AI Gateway instances send `drop_block`, so
+        // adaptive/enabled thinking on other routes would 400.
         // Claude on Bedrock gets the same strip (#5841): Bedrock cannot take drop_block.
         const toolSetKey = activeTools === undefined ? "" : [...activeTools].sort().join("\n");
         const consumedSwap = stepTracker?.consumedPrefixSwap;
@@ -3521,7 +3754,11 @@ export class StreamManager {
       maxOutputTokens,
       runtime,
     } = options;
-    const stepTracker: StepMessageTracker = { workspaceId: options.workspaceId };
+    // The tail hook is wired to streamInfo below, once it exists.
+    const stepTracker: StepMessageTracker = {
+      workspaceId: options.workspaceId,
+      recordVolatileSystemTail: () => undefined,
+    };
     const metadataModel = this.resolveMetadataModel(modelString, options.providersConfigSnapshot);
     const request = this.buildStreamRequestConfig({
       ...options,
@@ -3610,6 +3847,9 @@ export class StreamManager {
     // Single source for same-turn rebuilds: the receipt lives on initialMetadata (#5886).
     stepTracker.hasAnthropicReplayReceipt = () =>
       streamInfo.initialMetadata?.anthropicThinkingReplay === "off";
+    stepTracker.recordVolatileSystemTail = (rebuilt) => {
+      streamInfo.initialMetadata = withRebuiltSystemMetadata(streamInfo.initialMetadata, rebuilt);
+    };
 
     // Mid-turn thinking override: route applied levels into this stream's
     // metadata (partials, stream-end, final assistant message). Wired before
@@ -3690,7 +3930,8 @@ export class StreamManager {
           ...(mcpServer ? { mcpServer } : {}),
           state: "output-available" as const,
           output,
-          ...modelOnlyNotificationsField(modelOnlyNotifications),
+          // Set even when undefined: an earlier completion's notes must not outlive it (#6665).
+          modelOnlyNotifications,
         };
       }
     } else {
@@ -4150,14 +4391,14 @@ export class StreamManager {
       return;
     }
 
-    await this.recordSessionUsage(
+    await this.settleSessionUsage(
       workspaceId,
-      refusedModel,
+      streamInfo,
       usage,
       providerMetadata,
       "Failed to record refused-attempt session usage (fallback unaffected)",
       "warn",
-      streamInfo
+      refusedModel
     );
   }
 
@@ -4179,14 +4420,14 @@ export class StreamManager {
       return;
     }
 
-    await this.recordSessionUsage(
+    await this.settleSessionUsage(
       workspaceId,
-      refusedModel,
+      streamInfo,
       usage,
       providerMetadata,
       "Failed to record terminal-refusal session usage",
       "warn",
-      streamInfo
+      refusedModel
     );
   }
 
@@ -4492,6 +4733,14 @@ export class StreamManager {
       };
     }
 
+    // Before any await: the stream may already be preparing its first step, and a step-0
+    // thinking rebuild there records a newer volatile-tail plan (recordVolatileSystemTail),
+    // which must win over the patch's baseline. That rebuild always runs after an await.
+    streamInfo.initialMetadata = {
+      ...streamInfo.initialMetadata,
+      ...prepared.data.initialMetadataPatch,
+    };
+
     // The fallback stream exists now; durable side effects describing this
     // request identity (superseding turn envelope) may be recorded.
     await prepared.data.onStreamConstructed?.();
@@ -4533,10 +4782,9 @@ export class StreamManager {
       streamInfo.thinkingLevel = prepared.data.thinkingLevel;
     }
     // Final stream-end metadata spreads initialMetadata, so route attribution
-    // corrections and the fallback record propagate automatically.
+    // corrections (the patch, applied above) and the fallback record propagate automatically.
     streamInfo.initialMetadata = {
       ...streamInfo.initialMetadata,
-      ...prepared.data.initialMetadataPatch,
       modelFallback: {
         requestedModel: fallbackState.requestedModel,
         refusedModels: [...fallbackState.refusedModels],
@@ -5205,7 +5453,7 @@ export class StreamManager {
                 streamInfo.cumulativeUsage = addUsage(streamInfo.cumulativeUsage, stepUsage);
                 streamInfo.cumulativeProviderMetadata = accumulateProviderMetadata(
                   streamInfo.cumulativeProviderMetadata,
-                  stepProviderMetadata
+                  withLongContextTokens(stepProviderMetadata, stepUsage, streamInfo.metadataModel)
                 );
 
                 // Track last step's data for context window display
@@ -5226,6 +5474,7 @@ export class StreamManager {
                 });
                 streamInfo.currentStepStartIndex = streamInfo.parts.length;
                 this.emitTurnEvent(usageEvent);
+                await this.recordInFlightSessionUsage(workspaceId, streamInfo);
                 await this.checkSoftCancelStream(workspaceId, streamInfo);
                 break;
               }
@@ -5332,7 +5581,7 @@ export class StreamManager {
             const ttftMs = this.resolveTtftMsForStreamEnd(streamInfo);
             // Aggregated provider metadata across all steps (for cost calculation with cache tokens)
             const providerMetadata = markProviderMetadataCostsIncluded(
-              await this.getAggregatedProviderMetadata(streamInfo),
+              await this.resolveProviderMetadataForStreamEnd(streamInfo),
               streamInfo.initialMetadata?.costsIncluded
             );
             const canonicalModel = metadataModelIdentity(streamInfo.model);
@@ -5449,14 +5698,13 @@ export class StreamManager {
 
               // Update cumulative session usage (if service is available)
               // Wrapped in try-catch: usage recording is non-critical and shouldn't block stream completion
-              await this.recordSessionUsage(
+              await this.settleSessionUsage(
                 workspaceId,
-                streamInfo.model,
+                streamInfo,
                 totalUsage,
                 providerMetadata,
                 "Failed to record session usage (stream completion unaffected)",
-                "warn",
-                streamInfo
+                "warn"
               );
             }
 
@@ -5542,6 +5790,7 @@ export class StreamManager {
       ) {
         this.workspaceStreams.delete(workspaceId);
       }
+      await this.discardUnsettledSessionUsage(workspaceId, streamInfo);
 
       // Lifecycle spine event: emitted from the guaranteed-cleanup path so
       // EVERY terminal outcome (completion, abort/Escape, provider failure)
@@ -5674,32 +5923,7 @@ export class StreamManager {
     const canonicalModel = normalizeToCanonical(streamInfo.model);
     const isAnthropic = canonicalModel.startsWith("anthropic:");
 
-    const hasErrorProperty = (data: unknown): data is { error: { type?: string } } => {
-      return (
-        typeof data === "object" &&
-        data !== null &&
-        "error" in data &&
-        typeof data.error === "object" &&
-        data.error !== null
-      );
-    };
-
-    const isOverloadedApiCallError = (apiError: APICallError): boolean => {
-      return (
-        apiError.statusCode === 529 ||
-        (hasErrorProperty(apiError.data) && apiError.data.error.type === "overloaded_error")
-      );
-    };
-
-    const isAnthropicOverloaded =
-      isAnthropic &&
-      ((APICallError.isInstance(actualError) && isOverloadedApiCallError(actualError)) ||
-        (RetryError.isInstance(actualError) &&
-          actualError.lastError &&
-          APICallError.isInstance(actualError.lastError) &&
-          isOverloadedApiCallError(actualError.lastError)));
-
-    if (isAnthropicOverloaded) {
+    if (isAnthropic && isAnthropicOverloadError(actualError)) {
       errorMessage = "Anthropic is temporarily overloaded (HTTP 529). Please try again later.";
       errorType = "server_error";
     }
@@ -5788,15 +6012,17 @@ export class StreamManager {
           : undefined,
         streamInfo.initialMetadata?.costsIncluded
       );
-      await this.recordSessionUsage(
+      await this.settleSessionUsage(
         workspaceId,
-        streamInfo.model,
+        streamInfo,
         cumulativeErrorUsage,
         cumulativeErrorProviderMetadata,
         "Failed to record session usage for errored stream",
-        "warn",
-        streamInfo
+        "warn"
       );
+    } else {
+      // Refusals recorded their own usage above: drop any in-flight copy.
+      await this.discardInFlightSessionUsage(workspaceId, streamInfo);
     }
     const errorUsage = terminalRefusalUsage ?? cumulativeErrorUsage;
     const errorProviderMetadata =
@@ -5926,6 +6152,8 @@ export class StreamManager {
     streamInfo.lastPartialWriteTime = 0;
 
     if (!preserveUsage) {
+      // The dropped attempt's usage is not recorded (refused attempts settled their own).
+      await this.discardInFlightSessionUsage(workspaceId, streamInfo);
       streamInfo.cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
       streamInfo.cumulativeProviderMetadata = undefined;
       streamInfo.terminalRefusalUsage = undefined;
@@ -6327,9 +6555,23 @@ export class StreamManager {
         return "stream_truncated";
       }
 
+      // google-auth-library could not turn the GOOGLE_APPLICATION_CREDENTIALS file into
+      // a credential (Google Vertex AI). It reads the file locally, so a retry fails the
+      // same way, and the keyword rules below misread its text ("refresh_token").
+      if (message.startsWith(GOOGLE_ADC_ENV_FILE_ERROR_PREFIX)) {
+        return "authentication";
+      }
+
       if (error.name === "AbortError" || message.includes("abort")) {
         return "aborted";
-      } else if (message.includes("network") || message.includes("fetch")) {
+      } else if (
+        message.includes("network") ||
+        message.includes("fetch") ||
+        // node-fetch's text for a failed connection, which google-auth-library's HTTP client
+        // (gaxios) keeps. Its URL can be Google's OAuth token endpoint, and the "token" rule
+        // below would read that as a context window error.
+        (message.startsWith("request to ") && message.includes(" failed, reason: "))
+      ) {
         return "network";
       } else if (
         message.includes("model") &&

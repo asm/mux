@@ -87,9 +87,6 @@ isolated_unit_tests=(
   # (document/window set to undefined, a replaced baseline window), which would
   # perturb later suites in a shared process.
   ./tests/ui/domIsolation.test.ts
-  # Spawns a bun child that forces the Bun 1.3.12 test.each GC window (#6020); bun-only, so
-  # Jest skips it.
-  ./tests/bunEachTableGc.test.ts
 )
 # Strip the marker so every later use of isolated_unit_tests sees plain paths, and
 # record it per index, so the coverage choice cannot drift from the list.
@@ -249,7 +246,7 @@ done
 # src shards: a single ./ path switches `bun test` from filter mode (files run in
 # bun's own traversal order) to path mode (argument order), which reorders the whole
 # shard and exposed order-dependent module mocks that the usual order hides.
-tooling_roots=(./tests/ui/storybook ./tests/bugbash ./vscode/src ./scripts)
+tooling_roots=(./tests/ui/storybook ./tests/bugbash ./tests/stories ./vscode/src ./scripts)
 tooling_files=()
 while IFS= read -r tooling_file; do
   tooling_files+=("$tooling_file")

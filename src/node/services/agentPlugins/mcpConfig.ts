@@ -9,7 +9,12 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
 import { normalizeProjectMetadataIdentityPath } from "@/common/compat/legacyMux";
-import type { MCPServerInfo, MCPStdioServerInfo, WorkspaceMCPOverrides } from "@/common/types/mcp";
+import type {
+  MCPServerInfo,
+  MCPServerOAuthConfig,
+  MCPStdioServerInfo,
+  WorkspaceMCPOverrides,
+} from "@/common/types/mcp";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -27,6 +32,7 @@ import {
 import { serverConsentFingerprint } from "./componentConsent";
 import { expandPluginPlaceholders, type PluginPlaceholderValues } from "./expansion";
 import {
+  isReservedPluginEnvName,
   PLUGIN_MCP_CONFIG_PARSE_ERROR,
   readOpenAIMcpAuth,
   toServerOAuthConfig,
@@ -286,6 +292,31 @@ interface NormalizeContext {
   vars: PluginPlaceholderValues;
 }
 
+/** The first problem of a stdio entry's `env` object, or undefined when it is valid. */
+function stdioEnvError(env: Record<string, unknown>): string | undefined {
+  for (const [key, value] of Object.entries(env)) {
+    if (isReservedPluginEnvName(key)) {
+      // §9.2: reserved names in `env` make the entry invalid; the client
+      // supplies these variables itself.
+      return `'env' must not contain reserved variable '${key}'`;
+    }
+    if (typeof value !== "string") {
+      return `'env.${key}' must be a string`;
+    }
+    if (key.includes("\0") || value.includes("\0")) {
+      // Same spawn constraint as args: env entries must be NUL-free.
+      return `'env' entry ${JSON.stringify(key)} must not contain NUL bytes`;
+    }
+    if (key.length === 0 || key.includes("=")) {
+      // As env_vars names (codexEnvVarName): a key `PLUGIN_DATA=/x` would set PLUGIN_DATA in
+      // the joined env block, and Windows sorts that block, so order cannot protect it (#6713).
+      // An empty key would be an unnamed `=value` entry.
+      return `'env' key ${JSON.stringify(key)} must be a non-empty name without '='`;
+    }
+  }
+  return undefined;
+}
+
 /** Validate + normalize one stdio entry; returns null (with error) when invalid. */
 async function normalizeStdioEntry(
   entry: Record<string, unknown>,
@@ -323,20 +354,8 @@ async function normalizeStdioEntry(
     return { error: "'env' must be an object of strings" };
   }
   const env = entry.env ?? {};
-  for (const [key, value] of Object.entries(env)) {
-    if (key === "PLUGIN_ROOT" || key === "PLUGIN_DATA") {
-      // §9.2: reserved names in `env` make the entry invalid; the client
-      // supplies these variables itself.
-      return { error: `'env' must not contain reserved variable '${key}'` };
-    }
-    if (typeof value !== "string") {
-      return { error: `'env.${key}' must be a string` };
-    }
-    if (key.includes("\0") || value.includes("\0")) {
-      // Same spawn constraint as args: env entries must be NUL-free.
-      return { error: `'env' entry ${JSON.stringify(key)} must not contain NUL bytes` };
-    }
-  }
+  const envError = stdioEnvError(env);
+  if (envError !== undefined) return { error: envError };
 
   if (entry.cwd !== undefined && typeof entry.cwd !== "string") {
     return { error: "'cwd' must be a string" };
@@ -534,6 +553,31 @@ function normalizeRemoteEntry(
   };
 }
 
+/**
+ * A remote server's OAuth settings: applies the usable ones to `info` and returns the warnings
+ * for the rest. Discovery + DCR cover what the config omits.
+ */
+function remoteOAuthMessages(
+  info: Exclude<MCPServerInfo, MCPStdioServerInfo>,
+  entry: Record<string, unknown>,
+  codex: { ignored: string[]; warnings: string[]; hasClientSecret?: boolean },
+  /** Where the OAuth service rereads a Codex client secret (see readPluginClientSecret). */
+  secretSource: NonNullable<MCPServerOAuthConfig["clientSecretSource"]>
+): string[] {
+  const auth = readOpenAIMcpAuth(entry.extensions);
+  const { config: oauth, ignored: unusable } = toServerOAuthConfig(auth.auth, {
+    serverUrl: info.url,
+    ...(codex.hasClientSecret === true ? { clientSecretSource: secretSource } : {}),
+  });
+  if (oauth !== undefined) info.oauth = oauth;
+  const ignored = [...codex.ignored, ...auth.ignored, ...unusable];
+  if (codex.hasClientSecret === true && oauth?.clientSecretSource === undefined)
+    ignored.push("oauth.client_secret (needs client_id)");
+  const messages = [...codex.warnings, ...auth.warnings];
+  if (ignored.length > 0) messages.push(`Xum's MCP OAuth ignores: ${ignored.join(", ")}`);
+  return messages;
+}
+
 /** Normalize one (translated) entry by its transport; a translation error skips it. */
 async function normalizeServerEntry(
   translated: ReturnType<typeof translateCodexMcpEntry>,
@@ -719,39 +763,25 @@ export async function loadPluginMcpServers(
     }
 
     const info = result.info;
-    if (info.transport !== "stdio") {
-      // Unusable settings only warn: the server still loads, and discovery +
-      // DCR cover what the config omits. Messages name fields, never values
-      // (see openaiMcpAuth's SECURITY AUDIT).
-      const auth = readOpenAIMcpAuth(entry.extensions);
-      const { config: oauth, ignored: unusable } = toServerOAuthConfig(auth.auth, {
-        serverUrl: info.url,
-        ...(codex.hasClientSecret === true
-          ? {
-              clientSecretSource: {
-                pluginRoot: plugin.rootPath,
-                mcpConfigPath: plugin.mcpConfigPath,
-                serverName,
-              },
-            }
-          : {}),
+    // Unusable settings only warn: the server still loads. Messages name fields, never values
+    // (see openaiMcpAuth's SECURITY AUDIT).
+    const messages =
+      info.transport === "stdio"
+        ? codex.warnings
+        : remoteOAuthMessages(info, entry, codex, {
+            pluginRoot: plugin.rootPath,
+            mcpConfigPath: plugin.mcpConfigPath,
+            serverName,
+          });
+    for (const message of messages) {
+      const fullMessage = `${fileLabel} server '${serverName}': ${message}`;
+      log.warn(`Agent plugin ${plugin.rootPath}: ${fullMessage}`);
+      diagnostics.push({
+        path: plugin.mcpConfigPath,
+        scope: plugin.scope,
+        severity: "warning",
+        message: fullMessage,
       });
-      if (oauth !== undefined) info.oauth = oauth;
-      const ignored = [...codex.ignored, ...auth.ignored, ...unusable];
-      if (codex.hasClientSecret === true && oauth?.clientSecretSource === undefined)
-        ignored.push("oauth.client_secret (needs client_id)");
-      const messages = [...codex.warnings, ...auth.warnings];
-      if (ignored.length > 0) messages.push(`Xum's MCP OAuth ignores: ${ignored.join(", ")}`);
-      for (const message of messages) {
-        const fullMessage = `${fileLabel} server '${serverName}': ${message}`;
-        log.warn(`Agent plugin ${plugin.rootPath}: ${fullMessage}`);
-        diagnostics.push({
-          path: plugin.mcpConfigPath,
-          scope: plugin.scope,
-          severity: "warning",
-          message: fullMessage,
-        });
-      }
     }
     assert(
       info.plugin !== undefined,

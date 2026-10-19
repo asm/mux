@@ -559,10 +559,15 @@ export async function createCodeExecutionTool(
 `
       : "";
 
+  // PTC is exclusive-only: bridged tools are removed from the model-visible
+  // set, so "When to use" must say code_execution is the ONLY route. The old
+  // supplement-era wording ("prefer for 2+ calls") implied single calls go
+  // direct, so the first bash call of nearly every transcript failed with
+  // "Model tried to call unavailable tool 'bash'" before the model adapted.
   const codeExecutionTool = tool({
     description: `${kernelFirstPreamble}Execute sandboxed JavaScript to batch tools and transform outputs.
 
-**When to use:** Prefer this tool when making 2+ tool calls, especially when later calls depend on earlier results. Reduces round-trip latency.
+**When to use:** The \`xum.*\` tools below are reachable ONLY through this tool; they are not top-level tools, so calling one directly by name fails. Use this tool even for a single call (\`return xum.<tool>(args)\`), and batch multiple calls into one script, especially when later calls depend on earlier results.
 
 **Available tools (TypeScript definitions):**
 \`\`\`typescript
@@ -743,7 +748,7 @@ ${xumTypes}
           // their media/display-file bytes stripped from sandbox-visible
           // values by the bridge; re-attach the originals on this result so
           // the request path delivers media to the model as real attachments
-          // (extractToolMediaAsUserMessages) and the UI renders both kinds
+          // (extractToolMediaAsUserMessagesFromModelMessages) and the UI renders both kinds
           // from the carrier. Drain even for failed evals: received parts are
           // still valid, and leaving them pending would let them leak into a
           // later eval on this runtime.

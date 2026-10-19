@@ -36,10 +36,19 @@ import {
 } from "@/node/utils/gitNoHooksEnv";
 import { getErrorMessage } from "@/common/utils/errors";
 import { emitChatEventBestEffort } from "./toolUtils";
+import { skillFileBashHint } from "./skillFileHint";
 import type { BackgroundProcessMonitorConfig } from "@/node/services/backgroundProcessManager";
 
 const CAT_FILE_READ_NOTICE =
   "Use the `file_read` tool to read files instead of `cat`, `rg`, or `grep`: bash output may be truncated or auto-filtered, which can hide parts of the file, and file_read supports offset/limit paging.";
+
+/**
+ * Built at module level so the closure captures only the controller, not the tool's execute
+ * scope: a migrated record outlives the turn, and that scope holds the ToolConfiguration.
+ */
+function abortOnKill(controller: AbortController): () => void {
+  return () => controller.abort();
+}
 
 function prependToolNote(existing: string | undefined, extra: string): string {
   if (!existing) {
@@ -742,6 +751,73 @@ function createLineHandler(
 }
 
 /**
+ * What the file limit does to a command that is still running; returns whether it stopped it.
+ *
+ * The truncate policy returns the output it kept as a success, so it stops the command itself
+ * (#6732). Cancelling the output streams alone does not stop it reliably: the child's stdout is a
+ * Unix socket, and closing one that still holds unread data gives the writer ECONNRESET, not
+ * SIGPIPE. The command then exits with its own error status (perl: 1), which says nothing about
+ * the command, so the old code reported that cut as a failure. The tmpfile policy reports the
+ * overflow without the exit status, and keeps its old behavior.
+ */
+const AT_FILE_LIMIT: Record<
+  "tmpfile" | "truncate",
+  (running: boolean, stop: () => void) => boolean
+> = {
+  truncate: (running, stop) => {
+    if (running) stop();
+    return running;
+  },
+  tmpfile: () => false,
+};
+
+/**
+ * The result when waiting for the command failed (a stream read or the exit status rejected).
+ * A user abort wins. Then our own stop at the file limit: it can make a read or the exit status
+ * fail (a RemoteRuntime child that errors after the kill), which says nothing about the command,
+ * so the result stays the truncated success (#6873). Otherwise the failure itself.
+ */
+function failedWaitResult(
+  err: unknown,
+  state: {
+    aborted: boolean;
+    stoppedAtFileLimit: boolean;
+    lines: string[];
+    overflowReason: string | null;
+    overflowPolicy: "tmpfile" | "truncate";
+    effectiveTimeout: number;
+    wall_duration_ms: number;
+  }
+): BashToolResult {
+  if (state.aborted) {
+    return {
+      success: false,
+      error: "Command execution was aborted",
+      exitCode: -1,
+      wall_duration_ms: state.wall_duration_ms,
+    };
+  }
+  if (state.stoppedAtFileLimit) {
+    return formatResult(
+      EXIT_CODE_ABORTED,
+      state.lines,
+      true,
+      state.overflowReason,
+      state.wall_duration_ms,
+      state.overflowPolicy,
+      state.effectiveTimeout,
+      true
+    );
+  }
+  return {
+    success: false,
+    error: `Failed to execute command: ${getErrorMessage(err)}`,
+    exitCode: -1,
+    wall_duration_ms: state.wall_duration_ms,
+  };
+}
+
+/**
  * Formats the final bash tool result based on exit code and truncation state
  */
 function formatResult(
@@ -751,9 +827,21 @@ function formatResult(
   overflowReason: string | null,
   wall_duration_ms: number,
   overflowPolicy: "tmpfile" | "truncate",
-  effectiveTimeout: number
+  effectiveTimeout: number,
+  stoppedAtFileLimit = false
 ): BashToolResult {
   const output = lines.join("\n");
+
+  // The truncate policy stopped this command at the file limit, so its status is ours (#6732).
+  if (stoppedAtFileLimit) {
+    return {
+      success: true,
+      output,
+      exitCode: 0,
+      wall_duration_ms,
+      truncated: { reason: overflowReason ?? "unknown reason", totalLines: lines.length },
+    };
+  }
 
   // Check for special error codes from runtime
   if (exitCode === EXIT_CODE_ABORTED) {
@@ -1122,6 +1210,11 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
         });
       }
 
+      const sendToBackground = () => {
+        backgroundedRef.current = true;
+        // Both explicit backgrounding and queued input unblock the same foreground wait.
+        if (backgroundResolve) backgroundResolve();
+      };
       // Register foreground process for "send to background" feature
       // Only if manager is available (AI tool calls, not IPC)
       const fgRegistration =
@@ -1131,13 +1224,21 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
               toolCallId,
               script,
               safeDisplayName,
-              () => {
-                backgroundedRef.current = true;
-                // Resolve the background promise to unblock the wait
-                if (backgroundResolve) backgroundResolve();
-              }
+              sendToBackground
             )
           : null;
+      const backgroundForQueuedMessage = () => {
+        if (
+          fgRegistration &&
+          !foregroundCompleted &&
+          !backgroundedRef.current &&
+          config.hasQueuedMessages?.("tool-end") === true
+        ) {
+          sendToBackground();
+        }
+      };
+      // Input can arrive during Bash preparation, before a foreground registration exists.
+      backgroundForQueuedMessage();
 
       // Execute using runtime interface (works for both local and SSH)
       const scriptWithClosedStdin = `exec </dev/null
@@ -1172,6 +1273,8 @@ ${scriptWithEnv}`;
       // Collect output concurrently from Web Streams to avoid readline race conditions.
       const lines: string[] = [];
       let truncated = false;
+      // Set when the truncate policy stopped the command at the file limit (#6732).
+      let stoppedAtFileLimit = false;
 
       // Helper to trigger display truncation (stop showing to agent, keep collecting)
       const triggerDisplayTruncation = (reason: string) => {
@@ -1183,6 +1286,10 @@ ${scriptWithEnv}`;
 
       // Helper to trigger file truncation (stop collecting, close streams)
       const triggerFileTruncation = (reason: string) => {
+        // Runs once: the line handler stops calling it after the file limit is hit.
+        stoppedAtFileLimit = AT_FILE_LIMIT[overflowPolicy](!exitCodeResolved, () =>
+          wrappedAbortController.abort()
+        );
         truncationState.fileTruncated = true;
         truncationState.displayTruncated = true;
         truncated = true;
@@ -1242,6 +1349,9 @@ ${scriptWithEnv}`;
       };
 
       const flushLiveOutput = (): void => {
+        // Admission probes have no change event. Reuse this wait's existing cadence rather
+        // than cache a decision that cancellation/withdrawal can invalidate between enqueues.
+        backgroundForQueuedMessage();
         if (liveOutputStopped) return;
 
         const flush = (isError: boolean, buffer: string): void => {
@@ -1279,7 +1389,7 @@ ${scriptWithEnv}`;
         liveStderrBuffer = "";
       };
 
-      if (config.emitChatEvent && config.workspaceId && toolCallId) {
+      if (config.hasQueuedMessages || (config.emitChatEvent && config.workspaceId && toolCallId)) {
         liveOutputTimer = setInterval(flushLiveOutput, LIVE_FLUSH_INTERVAL_MS);
       }
 
@@ -1533,7 +1643,7 @@ ${scriptWithEnv}`;
                   existingOutput: lines,
                   // Abort is detached from the tool call once backgrounded, so the wrapped
                   // controller now only fires through the handle's terminate (#4760).
-                  kill: () => wrappedAbortController.abort(),
+                  kill: abortOnKill(wrappedAbortController),
                 },
                 config.backgroundProcessManager.getBgOutputDir()
               );
@@ -1613,21 +1723,17 @@ ${scriptWithEnv}`;
         // Unregister on error
         fgRegistration?.unregister();
 
-        // Check if this was an abort
-        if (abortSignal?.aborted) {
-          return withNotice({
-            success: false,
-            error: "Command execution was aborted",
-            exitCode: -1,
+        return withNotice(
+          failedWaitResult(err, {
+            aborted: abortSignal?.aborted === true,
+            stoppedAtFileLimit,
+            lines,
+            overflowReason,
+            overflowPolicy,
+            effectiveTimeout,
             wall_duration_ms: Math.round(performance.now() - startTime),
-          });
-        }
-        return withNotice({
-          success: false,
-          error: `Failed to execute command: ${getErrorMessage(err)}`,
-          exitCode: -1,
-          wall_duration_ms: Math.round(performance.now() - startTime),
-        });
+          })
+        );
       } finally {
         stopLiveOutput(true);
       }
@@ -1675,11 +1781,13 @@ ${scriptWithEnv}`;
           await writerInstance.write(encoder.encode(fullOutput));
           await writerInstance.close();
 
+          // A script that reads a skill file by path gets the call that returns it whole.
+          const skillFileHint = await skillFileBashHint(config, script);
           const noticeBase = `[OUTPUT OVERFLOW - ${overflowReason ?? "unknown reason"}]
 
 Full output (${lines.length} lines) saved to ${overflowPath}
 
-Use selective filtering tools (e.g. grep) to extract relevant information and continue your task
+${skillFileHint}Use selective filtering tools (e.g. grep) to extract relevant information and continue your task
 
 File will be automatically cleaned up when stream ends.`;
 
@@ -1711,7 +1819,8 @@ File will be automatically cleaned up when stream ends.`;
           overflowReason,
           wall_duration_ms,
           config.overflow_policy ?? "tmpfile",
-          effectiveTimeout
+          effectiveTimeout,
+          stoppedAtFileLimit
         )
       );
     },

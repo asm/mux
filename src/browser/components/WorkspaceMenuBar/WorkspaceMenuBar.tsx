@@ -7,7 +7,6 @@ import {
   BellOff,
   Ellipsis,
   Info,
-  Menu,
   PanelRightOpen,
   Pencil,
 } from "lucide-react";
@@ -22,10 +21,8 @@ import {
   updateUserPreferences,
   useUserPreferences,
 } from "@/browser/stores/AppConfigStore";
-import { WorkspaceHeartbeatModal } from "../WorkspaceHeartbeatModal";
-import { WorkspaceUnrelatedMessagingDialog } from "../WorkspaceUnrelatedMessagingModal/WorkspaceUnrelatedMessagingDialog";
-import { WorkspaceMCPModal } from "../WorkspaceMCPModal/WorkspaceMCPModal";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
+import { LazySettingsModal } from "./LazySettingsModal";
 import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
 import { Checkbox } from "../Checkbox/Checkbox";
 import {
@@ -40,6 +37,7 @@ import {
 } from "@/browser/utils/ui/keybinds";
 import { useRuntimeStatus, useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
+import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { Button } from "@/browser/components/Button/Button";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
@@ -66,6 +64,8 @@ import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceT
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 
 import { SkillIndicator } from "../SkillIndicator/SkillIndicator";
+import { BranchSelector } from "../BranchSelector/BranchSelector";
+import { LeftSidebarToggleBarSpacer } from "../SidebarCollapseButton/SidebarCollapseButton";
 import { WorkspaceLinks } from "../WorkspaceLinks/WorkspaceLinks";
 import { useLiveAPI } from "@/browser/contexts/API";
 
@@ -73,12 +73,8 @@ import { useWorkspaceActions, useWorkspaceContext } from "@/browser/contexts/Wor
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
-import { stopKeyboardPropagation } from "@/browser/utils/events";
-import {
-  NARROW_VIEWPORT_MAX_WIDTH_PX,
-  RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
-  WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
-} from "@/constants/layout";
+import { addWindowListenerWhile, stopKeyboardPropagation } from "@/browser/utils/events";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX, RIGHT_SIDEBAR_DEFAULT_COLLAPSED } from "@/constants/layout";
 import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { focusRightSidebarTab } from "@/browser/utils/rightSidebarTabFocus";
@@ -95,7 +91,6 @@ interface WorkspaceMenuBarProps {
   namedWorkspacePath: string;
   runtimeConfig?: RuntimeConfig;
   leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
   /** Callback to open integrated terminal in sidebar (optional, falls back to popout) */
   onOpenTerminal?: (options?: TerminalSessionCreateOptions) => void;
   /**
@@ -109,9 +104,34 @@ interface WorkspaceMenuBarProps {
 
 import { useArchiveWorkspaceConfirmation } from "@/browser/hooks/useArchiveWorkspaceConfirmation";
 
-const COLLAPSED_LEFT_SIDEBAR_MENU_BAR_STYLE = {
-  paddingLeft: `${WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX}px`,
-} as const;
+// T3 #5971: these modals (and the MCP app frame the MCP modal renders) load on their first open.
+// Imported statically, they were part of the workspace page chunk a phone downloads before the
+// composer works (~39 KB brotli). Opening the Workspace actions menu starts all three imports,
+// so a pick from it usually finds its modal loaded; the page load itself never requests them.
+function loadOnce<T>(load: () => Promise<T>): () => Promise<T> {
+  let chunk: Promise<T> | undefined;
+  return () => (chunk ??= load());
+}
+const loadHeartbeatModal = loadOnce(() => import("../WorkspaceHeartbeatModal"));
+const loadMessagingDialog = loadOnce(
+  () => import("../WorkspaceUnrelatedMessagingModal/WorkspaceUnrelatedMessagingDialog")
+);
+const loadMcpModal = loadOnce(() => import("../WorkspaceMCPModal/WorkspaceMCPModal"));
+const WorkspaceHeartbeatModal = React.lazy(async () => ({
+  default: (await loadHeartbeatModal()).WorkspaceHeartbeatModal,
+}));
+const WorkspaceUnrelatedMessagingDialog = React.lazy(async () => ({
+  default: (await loadMessagingDialog()).WorkspaceUnrelatedMessagingDialog,
+}));
+const WorkspaceMCPModal = React.lazy(async () => ({
+  default: (await loadMcpModal()).WorkspaceMCPModal,
+}));
+
+function preloadSettingsModals(): void {
+  for (const load of [loadHeartbeatModal, loadMessagingDialog, loadMcpModal]) {
+    load().catch(() => undefined); // React.lazy reports it on open
+  }
+}
 
 function setWorkspaceNotifyOnResponse(workspaceId: string, enabled: boolean): void {
   updateUserPreferences({
@@ -139,6 +159,28 @@ function getPhoneHeaderSnapshot(): boolean {
   );
 }
 
+/**
+ * Mounted like the footer's selector: for every repository workspace, because it loads its own
+ * branch (waking a stopped runtime when opened), and keyed by workspace so a header kept across a
+ * workspace switch never offers the previous workspace's branches.
+ */
+function WorkspaceDetailsBranch(props: {
+  workspaceId: string;
+  workspaceName: string;
+  hasRepository: boolean;
+}) {
+  if (!props.hasRepository) {
+    return null;
+  }
+  return (
+    <BranchSelector
+      key={props.workspaceId}
+      workspaceId={props.workspaceId}
+      workspaceName={props.workspaceName}
+    />
+  );
+}
+
 export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   workspaceId,
   projectName,
@@ -148,7 +190,6 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   namedWorkspacePath,
   runtimeConfig,
   leftSidebarCollapsed,
-  onToggleLeftSidebarCollapsed,
   onOpenTerminal,
   onOpenSidebar,
   sidebarFullscreen = false,
@@ -159,6 +200,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const isArchiving = archivingWorkspaceIds.has(workspaceId);
   const { workspaceMetadata } = useWorkspaceContext();
   const artifactsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const mcpAppsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MCP_APPS);
   const openTerminalPopout = useOpenTerminal();
   const openInEditor = useOpenInEditor();
   const runtimeStatus = useRuntimeStatus(workspaceId);
@@ -408,10 +450,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   // openArtifact() (chat cards, file cards, Review, palette) and "Open in tab" on an MCP Apps
   // tool card: while the sidebar is hidden, they show their tab full-screen (RightSidebar
   // handles the same events on wider layouts).
+  // Each event listens only while its own experiment is on (MCP Apps are independent, #6760).
   useEffect(() => {
-    if (!artifactsExperimentEnabled) {
-      return;
-    }
     const handler = (event: Event) => {
       const detail = (event as CustomEvent<{ workspaceId: string }>).detail;
       if (detail?.workspaceId !== workspaceId || !isTimelineSidebarHidden()) {
@@ -428,13 +468,27 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       }
       openSidebarTab(appViewTabFor(detail.toolCallId), activeElement());
     };
-    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
-    window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
+    const removeAppView = addWindowListenerWhile(
+      mcpAppsExperimentEnabled,
+      CUSTOM_EVENTS.OPEN_MCP_APP_VIEW,
+      appViewHandler
+    );
+    const removeArtifact = addWindowListenerWhile(
+      artifactsExperimentEnabled,
+      CUSTOM_EVENTS.OPEN_ARTIFACT,
+      handler
+    );
     return () => {
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
+      removeAppView();
+      removeArtifact();
     };
-  }, [artifactsExperimentEnabled, isTimelineSidebarHidden, openSidebarTab, workspaceId]);
+  }, [
+    artifactsExperimentEnabled,
+    mcpAppsExperimentEnabled,
+    isTimelineSidebarHidden,
+    openSidebarTab,
+    workspaceId,
+  ]);
 
   const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);
   const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";
@@ -594,7 +648,13 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const workspaceIsPinned = workspaceEntry ? isWorkspacePinned(workspaceEntry) : false;
   // Mirror sidebar share/archive actions in the workspace menu bar for quick access.
   const moreActionsMenu = (
-    <Popover open={moreMenuOpen} onOpenChange={setMoreMenuOpen}>
+    <Popover
+      open={moreMenuOpen}
+      onOpenChange={(open) => {
+        preloadSettingsModals(); // the first open starts the imports, later calls reuse them
+        setMoreMenuOpen(open);
+      }}
+    >
       <Tooltip {...(moreMenuOpen ? { open: false } : {})}>
         <TooltipTrigger asChild>
           <PopoverTrigger asChild>
@@ -685,14 +745,14 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         // A collapsed right sidebar floats below the header, so the header reaches the window's
         // right edge and must clear the titlebar overlay controls itself.
         rightSidebarCollapsed && "titlebar-safe-right titlebar-safe-right-gutter-2",
+        // The collapsed left sidebar is zero-width, so the header reaches the window's left edge,
+        // under the app shell's fixed toggle bar: its spacer starts at the edge.
+        leftSidebarCollapsed && "pl-0",
         // In desktop mode, make header draggable for window movement
         isDesktop && "titlebar-drag",
         // Keep header visible when iOS keyboard opens and causes scroll
         "mobile-sticky-header"
       )}
-      // Apply the collapsed-left-sidebar inset from props so the workspace header starts in
-      // the correct position on the very first paint instead of waiting for a later root-attr sync.
-      style={leftSidebarCollapsed ? COLLAPSED_LEFT_SIDEBAR_MENU_BAR_STYLE : undefined}
     >
       <div
         className={cn(
@@ -702,22 +762,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           isDesktop && "titlebar-no-drag"
         )}
       >
-        {leftSidebarCollapsed && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={onToggleLeftSidebarCollapsed}
-                aria-label="Open sidebar menu"
-                className="mobile-menu-btn text-muted hover:text-foreground hidden h-6 w-6 shrink-0"
-              >
-                <Menu className="h-3.5 w-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Open sidebar ({formatKeybind(KEYBINDS.TOGGLE_SIDEBAR)})</TooltipContent>
-          </Tooltip>
-        )}
+        {leftSidebarCollapsed && <LeftSidebarToggleBarSpacer showNewChat />}
         <WorkspaceHeaderTitle
           workspaceId={workspaceId}
           title={workspaceTitle ?? workspaceName}
@@ -760,6 +805,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             <span className="font-mono">{projectLabel}</span>
             <span>{workspaceName}</span>
             <span className="text-muted">{namedWorkspacePath}</span>
+            <WorkspaceDetailsBranch
+              workspaceId={workspaceId}
+              workspaceName={workspaceName}
+              hasRepository={hasWorkspaceRepository(workspaceEntry)}
+            />
           </PopoverContent>
         </Popover>
         {isArchiving && (
@@ -996,28 +1046,46 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           </TooltipContent>
         </Tooltip>
       )}
-      <WorkspaceHeartbeatModal
-        workspaceId={workspaceId}
+      <LazySettingsModal
+        name="Heartbeat settings"
         open={heartbeatModalOpen}
-        onOpenChange={setHeartbeatModalOpen}
-      />
-      <WorkspaceUnrelatedMessagingDialog
-        // Remount per workspace: the keyed open state above only closes the dialog, while
-        // the modal's own pending/error state and in-flight request id would otherwise
-        // survive the switch and surface in the next workspace's dialog.
-        key={workspaceId}
-        workspaceId={workspaceId}
-        runtimeConfig={runtimeConfig}
-        workspace={workspaceEntry}
+        onClose={() => setHeartbeatModalOpen(false)}
+      >
+        <WorkspaceHeartbeatModal
+          workspaceId={workspaceId}
+          open={heartbeatModalOpen}
+          onOpenChange={setHeartbeatModalOpen}
+        />
+      </LazySettingsModal>
+      <LazySettingsModal
+        name="Messaging settings"
         open={unrelatedMessagingModalOpen}
-        onOpenChange={(open) => setUnrelatedMessagingWorkspaceId(open ? workspaceId : null)}
-      />
-      <WorkspaceMCPModal
-        workspaceId={workspaceId}
-        projectPath={projectPath}
+        onClose={() => setUnrelatedMessagingWorkspaceId(null)}
+      >
+        <WorkspaceUnrelatedMessagingDialog
+          // Remount per workspace: the keyed open state above only closes the dialog, while
+          // the modal's own pending/error state and in-flight request id would otherwise
+          // survive the switch and surface in the next workspace's dialog.
+          key={workspaceId}
+          workspaceId={workspaceId}
+          runtimeConfig={runtimeConfig}
+          workspace={workspaceEntry}
+          open={unrelatedMessagingModalOpen}
+          onOpenChange={(open) => setUnrelatedMessagingWorkspaceId(open ? workspaceId : null)}
+        />
+      </LazySettingsModal>
+      <LazySettingsModal
+        name="MCP settings"
         open={mcpModalOpen}
-        onOpenChange={setMcpModalOpen}
-      />
+        onClose={() => setMcpModalOpen(false)}
+      >
+        <WorkspaceMCPModal
+          workspaceId={workspaceId}
+          projectPath={projectPath}
+          open={mcpModalOpen}
+          onOpenChange={setMcpModalOpen}
+        />
+      </LazySettingsModal>
       <DebugLlmRequestModal
         workspaceId={workspaceId}
         open={debugLlmRequestOpen}

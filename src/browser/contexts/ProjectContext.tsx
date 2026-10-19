@@ -8,22 +8,21 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI, type APIClient } from "@/browser/contexts/API";
 import type { ProjectConfig } from "@/common/types/project";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { z } from "zod";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
 import type { Secret } from "@/common/types/secrets";
 import type { Result } from "@/common/types/result";
-import { getDraftScopeId } from "@/common/constants/storage";
-import { deleteWorkspaceStorage } from "@/browser/utils/workspaceStorage";
-import { getDraftStore } from "@/browser/stores/DraftStore";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import type { ProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { getFirstTopLevelProjectPath } from "@/common/utils/subProjects";
+import type { ProjectIconName } from "@/common/constants/projectIcons";
 import {
   normalizeProjectPathForComparison,
   resolveProjectPathFromProjectQuery,
@@ -101,6 +100,7 @@ export interface ProjectContext {
   updateSecrets: (projectPath: string, secrets: Secret[]) => Promise<void>;
   updateDisplayName: (projectPath: string, displayName: string | null) => Promise<Result<void>>;
   updateColor: (projectPath: string, color: string | null) => Promise<Result<void>>;
+  updateIcon: (projectPath: string, icon: ProjectIconName | null) => Promise<Result<void>>;
   updateCustomInstructions: (
     projectPath: string,
     customInstructions: string | null
@@ -139,6 +139,22 @@ function toNonEmptyTrimmed(value?: string | null): string | null {
 
 function findSystemProjectPath(projects: Map<string, ProjectConfig>): string | null {
   return [...projects.entries()].find(([, cfg]) => cfg.projectKind === "system")?.[0] ?? null;
+}
+
+/** One project-settings write followed by a project list refresh, as a Result. */
+async function runProjectMutation(
+  liveApi: APIClient | null,
+  refreshProjects: () => Promise<void>,
+  mutate: (api: APIClient) => Promise<void>
+): Promise<Result<void>> {
+  if (!liveApi) return { success: false, error: "API not connected" };
+  try {
+    await mutate(liveApi);
+    await refreshProjects();
+    return { success: true, data: undefined };
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error) };
+  }
 }
 
 export function ProjectProvider(props: { children: ReactNode }) {
@@ -300,9 +316,6 @@ export function ProjectProvider(props: { children: ReactNode }) {
         };
       }
       try {
-        const draftIds = (getDraftStore().getCreationDraftsByProject()[path] ?? []).map(
-          (draft) => draft.draftId
-        );
         const result = await liveApi.projects.remove({
           projectPath: path,
           force: options?.force,
@@ -314,17 +327,8 @@ export function ProjectProvider(props: { children: ReactNode }) {
             return next;
           });
 
-          // The backend deleted the project's creation drafts. Clean up their localStorage
-          // settings: the drafts it deleted (this store's list may not have hydrated) and the ids
-          // captured before the call (optimistic rows the backend never saw), then drop them from
-          // memory.
-          for (const draft of result.data.removedCreationDrafts) {
-            deleteWorkspaceStorage(getDraftScopeId(draft.projectPath, draft.draftId));
-          }
-          for (const draftId of draftIds) {
-            deleteWorkspaceStorage(getDraftScopeId(path, draftId));
-          }
-          getDraftStore().forgetProject(path);
+          // The backend deleted the project's creation drafts (by their project field).
+          getCreationDraftStore().forgetProject(path);
 
           await refreshProjects();
           return { success: true };
@@ -639,19 +643,14 @@ export function ProjectProvider(props: { children: ReactNode }) {
       updateCustomInstructions,
       // Defined inline (not useCallback): the repo bans new manual useCallback
       // memoization, and inlining keeps exhaustive-deps satisfied via `liveApi`.
-      updateCodeWorkspaceSyncPath: async (
-        projectPath: string,
-        codeWorkspaceSyncPath: string | null
-      ): Promise<Result<void>> => {
-        if (!liveApi) return { success: false, error: "API not connected" };
-        try {
-          await liveApi.projects.setCodeWorkspaceSyncPath({ projectPath, codeWorkspaceSyncPath });
-          await refreshProjects();
-          return { success: true, data: undefined };
-        } catch (error) {
-          return { success: false, error: getErrorMessage(error) };
-        }
-      },
+      updateIcon: (projectPath: string, icon: ProjectIconName | null) =>
+        runProjectMutation(liveApi, refreshProjects, (api) =>
+          api.projects.setIcon({ projectPath, icon })
+        ),
+      updateCodeWorkspaceSyncPath: (projectPath: string, codeWorkspaceSyncPath: string | null) =>
+        runProjectMutation(liveApi, refreshProjects, (api) =>
+          api.projects.setCodeWorkspaceSyncPath({ projectPath, codeWorkspaceSyncPath })
+        ),
       assignWorkspaceToSubProject,
     }),
     [

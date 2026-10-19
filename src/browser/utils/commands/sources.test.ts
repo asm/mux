@@ -391,6 +391,27 @@ test("reset context and history truncation refuse while the transcript is not ca
   );
 });
 
+// #6627: the palette runs actions without a catch, so a lost connection must still show an
+// error instead of closing the palette with no word on the sign-out.
+test("plugin sign-out command reports a transport failure", async () => {
+  await withTestWindow(async () => {
+    const api = createMockORPCClient({});
+    api.agentPlugins.pendingSignOuts = () =>
+      Promise.resolve({ kind: "pending", servers: ["https://x/mcp"] });
+    api.agentPlugins.signOutPluginServers = () => Promise.reject(new Error("connection lost"));
+    const events = collectCommandEvents();
+    try {
+      const action = getActions({ api, onOpenSettings: mock() }).find(
+        (a) => a.id === CommandIds.pluginsSignOutServers()
+      );
+      await action!.run();
+      expect(events.receivedToasts).toEqual([{ type: "error", message: "connection lost" }]);
+    } finally {
+      events.dispose();
+    }
+  });
+});
+
 test("reset context command dispatches composer and toast outcomes", async () => {
   await withTestWindow(async () => {
     const cases = [
@@ -454,6 +475,32 @@ test("buildCoreSources includes create/switch workspace actions", () => {
   expect(titles.includes("Right Sidebar: Focus Terminal")).toBe(true);
   expect(titles.includes("New Terminal Window")).toBe(true);
   expect(titles.includes("Open Terminal Window for Workspace…")).toBe(true);
+});
+
+// #6856: on a Windows server, paths use "\\". The titles name the last segment, not the path.
+test("project and workspace commands name Windows server paths by their last segment", async () => {
+  const projectPath = "C:\\Users\\u\\repo";
+  const namedWorkspacePath = "C:\\Users\\u\\.xum\\src\\repo\\feat-x";
+  const userProjects = new Map<string, ProjectConfig>([
+    [projectPath, { workspaces: [{ path: namedWorkspacePath }] }],
+  ]);
+  const confirmTitles: string[] = [];
+  const actions = getActions({
+    userProjects,
+    selectedWorkspace: { projectPath, projectName: "repo", namedWorkspacePath, workspaceId: "w1" },
+    confirmDialog: (options: ConfirmDialogOptions) => {
+      confirmTitles.push(options.title);
+      return Promise.resolve(false);
+    },
+  });
+  expect(actions.find((a) => a.id === CommandIds.projectRemove(projectPath))?.title).toBe(
+    "Remove Project repo…"
+  );
+  expect(actions.find((a) => a.id === CommandIds.workspaceRemove())?.subtitle).toBe("repo/feat-x");
+  await actions
+    .find((a) => a.id === CommandIds.workspaceArchiveMergedInProject())
+    ?.prompt?.onSubmit({ projectPath });
+  expect(confirmTitles).toEqual(["Archive merged workspaces in repo?"]);
 });
 
 test("appearance commands offer auto when a manual theme is selected", () => {
@@ -2518,7 +2565,7 @@ test("app view entries tell several calls of one tool apart", () => {
     },
   });
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     selectedWorkspaceState: {
       messages: [call("a", { count: 2 }), call("b", { count: 4 }), call("c", { count: 4 })],
     } as unknown as WorkspaceState,
@@ -2553,7 +2600,7 @@ test("an app view with an open tab gets a Reload command that focuses its tab", 
     });
     updateRightSidebarLayout("w1", (state) => withAppViewTab(state, "open"));
     const actions = getActions({
-      artifactsEnabled: true,
+      mcpAppsEnabled: true,
       selectedWorkspaceState: {
         messages: [call("open"), call("closed")],
       } as unknown as WorkspaceState,
@@ -2575,7 +2622,7 @@ test("an app view with an open tab gets a Reload command that focuses its tab", 
 test("a plugin view's palette entry shows its server part and keeps the full key searchable", () => {
   const key = "plugin:0123456789abcdef:tray";
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     selectedWorkspaceState: {
       messages: [
         {
@@ -2614,7 +2661,7 @@ test("two plugin installs with one server name keep their instance markers apart
     },
   });
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     selectedWorkspaceState: {
       messages: [
         call("i1", "plugin:0123456789abcdef:tray"),
@@ -2644,7 +2691,7 @@ test("an MCP App entry point's palette entry shows its server label and opens it
   };
   const opened: unknown[] = [];
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     mcpAppEntrypoints: [entrypoint],
     api: createTestApiClient({
       mcpApps: {
@@ -2693,7 +2740,7 @@ test("a failed entry point open from the palette shows its error in a toast", as
     viewKey: "entrypoint:cad:cad.tray:global",
   };
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     mcpAppEntrypoints: [entrypoint],
     api: createTestApiClient({
       mcpApps: {
@@ -2727,7 +2774,7 @@ test("an entry point picked from the palette while disconnected says so in a toa
     viewKey: "entrypoint:cad:cad.tray:global",
   };
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     mcpAppEntrypoints: [entrypoint],
     api: null,
   });
@@ -2760,7 +2807,7 @@ test("an entry point with an open tab gets a Reload command that focuses its tab
   const [open, closed] = [entrypoint("cad.open"), entrypoint("cad.closed")];
   await withTestWindow(() => {
     updateRightSidebarLayout("w1", (state) => withAppViewTab(state, open.viewKey));
-    const actions = getActions({ artifactsEnabled: true, mcpAppEntrypoints: [open, closed] });
+    const actions = getActions({ mcpAppsEnabled: true, mcpAppEntrypoints: [open, closed] });
     expect(actions.some((a) => a.id === CommandIds.navReloadAppView(closed.viewKey))).toBe(false);
     const reload = actions.find((a) => a.id === CommandIds.navReloadAppView(open.viewKey));
     const focused: unknown[] = [];
@@ -2786,7 +2833,7 @@ test("a tool's global and thread entry points get palette commands that read dif
     viewKey: `entrypoint:cad:cad.board:${type}`,
   });
   const entrypoints = [entrypoint("global"), entrypoint("thread")];
-  const actions = getActions({ artifactsEnabled: true, mcpAppEntrypoints: entrypoints });
+  const actions = getActions({ mcpAppsEnabled: true, mcpAppEntrypoints: entrypoints });
   const shown = entrypoints.map((e) => {
     const action = actions.find((a) => a.id === CommandIds.navOpenAppEntrypoint(e.viewKey));
     return [action?.title, action?.subtitle].join(" ");
@@ -2794,11 +2841,29 @@ test("a tool's global and thread entry points get palette commands that read dif
   expect(shown[0]).not.toBe(shown[1]);
 });
 
+test("entry point commands follow the MCP Apps experiment, not Artifacts (#6760)", () => {
+  const entrypoint = {
+    serverName: "cad",
+    serverLabel: "cad",
+    toolName: "cad.board",
+    title: "Board",
+    resourceUri: "ui://cad/board",
+    type: "global" as const,
+    viewKey: "entrypoint:cad:cad.board:global",
+  };
+  const has = (flags: { artifactsEnabled: boolean; mcpAppsEnabled: boolean }) =>
+    getActions({ ...flags, mcpAppEntrypoints: [entrypoint] }).some(
+      (a) => a.id === CommandIds.navOpenAppEntrypoint(entrypoint.viewKey)
+    );
+  expect(has({ artifactsEnabled: true, mcpAppsEnabled: false })).toBe(false);
+  expect(has({ artifactsEnabled: false, mcpAppsEnabled: true })).toBe(true);
+});
+
 describe("Revoke MCP App View Domains…", () => {
   const stored = [
     { projectPath: "/repo/a", serverName: "charts", origins: ["https://api.example.com"] },
   ];
-  // Shown whatever the artifacts experiment: Settings lists stored approvals either way.
+  // Shown whatever the experiments: Settings lists stored approvals either way.
   const revokeAction = (api: APIClient, artifactsEnabled = false) =>
     getActions({ api, artifactsEnabled }).find(
       (action) => action.id === CommandIds.mcpAppsRevokeViewDomains()

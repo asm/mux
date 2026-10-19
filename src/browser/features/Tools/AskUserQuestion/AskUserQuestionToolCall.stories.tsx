@@ -6,7 +6,7 @@ import { createAssistantMessage, createUserMessage } from "@/browser/stories/moc
 import { createGenericTool, createPendingTool } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
 import { MOBILE_TOUCH_TARGET_PX } from "@/constants/layout";
-import { within, userEvent, waitFor } from "@storybook/test";
+import { within, userEvent, waitFor } from "storybook/test";
 import type { ComponentType } from "react";
 
 const meta = { ...appMeta, title: "App/Chat/Tools/AskUserQuestion" };
@@ -169,6 +169,58 @@ export const AskUserQuestionCompleted: AppStory = {
           ],
         })
       }
+    />
+  ),
+};
+
+/**
+ * Non-blocking (Exec) question: the tool already returned and the agent kept working, but the
+ * questions stay answerable; answers are delivered later as a steering message.
+ */
+export const AskUserQuestionNonBlocking: AppStory = {
+  // Same open form as AskUserQuestionPending apart from two hint lines, so a Pixel snapshot would
+  // spend repo budget on repeated layout; the card's behavior is covered by unit tests.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const questions = [
+          {
+            question: "Which approach should we take?",
+            header: "Approach",
+            options: [
+              { label: "A", description: "Approach A" },
+              { label: "B", description: "Approach B" },
+            ],
+            multiSelect: false,
+          },
+        ];
+        return setupSimpleChatStory({
+          messages: [
+            createUserMessage("msg-1", "Please implement the feature", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 60000,
+            }),
+            createAssistantMessage("msg-2", "Assuming approach A while you decide.", {
+              historySequence: 2,
+              timestamp: STABLE_TIMESTAMP - 55000,
+              toolCalls: [
+                createGenericTool(
+                  "call-ask-async",
+                  "ask_user_question",
+                  { questions },
+                  {
+                    summary: "Questions shown to the user.",
+                    ui_only: {
+                      ask_user_question: { questions, answers: {}, answerDelivery: "message" },
+                    },
+                  }
+                ),
+              ],
+            }),
+          ],
+        });
+      }}
     />
   ),
 };

@@ -5,17 +5,19 @@
  * e2e.config.ts runs this as the target's `app.command` with `--port {port}`, so every
  * explorer gets its own app on its own free port, and explorers never see each other's edits.
  *
- * Usage: bun tests/bugbash/startApp.ts --port <port> [--mcp-apps]   (needs `make build`: dist/ +
- *        renderer). --mcp-apps adds an MCP Apps server and a chat with its tool calls
- *        (mcpapps/seed.ts); e2e.mcpapps.config.ts passes it.
+ * Usage: bun tests/bugbash/startApp.ts --port <port> [--mcp-apps | --electron]   (needs `make
+ *        build`: dist/ + renderer). --mcp-apps adds an MCP Apps server and a chat with its tool
+ *        calls (mcpapps/seed.ts); e2e.mcpapps.config.ts passes it. --electron serves no `xum
+ *        server`: see serveElectronApp (tests/stories/e2e.electron.config.ts passes it).
  *
  * Steps:
  * 1. Create a temp root holding XUM_ROOT, HOME and a throwaway git repo.
  * 2. Start the server on a private port and seed it through the HTTP API: the demo project
  *    (trusted), one workspace with a few artifacts (one with stored versions), onboarding marked
- *    seen, the artifacts experiment, and a fake Anthropic provider on a dead loopback port.
+ *    seen, the artifacts and mcp-apps experiments, and a fake Anthropic provider on a dead loopback port.
  * 3. Stop that server, then serve the same root on `--port`. e2e polls `--port` for readiness,
- *    so no explorer can open the app before seeding has finished.
+ *    so no explorer can open the app before seeding has finished. SIGUSR2 restarts that server
+ *    on the same port and root (serve, appControl.ts).
  *
  * AI mode (aiMode.ts, BUGBASH_AI, default auto): real mode configures the app's provider with the
  * real key and base URL, makes the app model the default, and starts the server with
@@ -44,6 +46,12 @@ import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import { type AiMode, AiModeError, resolveAiMode } from "./aiMode";
+import {
+  appControlPath,
+  electronControlPath,
+  writeAppControl,
+  writeElectronControl,
+} from "./appControl";
 import { proxySocketMounted, sandboxShaped } from "./sandbox/inContainer";
 import { startFakeProvider } from "./fakeProvider";
 import { seedMcpChat, writeMcpConfig } from "./mcpapps/seed";
@@ -271,10 +279,20 @@ async function seed(
   ai: AiMode,
   fakeProviderOrigin: string | undefined,
   pluginSources: Map<string, string>,
-  gitEnv: NodeJS.ProcessEnv
+  gitEnv: NodeJS.ProcessEnv,
+  electron: boolean
 ): Promise<string> {
   await api(base, "splashScreens/markSplashScreenViewed", { splashId: "onboarding-wizard-v1" });
+  // Web stories turn tutorials off per test over the app's HTTP API (repros/helpers.ts
+  // disableTutorials). Xum Electron serves no HTTP API (XUM_NO_API_SERVER=1), so its seed does it.
+  if (electron) {
+    await api(base, "config/updateUserPreferences", {
+      patches: [{ ui: { tutorialState: { disabled: true } } }],
+    });
+  }
   await api(base, "experiments/set", { experimentId: "artifacts", enabled: true });
+  // MCP App views have their own experiment (#6760); the MCP Apps suite and repros need it.
+  await api(base, "experiments/set", { experimentId: "mcp-apps", enabled: true });
   if (ai.mode === "real") {
     await api(base, "providers/setProviderConfig", {
       provider: ai.provider,
@@ -491,9 +509,142 @@ async function seedVersionedArtifact(
   }
 }
 
+/** What the signal handlers act on: the server that runs now, and what comes after it. */
+export interface ServerSlot {
+  current: ChildProcess | null;
+  /** SIGINT or SIGTERM came: no server starts again. */
+  stopping: boolean;
+  /** serve() runs the app server (seeding is over). */
+  serving: boolean;
+  /** SIGUSR2 came: serve() starts a new server once the current one exits. */
+  restarting: boolean;
+}
+
+/**
+ * e2e stops the app with a signal, possibly while seeding: SIGINT and SIGTERM go to whichever
+ * server runs. SIGUSR2 restarts the app server (appControl.ts): a story checks what survives a
+ * restart, and e2e's `app.restart()` only opens a new page. It is ignored while seeding, so it
+ * cannot cut the seed short, and during a restart.
+ */
+export function handleSignals(slot: ServerSlot): void {
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.on(signal, () => {
+      slot.stopping = true;
+      slot.current?.kill(signal);
+    });
+  }
+  process.on("SIGUSR2", () => {
+    if (!slot.serving || slot.stopping || slot.restarting) return;
+    slot.restarting = true;
+    slot.current?.kill("SIGTERM");
+  });
+}
+
+/**
+ * Serves the app on `port` until a server exits without a restart, and returns its exit code.
+ * After each server is healthy it writes the control file (appControl.ts), and it removes the
+ * file at the end. `start` must serve the same env each time.
+ */
+export async function serve(
+  slot: ServerSlot,
+  port: number,
+  start: () => ChildProcess
+): Promise<number | null> {
+  // A crashed earlier run on this port can leave a file that names a dead pid.
+  fs.rmSync(appControlPath(port), { force: true });
+  slot.serving = true;
+  let generation = 0;
+  let code: number | null = null;
+  try {
+    while (!slot.stopping) {
+      slot.restarting = false;
+      const child = start();
+      slot.current = child;
+      // e2e polls the port itself on start; this probe tells a restarting story that the new
+      // server is up. It ends when the server exits, so awaiting both cannot hang.
+      const healthy = waitForHealth(`http://127.0.0.1:${port}`, child).then(
+        () => {
+          if (slot.current === child && !slot.stopping && !slot.restarting) {
+            generation += 1;
+            writeAppControl(port, { pid: process.pid, generation, ready: true });
+          }
+        },
+        (error: unknown) => {
+          if (slot.current === child && !slot.stopping && !slot.restarting) {
+            console.error(error instanceof Error ? error.message : error);
+          }
+        }
+      );
+      [code] = await Promise.all([waitForExit(child), healthy]);
+      if (!slot.restarting) break;
+      console.log(`[bugbash startApp] SIGUSR2: restarting the app server on port ${port}`);
+    }
+  } finally {
+    fs.rmSync(appControlPath(port), { force: true });
+  }
+  return code;
+}
+
+/** The built renderer's file for a URL path, or null when the path leaves `dist`. */
+export function distFile(dist: string, urlPath: string): string | null {
+  let rel: string;
+  try {
+    rel = decodeURIComponent(urlPath);
+  } catch {
+    return null;
+  }
+  const file = path.resolve(dist, `.${rel === "/" ? "/index.html" : rel}`);
+  return file === dist || file.startsWith(`${dist}${path.sep}`) ? file : null;
+}
+
+/**
+ * `--electron`: the app of the Electron story target. The seeded XUM_ROOT stays, and no `xum
+ * server` serves it: Xum Electron (tests/stories/electronProvider.ts) runs the backend in its
+ * main process. This process serves the built renderer on 127.0.0.1:`port` (Electron's
+ * XUM_DEVSERVER_PORT, and the target's app URL that e2e polls), after it wrote the control file
+ * (appControl.ts) that tells the provider the root, the port and the app switches. Not the Vite
+ * dev server: it writes node_modules/.vite, which the sandbox mounts read-only. Not file://: e2e
+ * needs an http app URL. Returns once SIGINT or SIGTERM came.
+ */
+async function serveElectronApp(
+  slot: ServerSlot,
+  port: number,
+  root: string,
+  switches: Record<string, string>
+): Promise<void> {
+  const dist = path.join(REPO_ROOT, "dist");
+  const stopped = new Promise<void>((resolve) => {
+    for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => resolve());
+  });
+  if (slot.stopping) return; // a signal during the seed
+  writeElectronControl({ pid: process.pid, port, root, switches, ready: true });
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port,
+    async fetch(request) {
+      const file = distFile(dist, new URL(request.url).pathname);
+      if (file == null) return new Response("not found", { status: 404 });
+      const found = Bun.file(file);
+      // A client-side route: the renderer's own router resolves it.
+      return (await found.exists())
+        ? new Response(found)
+        : new Response(Bun.file(path.join(dist, "index.html")));
+    },
+  });
+  console.log(`[bugbash startApp] serving ${dist} for Xum Electron on 127.0.0.1:${port}`);
+  try {
+    await stopped;
+  } finally {
+    await server.stop(true);
+    fs.rmSync(electronControlPath(), { force: true });
+  }
+}
+
 async function main(): Promise<void> {
   const port = parsePort(process.argv.slice(2));
   const mcpApps = process.argv.includes("--mcp-apps");
+  const electron = process.argv.includes("--electron");
+  if (mcpApps && electron) fail("--mcp-apps and --electron do not combine");
   if (!fs.existsSync(SERVER_ENTRY) || !fs.existsSync(path.join(REPO_ROOT, "dist/index.html"))) {
     fail("dist/ is missing the server or the renderer: run `make build` first");
   }
@@ -548,15 +699,8 @@ async function main(): Promise<void> {
   const unguarded = modelDrivenGuard(env);
   if (unguarded != null) fail(`${unguarded}: the app does not start`);
 
-  // e2e stops the app with a signal, possibly while seeding: pass it to whichever server runs.
-  let current: ChildProcess | null = null;
-  let stopping = false;
-  for (const signal of ["SIGINT", "SIGTERM"] as const) {
-    process.on(signal, () => {
-      stopping = true;
-      current?.kill(signal);
-    });
-  }
+  const slot: ServerSlot = { current: null, stopping: false, serving: false, restarting: false };
+  handleSignals(slot);
 
   let code: number | null = null;
   try {
@@ -567,29 +711,39 @@ async function main(): Promise<void> {
     if (mcpApps) writeMcpConfig(xumRoot);
 
     const seedPort = await getFreePort();
-    current = startServer(seedPort, env);
+    const seedServer = startServer(seedPort, env);
+    slot.current = seedServer;
     let workspaceId: string;
     try {
-      await waitForHealth(`http://127.0.0.1:${seedPort}`, current);
+      await waitForHealth(`http://127.0.0.1:${seedPort}`, seedServer);
       workspaceId = await seed(
         `http://127.0.0.1:${seedPort}`,
         projectPath,
         xumRoot,
-        current,
+        seedServer,
         ai,
         fakeProvider?.origin,
         pluginSources,
-        env
+        env,
+        electron
       );
     } finally {
-      current.kill("SIGTERM");
-      await waitForExit(current);
+      seedServer.kill("SIGTERM");
+      await waitForExit(seedServer);
     }
     if (mcpApps) seedMcpChat(xumRoot, workspaceId);
 
-    if (!stopping) {
-      current = startServer(port, env);
-      code = await waitForExit(current);
+    if (electron) {
+      // XUM_MOCK_AI and the three kill switches: what the server env got from appSwitches.
+      const switches = Object.fromEntries(
+        ["XUM_MOCK_AI", ...SWITCHES].flatMap((name) =>
+          env[name] == null ? [] : [[name, env[name]]]
+        )
+      ) as Record<string, string>;
+      await serveElectronApp(slot, port, xumRoot, switches);
+    } else {
+      // Every restart serves this same env, XUM_ROOT included: the temp root goes only below.
+      code = await serve(slot, port, () => startServer(port, env));
     }
   } finally {
     fakeProvider?.close();

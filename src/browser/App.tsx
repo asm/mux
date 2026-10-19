@@ -6,6 +6,10 @@ import { useWorkspaceContext, toWorkspaceSelection } from "./contexts/WorkspaceC
 import { useProjectContext } from "./contexts/ProjectContext";
 import type { WorkspaceSelection } from "./components/ProjectSidebar/ProjectSidebar";
 import { LeftSidebar } from "./components/LeftSidebar/LeftSidebar";
+import {
+  LeftSidebarToggleBar,
+  LeftSidebarToggleBarSpacer,
+} from "./components/SidebarCollapseButton/SidebarCollapseButton";
 import { ProjectCreateModal } from "./components/ProjectCreateModal/ProjectCreateModal";
 import { MultiProjectWorkspaceCreateModal } from "./components/MultiProjectWorkspaceCreateModal/MultiProjectWorkspaceCreateModal";
 import type * as AIViewModule from "./components/AIView/AIView";
@@ -17,13 +21,17 @@ import {
 } from "./hooks/usePersistedState";
 import { useResizableSidebar } from "./hooks/useResizableSidebar";
 import { useComputerUse } from "./hooks/useComputerUse";
-import { isDialogOpen, matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
+import {
+  getSideChatPaneWorkspaceId,
+  isDialogOpen,
+  matchesKeybind,
+  KEYBINDS,
+} from "./utils/ui/keybinds";
 import { openServerWindow } from "./utils/openServerWindow";
 import {
-  applyFastModeToggle,
   getFastModeProvider,
   getFastModeUnavailableReason,
-  isFastModeActive,
+  resolveChatServiceTier,
   setWorkspaceServiceTier,
   toggleServiceTier,
   type PremiumServiceTier,
@@ -53,7 +61,7 @@ import { useOpenTerminal } from "./hooks/useOpenTerminal";
 import { useMinThinkingLevels } from "./hooks/useMinThinkingLevels";
 import type { CommandAction } from "./contexts/CommandRegistryContext";
 import { useTheme, type ThemePreference } from "./contexts/ThemeContext";
-import { CommandPalette } from "./components/CommandPalette/CommandPalette";
+import { LazyCommandPalette } from "./components/CommandPalette/LazyCommandPalette";
 import {
   LEFT_SIDEBAR_DEFAULT_WIDTH_PX,
   LEFT_SIDEBAR_MAX_WIDTH_PX,
@@ -66,10 +74,7 @@ import {
   useMcpAppEntrypoints,
 } from "./features/RightSidebar/AppViewTab/mcpAppEntrypoints";
 
-import {
-  getTopLevelProjectEntries,
-  resolveWorkspaceCreationScope,
-} from "@/common/utils/subProjects";
+import { getTopLevelProjectEntries } from "@/common/utils/subProjects";
 import {
   THINKING_LEVELS,
   type OpenAIReasoningMode,
@@ -79,7 +84,7 @@ import { createCustomEvent, CUSTOM_EVENTS } from "@/common/constants/events";
 import { isWorkspaceForkSwitchEvent } from "./utils/workspaceEvents";
 import {
   getAgentsInitNudgeKey,
-  getProjectScopeId,
+  getCreationDraftScopeId,
   getWorkspaceLastReadKey,
   EXPANDED_PROJECTS_KEY,
   LAST_VISITED_ROUTE_KEY,
@@ -113,6 +118,7 @@ import { MuxGatewaySessionExpiredDialog } from "./components/MuxGatewaySessionEx
 import { SshPromptDialog } from "./components/SshPromptDialog/SshPromptDialog";
 import { TerminalDialog } from "./components/TerminalView/TerminalDialog";
 import { SplashScreenProvider } from "./features/SplashScreens/SplashScreenProvider";
+import { WorkspaceViewGuard } from "./features/StaticWorkspaceView/workspaceViewHandoff";
 import { TutorialProvider } from "./contexts/TutorialContext";
 import { PowerModeProvider } from "./contexts/PowerModeContext";
 import { TooltipProvider } from "./components/Tooltip/Tooltip";
@@ -130,10 +136,11 @@ import { useRouting } from "@/browser/hooks/useRouting";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
 import assert from "@/common/utils/assert";
+import { cn } from "@/common/lib/utils";
 import { createProjectRefs } from "@/common/utils/multiProject";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
-import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import {
   prependInitialAppProxyBasePath,
   stripInitialAppProxyBasePathFromPathname,
@@ -145,6 +152,7 @@ import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { markAppShellReady } from "@/browser/utils/perf/appShellReady";
 import { Err, Ok } from "@/common/types/result";
+import { serverPathLabel } from "@/common/utils/paths";
 
 // T3 #5971 (route split): each page is its own chunk. The workspace page's ErrorBoundary sits inside
 // its chunk, so a failed chunk load reaches PageArea's LazyFeature (Reload, which can recover).
@@ -222,27 +230,24 @@ function PageArea(props: { pageKey: string; children: React.ReactNode }) {
   );
 }
 
-function RootRouteShell(props: {
-  leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
-}) {
+function RootRouteShell(props: { leftSidebarCollapsed: boolean }) {
+  const isDesktop = isDesktopMode();
   return (
     // The page has no chat pane here, so the shell is its one `main` landmark (#5969).
     <main className="bg-surface-primary flex flex-1 flex-col overflow-hidden">
-      {props.leftSidebarCollapsed ? (
+      {props.leftSidebarCollapsed && (
+        // The collapsed page's title bar: a full-width window drag region on desktop. The fixed
+        // toggle bar over it is shrink-wrapped and its button is no-drag, so it cannot be one.
         <div
-          className={`bg-sidebar border-border-light flex shrink-0 items-center border-b px-4 py-2 ${isDesktopMode() ? "titlebar-drag" : ""}`}
+          className={cn(
+            "bg-sidebar border-border-light flex shrink-0 items-center border-b",
+            "[@media(max-width:768px)_and_(pointer:coarse)]:min-h-11",
+            isDesktop ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag` : "h-8"
+          )}
         >
-          <button
-            type="button"
-            onClick={props.onToggleLeftSidebarCollapsed}
-            className={`border-border-medium bg-background-secondary text-foreground hover:bg-hover rounded-md border px-3 py-1.5 text-sm transition-colors ${isDesktopMode() ? "titlebar-no-drag" : ""}`}
-            aria-label="Open sidebar menu"
-          >
-            Open sidebar
-          </button>
+          <LeftSidebarToggleBarSpacer showNewChat={false} />
         </div>
-      ) : null}
+      )}
       <div className="flex flex-1 items-center justify-center px-6">
         {/* text-content-secondary, not text-muted: the light theme's muted token is 3.8:1 on this
             surface, below WCAG AA for text-sm (#5948). */}
@@ -341,8 +346,9 @@ function AppInner() {
   const [isMultiProjectWorkspaceModalOpen, setMultiProjectWorkspaceModalOpen] = useState(false);
   const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
   const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
-  // MCP App entry points open as app tabs, so the Artifacts experiment gates them too.
-  useLoadMcpAppEntrypoints(selectedWorkspace?.workspaceId ?? null, artifactsEnabled);
+  const mcpAppsEnabled = useExperimentValue(EXPERIMENT_IDS.MCP_APPS);
+  // MCP App entry points open as app tabs, so the mcp-apps experiment gates them too.
+  useLoadMcpAppEntrypoints(selectedWorkspace?.workspaceId ?? null, mcpAppsEnabled);
   const mcpAppEntrypoints = useMcpAppEntrypoints(selectedWorkspace?.workspaceId ?? "");
   const sessionTapesEnabled = useExperimentValue(EXPERIMENT_IDS.SESSION_TAPES);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
@@ -382,15 +388,11 @@ function AppInner() {
   }, [sidebarCollapsed]);
   const creationProjectPath =
     !selectedWorkspace && !currentWorkspaceId ? pendingNewWorkspaceProject : null;
-  // Sub-project creation shares the owning parent's model preference, matching ChatInput.
-  const creationScope = creationProjectPath
-    ? resolveWorkspaceCreationScope(
-        creationProjectPath,
-        userProjects,
-        pendingNewWorkspaceSubProjectPath
-      )
-    : null;
-  const creationScopeId = creationScope ? getProjectScopeId(creationScope.projectPath) : null;
+  // The creation composer's choices belong to its draft, matching ChatInput.
+  const creationScopeId =
+    creationProjectPath && pendingNewWorkspaceDraftId
+      ? getCreationDraftScopeId(pendingNewWorkspaceDraftId)
+      : null;
 
   // History navigation (back/forward)
   const location = useLocation();
@@ -615,11 +617,7 @@ function AppInner() {
 
   // Pro mode is Responses-only; the palette command hides under chatCompletions
   // and on non-passthrough routes (mirroring the send path's header gating).
-  const {
-    config: providersConfig,
-    refresh: refreshProvidersConfig,
-    updateOptimistically,
-  } = useProvidersConfig();
+  const { config: providersConfig } = useProvidersConfig();
   const routing = useRouting();
   const getRouteForModel = useCallback(
     (canonicalModel: string) => routing.resolveRoute(canonicalModel).route,
@@ -677,10 +675,14 @@ function AppInner() {
       providersConfig,
       resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
     });
-    return provider === "openai"
-      ? (getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier) ===
-          "priority"
-      : provider != null && isFastModeActive(provider, providersConfig[provider]);
+    return (
+      provider != null &&
+      resolveChatServiceTier(
+        provider,
+        getWorkspaceAiSelection(scopeId).serviceTier,
+        providersConfig
+      ) === "priority"
+    );
   }, [creationScopeId, getModelForWorkspace, getRouteForModel, providersConfig, selectedWorkspace]);
 
   // Plain function: React Compiler handles memoization.
@@ -694,12 +696,14 @@ function AppInner() {
         providersConfig,
         resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
       }) &&
-      (getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier) ===
-        "ultrafast"
+      resolveChatServiceTier(
+        "openai",
+        getWorkspaceAiSelection(scopeId).serviceTier,
+        providersConfig
+      ) === "ultrafast"
     );
   };
 
-  const fastModeToggleInFlightRef = useRef(false);
   // Native host computer use belongs to the selected workspace. Offer it only where the backend
   // accepts it: in the desktop app, for workspaces that run on this machine.
   const computerUse = useComputerUse(selectedWorkspace?.workspaceId ?? null);
@@ -711,17 +715,15 @@ function AppInner() {
     computerUse.status?.supported === true &&
     (isWorktreeRuntime(selectedRuntimeConfig) || isLocalProjectRuntime(selectedRuntimeConfig));
 
-  // OpenAI speed is scoped to the chat; other providers retain their existing Fast preferences.
+  // Speed is scoped to the chat for every provider, like its reasoning level.
   const togglePremiumServiceTier = useCallback(
-    async (targetServiceTier: PremiumServiceTier) => {
-      const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
-      if (!liveApi || !scopeId || providersConfig == null || fastModeToggleInFlightRef.current)
-        return;
+    (targetServiceTier: PremiumServiceTier, sideChatWorkspaceId?: string | null) => {
+      // Speed belongs to a chat: the shortcut acts on the focused /side chat, if any.
+      const scopeId = sideChatWorkspaceId ?? selectedWorkspace?.workspaceId ?? creationScopeId;
+      if (!liveApi || !scopeId || providersConfig == null) return;
 
       // Creation composers use the same project-scoped model preference as their selector,
       // so the global shortcut remains available before the first workspace exists.
-      // Serialize requests so a quick double press cannot compute two writes from stale config.
-      fastModeToggleInFlightRef.current = true;
       const model = getModelForWorkspace(scopeId);
       const availabilityOptions = {
         providersConfig,
@@ -732,7 +734,6 @@ function AppInner() {
         targetServiceTier === "ultrafast" &&
         !ultrafastModeAvailable(model, availabilityOptions)
       ) {
-        fastModeToggleInFlightRef.current = false;
         window.dispatchEvent(
           createCustomEvent(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, {
             type: "error",
@@ -743,7 +744,6 @@ function AppInner() {
         return;
       }
       if (provider == null) {
-        fastModeToggleInFlightRef.current = false;
         // The shortcut used to do nothing here, so it looked broken (#5693). Say why instead.
         window.dispatchEvent(
           createCustomEvent(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, {
@@ -758,29 +758,12 @@ function AppInner() {
         return;
       }
 
-      try {
-        if (provider === "openai") {
-          const current =
-            getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier;
-          setWorkspaceServiceTier(liveApi, scopeId, toggleServiceTier(current, targetServiceTier));
-          return;
-        }
-        const patch = await applyFastModeToggle(
-          liveApi.providers,
-          provider,
-          providersConfig[provider],
-          targetServiceTier
-        );
-        if (patch) {
-          updateOptimistically(provider, patch);
-        } else {
-          await refreshProvidersConfig();
-        }
-      } catch {
-        await refreshProvidersConfig();
-      } finally {
-        fastModeToggleInFlightRef.current = false;
-      }
+      const current = resolveChatServiceTier(
+        provider,
+        getWorkspaceAiSelection(scopeId).serviceTier,
+        providersConfig
+      );
+      setWorkspaceServiceTier(liveApi, scopeId, toggleServiceTier(current, targetServiceTier));
     },
     [
       liveApi,
@@ -788,9 +771,7 @@ function AppInner() {
       getModelForWorkspace,
       getRouteForModel,
       providersConfig,
-      refreshProvidersConfig,
       selectedWorkspace,
-      updateOptimistically,
     ]
   );
 
@@ -844,10 +825,7 @@ function AppInner() {
           ? branchResult.recommendedTrunk
           : candidateBranches[0]) ?? null;
       if (!trunkBranch) {
-        const primaryProjectName =
-          primaryProjectPath.split("/").pop() ??
-          primaryProjectPath.split("\\").pop() ??
-          primaryProjectPath;
+        const primaryProjectName = serverPathLabel(primaryProjectPath, primaryProjectPath);
         throw new Error(
           `No branches found for ${primaryProjectName}. Initialize a git repository before creating a multi-project workspace.`
         );
@@ -1088,6 +1066,7 @@ function AppInner() {
     onStartMultiProjectWorkspaceCreation: openNewMultiProjectWorkspaceFromPalette,
     multiProjectWorkspacesEnabled,
     artifactsEnabled,
+    mcpAppsEnabled,
     mcpAppEntrypoints,
     perfFlightRecorderEnabled,
     sessionTapesEnabled,
@@ -1199,12 +1178,14 @@ function AppInner() {
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_FAST_MODE)) {
         e.preventDefault();
         // Modals trap focus and hide the page behind them; don't change hidden page UI.
-        if (!isDialogOpen()) togglePremiumServiceTier("priority").catch(() => undefined);
+        // A held chord would flip the tier once per repeat, leaving it timing-dependent.
+        if (!isDialogOpen() && !e.repeat) {
+          togglePremiumServiceTier("priority", getSideChatPaneWorkspaceId(e.target));
+        }
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_ULTRAFAST_MODE)) {
         e.preventDefault();
-        // A held chord would re-toggle once each write settles, leaving the tier timing-dependent.
         if (!isDialogOpen() && !e.repeat) {
-          togglePremiumServiceTier("ultrafast").catch(() => undefined);
+          togglePremiumServiceTier("ultrafast", getSideChatPaneWorkspaceId(e.target));
         }
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_COMPUTER_USE) && computerUseAvailable) {
         e.preventDefault();
@@ -1531,12 +1512,25 @@ function AppInner() {
     );
   }
 
+  const toggleBarShowsNewChat =
+    sidebarCollapsed && (selectedWorkspace != null || creationProjectPath != null);
+  // While collapsed, the fixed toggle bar sits over the top of the main column, so a platform
+  // warning banner there starts after it instead of under it.
+  const bannerToggleBarSpacer = sidebarCollapsed ? (
+    <LeftSidebarToggleBarSpacer showNewChat={toggleBarShowsNewChat} />
+  ) : null;
+
   return (
     <>
       <div
         className="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]"
         ref={appShellRef}
       >
+        <LeftSidebarToggleBar
+          collapsed={sidebarCollapsed}
+          showNewChat={toggleBarShowsNewChat}
+          onToggle={handleToggleSidebar}
+        />
         <LeftSidebar
           collapsed={sidebarCollapsed}
           onToggleCollapsed={handleToggleSidebar}
@@ -1547,8 +1541,9 @@ function AppInner() {
           workspaceRecency={workspaceRecency}
         />
         <div className="mobile-main-content flex min-w-0 flex-1 flex-col overflow-hidden">
-          <WindowsToolchainBanner />
-          <RosettaBanner />
+          <WindowsToolchainBanner toggleBarSpacer={bannerToggleBarSpacer} />
+          <RosettaBanner toggleBarSpacer={bannerToggleBarSpacer} />
+          <WorkspaceViewGuard />
           <PageArea
             pageKey={
               selectedWorkspace || currentWorkspaceId
@@ -1588,7 +1583,6 @@ function AppInner() {
                     projectPath={selectedWorkspace.projectPath}
                     projectName={selectedWorkspace.projectName}
                     leftSidebarCollapsed={sidebarCollapsed}
-                    onToggleLeftSidebarCollapsed={handleToggleSidebar}
                     workspaceName={workspaceName}
                     namedWorkspacePath={workspacePath}
                     runtimeConfig={currentMetadata.runtimeConfig}
@@ -1614,28 +1608,19 @@ function AppInner() {
                 // If metadata never hydrated for the routed workspace, avoid trapping the user
                 // on a permanent spinner. Show the same non-blocking root shell while the route
                 // waits for a later retry or manual navigation.
-                <RootRouteShell
-                  leftSidebarCollapsed={sidebarCollapsed}
-                  onToggleLeftSidebarCollapsed={handleToggleSidebar}
-                />
+                <RootRouteShell leftSidebarCollapsed={sidebarCollapsed} />
               )
             ) : creationProjectPath === SCRATCH_PROJECT_CONFIG_KEY ? (
               <ScratchPage
                 leftSidebarCollapsed={sidebarCollapsed}
-                onToggleLeftSidebarCollapsed={handleToggleSidebar}
                 pendingDraftId={pendingNewWorkspaceDraftId}
                 onWorkspaceCreated={handleWorkspaceCreated}
               />
             ) : creationProjectPath ? (
               <ProjectPage
                 projectPath={creationProjectPath}
-                projectName={
-                  creationProjectPath.split("/").pop() ??
-                  creationProjectPath.split("\\").pop() ??
-                  "Project"
-                }
+                projectName={serverPathLabel(creationProjectPath, "Project")}
                 leftSidebarCollapsed={sidebarCollapsed}
-                onToggleLeftSidebarCollapsed={handleToggleSidebar}
                 pendingSubProjectPath={pendingNewWorkspaceSubProjectPath}
                 pendingDraftId={pendingNewWorkspaceDraftId}
                 onWorkspaceCreated={handleWorkspaceCreated}
@@ -1644,15 +1629,14 @@ function AppInner() {
               // The dedicated Xum home page was removed. Keep `/` as a minimal shell so
               // WorkspaceContext can redirect it to a concrete project route when possible,
               // without reintroducing a sticky dashboard screen.
-              <RootRouteShell
-                leftSidebarCollapsed={sidebarCollapsed}
-                onToggleLeftSidebarCollapsed={handleToggleSidebar}
-              />
+              <RootRouteShell leftSidebarCollapsed={sidebarCollapsed} />
             )}
           </PageArea>
         </div>
         <WorkspaceActiveGoalsWarningToast />
-        <CommandPalette getSlashContext={() => ({ workspaceId: selectedWorkspace?.workspaceId })} />
+        <LazyCommandPalette
+          getSlashContext={() => ({ workspaceId: selectedWorkspace?.workspaceId })}
+        />
         {/* Before SettingsPage so settings opened from analytics stacks above it. */}
         <LazyAnalyticsDashboard />
         <LazySettingsPage />
@@ -1690,8 +1674,7 @@ function AppInner() {
             onClose={() => setMultiProjectWorkspaceModalOpen(false)}
             projectOptions={getTopLevelProjectEntries(userProjects).map(([projectPath]) => ({
               projectPath,
-              projectName:
-                projectPath.split("/").pop() ?? projectPath.split("\\").pop() ?? "Unnamed Project",
+              projectName: serverPathLabel(projectPath, "Unnamed Project"),
             }))}
             onConfirm={createMultiProjectWorkspace}
           />

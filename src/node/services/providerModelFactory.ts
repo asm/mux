@@ -7,7 +7,8 @@ export {
   normalizeOpenAICompatibleBaseURL,
 } from "@/common/utils/providers/baseUrl";
 import assert from "node:assert";
-import { createHash } from "node:crypto";
+import { createHash, createPrivateKey } from "node:crypto";
+import { readFile, stat } from "node:fs/promises";
 import { Effect } from "effect";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type {
@@ -136,6 +137,7 @@ import { MUX_GATEWAY_AI_BASE_URL } from "@/common/constants/muxGatewayOAuth";
 import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/appAttribution";
 import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 import {
+  MAX_CREDENTIAL_FILE_BYTES,
   resolveCustomProviderCredentials,
   resolveProviderCredentials,
   resolveTypeSafeCredentials,
@@ -348,9 +350,85 @@ function injectProviderOptionsDefaults(
  */
 export function wrapFetchWithXAIServiceTier(
   baseFetch: typeof fetch,
-  serviceTier?: XAIServiceTier
+  serviceTier?: XAIServiceTier,
+  // A chat's mid-turn speed change applies to its next request, like the OpenAI tier.
+  getLiveServiceTier?: () => XAIServiceTier | undefined
 ): typeof fetch {
-  return wrapFetchWithServiceTier(baseFetch, serviceTier);
+  if (getLiveServiceTier == null) return wrapFetchWithServiceTier(baseFetch, serviceTier);
+  return wrapFetchWithJsonBodyPatch(baseFetch, (body) => {
+    const tier = getLiveServiceTier() ?? serviceTier;
+    return tier == null ? body : { ...body, service_tier: tier };
+  });
+}
+
+/** xAI has only Standard and Priority; any other chat tier pick means Standard there. */
+function toXAIServiceTier(tier: ServiceTier | undefined): XAIServiceTier | undefined {
+  if (tier == null) return undefined;
+  return tier === "priority" ? "priority" : "default";
+}
+
+type GetServiceTierOverride = () => ServiceTier | undefined;
+
+/**
+ * Speed belongs to the chat, like its reasoning level, so its pick drives every Fast-mode
+ * provider; a chat without a pick inherits each provider's preference. The pick travels as
+ * the OpenAI tier, and a live mid-turn pick wins over the one the request was built with.
+ */
+function readChatServiceTier(
+  muxProviderOptions: MuxProviderOptions | undefined,
+  getServiceTierOverride: GetServiceTierOverride | undefined
+): ServiceTier | undefined {
+  return ServiceTierSchema.safeParse(
+    getServiceTierOverride?.() ?? muxProviderOptions?.openai?.serviceTier
+  ).data;
+}
+
+/**
+ * Anthropic `speed` for a model that supports Fast mode: pinned from the chat's pick (else the
+ * provider preference), and like the OpenAI tier, a mid-turn pick applies to the next call.
+ */
+function resolveAnthropicFastMode(
+  chatServiceTier: ServiceTier | undefined,
+  providerSpeed: unknown,
+  getServiceTierOverride: GetServiceTierOverride | undefined
+): { defaults: { speed?: "fast" }; liveOverrides?: () => { speed?: "fast" } } | undefined {
+  const pinned =
+    chatServiceTier != null ? chatServiceTier === "priority" : providerSpeed === "fast";
+  if (getServiceTierOverride == null) return pinned ? { defaults: { speed: "fast" } } : undefined;
+  return {
+    defaults: pinned ? { speed: "fast" } : {},
+    liveOverrides: () => {
+      const tier = getServiceTierOverride();
+      if (tier == null) return {};
+      return { speed: tier === "priority" ? "fast" : undefined };
+    },
+  };
+}
+
+/**
+ * xAI `service_tier` for one model: an explicit request tier, then (frontier Grok only, the
+ * models with Fast mode) the chat's pick, then the provider preference.
+ */
+function resolveXAIServiceTier(input: {
+  requestTier: XAIServiceTier | null | undefined;
+  configuredTier: unknown;
+  chatServiceTier: ServiceTier | undefined;
+  followsChat: boolean;
+  getServiceTierOverride: GetServiceTierOverride | undefined;
+}): { serviceTier?: XAIServiceTier; getLiveServiceTier?: () => XAIServiceTier | undefined } {
+  const configuredTier =
+    input.configuredTier === "default" || input.configuredTier === "priority"
+      ? input.configuredTier
+      : undefined;
+  // An explicit request tier wins, also over a live mid-turn chat change.
+  if (input.requestTier != null) return { serviceTier: input.requestTier };
+  if (!input.followsChat) return { serviceTier: configuredTier };
+  const getServiceTierOverride = input.getServiceTierOverride;
+  return {
+    serviceTier: toXAIServiceTier(input.chatServiceTier) ?? configuredTier,
+    getLiveServiceTier:
+      getServiceTierOverride && (() => toXAIServiceTier(getServiceTierOverride())),
+  };
 }
 
 function wrapFetchWithServiceTier(baseFetch: typeof fetch, serviceTier?: string): typeof fetch {
@@ -1128,6 +1206,93 @@ export function requestEndpoint(requestUrl: string): string {
   }
 }
 
+/** Google Vertex AI: ADC by default, express mode when an API key resolves. */
+function createGoogleVertexModelEffect(
+  providerConfig: ProviderConfig,
+  modelId: string
+): Effect.Effect<Result<LanguageModel, SendMessageError>> {
+  return Effect.gen(function* () {
+    const creds = resolveProviderCredentials("google-vertex", providerConfig);
+    if (!creds.isConfigured) {
+      return Err({ type: "api_key_not_found", provider: "google-vertex" });
+    }
+    // google-auth-library parses the key file only at request time, where a
+    // missing file, a directory or invalid JSON surfaced as a retried request
+    // error whose text echoed the path or the file's first characters. Fail
+    // here instead, with a non-retryable configuration error.
+    const { keyFilename } = creds;
+    if (keyFilename != null && !(yield* Effect.promise(() => isUsableKeyFile(keyFilename)))) {
+      return Err({ type: "api_key_not_found", provider: "google-vertex" });
+    }
+    const { createVertex } = yield* Effect.promise(async () =>
+      PROVIDER_REGISTRY["google-vertex"]()
+    );
+    // Pass only explicit SDK settings: Xum resolved config and env already,
+    // so the SDK must not reread env. An empty apiKey keeps ADC selected
+    // (the SDK falls back to GOOGLE_VERTEX_API_KEY only when undefined).
+    const provider = createVertex({
+      apiKey: creds.apiKey ?? "",
+      project: creds.project,
+      location: creds.location,
+      // google-auth-library reads the env key file itself: its ADC lookup also
+      // applies GOOGLE_CLOUD_QUOTA_PROJECT, which an explicit keyFilename skips.
+      ...(creds.keyFilenameSource === "config" && { googleAuthOptions: { keyFilename } }),
+      ...(creds.baseUrl != null && { baseURL: creds.baseUrl }),
+      headers: providerConfig.headers,
+      fetch: getProviderFetch(providerConfig),
+    });
+    try {
+      return Ok(provider(modelId));
+    } catch (error) {
+      // The SDK rejects some model IDs synchronously (e.g. tuned endpoints/...
+      // models with an express mode API key). That is deterministic for this
+      // model string, so report it as a non-retryable model error.
+      return Err({ type: "invalid_model_string", message: getErrorMessage(error) });
+    }
+  });
+}
+
+async function isUsableKeyFile(filePath: string): Promise<boolean> {
+  let reason: string;
+  try {
+    // Check the type and size before reading: reading a FIFO blocks until a
+    // writer appears, reading a device such as /dev/zero never ends, and a
+    // huge file would be read whole.
+    const fileStat = await stat(filePath);
+    if (!fileStat.isFile()) {
+      reason = "not a regular file";
+    } else if (fileStat.size > MAX_CREDENTIAL_FILE_BYTES) {
+      reason = "too large";
+    } else {
+      const parsed: unknown = JSON.parse(await readFile(filePath, "utf8"));
+      if (!isPlainObject(parsed)) {
+        reason = "not a JSON object";
+      } else if (typeof parsed.private_key === "string" && !isPrivateKey(parsed.private_key)) {
+        // google-auth-library decodes the key only when it signs a token request, and
+        // that decoder error ("DECODER routines::unsupported") read as a retryable API error.
+        reason = "invalid private key";
+      } else {
+        return true;
+      }
+    }
+  } catch (error) {
+    // Only the failure kind: fs messages carry the path, JSON errors quote the file.
+    reason = error instanceof SyntaxError ? "invalid JSON" : "unreadable";
+  }
+  log.warn("Google Vertex AI service account key file is unusable", { reason });
+  return false;
+}
+
+function isPrivateKey(pem: string): boolean {
+  try {
+    createPrivateKey(pem);
+    return true;
+  } catch {
+    // Not logged: the caller logs only the failure kind.
+    return false;
+  }
+}
+
 /**
  * Get fetch function for provider - use custom if provided, otherwise unlimited timeout default
  */
@@ -1877,7 +2042,7 @@ export class ProviderModelFactory {
           liveOverrides?: () => Record<string, ServiceTier | undefined>;
         }
       | undefined;
-    let anthropicFastModePinned = false;
+    let anthropicFastMode: ReturnType<typeof resolveAnthropicFastMode>;
     // The explicit annotation restores the contextual typing the old async
     // signature provided, so the wire-error literals below stay narrowed.
     const pipeline: Effect.Effect<Result<LanguageModel, SendMessageError>> = Effect.gen(
@@ -1975,6 +2140,12 @@ export class ProviderModelFactory {
         const effectiveAnthropicCacheTtl =
           muxProviderOptions?.anthropic?.cacheTtl ?? configAnthropicCacheTtl;
 
+        // Capture the chat's speed before non-OpenAI routes strip the OpenAI tier below.
+        const chatServiceTier = readChatServiceTier(
+          muxProviderOptions,
+          opts?.getServiceTierOverride
+        );
+
         // Fast is one OpenAI preference across direct and forwarding gateways.
         // Resolve it after routing, from the model's config snapshot, so pinned
         // requests cannot change tier midway through creation or on fallback.
@@ -2034,14 +2205,20 @@ export class ProviderModelFactory {
         // Anthropic Fast mode is a first-party-API-only beta. Pin it at creation
         // like the OpenAI tier so fallbacks and headless callers cannot drift, and
         // never send `speed` where it is unsupported (the API rejects it).
-        anthropicFastModePinned =
+        const anthropicFastModeSupported =
           providerName === "anthropic" &&
           !providerIsCustom &&
-          providersConfig.anthropic?.speed === "fast" &&
           muxProviderOptions?.anthropic?.disableBetaFeatures !== true &&
           anthropicFastModeAvailable(modelString, {
             providersConfig: self.providerService.getConfig(providersConfig),
           });
+        anthropicFastMode = anthropicFastModeSupported
+          ? resolveAnthropicFastMode(
+              chatServiceTier,
+              providersConfig.anthropic?.speed,
+              opts?.getServiceTierOverride
+            )
+          : undefined;
 
         // OpenAI-specific: merge global store setting into muxProviderOptions.
         // Coder instances classify by the instance's exact TYPE ("openai" =
@@ -2535,13 +2712,27 @@ export class ProviderModelFactory {
             };
           }
 
-          const configuredServiceTier =
-            serviceTier === "default" || serviceTier === "priority" ? serviceTier : undefined;
-          const effectiveServiceTier =
-            muxProviderOptions?.xai?.serviceTier ?? configuredServiceTier;
+          // Frontier Grok uses the Responses API so @ai-sdk/xai surfaces exact billed
+          // cost metadata (including Priority Processing). Mapped provider aliases inherit
+          // that capability; older custom model strings stay on Chat Completions for
+          // legacy search_parameters compatibility.
+          const capabilityModel = resolveModelForMetadata(`xai:${modelId}`, providersConfig);
+          const isFrontierGrok = isGrokFrontierModel(capabilityModel);
+
+          const xaiTier = resolveXAIServiceTier({
+            requestTier: muxProviderOptions?.xai?.serviceTier,
+            configuredTier: serviceTier,
+            chatServiceTier,
+            followsChat: isFrontierGrok,
+            getServiceTierOverride: opts?.getServiceTierOverride,
+          });
 
           const { createXai } = yield* Effect.promise(async () => PROVIDER_REGISTRY.xai());
-          const providerFetch = wrapFetchWithXAIServiceTier(baseFetch, effectiveServiceTier);
+          const providerFetch = wrapFetchWithXAIServiceTier(
+            baseFetch,
+            xaiTier.serviceTier,
+            xaiTier.getLiveServiceTier
+          );
           const provider = createXai({
             apiKey: resolvedApiKey,
             baseURL: creds.baseUrl ?? baseURL,
@@ -2549,14 +2740,7 @@ export class ProviderModelFactory {
             ...restOptions,
             fetch: providerFetch,
           });
-          // Frontier Grok uses the Responses API so @ai-sdk/xai surfaces exact billed
-          // cost metadata (including Priority Processing). Mapped provider aliases inherit
-          // that capability; older custom model strings stay on Chat Completions for
-          // legacy search_parameters compatibility.
-          const capabilityModel = resolveModelForMetadata(`xai:${modelId}`, providersConfig);
-          const model = isGrokFrontierModel(capabilityModel)
-            ? provider.responses(modelId)
-            : provider.chat(modelId);
+          const model = isFrontierGrok ? provider.responses(modelId) : provider.chat(modelId);
 
           // Frontier Grok Responses: force store=false by default so ZDR and non-ZDR share
           // one path. buildProviderOptions already defaults this; inject here too so
@@ -2733,6 +2917,10 @@ export class ProviderModelFactory {
             fetch: providerFetch,
           });
           return Ok(provider(modelId));
+        }
+
+        if (providerName === "google-vertex") {
+          return yield* createGoogleVertexModelEffect(providerConfig, modelId);
         }
 
         // Handle Xum Gateway provider
@@ -3193,9 +3381,14 @@ export class ProviderModelFactory {
             serviceTierDefault.liveOverrides
           );
         }
-        if (result.success && anthropicFastModePinned && typeof result.data !== "string") {
+        if (result.success && anthropicFastMode && typeof result.data !== "string") {
           // @ai-sdk/anthropic adds the fast-mode beta header for this option.
-          injectProviderOptionsDefaults(result.data, "anthropic", { speed: "fast" });
+          injectProviderOptionsDefaults(
+            result.data,
+            "anthropic",
+            anthropicFastMode.defaults,
+            anthropicFastMode.liveOverrides
+          );
         }
         return result;
       }),

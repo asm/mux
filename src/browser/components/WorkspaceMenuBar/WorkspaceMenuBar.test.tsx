@@ -1,12 +1,19 @@
 import "../../../../tests/ui/dom";
 
-import { StrictMode, type ComponentProps, type PropsWithChildren, type ReactNode } from "react";
+import {
+  StrictMode,
+  useState,
+  type ComponentProps,
+  type PropsWithChildren,
+  type ReactNode,
+} from "react";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
+import * as RealHeartbeatModalModule from "@/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal";
 import * as APIModule from "@/browser/contexts/API";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
@@ -33,6 +40,7 @@ import * as WorkspaceActionsMenuContentModule from "../WorkspaceActionsMenuConte
 import type { WorkspaceActionId } from "../WorkspaceActionsMenuContent/workspaceActionItems";
 import * as WorkspaceTerminalIconModule from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import * as SkillIndicatorModule from "../SkillIndicator/SkillIndicator";
+import * as BranchSelectorModule from "../BranchSelector/BranchSelector";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
@@ -47,10 +55,7 @@ import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appVie
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { CODER_RUNTIME_PLACEHOLDER, type RuntimeConfig } from "@/common/types/runtime";
 import { Err, Ok, type Result } from "@/common/types/result";
-import {
-  NARROW_VIEWPORT_MAX_WIDTH_PX,
-  WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
-} from "@/constants/layout";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 
 // The consent dialog integration test renders the REAL modal inside the menu bar. Radix
 // Dialog portals do not render in happy-dom, so the shell is inlined (same double as the
@@ -80,6 +85,18 @@ const RealWorkspaceUnrelatedMessagingModal =
 // the "another modal is open" test needs the actual overlay the MCP/heartbeat dialogs render.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const RealDialog = require("../Dialog/Dialog?real=1") as typeof RealDialogModule;
+
+// Counts imports of the heartbeat modal's index, which only the lazy loader in WorkspaceMenuBar
+// does. The factory runs on the first import of the mocked specifier.
+let heartbeatModalImports = 0;
+const realHeartbeatModalIndex = { ...RealHeartbeatModalModule };
+restoreModulesAfterSuite([
+  ["@/browser/components/WorkspaceHeartbeatModal", realHeartbeatModalIndex],
+]);
+void mock.module("@/browser/components/WorkspaceHeartbeatModal", () => {
+  heartbeatModalImports++;
+  return realHeartbeatModalIndex;
+});
 
 let WorkspaceMenuBar!: typeof WorkspaceMenuBarComponent;
 
@@ -230,6 +247,9 @@ function installWorkspaceMenuBarTestDoubles() {
       }) as unknown as ReturnType<typeof WorkspaceStoreModule.useWorkspaceSidebarState>
   );
   spyOn(RuntimeStatusStoreModule, "useRuntimeStatus").mockImplementation(() => "unsupported");
+  spyOn(BranchSelectorModule, "BranchSelector").mockImplementation(
+    (() => null) as unknown as typeof BranchSelectorModule.BranchSelector
+  );
   spyOn(RuntimeStatusStoreModule, "useRuntimeStatusStoreRaw").mockImplementation(
     () =>
       ({ invalidateWorkspace: () => undefined }) as unknown as ReturnType<
@@ -354,6 +374,11 @@ function getLastUnrelatedMessagingModalProps() {
   return spy.mock.calls.at(-1)?.[0];
 }
 
+// The dialog loads on its first open (#5971), so before that it is not rendered at all.
+function messagingDialogOpen(): boolean {
+  return getLastUnrelatedMessagingModalProps()?.open === true;
+}
+
 /**
  * Replace window.matchMedia so viewport-gated actions can be exercised per test.
  * `matches` is re-read on every access and registered change listeners are returned
@@ -394,8 +419,19 @@ const defaultProps: ComponentProps<typeof WorkspaceMenuBarComponent> = {
   namedWorkspacePath: "/projects/demo/workspaces/feature-branch",
   runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
   leftSidebarCollapsed: false,
-  onToggleLeftSidebarCollapsed: () => undefined,
 };
+
+function repoWorkspaceMetadata(id: string): FrontendWorkspaceMetadata {
+  return {
+    id,
+    name: "feature-branch",
+    projectName: "demo",
+    projectPath: "/projects/demo",
+    namedWorkspacePath: `/projects/demo/workspaces/${id}`,
+    runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
+    createdAt: "2026-01-01T00:00:00.000Z",
+  };
+}
 
 const CONSENT_SWITCH_NAME = /allow messages from unrelated workspaces/i;
 
@@ -719,6 +755,45 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(document.activeElement).toBe(focused);
   });
 
+  it("offers the branch selector in repository workspace details before git status loads", () => {
+    workspaceMetadata.set(workspaceId, repoWorkspaceMetadata(workspaceId));
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    const branchSelector = BranchSelectorModule.BranchSelector as unknown as {
+      mock: { calls: Array<[{ workspaceId: string; workspaceName: string }]> };
+    };
+    expect(branchSelector.mock.calls.at(-1)?.[0]).toMatchObject({
+      workspaceId,
+      workspaceName: defaultProps.workspaceName,
+    });
+  });
+
+  it("leaves the branch selector out of scratch workspace details", () => {
+    workspaceMetadata.set(workspaceId, { ...repoWorkspaceMetadata(workspaceId), kind: "scratch" });
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    expect(BranchSelectorModule.BranchSelector).not.toHaveBeenCalled();
+  });
+
+  it("remounts the details branch selector when the workspace changes", () => {
+    const mountedFor: string[] = [];
+    spyOn(BranchSelectorModule, "BranchSelector").mockImplementation(((props: {
+      workspaceId: string;
+    }) => {
+      useState(() => mountedFor.push(props.workspaceId));
+      return null;
+    }) as unknown as typeof BranchSelectorModule.BranchSelector);
+    workspaceMetadata.set(workspaceId, repoWorkspaceMetadata(workspaceId));
+    workspaceMetadata.set("workspace-2", repoWorkspaceMetadata("workspace-2"));
+
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+
+    expect(mountedFor).toEqual([workspaceId, "workspace-2"]);
+  });
+
   it("offers the hidden sidebar as one row, and opens it full-screen", () => {
     stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
     const onOpenSidebar = mock((_returnFocusTo: HTMLElement | null) => undefined);
@@ -827,6 +902,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     it('"Open in tab" shows the view\'s own app tab, openArtifact() the Artifacts tab', () => {
       narrow();
       setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
+      setTestExperiment(EXPERIMENT_IDS.MCP_APPS, true);
       const { shown } = renderRecording();
       act(() => {
         window.dispatchEvent(
@@ -839,6 +915,21 @@ describe("WorkspaceMenuBar archive confirmations", () => {
         );
       });
       expect(shown).toEqual([appViewTabFor("call-1"), "artifacts"]);
+    });
+
+    it('with MCP Apps off, "Open in tab" shows nothing, even with Artifacts on (#6760)', () => {
+      narrow();
+      setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
+      const { shown } = renderRecording();
+      act(() => {
+        window.dispatchEvent(
+          createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId, toolCallId: "call-1" })
+        );
+        window.dispatchEvent(
+          createCustomEvent(CUSTOM_EVENTS.OPEN_ARTIFACT, { workspaceId, path: "report.md" })
+        );
+      });
+      expect(shown).toEqual(["artifacts"]);
     });
 
     it("leave keys alone while the sidebar is visible or a modal is open", () => {
@@ -1001,32 +1092,35 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       opener: "keyboard shortcut",
       open: () => fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true }),
     },
-  ])("closes the consent dialog opened from the $opener when switching workspaces", ({ open }) => {
-    const view = render(<WorkspaceMenuBar {...defaultProps} />);
-    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+  ])(
+    "closes the consent dialog opened from the $opener when switching workspaces",
+    async ({ open }) => {
+      const view = render(<WorkspaceMenuBar {...defaultProps} />);
+      expect(messagingDialogOpen()).toBe(false);
 
-    act(() => {
-      open();
-    });
-    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(true);
-    const staleOnOpenChange = getLastUnrelatedMessagingModalProps()!.onOpenChange;
+      act(() => {
+        open();
+      });
+      await waitFor(() => expect(messagingDialogOpen()).toBe(true));
+      const staleOnOpenChange = getLastUnrelatedMessagingModalProps()!.onOpenChange;
 
-    // Consent is granted per recipient workspace. Selecting another workspace while App
-    // reuses this menu bar must close the dialog so the switch cannot be flipped against
-    // the workspace the user navigated to.
-    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
-    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+      // Consent is granted per recipient workspace. Selecting another workspace while App
+      // reuses this menu bar must close the dialog so the switch cannot be flipped against
+      // the workspace the user navigated to.
+      view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+      expect(messagingDialogOpen()).toBe(false);
 
-    // A callback retained from the first workspace's dialog cannot reopen it here either.
-    act(() => {
-      staleOnOpenChange(true);
-    });
-    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+      // A callback retained from the first workspace's dialog cannot reopen it here either.
+      act(() => {
+        staleOnOpenChange(true);
+      });
+      expect(messagingDialogOpen()).toBe(false);
 
-    // Returning does not resurrect it: the retained id is cleared on leave.
-    view.rerender(<WorkspaceMenuBar {...defaultProps} />);
-    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
-  });
+      // Returning does not resurrect it: the retained id is cleared on leave.
+      view.rerender(<WorkspaceMenuBar {...defaultProps} />);
+      expect(messagingDialogOpen()).toBe(false);
+    }
+  );
 
   it("gives each workspace its own consent dialog so a pending request cannot leak across a switch", async () => {
     // Real-shaped client whose calls stay pending until the test settles them.
@@ -1053,6 +1147,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     act(() => {
       menuAction("configureMessaging")?.(document.body);
     });
+    await view.findByRole("switch", { name: CONSENT_SWITCH_NAME });
     // Workspace A: start a request and leave it in flight (switch locked, "Saving" shown).
     fireEvent.click(view.getByRole("switch", { name: CONSENT_SWITCH_NAME }));
     expect(requests).toHaveLength(1);
@@ -1099,6 +1194,78 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(view.queryByRole("alert")).toBeNull();
   });
 
+  it("mounts a settings modal on its first open and keeps it mounted after close", async () => {
+    // Lazy (#5971): nothing renders while closed, and the dialog stays mounted after its first
+    // open, so its close animation still runs.
+    const mcpCalls = () =>
+      (
+        WorkspaceMCPModalModule.WorkspaceMCPModal as unknown as {
+          mock: { calls: Array<[{ open: boolean; onOpenChange: (open: boolean) => void }]> };
+        }
+      ).mock.calls;
+    render(<WorkspaceMenuBar {...defaultProps} />);
+    expect(mcpCalls()).toHaveLength(0);
+    expect(getLastUnrelatedMessagingModalProps()).toBeUndefined();
+
+    // One opens from its keyboard shortcut, one from the menu: both must work on first use.
+    act(() => {
+      fireEvent.keyDown(window, { key: "M", ctrlKey: true, shiftKey: true });
+      menuAction("configureMessaging")?.(document.body);
+    });
+    await waitFor(() => expect(mcpCalls().at(-1)?.[0].open).toBe(true));
+    await waitFor(() => expect(messagingDialogOpen()).toBe(true));
+
+    act(() => {
+      mcpCalls().at(-1)![0].onOpenChange(false);
+      getLastUnrelatedMessagingModalProps()!.onOpenChange(false);
+    });
+    expect(mcpCalls().at(-1)?.[0].open).toBe(false);
+    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+  });
+
+  it("starts the settings modal imports when the Workspace actions menu opens", async () => {
+    // Runs before any test here opens the heartbeat modal, so its module is not imported yet.
+    // The Workspace actions popover is the one around the WorkspaceActionsMenuContent double.
+    let moreMenuOnOpenChange: ((open: boolean) => void) | undefined;
+    spyOn(PopoverModule, "Popover").mockImplementation(((
+      props: PropsWithChildren<{ onOpenChange?: (open: boolean) => void }>
+    ) => (
+      <div
+        ref={(el) => {
+          if (el?.querySelector('[aria-label="Workspace actions"]'))
+            moreMenuOnOpenChange = props.onOpenChange;
+        }}
+      >
+        {props.children}
+      </div>
+    )) as unknown as typeof PopoverModule.Popover);
+    render(<WorkspaceMenuBar {...defaultProps} />);
+    expect(moreMenuOnOpenChange).toBeDefined();
+    expect(heartbeatModalImports).toBe(0);
+    act(() => {
+      moreMenuOnOpenChange?.(true);
+    });
+    await waitFor(() => expect(heartbeatModalImports).toBe(1));
+  });
+
+  it("shows a loading dialog that blocks a second modal while a settings modal loads", async () => {
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    act(() => {
+      menuAction("configureHeartbeat")?.(document.body);
+    });
+    // Until the chunk arrives, a loading dialog holds the place of the heartbeat dialog. Its
+    // backdrop and focus trap (LazySettingsModal.test.tsx) keep pointer and keyboard off the
+    // menu, and the open-overlay marker blocks the global shortcuts.
+    expect(view.queryByText("Loading…")).not.toBeNull();
+    act(() => {
+      fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
+    });
+    // The first import of the real heartbeat modal can take over a second here.
+    await waitFor(() => expect(view.queryByText("Loading…")).toBeNull(), { timeout: 10_000 });
+    expect(view.getByText("Configure heartbeat")).not.toBeNull();
+    expect(messagingDialogOpen()).toBe(false);
+  }, 20_000);
+
   it("ignores the consent shortcut while another modal is open", () => {
     // A real open modal built from the shared primitives (overlay inline: the Radix Portal does
     // not render in happy-dom). Like the MCP and heartbeat dialogs at runtime, nothing here
@@ -1118,7 +1285,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
     });
 
-    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+    expect(messagingDialogOpen()).toBe(false);
   });
 
   // Unrelated delivery requires local or worktree runtimes on BOTH endpoints (TaskService
@@ -1130,16 +1297,19 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     { runtime: "project-dir local", runtimeConfig: { type: "local" } },
     { runtime: "legacy local worktree", runtimeConfig: { type: "local", srcBaseDir: "/tmp/src" } },
     { runtime: "canonical default (unset)", runtimeConfig: undefined },
-  ])("offers the consent action and shortcut for $runtime workspaces", ({ runtimeConfig }) => {
-    render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
+  ])(
+    "offers the consent action and shortcut for $runtime workspaces",
+    async ({ runtimeConfig }) => {
+      render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
 
-    expect(typeof menuAction("configureMessaging")).toBe("function");
-    act(() => {
-      fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
-    });
-    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(true);
-    expect(getLastUnrelatedMessagingModalProps()?.consentSupported).toBe(true);
-  });
+      expect(typeof menuAction("configureMessaging")).toBe("function");
+      act(() => {
+        fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
+      });
+      await waitFor(() => expect(messagingDialogOpen()).toBe(true));
+      expect(getLastUnrelatedMessagingModalProps()?.consentSupported).toBe(true);
+    }
+  );
 
   it.each<{ runtime: string; runtimeConfig: RuntimeConfig }>([
     { runtime: "SSH", runtimeConfig: { type: "ssh", host: "dev.example", srcBaseDir: "/srv/src" } },
@@ -1152,16 +1322,19 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       runtime: "devcontainer",
       runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
     },
-  ])("opens the dialog without the consent switch for $runtime workspaces", ({ runtimeConfig }) => {
-    render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
+  ])(
+    "opens the dialog without the consent switch for $runtime workspaces",
+    async ({ runtimeConfig }) => {
+      render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
 
-    expect(typeof menuAction("configureMessaging")).toBe("function");
-    act(() => {
-      fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
-    });
-    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(true);
-    expect(getLastUnrelatedMessagingModalProps()?.consentSupported).toBe(false);
-  });
+      expect(typeof menuAction("configureMessaging")).toBe("function");
+      act(() => {
+        fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
+      });
+      await waitFor(() => expect(messagingDialogOpen()).toBe(true));
+      expect(getLastUnrelatedMessagingModalProps()?.consentSupported).toBe(false);
+    }
+  );
 
   it("offers no Sidebar row when immersive review hides the sidebar", () => {
     stubMatchMedia(() => false);
@@ -1191,14 +1364,6 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     });
     expect(onOpenSidebar).not.toHaveBeenCalled();
     shell.remove();
-  });
-
-  it("applies the collapsed-left-sidebar inset immediately from props", () => {
-    const view = render(<WorkspaceMenuBar {...defaultProps} leftSidebarCollapsed />);
-
-    expect(view.getByTestId("workspace-menu-bar").style.paddingLeft).toBe(
-      `${WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX}px`
-    );
   });
 
   it("opens the archive confirmation modal when preflight finds untracked files", async () => {

@@ -15,6 +15,13 @@
 
 @source "../node_modules/streamdown/dist/index.js";
 
+/* src/common/staticWorkspaceView holds captured markup: the static view's class allow-list and
+   the generated phone skeleton. Those files spell out Streamdown's own utility classes as strings,
+   and scanning them made Tailwind generate utilities the transcript never had (#6836), such as
+   bg-muted/80 on table headers and list-inside on lists. They mirror classes rather than use
+   them, so leave them out of the scan. */
+@source not "../../common/staticWorkspaceView";
+
 /* Geist Font Declarations */
 @font-face {
   font-family: "Geist";
@@ -254,6 +261,13 @@
 
   --color-success: hsl(122 39% 45%);
   --color-success-light: hsl(123 46% 60%);
+  /* The success hue, darker: WCAG AA (4.5:1) on every light surface and success tint, down to
+     4.52:1. The success color itself was 2.29-3.1:1 as text (#6882). --color-success stays the
+     fill, border and tint color. */
+  --color-success-text: hsl(122 39% 30%);
+  /* Text-only variant of --color-success-light (diff "+N" counts). The light success-light was
+     2.08:1 on white, so light themes use the success text color (#6885). */
+  --color-success-light-text: var(--color-success-text);
   --color-on-success: hsl(0 0% 100%);
 
   --color-danger: hsl(4 78% 52%);
@@ -263,6 +277,10 @@
 
   --color-warning: hsl(45 100% 50%);
   --color-warning-light: hsl(38 100% 70%);
+  /* Text-only variant of --color-warning-light (diff "-N" counts, "M" status letters). The light
+     warning-light was 1.54:1 on white; this one reaches WCAG AA down to the selected-row tint,
+     4.86:1 (#6935). */
+  --color-warning-light-text: hsl(38 100% 26%);
   --color-warning-text: var(--color-review-warning);
 
   --color-code-type: hsl(200 84% 28%);
@@ -285,7 +303,8 @@
   --color-selection: hsl(204 100% 45% / 0.3);
   --color-vim-status: hsl(210 18% 32% / 0.6);
   --color-code-keyword-overlay-light: hsl(210 88% 28% / 0.16);
-  --color-code-keyword-overlay: hsl(210 88% 28% / 0.32);
+  /* Selected review file row. At 0.32 the row's colored texts could not reach WCAG AA on it (#6935). */
+  --color-code-keyword-overlay: hsl(210 88% 28% / 0.16);
 
   --color-info-light: hsl(5 90% 70%);
   --color-info-yellow: hsl(38 100% 60%);
@@ -511,6 +530,10 @@
 
   --color-success: #66800b;
   --color-success-light: color-mix(in srgb, var(--color-success), white 35%);
+  /* Darker green: WCAG AA (4.5:1) on every flexoki-light surface and success tint, down to
+     4.69:1, where #66800b was 3.02:1 (#6882). */
+  --color-success-text: #4d6008;
+  --color-success-light-text: var(--color-success-text);
   --color-on-success: #fffcf0;
 
   --color-danger: #af3029;
@@ -520,6 +543,9 @@
 
   --color-warning: #ad8301;
   --color-warning-light: color-mix(in srgb, var(--color-warning), white 35%);
+  /* Darker warning for text: WCAG AA down to the selected-row tint, 4.80:1, where warning-light
+     was 1.27:1 (#6935). */
+  --color-warning-light-text: color-mix(in srgb, var(--color-warning), black 30%);
 
   --color-code-type: #24837b;
   --color-code-keyword: #205ea6;
@@ -544,7 +570,7 @@
   --color-selection: hsl(from var(--color-accent) h s l / 0.25);
   --color-vim-status: hsl(from var(--color-foreground) h s l / 0.35);
   --color-code-keyword-overlay-light: hsl(from var(--color-code-keyword) h s l / 0.16);
-  --color-code-keyword-overlay: hsl(from var(--color-code-keyword) h s l / 0.32);
+  --color-code-keyword-overlay: hsl(from var(--color-code-keyword) h s l / 0.16); /* #6935 */
 
   --color-info: #24837b;
   --color-info-light: color-mix(in srgb, var(--color-info), white 35%);
@@ -713,7 +739,9 @@
   --color-input-border: #4385be;
   --color-input-border-focus: color-mix(in srgb, var(--color-input-border), white 22%);
 
-  --color-muted: #878580;
+  /* Flexoki base-400, the same as --color-secondary: WCAG AA on every flexoki-dark surface, down to
+     #343331 (4.65:1). base-500 #878580 was 4.04:1 on hover (#6544). */
+  --color-muted: #9f9d96;
   --color-muted-light: #cecdc3;
   --color-muted-dark: #575653;
   --color-placeholder: #575653;
@@ -853,8 +881,10 @@ body,
   background-color: var(--color-surface-primary);
 }
 
-/* iOS 26 standalone colors the status bar from an opaque, near-full-width fixed element at the
-   top edge (element lives in index.html); keep it at least 1px tall when there is no inset. */
+/* iOS 26+ standalone colors the status bar from the fixed box 4px below the top edge's midpoint
+   when it spans at least 90% of the viewport and is over 10px tall (WebKit fixedContainerEdges).
+   Without one, iPadOS blurs about 40pt of the app below the status bar. The element lives in
+   index.html so it exists from the first frame: iPadOS can keep the blur after a frame without it. */
 .ios-status-bar-band {
   display: none;
 }
@@ -867,10 +897,12 @@ body,
       top: 0;
       left: 0;
       right: 0;
-      height: max(1px, env(safe-area-inset-top, 0px));
+      height: 12px;
       background-color: var(--color-sidebar);
-      /* Above the off-canvas drawer (z-index 1000). */
-      z-index: 1001;
+      /* WebKit reads the color from the style, and with no text this clip paints nothing. */
+      background-clip: text;
+      /* Topmost, so no menu or overlay covers the sampled point. */
+      z-index: 2147483647;
       pointer-events: none;
     }
   }
@@ -910,8 +942,11 @@ body,
 
   button,
   a,
-  [role="button"] {
-    /* Keep in sync with MOBILE_TOUCH_TARGET_PX, which tests use to reproduce this rule. */
+  [role="button"],
+  .mobile-touch-target {
+    /* Keep in sync with MOBILE_TOUCH_TARGET_PX, which tests use to reproduce this rule.
+       .mobile-touch-target: an inert placeholder that holds a button's slot while it loads gets
+       the button's size, or the header icons after it jump when the button arrives (#6841). */
     min-height: 44px;
     min-width: 44px;
   }
@@ -974,10 +1009,10 @@ body,
     display: inline-flex !important;
   }
 
-  /* The collapsed-left-sidebar header inset reserves room for the desktop reopen affordance; at
-     phone widths this button is that affordance, so fall back to the header's ordinary gutter. */
-  .mobile-sticky-header:has(.mobile-menu-btn) {
-    padding-left: 0.5rem !important;
+  /* The app shell's fixed left sidebar toggle bar and its header spacers take the header's
+     ordinary phone gutter. */
+  .left-sidebar-toggle-host {
+    padding-left: max(var(--titlebar-left-inset, 0px), 0.5rem) !important;
   }
 
   .mobile-overlay {
@@ -1052,15 +1087,17 @@ body,
 /* Touch targets widen this button to 44px (see the coarse-pointer block above), so centering
    would drift the icon to 22px; anchor the box to the header edge to keep it on the 12px gutter.
    Fine pointers keep the 24px box, where this inset would push the icon out of the box and paint
-   the hover pill against the window edge. */
+   the hover pill against the window edge. The toggle bar and its spacers match the page header's
+   44px touch height, so the bar lines up with the header under it. */
 @media (max-width: 768px) and (pointer: coarse) {
   .mobile-menu-btn {
     justify-content: flex-start !important;
     padding-left: 12px !important;
   }
 
-  .mobile-sticky-header:has(.mobile-menu-btn) {
-    padding-left: 0 !important;
+  .left-sidebar-toggle-host {
+    padding-left: var(--titlebar-left-inset, 0px) !important;
+    min-height: 44px;
   }
 }
 

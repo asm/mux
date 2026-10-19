@@ -116,6 +116,9 @@ jobs:
               - 'scripts/gen_builtin_skills.ts'
               - 'scripts/gen_workflow_runtime_sources.ts'
               - 'scripts/precompress-static.ts'
+              - 'scripts/stamp-service-worker.ts'
+              - 'scripts/perf/firstLoadJs.ts'
+              - 'scripts/build-row-tree-worker.ts'
               - 'scripts/check-analytics-worker.cjs'
               - 'docs/**'
               - 'index.html'
@@ -256,16 +259,33 @@ jobs:
       - name: web_fetch pinning tests with curl 8.7+
         if: matrix.shard == 1 && github.event.inputs.test_filter == ''
         env:
+          # A version bump needs new checksums for BOTH assets below (#6492). Never copy them
+          # from the release page: download each curl-linux-<arch>-musl-<version>.tar.xz
+          # yourself, run `sha256sum` on it, and check that the result equals the digest
+          # GitHub computed at upload (`gh api repos/stunnel/static-curl/releases/tags/<version>
+          # --jq '.assets[] | select(.name == "<asset>") | .digest'`). The release has no
+          # build attestations, so those two must agree before the new values land.
           STATIC_CURL_VERSION: 8.22.0
-          STATIC_CURL_SHA256: dfb02460ba2abe513087538f12a3cf79b74b64a5ea3787ce8ac0cdb11251f884
+          STATIC_CURL_SHA256_X86_64: dfb02460ba2abe513087538f12a3cf79b74b64a5ea3787ce8ac0cdb11251f884
+          STATIC_CURL_SHA256_AARCH64: cf94cbeaae1b3c1944a4a761ef04478f8f0b23e93a324b5ed009b2082eda11f3
           XUM_WEB_FETCH_REQUIRE_CURL_FALLBACK: "1"
         run: |
+          # Pick the asset for this runner's CPU, so a move to arm64 runners keeps the step
+          # (#6492). Any other CPU fails here instead of silently testing nothing.
+          case "$(uname -m)" in
+            x86_64) arch=x86_64 sha256="$STATIC_CURL_SHA256_X86_64" ;;
+            aarch64 | arm64) arch=aarch64 sha256="$STATIC_CURL_SHA256_AARCH64" ;;
+            *)
+              echo "::error::no pinned static curl for $(uname -m); add its asset and checksum"
+              exit 1
+              ;;
+          esac
           dir="$RUNNER_TEMP/static-curl"
           mkdir -p "$dir"
           archive="$dir/curl.tar.xz"
           curl -fsSL --retry 3 -o "$archive" \
-            "https://github.com/stunnel/static-curl/releases/download/${STATIC_CURL_VERSION}/curl-linux-x86_64-musl-${STATIC_CURL_VERSION}.tar.xz"
-          echo "${STATIC_CURL_SHA256}  ${archive}" | sha256sum -c -
+            "https://github.com/stunnel/static-curl/releases/download/${STATIC_CURL_VERSION}/curl-linux-${arch}-musl-${STATIC_CURL_VERSION}.tar.xz"
+          echo "${sha256}  ${archive}" | sha256sum -c -
           tar -xJf "$archive" -C "$dir" curl
           PATH="$dir:$PATH"
           curl -q --version
@@ -568,6 +588,12 @@ jobs:
           SHARD: ${{ matrix.shard }}
           # No provider secrets here, so the repros' app uses the mock AI.
           BUGBASH_REPROS: ${{ matrix.shard == '1/4' && '1' || '0' }}
+      # The static workspace view's phone skeleton must match the live page (#5971). On drift, the
+      # failure names the element and the command that regenerates the skeleton.
+      # It reuses the `make build` of `make test-e2e` above.
+      - name: Check the phone chrome skeleton
+        if: matrix.os == 'linux' && matrix.shard == '1/4'
+        run: make check-phone-chrome
       - name: Run tests
         if: matrix.os == 'macos'
         env:
@@ -651,6 +677,12 @@ jobs:
       - name: Verify Windows namespaced filesystem roots
         shell: pwsh
         run: bun test src/node/utils/pathUtils.test.ts -t "refuses Windows namespaced roots"
+      - name: Verify legacy workspace lookups on Windows checkout paths
+        shell: pwsh
+        run: bun test src/node/config.test.ts -t "legacy rows with a Windows checkout path"
+      - name: Verify a new workspace's projectName on a Windows project path
+        shell: pwsh
+        run: bun test src/node/services/workspaceService.planNamespace.test.ts -t "folder name, not its path"
       - name: Run Windows integration smoke tests
         shell: pwsh
         run: |

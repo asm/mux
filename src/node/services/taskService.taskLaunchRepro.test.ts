@@ -28,6 +28,7 @@ import { createAgentSessionHarness } from "@/node/services/agentSession.testHarn
 import type { TurnCompletion } from "@/node/services/streamManager";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
+import * as attemptSettlements from "@/node/services/subagentAttemptSettlements";
 import { WorkspaceBusyError, workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import { createUnknownSendMessageError } from "@/node/services/utils/sendMessageError";
 import type { TaskService } from "@/node/services/taskService";
@@ -1022,6 +1023,16 @@ describe("task launch races", () => {
               );
             }
             return published;
+          }
+        );
+
+        // A loaded runner's disk: the Stop's settlement receipt lands late. A resolved Stop must
+        // still mean the child accepts a message at once (#6727, after the #6677 flake).
+        const realWriteReceipt = attemptSettlements.writeSubagentAttemptSettlementReceipt;
+        spyOn(attemptSettlements, "writeSubagentAttemptSettlementReceipt").mockImplementation(
+          async (params) => {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            return realWriteReceipt(params);
           }
         );
 

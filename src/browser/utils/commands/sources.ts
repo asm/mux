@@ -197,6 +197,7 @@ import {
   getPresetForSlot,
 } from "@/browser/utils/uiLayouts";
 import { formatProjectHierarchyLabel, getTopLevelProjectEntries } from "@/common/utils/subProjects";
+import { serverPathLabel } from "@/common/utils/paths";
 import type { LayoutPresetsConfig, LayoutSlotNumber } from "@/common/types/uiLayouts";
 import {
   hasTab,
@@ -299,8 +300,10 @@ export interface BuildSourcesParams {
   onStartWorkspaceCreation: (projectPath: string) => void;
   onStartMultiProjectWorkspaceCreation: () => void;
   multiProjectWorkspacesEnabled: boolean;
-  /** artifacts experiment: gates "Open Artifacts", "Open File as Artifact…" and entry points. */
+  /** artifacts experiment: gates "Open Artifacts" and "Open File as Artifact…". */
   artifactsEnabled?: boolean;
+  /** mcp-apps experiment: gates the MCP App view and entry-point commands. */
+  mcpAppsEnabled?: boolean;
   /** The selected workspace's MCP App entry points; undefined until listed. */
   mcpAppEntrypoints?: readonly McpAppEntrypoint[];
   /** perfFlightRecorder experiment: gates "Report slowness". */
@@ -563,6 +566,25 @@ function describeConfigToggle(value: boolean | undefined, fallback: string): str
 }
 
 /**
+ * The mcp-apps experiment's palette commands (independent of Artifacts, #6760): one per MCP App
+ * view of the workspace (transcript or opened this session), which opens its tab or focuses the
+ * one it has (the keyboard path to "Open in tab"; the subtitle carries each call's detail, so
+ * several calls of one tool differ), and one per entry point of an enabled server, which opens
+ * its app tab (calling the tool with {}) or focuses the one it has.
+ */
+function mcpAppNavigationActions(
+  p: BuildSourcesParams,
+  wsId: string,
+  navigationSection: CommandAction["section"]
+): CommandAction[] {
+  if (p.mcpAppsEnabled !== true) return [];
+  return [
+    ...appViewActions(wsId, p.selectedWorkspaceState?.messages ?? [], navigationSection),
+    ...entrypointActions(p.api, wsId, p.mcpAppEntrypoints ?? [], navigationSection),
+  ];
+}
+
+/**
  * The palette actions of the workspace's MCP App views: one "Open App View" per view (its tab,
  * or the tab it has), and one "Reload App View" per view whose tab is open. The subtitle carries
  * each call's detail, so several calls of one tool differ.
@@ -600,6 +622,34 @@ async function pluginsNeedingReviewOptions(api: BuildSourcesParams["api"]) {
   return result.data
     .filter((item) => item.managed && (item.reviewRequiredCount ?? 0) > 0)
     .map((item) => ({ id: item.name, label: item.name, keywords: [item.name, item.location] }));
+}
+
+/** The palette path of the broken sign-out record notice in Settings → Plugins (#6627). */
+async function signOutPluginServersFromPalette(api: BuildSourcesParams["api"]): Promise<void> {
+  // The palette runs actions without a catch: a lost connection must still show an error.
+  await signOutPluginServersOrThrow(api).catch((error: unknown) =>
+    showCommandFeedbackToast({ type: "error", message: getErrorMessage(error) })
+  );
+}
+
+async function signOutPluginServersOrThrow(api: BuildSourcesParams["api"]): Promise<void> {
+  if (!api) return;
+  // Without a record the backend signs nothing out: do not report a sign-out that did not run.
+  if ((await api.agentPlugins.pendingSignOuts()).kind === "none") {
+    showCommandFeedbackToast({
+      type: "error",
+      message: "There is no pending plugin sign-out record. Nothing was signed out.",
+    });
+    return;
+  }
+  const result = await api.agentPlugins.signOutPluginServers();
+  if (!result.success) {
+    showCommandFeedbackToast({ type: "error", message: result.error });
+    return;
+  }
+  publishPluginsSectionIntent({ type: "refresh" });
+  publishAgentPluginsMutated();
+  showCommandFeedbackToast({ type: "success", message: "Signed out of the plugin MCP servers." });
 }
 
 export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandAction[]> {
@@ -681,7 +731,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
 
     // Remove current workspace (rename action intentionally omitted until we add a proper modal)
     if (selected?.namedWorkspacePath) {
-      const workspaceDisplayName = `${selected.projectName}/${selected.namedWorkspacePath.split("/").pop() ?? selected.namedWorkspacePath}`;
+      // A server path: on a Windows server it uses "\\" (#6856).
+      const workspaceDisplayName = `${selected.projectName}/${serverPathLabel(selected.namedWorkspacePath, selected.namedWorkspacePath)}`;
       const selectedMeta = p.workspaceMetadata.get(selected.workspaceId);
       if (selectedMeta?.sideChatParentWorkspaceId == null) {
         list.push({
@@ -714,8 +765,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             run: async () => {
               const branchName =
                 selectedMeta?.name ??
-                selected.namedWorkspacePath.split("/").pop() ??
-                selected.namedWorkspacePath;
+                serverPathLabel(selected.namedWorkspacePath, selected.namedWorkspacePath);
               const ok = await p.confirmDialog(
                 removeWorkspaceConfirmOptions("Remove current workspace?", {
                   name: branchName,
@@ -1084,13 +1134,6 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 keywords: ["artifacts", "preview", "versions"],
                 run: () => openArtifactsTab(wsId),
               },
-              // One per MCP App view of the workspace (transcript or opened this session): opens
-              // its tab or focuses the one it has, the keyboard path to "Open in tab".
-              // The subtitle carries each call's detail, so several calls of one tool differ.
-              ...appViewActions(wsId, p.selectedWorkspaceState?.messages ?? [], section.navigation),
-              // One per MCP App entry point of an enabled server: opens its app tab (calling
-              // the tool with {}) or focuses the one it has.
-              ...entrypointActions(p.api, wsId, p.mcpAppEntrypoints ?? [], section.navigation),
               {
                 id: CommandIds.navOpenFileAsArtifact(),
                 title: "Open File as Artifact…",
@@ -1118,6 +1161,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               },
             ]
           : []),
+        ...mcpAppNavigationActions(p, wsId, section.navigation),
         {
           id: CommandIds.navRightSidebarFocusTerminal(),
           title: "Right Sidebar: Focus Terminal",
@@ -2212,7 +2256,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           ],
           onSubmit: async (vals) => {
             const projectPath = vals.projectPath;
-            const projectName = projectPath.split("/").pop() ?? projectPath;
+            const projectName = serverPathLabel(projectPath, projectPath);
 
             const ok = await p.confirmDialog({
               title: `Archive merged workspaces in ${projectName}?`,
@@ -2229,7 +2273,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     ];
 
     for (const [projectPath] of p.userProjects.entries()) {
-      const projectName = projectPath.split("/").pop() ?? projectPath;
+      const projectName = serverPathLabel(projectPath, projectPath);
       list.push({
         id: CommandIds.projectRemove(projectPath),
         title: `Remove Project ${projectName}…`,
@@ -2493,7 +2537,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       {
         id: CommandIds.pluginsReviewComponents(),
         title: "Review Plugin Components…",
-        subtitle: "Approve skills and MCP servers that do not load until you review them",
+        subtitle: "Approve plugin components that are new or changed since your review",
         section: section.settings,
         keywords: ["plugin", "components", "review", "approve", "skills", "mcp", "consent"],
         run: () => undefined,
@@ -2597,6 +2641,16 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           });
           openSettings("plugins");
         },
+      },
+      {
+        // Keyboard path for the broken sign-out record notice (#6627): the record fences the
+        // plugin servers, so Settings → MCP has no Logout for them.
+        id: CommandIds.pluginsSignOutServers(),
+        title: "Sign Out of Plugin MCP Servers",
+        subtitle: "Recover from a broken pending sign-out record",
+        section: section.settings,
+        keywords: ["plugin", "mcp", "sign out", "logout", "pending", "record"],
+        run: () => signOutPluginServersFromPalette(p.api),
       },
       {
         id: CommandIds.pluginsUpdateAll(),

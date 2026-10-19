@@ -80,10 +80,7 @@ import {
 import { NotificationEngine } from "@/node/services/agentNotifications/NotificationEngine";
 import { TodoListReminderSource } from "@/node/services/agentNotifications/sources/TodoListReminderSource";
 import { HomeClutterReminderSource } from "@/node/services/agentNotifications/sources/HomeClutterReminderSource";
-import {
-  getAvailableTools,
-  supportsGoogleNativeToolsWithFunctionTools,
-} from "@/common/utils/tools/toolDefinitions";
+import { getAvailableTools } from "@/common/utils/tools/toolDefinitions";
 import { sanitizeMCPToolsForOpenAI } from "@/common/utils/tools/schemaSanitizer";
 import type { ToolSearchRuntime } from "@/common/utils/tools/toolCatalog";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
@@ -185,6 +182,8 @@ export interface ToolConfiguration {
   overflow_policy?: "truncate" | "tmpfile";
   /** Background process manager for bash tool (optional, AI-only) */
   backgroundProcessManager?: BackgroundProcessManager;
+  /** Live session queue decision, shared with stream boundaries; never cached by process managers. */
+  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   /** When true, restrict edits to the plan file (plan agent behavior). */
   planFileOnly?: boolean;
   /** Plan file path - only this file can be edited when planFileOnly is true. */
@@ -1132,7 +1131,7 @@ export async function getToolsForModel(
   // Tool hooks (.xum/tool_pre, .xum/tool_post) can run only here (trusted project). A
   // provider-native tool runs on the provider, so no hook can gate it. While hooks can run,
   // fetch goes through Xum's hook-wrapped client web_fetch instead of native fetch
-  // (Anthropic web_fetch_20250910, Google url_context), so every fetch is gated, including
+  // (Anthropic web_fetch_20250910), so every fetch is gated, including
   // after a hook is added mid-turn: withHooks finds hook files again on each call. User
   // decision (#5840, Option A): trusted projects lose native fetch even with no hook file.
   // Native web search has no client version and stays unhooked.
@@ -1222,21 +1221,8 @@ export async function getToolsForModel(
         break;
       }
 
-      case "google": {
-        if (supportsGoogleNativeToolsWithFunctionTools(modelId)) {
-          const { google } = await import("@ai-sdk/google");
-          allTools = {
-            ...baseTools,
-            ...(mcpTools ?? {}),
-            // Google exposes native Search and URL Context as provider-executed tools for
-            // Gemini 3+. These coexist with Xum function tools in the standard streaming API.
-            google_search: google.tools.googleSearch({}) as Tool,
-            // URL Context fetches on Google's side, past tool hooks; client web_fetch covers it.
-            ...(!hooksCanRun && { url_context: google.tools.urlContext({}) as Tool }),
-          };
-        }
-        break;
-      }
+      // Gemini (google, google-vertex) gets no built-in tools: google_search broke Gemini's
+      // implicit caching, and agents never called it or url_context.
     }
   } catch (error) {
     // If tools aren't available, just use base tools

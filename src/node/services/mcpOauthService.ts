@@ -1,4 +1,5 @@
 import * as crypto from "crypto";
+import assert from "@/common/utils/assert";
 import { getOwn } from "@/common/utils/getOwn";
 import * as http from "http";
 import type { IncomingHttpHeaders } from "http";
@@ -283,6 +284,16 @@ function pluginClient(
   };
 }
 
+// Keyed by instance instead of a `#raw` field: Bun (through 1.4.3) emits a `#private` field
+// natively, and any class with one makes Bun's coverage read every line of this file as hit
+// (oven-sh/bun#41528). A WeakMap keeps the value off the object like the field did.
+const exactResourceHrefs = new WeakMap<ExactResourceURL, string>();
+function rawHref(url: ExactResourceURL): string {
+  const raw = exactResourceHrefs.get(url);
+  assert(raw !== undefined, "ExactResourceURL stores its href in the constructor");
+  return raw;
+}
+
 /**
  * A URL whose serialization is the configured string. The SDK sends `resource.href` in the
  * authorization, token and refresh requests, and `new URL("https://api.example.com").href`
@@ -290,19 +301,18 @@ function pluginClient(
  * that. The value is still validated as a URL by the constructor.
  */
 class ExactResourceURL extends URL {
-  readonly #raw: string;
   constructor(raw: string) {
     super(raw);
-    this.#raw = raw;
+    exactResourceHrefs.set(this, raw);
   }
   override get href(): string {
-    return this.#raw;
+    return rawHref(this);
   }
   override toString(): string {
-    return this.#raw;
+    return rawHref(this);
   }
   override toJSON(): string {
-    return this.#raw;
+    return rawHref(this);
   }
 }
 
@@ -1194,6 +1204,8 @@ export class McpOauthService {
     projectPath?: string;
     serverName: string;
     pendingServer?: MCPOAuthPendingServerConfig;
+    /** Caller-generated, so Cancel reaches the flow while it starts (#6565). */
+    flowId?: string;
   }): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
     return this.startDesktopFlow({
       ...input,
@@ -1206,6 +1218,8 @@ export class McpOauthService {
       projectPath?: string;
       serverName: string;
       pendingServer?: MCPOAuthPendingServerConfig;
+      /** See startDesktopFlowForApi. */
+      flowId?: string;
     },
     headers?: IncomingHttpHeaders
   ): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
@@ -1312,7 +1326,59 @@ export class McpOauthService {
       hasRefreshToken: Boolean(tokens?.refresh_token),
       scope: tokens?.scope,
       updatedAtMs: creds?.updatedAtMs,
+      ...this.insufficientScopeFields(normalizedServerUrl, Boolean(tokens)),
     };
+  }
+
+  /** The prompt scopes of a signed-in server (see insufficientScopes). */
+  private insufficientScopeFields(
+    key: string,
+    signedIn: boolean
+  ): { insufficientScopes?: string[] } {
+    const scopes = signedIn ? this.insufficientScopes.get(key) : undefined;
+    return scopes !== undefined ? { insufficientScopes: scopes } : {};
+  }
+
+  /**
+   * Scope names a server asked for in a 403 `insufficient_scope` answer, per credential key
+   * (#6622). The stored tokens stay (tools that need less keep working). Settings → MCP shows a
+   * sign-in prompt that names these scopes until a new sign-in or a sign-out. In memory only: a
+   * restart shows the prompt again on the next refused request.
+   */
+  private readonly insufficientScopes = new Map<string, string[]>();
+
+  /** A new interactive sign-in asked for the scopes again: the prompt starts over (#6622). */
+  private endInsufficientScopePrompt(
+    saved: boolean,
+    input: { serverUrl: string; flowGeneration?: number }
+  ): void {
+    if (saved && input.flowGeneration !== undefined)
+      this.insufficientScopes.delete(input.serverUrl);
+  }
+
+  /** Records a 403 `insufficient_scope` answer (scopes are already sanitized). */
+  recordInsufficientScope(input: { serverUrl: string; scopes: string[] }): void {
+    const key = normalizeServerUrlForComparison(input.serverUrl);
+    if (!key) return;
+    this.insufficientScopes.set(key, input.scopes);
+    // Mounted Settings rows refresh on this signal: a 403 changes nothing they would otherwise see.
+    for (const listener of this.insufficientScopeListeners) listener(key);
+  }
+
+  private readonly insufficientScopeListeners = new Set<(key: string) => void>();
+
+  /**
+   * Notifies with the credential key (the `serverUrl` of getAuthStatus) when a refused request
+   * records a sign-in prompt (#6739); returns an unsubscribe.
+   */
+  onInsufficientScope(listener: (key: string) => void): () => void {
+    this.insufficientScopeListeners.add(listener);
+    return () => this.insufficientScopeListeners.delete(listener);
+  }
+
+  /** The credential keys that have a sign-in prompt now (replayed to a new subscriber). */
+  insufficientScopeKeys(): string[] {
+    return [...this.insufficientScopes.keys()];
   }
 
   /**
@@ -1370,6 +1436,8 @@ export class McpOauthService {
         await this.persistStoreLocked(store);
       });
 
+      // After the store write: a failed sign-out keeps the token, so it keeps the prompt too.
+      this.insufficientScopes.delete(normalizedServerUrl);
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);
@@ -2467,6 +2535,7 @@ export class McpOauthService {
       return true;
     });
     rejectDroppedFlowSave(saved, input.flowGeneration);
+    this.endInsufficientScopePrompt(saved, input);
   }
 
   /** A stale flow's write, or a refresh's back-stamp of a client another sign-in replaced. */

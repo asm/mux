@@ -190,8 +190,10 @@ function getReviewStatusSidebarClasses(status: Review["status"]): {
   if (status === "checked") {
     return {
       accent: "bg-success",
-      badge: "bg-success/20 text-success",
-      icon: "text-success",
+      // Foreground text on the success tint: success text on its own tint was 2.3-3.9:1 in every
+      // theme (#6767). The tint, the accent bar and the icon keep the success color.
+      badge: "bg-success/20 text-foreground",
+      icon: "text-success-text",
     };
   }
 
@@ -205,7 +207,8 @@ function getReviewStatusSidebarClasses(status: Review["status"]): {
 
   return {
     accent: "bg-muted",
-    badge: "bg-muted/25 text-muted",
+    // Foreground text: muted text on its own muted tint was 3.2-4.3:1 in every theme (#6544).
+    badge: "bg-muted/25 text-foreground",
     icon: "text-muted",
   };
 }
@@ -2496,7 +2499,12 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
               >
                 Notes
               </h2>
-              <span className="bg-muted/20 text-muted rounded px-1.5 py-0.5 font-mono text-[10px]">
+              {/* Foreground text: the muted tint lightens with --color-muted, so muted text on it
+                  fell to 4.23:1 on this dark panel (#6544). */}
+              <span
+                data-testid="immersive-notes-count"
+                className="bg-muted/20 text-foreground rounded px-1.5 py-0.5 font-mono text-[10px]"
+              >
                 {allReviews.length}
               </span>
             </div>

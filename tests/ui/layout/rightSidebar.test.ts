@@ -28,7 +28,7 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 
 import { installDom } from "../dom";
 import { renderApp } from "../renderReviewPanel";
-import { cleanupView, setupWorkspaceView } from "../helpers";
+import { cleanupView, openSidebarNewTab, setupWorkspaceView } from "../helpers";
 import {
   RIGHT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_TAB_KEY,
@@ -215,11 +215,9 @@ describeIntegration("RightSidebar (UI)", () => {
   const getTabs = (sidebar: HTMLElement) =>
     Array.from(sidebar.querySelectorAll<HTMLElement>('[role="tab"]'));
 
-  /** "+" opens the New tab; its launcher lists the tools. */
+  /** The All tabs menu's New tab row opens the New tab; its launcher lists the tools. */
   async function openLauncher(sidebar: HTMLElement): Promise<HTMLElement> {
-    fireEvent.click(
-      await findRequiredElement(sidebar, 'button[aria-label="New tab"]', "New tab button not found")
-    );
+    await openSidebarNewTab(sidebar);
     return findSidebarPanel(sidebar, "-panel-new");
   }
 
@@ -751,7 +749,7 @@ describeIntegration("RightSidebar (UI)", () => {
       fireEvent.click(reviewTab);
       await findSidebarPanel(sidebar, "review");
 
-      // Create a terminal via "+" (New tab) and its launcher, and verify its content
+      // Create a terminal from a New tab's launcher, and verify its content
       const terminalTab = await createTerminalTab(sidebar);
 
       await waitFor(() => {
@@ -799,9 +797,9 @@ describeIntegration("RightSidebar (UI)", () => {
       // Shrink slightly rather than grow so this test remains stable even when the initial
       // sidebar width is already clamped by the available shell width, while still keeping
       // the neighboring tabs visible.
-      fireEvent.mouseDown(resizeHandle, { clientX: 800 });
-      fireEvent.mouseMove(document, { clientX: 830 });
-      fireEvent.mouseUp(document);
+      fireEvent.pointerDown(resizeHandle, { clientX: 800 });
+      fireEvent.pointerMove(document, { clientX: 830 });
+      fireEvent.pointerUp(document);
 
       // Wait for width to change (resize should update inline style)
       await waitFor(() => {
@@ -873,9 +871,9 @@ describeIntegration("RightSidebar (UI)", () => {
       // Shrink slightly while on Review so the assertion is stable even when the sidebar
       // starts at the maximum width allowed by the current shell measurement, while still
       // leaving enough room for the tab strip itself.
-      fireEvent.mouseDown(resizeHandle, { clientX: 800 });
-      fireEvent.mouseMove(document, { clientX: 830 });
-      fireEvent.mouseUp(document);
+      fireEvent.pointerDown(resizeHandle, { clientX: 800 });
+      fireEvent.pointerMove(document, { clientX: 830 });
+      fireEvent.pointerUp(document);
 
       // Wait for width to change in UI
       await waitFor(() => {
@@ -908,9 +906,9 @@ describeIntegration("RightSidebar (UI)", () => {
       // Resize again on Costs tab (shrink).
       // The sidebar may already be clamped to its max width depending on the viewport,
       // so shrinking is the most reliable way to ensure a second drag produces a change.
-      fireEvent.mouseDown(resizeHandle, { clientX: 800 });
-      fireEvent.mouseMove(document, { clientX: 900 });
-      fireEvent.mouseUp(document);
+      fireEvent.pointerDown(resizeHandle, { clientX: 800 });
+      fireEvent.pointerMove(document, { clientX: 900 });
+      fireEvent.pointerUp(document);
 
       await waitFor(() => {
         const width = getSidebarWidth(sidebar);
@@ -951,10 +949,10 @@ describeIntegration("RightSidebar (UI)", () => {
       const chatMinWidthPx = 384; // ChatPane uses tailwind `min-w-96`
       const expectedMaxWidth = 900 - chatMinWidthPx;
 
-      fireEvent.mouseDown(resizeHandle, { clientX: 1000 });
+      fireEvent.pointerDown(resizeHandle, { clientX: 1000 });
       // Move far left to try to exceed max width.
-      fireEvent.mouseMove(document, { clientX: 0 });
-      fireEvent.mouseUp(document);
+      fireEvent.pointerMove(document, { clientX: 0 });
+      fireEvent.pointerUp(document);
 
       await waitFor(() => {
         const styleWidth = sidebar.style.width;
@@ -988,9 +986,9 @@ describeIntegration("RightSidebar (UI)", () => {
 
       // Moving the handle right by the sidebar's whole width asks for a 0px sidebar, far past
       // the snap point, so the sidebar collapses instead of holding at its minimum width.
-      fireEvent.mouseDown(resizeHandle, { clientX: 800 });
-      fireEvent.mouseMove(document, { clientX: 800 + widthBeforeDrag });
-      fireEvent.mouseUp(document);
+      fireEvent.pointerDown(resizeHandle, { clientX: 800 });
+      fireEvent.pointerMove(document, { clientX: 800 + widthBeforeDrag });
+      fireEvent.pointerUp(document);
 
       const card = await waitFor(() => {
         const element = view.container.querySelector<HTMLElement>(RIGHT_SIDEBAR_SELECTOR);

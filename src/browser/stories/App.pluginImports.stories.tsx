@@ -1,4 +1,4 @@
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import { appMeta, AppWithMocks, type AppStory } from "./meta";
 import { expandLeftSidebar } from "./helpers/uiState";
 import { getSettingsDialog, openSettingsDialog } from "./storyPlayHelpers";
@@ -32,6 +32,8 @@ const preview: AgentPluginInstallPreview = {
   agents: ["reviewer.md"],
   workflows: ["review.js"],
   slashCommands: [{ name: "review-status", description: "Summarize review status" }],
+  consentDigest: "c".repeat(64),
+  reviewedComponents: [],
   codexHooks: [],
   hook: { path: "hooks.js", toolGrants: ["file_read"] },
   warnings: [],
@@ -85,6 +87,11 @@ function setupPluginSettings(installed = false, conflict = false) {
           ]
         : [],
     });
+  // Settings → Plugins lists through listForSettings (#6627).
+  client.agentPlugins.listForSettings = async () => ({
+    list: await client.agentPlugins.list(),
+    pendingSignOuts: { kind: "none" },
+  });
   client.agentPlugins.getComponents = () =>
     Promise.resolve({
       success: true,

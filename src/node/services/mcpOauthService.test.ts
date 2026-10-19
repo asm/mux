@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { createServer } from "http";
+import { createServer, Server } from "http";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -961,6 +961,41 @@ describe("McpOauthService OAuth flows", () => {
     }
   );
 
+  // The desktop start checks for a Cancel once more after it binds its listener: binding is the
+  // only step between the server lookup and the flow's registration (#6565).
+  test("a desktop sign-in cancelled while its listener binds closes the listener", async () => {
+    spyOn(mcpConfigService, "listServers").mockResolvedValue({
+      docs: { transport: "http", url: "https://example.com/mcp", disabled: true },
+    });
+    const flowId = "caller-flow-id-0123456789";
+    // The original, read before the spy replaces it (Reflect.get: no unbound method reference).
+    const listen = Reflect.get(Server.prototype, "listen") as (...a: unknown[]) => Server;
+    const listeners: Server[] = [];
+    const bind = spyOn(Server.prototype, "listen").mockImplementationOnce(function (
+      this: Server,
+      ...args: unknown[]
+    ) {
+      listeners.push(this);
+      // The Cancel lands after the lookup's check and before the bind completes.
+      void service.cancelDesktopFlow(flowId);
+      return listen.apply(this, args);
+    });
+    try {
+      expect(await service.startDesktopFlow({ projectPath, serverName: "docs", flowId })).toEqual({
+        success: false,
+        error: "OAuth flow cancelled",
+      });
+      expect(listeners).toHaveLength(1);
+      expect(listeners[0]?.listening).toBe(false);
+      expect(await service.waitForDesktopFlow(flowId)).toEqual({
+        success: false,
+        error: "OAuth flow not found",
+      });
+    } finally {
+      bind.mockRestore();
+    }
+  });
+
   test("a caller flow ID must be well-formed and unused (#6565)", async () => {
     await withAuthServer(async (base) => {
       spyOn(mcpConfigService, "listServers").mockResolvedValue({
@@ -1812,56 +1847,66 @@ describe("McpOauthService OAuth flows", () => {
   // AuthCallReads keys each auth() call's reads by the context object the SDK passes. If an SDK
   // update passes a new object per provider call, every write falls back to the latest read and
   // the shared-slot race comes back silently (#6537). This pins that contract with the real auth().
-  test("the SDK's auth() passes one context object to every provider call of a refresh (#6537)", async () => {
+  test("the SDK's auth() passes one context object to every provider call of a refresh, and a new one per call (#6537)", async () => {
     await withAuthServer(async (base) => {
       const serverUrl = `${base}/mcp`;
-      await fs.writeFile(
-        getStoreFilePath(xumHome),
-        JSON.stringify({
-          version: 2,
-          entries: {
-            [serverUrl]: {
-              serverUrl,
-              updatedAtMs: Date.now(),
-              clientInformation: { client_id: "c" },
-              tokens: { access_token: "old", token_type: "Bearer", refresh_token: "rt" },
+      const seed = () =>
+        fs.writeFile(
+          getStoreFilePath(xumHome),
+          JSON.stringify({
+            version: 2,
+            entries: {
+              [serverUrl]: {
+                serverUrl,
+                updatedAtMs: Date.now(),
+                clientInformation: { client_id: "c" },
+                tokens: { access_token: "old", token_type: "Bearer", refresh_token: "rt" },
+              },
             },
-          },
-        })
-      );
+          })
+        );
+      await seed();
       const provider = await service.getAuthProviderForServer({ serverUrl });
       if (provider === undefined) throw new Error("expected a provider");
-      const contexts = new Map<string, unknown[]>();
-      const recorded = new Proxy(provider, {
-        get(target, key, receiver) {
-          const value: unknown = Reflect.get(target, key, receiver);
-          const name = String(key);
-          if (
-            typeof value !== "function" ||
-            !/^(clientInformation|tokens|saveTokens|saveClientInformation)$/.test(name)
-          )
-            return value;
-          return (...args: unknown[]) => {
-            // The context is the last argument: (ctx) for reads, (value, ctx) for writes.
-            const ctx = name.startsWith("save") ? args[1] : args[0];
-            contexts.set(name, [...(contexts.get(name) ?? []), ctx]);
-            return (value as (...a: unknown[]) => unknown).apply(target, args);
-          };
-        },
-      });
+      // One refresh through the real auth(); returns the context arguments by provider method.
+      const refreshOnce = async () => {
+        await seed();
+        const contexts = new Map<string, unknown[]>();
+        const recorded = new Proxy(provider, {
+          get(target, key, receiver) {
+            const value: unknown = Reflect.get(target, key, receiver);
+            const name = String(key);
+            if (
+              typeof value !== "function" ||
+              !/^(clientInformation|tokens|saveTokens|saveClientInformation)$/.test(name)
+            )
+              return value;
+            return (...args: unknown[]) => {
+              // The context is the last argument: (ctx) for reads, (value, ctx) for writes.
+              const ctx = name.startsWith("save") ? args[1] : args[0];
+              contexts.set(name, [...(contexts.get(name) ?? []), ctx]);
+              return (value as (...a: unknown[]) => unknown).apply(target, args);
+            };
+          },
+        });
+        expect(await auth(recorded, { serverUrl })).toBe("AUTHORIZED");
+        expect(contexts.get("clientInformation")?.length).toBeGreaterThan(0);
+        expect(contexts.get("tokens")?.length).toBeGreaterThan(0);
+        expect(contexts.get("saveTokens")?.length).toBeGreaterThan(0);
+        return [...contexts.values()].flat();
+      };
 
-      expect(await auth(recorded, { serverUrl })).toBe("AUTHORIZED");
-
-      const all = [...contexts.values()].flat();
-      expect(contexts.get("clientInformation")?.length).toBeGreaterThan(0);
-      expect(contexts.get("tokens")?.length).toBeGreaterThan(0);
-      expect(contexts.get("saveTokens")?.length).toBeGreaterThan(0);
-      expect(all[0]).toBeDefined();
-      expect(all.every((ctx) => ctx === all[0])).toBe(true);
+      const first = await refreshOnce();
+      expect(first[0]).toBeDefined();
+      expect(first.every((ctx) => ctx === first[0])).toBe(true);
       const stored = JSON.parse(await fs.readFile(getStoreFilePath(xumHome), "utf-8")) as {
         entries: Record<string, { tokens?: { access_token: string } }>;
       };
       expect(stored.entries[serverUrl].tokens?.access_token).toBe("flow-token");
+      // A context shared across calls would merge the reads of overlapping refreshes.
+      const second = await refreshOnce();
+      expect(second.every((ctx) => ctx === second[0])).toBe(true);
+      expect(second[0]).not.toBe(first[0]);
     });
   });
 
@@ -1936,7 +1981,8 @@ describe("McpOauthService OAuth flows", () => {
   const signInWithGrant = async (
     grant: Record<string, unknown>,
     oauth: MCPServerOAuthConfig,
-    check: (serverUrl: string, result: Result<void, string>) => Promise<void>
+    check: (serverUrl: string, result: Result<void, string>) => Promise<void>,
+    beforeSignIn?: (serverUrl: string) => void
   ): Promise<void> => {
     const server = createServer((req, res) => {
       const pathname = (req.url ?? "/").split("?")[0];
@@ -1961,6 +2007,7 @@ describe("McpOauthService OAuth flows", () => {
       spyOn(mcpConfigService, "listServers").mockResolvedValue({
         docs: { transport: "http", url: serverUrl, disabled: true, oauth },
       });
+      beforeSignIn?.(serverUrl);
       const start = await service.startServerFlow({
         projectPath,
         serverName: "docs",
@@ -1989,6 +2036,35 @@ describe("McpOauthService OAuth flows", () => {
       );
       expect(await service.hasAuthTokens({ serverUrl })).toBe(false);
     });
+  });
+
+  test("a new sign-in ends the insufficient_scope prompt (#6622)", async () => {
+    const oauth = { clientId: "c", baseScopes: ["read"] };
+    await signInWithGrant(
+      { scope: "read files.write" },
+      oauth,
+      async (serverUrl, result) => {
+        expect(result.success).toBe(true);
+        expect(
+          (await service.getAuthStatus({ serverUrl, oauth })).insufficientScopes
+        ).toBeUndefined();
+      },
+      (serverUrl) => service.recordInsufficientScope({ serverUrl, scopes: ["files.write"] })
+    );
+  });
+
+  test("a recorded insufficient_scope prompt notifies subscribers until they unsubscribe (#6739)", () => {
+    // Mounted Settings rows refresh on this signal, keyed like getAuthStatus.
+    const keys: string[] = [];
+    const unsubscribe = service.onInsufficientScope((key) => keys.push(key));
+    service.recordInsufficientScope({
+      serverUrl: "https://x.example/mcp/",
+      scopes: ["files.write"],
+    });
+    expect(keys).toEqual(["https://x.example/mcp"]);
+    unsubscribe();
+    service.recordInsufficientScope({ serverUrl: "https://x.example/mcp", scopes: ["admin"] });
+    expect(keys).toHaveLength(1);
   });
 
   test("a sign-in whose server renames the granted scopes stays signed in (#6564)", async () => {
