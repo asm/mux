@@ -22,10 +22,11 @@
  * that this process runs for the job, on a unix socket that the container gets read-only. The
  * provider key stays here, and BUGBASH_BUDGET_USD caps the spend at list price (not a billing
  * cap: the upstream key's own limit is the backstop); run.ts shares one budget across its jobs.
- * The proxy writes one record per call to `<output>.proxy.jsonl` on the host only. In an explore
- * job with the real app AI (run.ts resolves it with probeApp()), the app reaches
- * BUGBASH_APP_MODEL through the same proxy. The host pause still refuses every model-driven run
- * on the host. There is no host fallback.
+ * The proxy writes one record per call to `<output>.proxy.jsonl` on the host only, and a job with
+ * its own budget writes its spend (settled costs plus kept reservations) to `<output>.spend.json`
+ * at the end. In an explore job with the real app AI (run.ts resolves it with probeApp()), the
+ * app reaches BUGBASH_APP_MODEL through the same proxy. The host pause still refuses every
+ * model-driven run on the host. There is no host fallback.
  * Exit codes: the job's code, 2 refused, 3 the container state is unknown after cleanup, 4 the
  * evidence is incomplete, 5 the proxy reported a fault (a call cost more than its bound, or a
  * call outlived close()), 6 the job itself exited 3 (e2e's infrastructure error, moved so that 3
@@ -480,7 +481,7 @@ function checkJob(args: string[], o: LaunchOptions) {
     o.env.BUGBASH_SANDBOX_BUILD_STALE === "1" && (selfCheck || (exactStep && !agentRepros));
   // The job's folder: its cwd in the container, and where its output comes back.
   const dir = stories ? storiesDir : bugbash;
-  return { dir, drivenRun, selfCheck, ai, driven, localBuild };
+  return { dir, drivenRun, selfCheck, ai, driven, localBuild, stories };
 }
 
 /** A job's checks and the Docker check, with no job: `--preflight` (Makefile, before the build). */
@@ -492,11 +493,12 @@ export async function preflight(args: string[], o: LaunchOptions): Promise<Clean
 /** Runs one job. A refusal before any docker command is thrown; anything later is returned. */
 export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOutcome> {
   const log = o.log ?? logLine;
-  const { dir, drivenRun, selfCheck, ai, driven, localBuild } = checkJob(args, o);
+  const { dir, drivenRun, selfCheck, ai, driven, localBuild, stories } = checkJob(args, o);
   const output = outputDir(args);
   const dest = path.join(dir, output);
   const records = `${dest}.proxy.jsonl`;
-  for (const file of [dest, records])
+  const spendFile = `${dest}.spend.json`;
+  for (const file of [dest, records, spendFile])
     if (fs.lstatSync(file, { throwIfNoEntry: false }) != null)
       throw new Refusal(`${path.relative(dir, file)} exists: remove it first`);
   const mounts = () =>
@@ -518,6 +520,8 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
   let recordFault: string | undefined;
   /** The model-driven run's probe proxy fault: its own proxy, closed before the job's starts. */
   let probeFault: string | undefined;
+  /** The probe's call outcomes: it charges the job's ledger through a proxy of its own. */
+  const probeCounts = { settled: 0, kept: 0, refused: 0, released: 0 };
   // The first proxy fault stops this job at once (its proxy closes with the lifeline), so no
   // more paid calls go out on a wrong cost model or without a record.
   let faulted = false;
@@ -577,7 +581,7 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
     }
     made = true;
     const staged = path.join(jobDir, "stage");
-    log(`${name} staged ${stage(o.root, staged)} files`);
+    log(`${name} staged ${stage(o.root, staged, { cacheSeed: stories })} files`);
     const nonce = crypto.randomUUID();
     fs.writeFileSync(path.join(staged, ".sandbox-nonce"), nonce, { flag: "wx" });
     const [uid, gid] = [process.getuid!(), process.getgid!()];
@@ -608,7 +612,12 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
         fault(probeFault);
         throw error;
       });
-      for (const entry of probe.records) record(entry);
+      for (const entry of probe.records) {
+        record(entry);
+        const outcome = "outcome" in entry ? entry.outcome : undefined;
+        if (typeof outcome === "string" && outcome in probeCounts)
+          probeCounts[outcome as keyof typeof probeCounts] += 1;
+      }
       if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
       if (probe.status !== 200)
         throw new Refusal(
@@ -713,6 +722,29 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
       `${name} proxy: ${settled} settled, ${kept} kept in full, ${refused} refused ` +
         `${JSON.stringify(refusedBy)}${spent}`
     );
+    // The job's spend as a file beside its proxy record, which holds only reservations. Only
+    // with the job's own ledger: a shared ledger's totals are the run's (run.ts). No key or URL.
+    // The counts add the probe's calls, as spentUsd does (both are in the proxy record).
+    if (!o.ledger) {
+      const spend = {
+        spentUsd: spentNanoUsd / 1e9,
+        capUsd: capNanoUsd / 1e9,
+        settled: settled + probeCounts.settled,
+        kept: kept + probeCounts.kept,
+        refused: refused + probeCounts.refused,
+        released: released + probeCounts.released,
+        refusedBy,
+      };
+      try {
+        fs.writeFileSync(spendFile, `${JSON.stringify(spend, null, 2)}\n`, {
+          mode: 0o600,
+          flag: "wx",
+        });
+      } catch (error) {
+        // The errno code only: the message can hold the path. Cleanup must still run.
+        log(`${name} spend: not written (${(error as NodeJS.ErrnoException).code ?? "error"})`);
+      }
+    }
   }
   const cleanup = await session.cleanup();
   if (made) fs.rmSync(jobDir, { recursive: true, force: true });
