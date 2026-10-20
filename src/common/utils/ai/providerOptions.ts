@@ -53,6 +53,7 @@ import {
   openaiModelSupportsServiceTier,
   openaiServiceTierAvailable,
 } from "./openaiProviderOptionsAvailability";
+import { isFirstPartyAnthropicBaseUrl } from "./anthropicFastMode";
 import { openaiCyberAccessProgram } from "./cyberMode";
 import { openaiProModeAvailable } from "./proMode";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
@@ -439,6 +440,40 @@ export function anthropicBetweenToolsRouteAvailable(
     );
   }
   return routeProvider === "coder" && anthropicTypedCoderRoute(modelString, providersConfig);
+}
+
+/**
+ * Whether Anthropic's native web_fetch (a server tool) can go on this route (#2922). Only the
+ * first-party API runs it: Vertex, Bedrock and Anthropic-compatible proxies (LiteLLM and
+ * others) reject the whole request on the unknown tool type. Unlike between_tools, a proxy
+ * that forwards fields verbatim is not enough, so a non-first-party base URL withholds it, and
+ * the model gets Xum's own web_fetch instead. Gateways that forward to the first-party API keep
+ * it: mux-gateway, and a `coder` instance typed exactly "anthropic".
+ */
+export function anthropicNativeWebFetchRouteAvailable(
+  modelString: string,
+  routeProvider: ProviderName | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined
+): boolean {
+  const prefix = modelString.split(":", 1)[0];
+  if (isCustomProviderConfig(providersConfig?.[prefix])) return false;
+  if (routeProvider === "mux-gateway") return true;
+  if (routeProvider === "coder") return anthropicTypedCoderRoute(modelString, providersConfig);
+  // No resolved route is the built-in provider; any other gateway transforms the request.
+  return isBuiltInAnthropicRoute(routeProvider) && anthropicBaseUrlIsFirstParty(providersConfig);
+}
+
+function isBuiltInAnthropicRoute(routeProvider: ProviderName | undefined): boolean {
+  return routeProvider === undefined || routeProvider === "anthropic";
+}
+
+/** True when the built-in Anthropic provider has no base URL or the first-party one. */
+function anthropicBaseUrlIsFirstParty(
+  providersConfig: ProvidersConfigMap | null | undefined
+): boolean {
+  const anthropicConfig = providersConfig?.anthropic;
+  const baseUrl = anthropicConfig?.baseUrlResolved ?? anthropicConfig?.baseUrl;
+  return baseUrl == null || baseUrl.trim() === "" || isFirstPartyAnthropicBaseUrl(baseUrl);
 }
 
 /**
