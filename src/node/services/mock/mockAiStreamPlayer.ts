@@ -43,6 +43,25 @@ const MOCK_TOKENIZER_MODEL = KNOWN_MODELS.GPT.id;
 const TOKENIZE_TIMEOUT_MS = 150;
 let tokenizerFallbackLogged = false;
 let tokenizerUnavailableLogged = false;
+/**
+ * A tokenizer call that missed TOKENIZE_TIMEOUT_MS and is still running (cold tokenizer load or
+ * a busy worker). Until it settles, deltas use the approximate count at once: waiting the full
+ * timeout per delta held the event queue for 150 ms per 25 ms delta, and the throttled partial
+ * write queued behind that backlog (partial.json appeared ~1.9 s into a stream, #7065).
+ */
+let slowTokenizeInFlight: Promise<unknown> | null = null;
+
+function trackSlowTokenize(pending: Promise<unknown>): void {
+  const inFlight = pending.finally(() => {
+    if (slowTokenizeInFlight === inFlight) slowTokenizeInFlight = null;
+  });
+  slowTokenizeInFlight = inFlight;
+}
+
+async function countMockTokens(text: string, context: string): Promise<number> {
+  if (slowTokenizeInFlight !== null) return approximateTokenCount(text);
+  return tokenizeWithMockModel(text, context);
+}
 
 function approximateTokenCount(text: string): number {
   const normalizedLength = text.trim().length;
@@ -66,6 +85,7 @@ async function tokenizeWithMockModel(text: string, context: string): Promise<num
   const fallbackPromise = new Promise<number>((resolve) => {
     timeoutId = setTimeout(() => {
       fallbackUsed = true;
+      trackSlowTokenize(actualPromise);
       resolve(approximateTokens);
     }, TOKENIZE_TIMEOUT_MS);
   });
@@ -973,7 +993,7 @@ export class MockAiStreamPlayer {
       }
       case "reasoning-delta": {
         // Mock streams use the same tokenization logic as real streams for consistency
-        const tokens = await tokenizeWithMockModel(event.text, "reasoning-delta text");
+        const tokens = await countMockTokens(event.text, "reasoning-delta text");
         if (active.cancelled) return;
         const payload: ReasoningDeltaEvent = {
           type: "reasoning-delta",
@@ -998,7 +1018,7 @@ export class MockAiStreamPlayer {
         }
         // Mock streams use the same tokenization logic as real streams for consistency
         const inputText = JSON.stringify(event.args);
-        const tokens = await tokenizeWithMockModel(inputText, "tool-call args");
+        const tokens = await countMockTokens(inputText, "tool-call args");
         if (active.cancelled) return;
         const payload: ToolCallStartEvent = {
           type: "tool-call-start",
@@ -1038,7 +1058,7 @@ export class MockAiStreamPlayer {
         // Mock streams use the same tokenization logic as real streams for consistency
         let tokens: number;
         try {
-          tokens = await tokenizeWithMockModel(event.text, "stream-delta text");
+          tokens = await countMockTokens(event.text, "stream-delta text");
         } catch (error) {
           log.error("tokenize failed for stream-delta", error);
           throw error;
