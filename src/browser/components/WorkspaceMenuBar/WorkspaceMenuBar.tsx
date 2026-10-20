@@ -262,6 +262,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     useUserPreferences(
       (preferences) => preferences.notifications?.notifyOnResponseByWorkspace?.[workspaceId]
     ) ?? false;
+  // Shown in the bell's tooltip and given to screen readers: the icon is the only other cue.
+  const notifyOnResponseLabel = `Notify on all responses: ${notifyOnResponse ? "on" : "off"}`;
   const setNotifyOnResponse = (enabled: boolean) =>
     setWorkspaceNotifyOnResponse(workspaceId, enabled);
 
@@ -306,8 +308,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
 
   // The right sidebar (home of the Timeline tab) is CSS-hidden by a viewport media query and by
-  // the workspace-shell container query. Read its actual computed visibility so the timeline
-  // dialog gate matches the CSS truth (see isWorkspaceRightSidebarHidden).
+  // the workspace-shell container query. Read its actual computed visibility so the full-screen
+  // gate matches the CSS truth (see isWorkspaceRightSidebarHidden).
   const isTimelineSidebarHidden = useCallback((): boolean => {
     if (typeof window === "undefined") {
       return false;
@@ -862,6 +864,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                   )}
                   data-testid="notify-on-response-button"
                   aria-label="Notifications"
+                  // The icon is the only visible state, and a click does not toggle it, so the
+                  // state cannot be aria-pressed (#5761).
+                  aria-description={notifyOnResponseLabel}
                 >
                   {notifyOnResponse ? (
                     <Bell className="h-3.5 w-3.5" />
@@ -877,7 +882,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             <TooltipContent side="bottom" align="end">
               Notifications
               <br />
-              Notify on all responses: {notifyOnResponse ? "on" : "off"}
+              {notifyOnResponseLabel}
               <span className="mobile-hide-shortcut-hints">
                 {" "}
                 ({formatKeybind(KEYBINDS.TOGGLE_NOTIFICATIONS)})
