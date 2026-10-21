@@ -199,10 +199,9 @@ import {
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
 import {
-  focusRightSidebarTab,
+  focusRightSidebarTabWithKeyboard,
   openRightSidebarTool,
   readRightSidebarLayout,
-  requestFocusedTabFocus,
   splitRightSidebarPane,
   updateRightSidebarLayout,
 } from "@/browser/utils/rightSidebarTabFocus";
@@ -435,10 +434,8 @@ const findFirstTerminalSessionTab = (
 
 function focusExistingTerminalTab(workspaceId: string): void {
   const found = findFirstTerminalSessionTab(readRightSidebarLayout(workspaceId).root);
-  if (!found) return;
-  focusRightSidebarTab(workspaceId, found.tab);
   // "Focus Terminal" and Add Tool > Terminal: the terminal takes the keyboard, like other tools.
-  requestFocusedTabFocus(workspaceId);
+  if (found) focusRightSidebarTabWithKeyboard(workspaceId, found.tab);
 }
 
 /**
