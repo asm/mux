@@ -1,7 +1,8 @@
 /**
  * Story: a chat survives trips through Settings. The user sends a message and gets the reply,
- * then opens Settings, visits Models and Providers, and closes it, once by the agent and three
- * more times by exact steps (no model calls). Closing Settings returns to the route it opened
+ * then opens Settings, visits Models and Providers, and closes it: first the agent opens Settings
+ * and Models and exact steps do the rest, then three more trips by exact steps (no model
+ * calls). Closing Settings returns to the route it opened
  * from (RouterContext navigateFromSettings), so the chat, its reply and a working message box
  * must still be there. It replaces the Playwright tests "chat history survives settings
  * navigation" (tests/e2e/scenarios/persistence.spec.ts) and "survives rapid settings navigation"
@@ -31,12 +32,17 @@ test(
     await agent.act(`send the chat message '${MESSAGE}' and wait for the reply`);
     await expect(transcript).toContainText(REPLY, { timeout: 30_000 });
 
-    // Two agent steps, not one: as one step, Haiku 5.5 ran out of turns (TEST_SETUP_FAILED).
+    // One agent step, ending on a screen it can see (Settings open). As one step with the close,
+    // Haiku 5.5 ran out of turns (TEST_SETUP_FAILED).
     await agent.act("open Settings, then open its Models section");
     await expect(settings).toBeVisible();
-    await agent.act("open the Providers section of Settings, then close Settings");
-    await expect(settings).not.toBeVisible();
+    // exact steps: an agent step that ends with "close Settings" ends on an absence. Its replay
+    // ran the taps, the end-state check then handed off, and Haiku 5.5 took the closed dialog for
+    // a step that had not run (2 of 2 PR-lane runs on #7140).
     // The button names of SettingsButton.tsx and SettingsPage.tsx.
+    await settings.getByRole("button", "Providers").tap();
+    await settings.getByRole("button", "Close settings").tap();
+    await expect(settings).not.toBeVisible();
     for (let i = 0; i < 3; i++) {
       await screen.getByTestId("settings-button").tap();
       await expect(settings).toBeVisible();
