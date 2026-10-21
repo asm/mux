@@ -2029,6 +2029,15 @@ export const workspace = {
       }),
       output: ResultSchema(z.void(), z.string()),
     },
+    // Milliseconds until the next heartbeat slot opens; null while the scheduler does not track
+    // the workspace (see HeartbeatService.getMsUntilNextHeartbeat).
+    next: {
+      // Not blank: the service asserts on it, and client input must fail validation instead.
+      input: z.object({
+        workspaceId: z.string().refine((id) => id.trim().length > 0, "workspaceId is blank"),
+      }),
+      output: z.number().nullable(),
+    },
   },
   goalDefaults: {
     // Per-workspace override of the global `goalDefaults` block. `get`
