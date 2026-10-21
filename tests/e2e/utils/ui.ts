@@ -516,8 +516,8 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
    */
   async function openFromNewTab(toolName: string): Promise<void> {
     const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
-    // Tools are opt-in now: wait for either the collapsed expand action or the open strip.
-    const expandButton = page.getByRole("button", { name: /^Expand (right )?sidebar$/ });
+    // Tools are opt-in now: wait for either the collapsed sidebar's toggle or the open strip.
+    const expandButton = page.getByRole("button", { name: "Expand right sidebar", exact: true });
     const menuButton = sidebar.getByRole("button", { name: "All tabs", exact: true }).first();
     await expect(expandButton.or(menuButton)).toBeVisible();
     if (await expandButton.isVisible()) await expandButton.click();
@@ -535,7 +535,15 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
 
   const metaSidebar = {
     async expectVisible(): Promise<void> {
-      await expect(page.getByRole("complementary", { name: "Workspace insights" })).toBeVisible();
+      // Collapsed (a fresh workspace's state), the sidebar is 0px wide and only its toggle shows
+      // (the overview card floats outside the sidebar's box), so either state counts.
+      const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
+      const expandButton = page.getByRole("button", { name: "Expand right sidebar", exact: true });
+      await expect
+        .poll(async () => (await sidebar.isVisible()) || (await expandButton.isVisible()), {
+          message: "neither the expanded right sidebar nor its Expand toggle is visible",
+        })
+        .toBe(true);
     },
 
     async selectTab(label: string): Promise<void> {
