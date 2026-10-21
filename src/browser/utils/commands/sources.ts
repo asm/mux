@@ -195,14 +195,15 @@ import { formatProjectHierarchyLabel, getTopLevelProjectEntries } from "@/common
 import { serverPathLabel } from "@/common/utils/paths";
 import {
   hasTab,
-  openToolFromNewTab,
-  splitFocusedTabset,
   toggleTab,
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
 import {
   focusRightSidebarTab,
+  openRightSidebarTool,
   readRightSidebarLayout,
+  requestFocusedTabFocus,
+  splitRightSidebarPane,
   updateRightSidebarLayout,
 } from "@/browser/utils/rightSidebarTabFocus";
 
@@ -434,7 +435,10 @@ const findFirstTerminalSessionTab = (
 
 function focusExistingTerminalTab(workspaceId: string): void {
   const found = findFirstTerminalSessionTab(readRightSidebarLayout(workspaceId).root);
-  if (found) focusRightSidebarTab(workspaceId, found.tab);
+  if (!found) return;
+  focusRightSidebarTab(workspaceId, found.tab);
+  // "Focus Terminal" and Add Tool > Terminal: the terminal takes the keyboard, like other tools.
+  requestFocusedTabFocus(workspaceId);
 }
 
 /**
@@ -1155,19 +1159,13 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           id: CommandIds.navRightSidebarSplitHorizontal(),
           title: "Right Sidebar: Split Horizontally",
           section: section.navigation,
-          run: () => {
-            updatePersistedState(getRightSidebarCollapsedKey(wsId), false);
-            updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "horizontal"));
-          },
+          run: () => splitRightSidebarPane(wsId, "horizontal"),
         },
         {
           id: CommandIds.navRightSidebarSplitVertical(),
           title: "Right Sidebar: Split Vertically",
           section: section.navigation,
-          run: () => {
-            updatePersistedState(getRightSidebarCollapsedKey(wsId), false);
-            updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "vertical"));
-          },
+          run: () => splitRightSidebarPane(wsId, "vertical"),
         },
         {
           id: CommandIds.navRightSidebarNewTab(),
@@ -1230,10 +1228,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 return;
               }
 
-              // Same as picking the tool in the focused pane's New tab: it takes the New tab's
-              // place, or is selected where it is already open.
-              updatePersistedState(getRightSidebarCollapsedKey(wsId), false);
-              updateRightSidebarLayout(wsId, (s) => openToolFromNewTab(s, s.focusedTabsetId, tool));
+              // Same as picking the tool in the focused pane's New tab, focus included.
+              openRightSidebarTool(wsId, tool);
               // While the sidebar is hidden (phones) that tab cannot be seen, so WorkspaceMenuBar
               // shows it in the full-screen sidebar; with the sidebar visible it ignores the event.
               // "costs" is the Stats tab's id.
