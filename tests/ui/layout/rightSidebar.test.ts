@@ -48,7 +48,7 @@ import {
 } from "@/browser/utils/rightSidebarLayout";
 import type { TabType } from "@/browser/types/rightSidebar";
 import { openRightSidebarTool, splitRightSidebarPane } from "@/browser/utils/rightSidebarTabFocus";
-import { BROWSER_VIEWPORT_ATTR } from "@/browser/utils/ui/keybinds";
+import { BROWSER_VIEWPORT_ATTR, TERMINAL_CONTAINER_ATTR } from "@/browser/utils/ui/keybinds";
 
 const RIGHT_SIDEBAR_SELECTOR = '[role="complementary"][aria-label="Workspace insights"]';
 
@@ -590,6 +590,87 @@ describeIntegration("RightSidebar (UI)", () => {
         const tablist = sidebar.querySelector('[role="tablist"]');
         if (!tablist) throw new Error("Tablist should be visible after expand");
       });
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("Ctrl+Shift+B collapses and expands the sidebar, but not from a terminal", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
+    });
+    const tablist = () => sidebar.querySelector('[role="tablist"]');
+
+    try {
+      await waitFor(() => {
+        if (!tablist()) throw new Error("Tablist should be visible when expanded");
+      });
+
+      const chord = { key: "B", code: "KeyB", ctrlKey: true, shiftKey: true };
+      fireEvent.keyDown(window, chord);
+      await waitFor(() => {
+        if (tablist()) throw new Error("Ctrl+Shift+B should collapse the sidebar");
+      });
+
+      // A focused terminal keeps the key: the sidebar stays collapsed.
+      const terminal = document.createElement("div");
+      terminal.setAttribute(TERMINAL_CONTAINER_ATTR, "");
+      document.body.append(terminal);
+      try {
+        fireEvent.keyDown(terminal, chord);
+      } finally {
+        terminal.remove();
+      }
+      expect(readPersistedState(getRightSidebarCollapsedKey(workspaceId), false)).toBe(true);
+
+      fireEvent.keyDown(window, chord);
+      await waitFor(() => {
+        if (!tablist()) throw new Error("Ctrl+Shift+B should expand the sidebar again");
+      });
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("Ctrl+Shift+B over an overlay is claimed but does not toggle", async () => {
+    const { cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
+    });
+    // Stand-ins for the overlays that block the toggle. The modal's control stops keydown
+    // propagation, as ConfirmationModal's controls do.
+    const overlays: [string, (root: HTMLElement) => void][] = [
+      ["command palette", (root) => root.setAttribute("cmdk-root", "")],
+      ["popover", (root) => root.setAttribute("data-radix-popper-content-wrapper", "")],
+      [
+        "modal that stops propagation",
+        (root) => {
+          root.setAttribute("role", "dialog");
+          root.setAttribute("aria-modal", "true");
+        },
+      ],
+    ];
+
+    try {
+      for (const [name, mark] of overlays) {
+        const root = document.createElement("div");
+        mark(root);
+        const control = document.createElement("button");
+        control.addEventListener("keydown", (e) => e.stopPropagation());
+        root.append(control);
+        document.body.append(root);
+        try {
+          const chord = { key: "B", code: "KeyB", ctrlKey: true, shiftKey: true };
+          // fireEvent returns false when a handler called preventDefault: in a browser, the
+          // chord must not fall through to Chrome's bookmarks bar.
+          expect({ name, notPrevented: fireEvent.keyDown(control, chord) }).toEqual({
+            name,
+            notPrevented: false,
+          });
+          expect(readPersistedState(getRightSidebarCollapsedKey(workspaceId), true)).toBe(false);
+        } finally {
+          root.remove();
+        }
+      }
     } finally {
       await cleanup();
     }
