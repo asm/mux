@@ -316,6 +316,8 @@ interface AgentSkillScanCandidate {
   singleSkillName?: string;
   /** Agent Plugins only: the single skill is a Claude command, `<root>/<name>.md` (claudeCommands.ts). */
   commandSkill?: true | undefined;
+  /** Agent Plugins only: the plugin is skills-only (a generated Skills install): no scripts run. */
+  skillsOnlyPlugin?: true | undefined;
   /** Agent Plugins only: the plugin is a Claude Code package (AgentPluginInfo.claudeFallback). */
   claudePackagePlugin?: true | undefined;
   importedSkills?: string[];
@@ -395,6 +397,7 @@ async function buildPluginScanCandidates(args: {
         pluginName: plugin.name,
         singleSkillName: root.name,
         commandSkill: root.command,
+        skillsOnlyPlugin: plugin.skillsOnly,
         claudePackagePlugin: plugin.claudeFallback,
         importedSkills,
         skillConsent,
@@ -1148,6 +1151,8 @@ export interface ResolvedAgentSkill {
    * of its own, so the `skill://` resolver runs no script for it.
    */
   commandSkill?: true | undefined;
+  /** The skill's plugin is skills-only (AgentPluginInfo.skillsOnly): the resolver runs no script. */
+  skillsOnlyPlugin?: true | undefined;
   /** The skill's plugin is a Claude Code package (AgentPluginInfo.claudeFallback): no script runs. */
   claudePackagePlugin?: true | undefined;
 }
@@ -1157,7 +1162,12 @@ function withPluginName(
   resolved: ResolvedAgentSkill | null,
   candidate: Pick<
     AgentSkillScanCandidate,
-    "pluginName" | "pluginConsent" | "pluginApprovedCopies" | "commandSkill" | "claudePackagePlugin"
+    | "pluginName"
+    | "pluginConsent"
+    | "pluginApprovedCopies"
+    | "commandSkill"
+    | "skillsOnlyPlugin"
+    | "claudePackagePlugin"
   >
 ): ResolvedAgentSkill | null {
   if (resolved == null || candidate.pluginName == null) return resolved;
@@ -1167,6 +1177,7 @@ function withPluginName(
     pluginConsent: candidate.pluginConsent,
     pluginApprovedCopies: candidate.pluginApprovedCopies,
     ...(candidate.commandSkill === true ? { commandSkill: true } : {}),
+    ...(candidate.skillsOnlyPlugin === true ? { skillsOnlyPlugin: true } : {}),
     ...(candidate.claudePackagePlugin === true ? { claudePackagePlugin: true } : {}),
   };
 }

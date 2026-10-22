@@ -191,6 +191,12 @@ async function resolveSkillWorkflowScript(
   if (resolvedSkill.commandSkill === true) {
     throw new Error(`Skill '${parsed.skillName}' is a Claude command and has no workflow scripts`);
   }
+  // A Skills install loads skills only (installMethods.ts): its skills run no workflow scripts.
+  if (resolvedSkill.skillsOnlyPlugin === true) {
+    throw new Error(
+      `Skill '${parsed.skillName}' comes from a skills-only plugin install and has no workflow scripts`
+    );
+  }
   // A Claude Code package runs no Xum code (docs/agents/agent-skills.mdx): no workflow scripts.
   if (resolvedSkill.claudePackagePlugin === true) {
     throw new Error(
