@@ -157,7 +157,10 @@ function readWorkflowSkill(
   const roots = workflowSkillRoots(input);
   const projectSearchRoot = roots?.projectSearchRoot ?? input.projectSearchRoot ?? workspacePath;
   return readAgentSkill(workflowSkillRuntime(input), workspacePath, skillName, {
-    ...(roots != null ? { roots } : { projectSearchRoot }),
+    // #6426: default roots include project plugin skills only in a trusted project.
+    ...(roots != null
+      ? { roots }
+      : { projectSearchRoot, projectPluginsTrusted: input.projectTrusted }),
     containment: workflowSkillContainment(input, projectSearchRoot),
   });
 }
@@ -280,6 +283,7 @@ export async function discoverWorkflowPlugins(input: {
     input.skillStorageContext?.roots ??
     getDefaultAgentSkillsRoots(input.runtime, input.workspacePath, {
       projectSearchRoot: input.projectSearchRoot,
+      projectPluginsTrusted: input.projectTrusted,
     });
   const projectContainmentRoot =
     input.skillStorageContext?.containment.kind === "local"

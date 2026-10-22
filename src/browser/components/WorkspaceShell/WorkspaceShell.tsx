@@ -18,18 +18,16 @@ import { guardSidebarKeys, holdSidebarInput, type HeldSidebarInput } from "./def
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
 import {
   isBrowserViewportFocused,
-  isCommandPaletteTarget,
   isDesktopViewportFocused,
-  isDialogOpen,
   isTerminalFocused,
   KEYBINDS,
   matchesKeybind,
 } from "@/browser/utils/ui/keybinds";
 
 import {
-  focusRightSidebarToggle,
+  isRightSidebarToggleBlocked,
   isWorkspaceRightSidebarHidden,
-  toggleRightSidebarCollapsed,
+  toggleRightSidebarFromKey,
 } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
@@ -54,6 +52,7 @@ import {
 } from "@/constants/layout";
 import { ChatPane } from "../ChatPane/ChatPane";
 import {
+  PinnedViewToolbarSpacerProvider,
   RightSidebarToggle,
   RightSidebarToggleHole,
 } from "../SidebarCollapseButton/SidebarCollapseButton";
@@ -350,33 +349,6 @@ function isRightSidebarToggleChord(e: KeyboardEvent): boolean {
 }
 
 /**
- * True when an overlay blocks the right sidebar toggle: a modal dialog, the command palette (not a
- * modal dialog, bug bash RS1), or a focused popover or menu (Radix portals them out of the sidebar,
- * so a collapse would unmount the control with focus and leave focus on <body>). A held key also
- * blocks it, or it would flip the sidebar on every repeat.
- */
-function isRightSidebarToggleBlocked(e: KeyboardEvent): boolean {
-  return (
-    e.repeat ||
-    isDialogOpen() ||
-    isCommandPaletteTarget(e.target) ||
-    (e.target instanceof Element && e.target.closest("[data-radix-popper-content-wrapper]") != null)
-  );
-}
-
-/**
- * Toggles the right sidebar for its hotkey. A collapse unmounts the focused control, and focus then
- * fell to <body> (bug bash RS3), so focus moves to the header toggle.
- */
-function toggleRightSidebarFromKey(workspaceId: string, shell: HTMLElement | null): void {
-  const sidebar = shell?.querySelector(".mobile-hide-right-sidebar");
-  const focusWasInSidebar = sidebar?.contains(document.activeElement) === true;
-  if (toggleRightSidebarCollapsed(workspaceId, shell) && focusWasInSidebar) {
-    focusRightSidebarToggle(shell);
-  }
-}
-
-/**
  * The right sidebar had no hotkey (user request). It lives in WorkspaceShell, outside the lazy
  * sidebar, so it works while the sidebar chunk loads, like the header toggle. It also works from
  * the chat input, where the chord types nothing, like TOGGLE_SIDEBAR for the left sidebar.
@@ -641,24 +613,28 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
         immersive={isReviewImmersive}
       />
 
-      <LazyRightSidebar
-        held={heldSidebarInput}
-        collapsed={rightSidebarCollapsed}
-        key={props.workspaceId}
-        workspaceId={props.workspaceId}
-        workspacePath={props.namedWorkspacePath}
-        projectPath={props.projectPath}
-        width={sidebarWidth}
-        onStartResize={startResize}
-        isResizing={isResizing}
-        onReviewNote={handleReviewNote}
-        isCreating={props.isInitializing === true}
-        immersiveHidden={isReviewImmersive}
-        addTerminalRef={addTerminalRef}
-        fullscreen={sidebarFullscreen}
-        onCloseFullscreen={closeSidebarFullscreen}
-        onRequestFullscreen={handleRequestSidebarFullscreen}
-      />
+      {/* App's resolved left sidebar state (not the persisted key, whose default App picks at
+          mount) decides whether pinned views in the sidebar reserve the toggle bar's width. */}
+      <PinnedViewToolbarSpacerProvider leftSidebarCollapsed={props.leftSidebarCollapsed}>
+        <LazyRightSidebar
+          held={heldSidebarInput}
+          collapsed={rightSidebarCollapsed}
+          key={props.workspaceId}
+          workspaceId={props.workspaceId}
+          workspacePath={props.namedWorkspacePath}
+          projectPath={props.projectPath}
+          width={sidebarWidth}
+          onStartResize={startResize}
+          isResizing={isResizing}
+          onReviewNote={handleReviewNote}
+          isCreating={props.isInitializing === true}
+          immersiveHidden={isReviewImmersive}
+          addTerminalRef={addTerminalRef}
+          fullscreen={sidebarFullscreen}
+          onCloseFullscreen={closeSidebarFullscreen}
+          onRequestFullscreen={handleRequestSidebarFullscreen}
+        />
+      </PinnedViewToolbarSpacerProvider>
 
       {/* After the sidebar in DOM order: see RightSidebarToggleHole. */}
       <RightSidebarToggleHole />

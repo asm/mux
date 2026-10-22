@@ -127,6 +127,7 @@ export async function summarizeContinuousCompaction(args: {
     agent.data.agentDefinition.id,
     {
       skipScopesAbove: getSkipScopesAboveForKnownScope(agent.data.agentDefinition.scope),
+      projectPluginsTrusted: agent.data.projectPluginsTrusted,
     }
   );
   args.signal.throwIfAborted();

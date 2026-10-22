@@ -166,7 +166,9 @@ export async function buildWorkspaceComposition(
   // roots (no project plugin roots).
   const defaultSkillRoots =
     args.hostCheckoutRoot != null
-      ? getDefaultAgentSkillsRoots(args.runtime, args.workspacePath)
+      ? getDefaultAgentSkillsRoots(args.runtime, args.workspacePath, {
+          projectPluginsTrusted: args.projectTrusted,
+        })
       : undefined;
   const checkoutSkillRoots =
     defaultSkillRoots?.projectPluginRoots != null && args.hostCheckoutRoot != null
@@ -206,6 +208,7 @@ export async function buildWorkspaceComposition(
 
   const agentDescriptors = await discoverAgentDefinitions(args.runtime, args.workspacePath, {
     dedupeById: false,
+    projectPluginsTrusted: args.projectTrusted,
   });
   const agents = markShadowed(
     agentDescriptors.map((agent) => ({

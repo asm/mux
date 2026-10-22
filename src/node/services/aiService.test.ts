@@ -87,8 +87,10 @@ import * as agentResolution from "./agentResolution";
 import * as turnContextAssembler from "./turnContextAssembler";
 import { resolveCompactionInputBudgetTokens } from "./turnRequestBuilder";
 import * as messagePipeline from "./messagePipeline";
+import type { ActiveTurnThinkingOverride } from "./thinkingOverride";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
+import { compactToolInputSchema } from "@/node/services/toolSchemaCompactionMiddleware";
 import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
@@ -360,6 +362,7 @@ function resolvedAgentResultFor(
       shouldDisableTaskToolsForDepth: false,
       effectiveToolPolicy: undefined,
       switchableAgents: undefined,
+      projectPluginsTrusted: false,
     },
   };
 }
@@ -5151,22 +5154,31 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         label: "root exec",
         agentId: "exec",
         overrides: {},
-        toolChars: 47_100,
-        systemChars: 7_100,
+        toolChars: 46_000,
+        systemChars: 6_500,
       },
       {
         label: "explore sub-agent",
         agentId: "explore",
         overrides: { parentWorkspaceId: "parent-workspace", agentId: "explore" },
-        toolChars: 26_800,
+        toolChars: 26_500,
         systemChars: 6_500,
       },
       {
         label: "exec sub-agent",
         agentId: "exec",
         overrides: { parentWorkspaceId: "parent-workspace", agentId: "exec" },
-        toolChars: 42_900,
-        systemChars: 8_900,
+        toolChars: 42_000,
+        systemChars: 8_300,
+      },
+      {
+        label: "root scratch",
+        agentId: "exec",
+        overrides: { kind: "scratch" as const },
+        toolChars: 43_800,
+        systemChars: 6_700,
+        // A scratch chat has no repository, and its sub-agents never return patches.
+        absentTools: ["review_pane_get", "review_pane_update", "task_apply_git_patch"],
       },
     ];
 
@@ -5183,7 +5195,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     it.each(SCENARIOS)(
       "keeps the $label tool block and system prompt within budget",
-      async ({ agentId, overrides, toolChars, systemChars }) => {
+      async ({ agentId, overrides, toolChars, systemChars, absentTools = [] }) => {
         using xumHome = new DisposableTempDir("ai-service-size-budget");
         process.env.XUM_ROOT = xumHome.path;
         process.env.HOME = xumHome.path;
@@ -5240,19 +5252,31 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         });
         expect(result.success).toBe(true);
         const request = harness.startStreamCalls.at(-1)!;
+        expect(
+          Object.keys(request.tools ?? {}).filter((name) => absentTools.includes(name))
+        ).toEqual([]);
 
-        // Wire size per tool: name, description and input schema as sent.
-        const perTool = Object.entries(request.tools ?? {})
-          .filter(([, t]) => t.providerOptions?.anthropic?.deferLoading !== true)
-          .map(([name, t]) => ({
-            name,
-            chars:
-              name.length +
-              (t.description ?? "").length +
-              JSON.stringify(t.type === "provider" ? t.args : asSchema(t.inputSchema).jsonSchema)
-                .length,
-          }))
-          .sort((a, b) => b.chars - a.chars);
+        // Wire size per tool: name, description and input schema as sent to Anthropic.
+        const perTool = (
+          await Promise.all(
+            Object.entries(request.tools ?? {})
+              .filter(([, t]) => t.providerOptions?.anthropic?.deferLoading !== true)
+              .map(async ([name, t]) => ({
+                name,
+                chars:
+                  name.length +
+                  (t.description ?? "").length +
+                  JSON.stringify(
+                    t.type === "provider"
+                      ? t.args
+                      : compactToolInputSchema(
+                          { name, inputSchema: await asSchema(t.inputSchema).jsonSchema },
+                          { anthropicWire: true }
+                        )
+                  ).length,
+              }))
+          )
+        ).sort((a, b) => b.chars - a.chars);
         const measuredToolChars = perTool.reduce((sum, t) => sum + t.chars, 0);
         const measuredSystemChars = request.messages
           .filter((message) => message.role === "system")
@@ -6508,7 +6532,7 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
       expect(result.success).toBe(true);
       return startStreamCalls.at(-1)!;
     };
-    return { workspaceId, mcp, send, service, config };
+    return { workspaceId, mcp, send, service, config, historyService };
   }
 
   const hotTail = (text: string) => `\n\n<hot_memories>${text}</hot_memories>`;
@@ -6657,6 +6681,117 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
     // The step-0 rebuild returns its record too, for StreamManager to apply.
     const rebuilt = await unfolded.rebuildFirstStepForThinkingLevel!("off", {});
     expect(rebuilt.volatileSystemTail).toEqual({ text: hotTail("B"), placement: "row" });
+  });
+
+  // The fold runs before the placeholder append (#5286). A change written while that append's
+  // file I/O runs must still reach the messages, as when the fold ran after the append.
+  it("folds a thinking change written while the assistant placeholder is appended", async () => {
+    using xumHome = new DisposableTempDir("ai-service-fold-during-append");
+    const { send, historyService, workspaceId } = await setup(xumHome);
+    const history = [
+      createMuxMessage("u1", "user", "first"),
+      createMuxMessage("a1", "assistant", "answer", {
+        volatileSystemTail: { text: hotTail("A"), placement: "system" },
+      }),
+      createMuxMessage("u2", "user", "second"),
+      createMuxMessage(
+        "r0",
+        "assistant",
+        "",
+        { volatileSystemTail: { text: hotTail("B"), placement: "row" } },
+        [{ type: "reasoning", text: "thinking", signature: "sig-r0" }]
+      ),
+      createMuxMessage("u3", "user", "third"),
+    ];
+    const override: ActiveTurnThinkingOverride = {};
+    // The real append writes the placeholder. The change lands while its file I/O is in flight.
+    spyOn(historyService, "appendToHistory").mockRestore();
+    const realAppend = historyService.appendToHistory.bind(historyService);
+    spyOn(historyService, "appendToHistory").mockImplementation((appendWorkspaceId, message) => {
+      const appended = realAppend(appendWorkspaceId, message);
+      if (message.role === "assistant") override.pending = "off";
+      return appended;
+    });
+    const call = await send(history, "B", {
+      modelString: KNOWN_MODELS.HAIKU.id,
+      activeTurnThinkingOverride: override,
+    });
+    expect(override).toEqual({ applied: "off" });
+    expect(call.thinkingLevel).toBe("off");
+    // At "off" the reasoning-only row is dropped, so the request appends row B again.
+    expect(call.messages.at(-1)?.role).toBe("system");
+    const persisted = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!persisted.success) throw new Error(persisted.error);
+    const placeholder = persisted.data.find((row) => row.id === call.messageId);
+    expect(placeholder?.role).toBe("assistant");
+    expect(placeholder?.metadata?.historySequence).toBeNumber();
+  });
+
+  it("a stop during the placeholder append skips the refold and deletes the placeholder", async () => {
+    using xumHome = new DisposableTempDir("ai-service-stop-during-append");
+    const { service, historyService, workspaceId } = await setup(xumHome);
+    const controller = new AbortController();
+    const override: ActiveTurnThinkingOverride = {};
+    spyOn(historyService, "appendToHistory").mockRestore();
+    const realAppend = historyService.appendToHistory.bind(historyService);
+    spyOn(historyService, "appendToHistory").mockImplementation((appendWorkspaceId, message) => {
+      const appended = realAppend(appendWorkspaceId, message);
+      if (message.role === "assistant") {
+        override.pending = "off";
+        controller.abort();
+      }
+      return appended;
+    });
+    const assemblies = spyOn(turnContextAssembler, "assemblePromptPayload");
+    try {
+      const result = await service.streamMessage({
+        messages: [createMuxMessage("u1", "user", "first")],
+        workspaceId,
+        modelString: KNOWN_MODELS.HAIKU.id,
+        thinkingLevel: "high",
+        abortSignal: controller.signal,
+        activeTurnThinkingOverride: override,
+      });
+      // The stopped turn returns its aborted handle: no refold ran, the pending level stays.
+      expect(result.success).toBe(true);
+      expect(override).toEqual({ pending: "off" });
+      expect(assemblies).toHaveBeenCalledTimes(1);
+    } finally {
+      assemblies.mockRestore();
+    }
+    const persisted = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!persisted.success) throw new Error(persisted.error);
+    expect(persisted.data.filter((row) => row.role === "assistant")).toEqual([]);
+  });
+
+  it("a turn stopped before start folds no pending thinking change", async () => {
+    using xumHome = new DisposableTempDir("ai-service-fold-after-stop");
+    const { service, workspaceId } = await setup(xumHome);
+    const controller = new AbortController();
+    const options = {
+      messages: [createMuxMessage("u1", "user", "first")],
+      workspaceId,
+      modelString: KNOWN_MODELS.HAIKU.id,
+      thinkingLevel: "high" as const,
+      abortSignal: controller.signal,
+    };
+    const candidate = await service.prepareStreamMessage(options);
+    if (!candidate.success) throw new Error(JSON.stringify(candidate.error));
+    await using request = candidate.data;
+    controller.abort();
+    const override: ActiveTurnThinkingOverride = { pending: "off" };
+    const assemblies = spyOn(turnContextAssembler, "assemblePromptPayload");
+    try {
+      expect(
+        (await request.start({ ...options, activeTurnThinkingOverride: override })).success
+      ).toBe(true);
+      // Only the admission re-assembly ran: the stopped turn neither rebuilt nor consumed the
+      // pending level.
+      expect(assemblies).toHaveBeenCalledTimes(1);
+      expect(override).toEqual({ pending: "off" });
+    } finally {
+      assemblies.mockRestore();
+    }
   });
 
   it("sends as before when middleware edited a volatile section", async () => {

@@ -16011,6 +16011,8 @@ export class AgentSession {
       options: {
         ...(skillCtx != null ? { roots: skillCtx.roots, containment: skillCtx.containment } : {}),
         includeClaudeSkills,
+        // #6426: the default roots (no storage context) add project plugins only when trusted.
+        projectPluginsTrusted: isWorkspaceProjectTrusted(this.config, args.metadata),
       },
     };
   }
