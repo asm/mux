@@ -56,6 +56,9 @@ from tree_sitter_language_pack import get_parser
 # Reuse the CRAP gate's production-file rule and LCOV reader.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "crap"))
 from crapper_report import is_production, load_coverage  # noqa: E402
+from markers import Comments  # noqa: E402
+
+MARKER = "mutation-equivalent"
 
 MAX_TEST_FILES = 10
 TIMEOUT_FACTOR = 10  # mutator's default: a mutant gets 10x the baseline,
@@ -351,6 +354,24 @@ def run_all(
         return list(pool.map(one, sites))
 
 
+def accept_marked(root: Path, rows: list[dict]) -> None:
+    """A survivor under a `mutation-equivalent:` marker (markers.py) becomes
+    "equivalent", with the marker's reason. Only survivors: a marked mutant that
+    a test kills is still reported as killed."""
+
+    cache: dict[str, Comments] = {}
+    for result in rows:
+        if result["outcome"] != "survived":
+            continue
+        if result["path"] not in cache:
+            source = (root / result["path"]).read_bytes().decode("utf-8")
+            cache[result["path"]] = Comments(source, result["path"])
+        reason = cache[result["path"]].reason(result["line"], result["line"], MARKER)
+        if reason is not None:
+            result["outcome"] = "equivalent"
+            result["reason"] = reason
+
+
 def baselines(
     tests: list[str], free: Queue, worker_count: int, deadline: float, runner=run_test
 ) -> tuple[dict[str, float], list[dict]]:
@@ -469,6 +490,7 @@ def main(argv: list[str]) -> int:
             plan[source] = [t for t in plan[source] if t in timeouts]
         rows += run_all(root, budget, plan, free, len(workers), timeouts, deadline)
 
+    accept_marked(root, rows)
     rows.sort(key=lambda r: (r["path"], r["line"], r["original"], r["mutant"]))
     report = {
         "mutants": rows,

@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "crap"))
 
 from dryer_report import Form, base_line, keyed, new_pairs  # noqa: E402
 
@@ -131,6 +132,28 @@ def test_a_new_copy_with_the_name_of_an_old_match_is_reported():
     assert names(pairs) == [("@1", "@27"), ("@1", "@8")]
 
 
+def test_a_marker_needs_a_reason_and_sits_in_or_right_above_the_span():
+    from markers import Comments
+
+    def marker_reason(lines, first, last, marker):
+        return Comments("\n".join(lines), "a.ts").reason(first, last, marker)
+
+    lines = [
+        "const a = 1;",  # 1
+        "/**",  # 2
+        " * dry-duplicate-ok: v1 and v2 parsers must change apart",  # 3
+        " */",  # 4
+        "export function parse() {",  # 5
+        "  return 1; // dry-duplicate-ok:",  # 6, no reason
+        "}",  # 7
+        "// dry-duplicate-ok: far away",  # 8
+    ]
+    assert marker_reason(lines, 5, 7, "dry-duplicate-ok") == "v1 and v2 parsers must change apart"
+    assert marker_reason(lines, 6, 7, "dry-duplicate-ok") is None  # line 6 has no reason, 5 is code
+    assert marker_reason(lines, 1, 1, "dry-duplicate-ok") is None
+    assert marker_reason(["x; /* mutation-equivalent: never empty */"], 1, 1, "mutation-equivalent") == "never empty"
+
+
 def test_a_new_copy_is_reported_when_the_original_stays():
     # Same as above, but the original stays in its file: a copy, not a move.
     copy = form("src/b.ts", "@1", 1, SHAPE)
@@ -159,6 +182,43 @@ def test_naming_parses_each_reported_file_once(monkeypatch):
     side = lambda line: {"path": "src/a.ts", "name": f"@{line}", "startLine": line}
     dryer_report.name_reported(Path("."), [{"left": side(1), "right": side(9)} for _ in range(5)])
     assert calls == ["src/a.ts"]
+
+
+def test_marker_text_inside_a_string_is_not_a_marker():
+    from markers import Comments
+
+    def marker_reason(lines, first, last, marker):
+        return Comments("\n".join(lines), "a.ts").reason(first, last, marker)
+
+    lines = [
+        'const help = "// mutation-equivalent: example";',  # 1: a string, not a comment
+        "const url = 'http://x/* dry-duplicate-ok: no */';",  # 2: a string, not a comment
+        'const s = "a"; // mutation-equivalent: real reason',  # 3: a real comment after a string
+        "const t = `x ${y}`; /* dry-duplicate-ok: block comment */",  # 4: a template, then a comment
+    ]
+    assert marker_reason(lines, 1, 1, "mutation-equivalent") is None
+    assert marker_reason(lines, 2, 2, "dry-duplicate-ok") is None
+    assert marker_reason(lines, 3, 3, "mutation-equivalent") == "real reason"
+    assert marker_reason(lines, 4, 4, "dry-duplicate-ok") == "block comment"
+
+
+def test_a_marker_is_a_whole_token_and_a_jsx_comment_counts():
+    from markers import Comments
+
+    def marker_reason(lines, first, path="a.ts"):
+        return Comments("\n".join(lines), path).reason(first, first, "mutation-equivalent")
+
+    assert marker_reason(["x; // no-mutation-equivalent: not actually equivalent"], 1) is None
+    assert marker_reason(["x; // see mutation-equivalent: a reason"], 1) == "a reason"
+    jsx = [
+        "const v = (",  # 1
+        "  <div>",  # 2
+        "    {/* mutation-equivalent: the label is never empty */}",  # 3
+        "    {label || 'none'}",  # 4
+        "  </div>",  # 5
+        ");",  # 6
+    ]
+    assert marker_reason(jsx, 4, "a.tsx") == "the label is never empty"
 
 
 def test_a_function_rewritten_line_for_line_keeps_its_old_pairs_quiet():
