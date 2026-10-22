@@ -100,6 +100,7 @@ describe("AgentPluginInstallService install methods", () => {
     const preview = await service.preview({ input: remoteDir });
     expect(preview.method).toEqual({ kind: "skills" });
     expect(preview.methods).toEqual([{ kind: "skills" }]);
+    expect(preview.skillsCliSkills).toEqual(["alpha", "beta"]);
     expect(preview.manifest.name).toBe("acme-skills");
     expect(preview.skills.map((skill) => skill.name)).toEqual(["alpha", "beta"]);
     expect(preview.hook).toBeUndefined();
@@ -120,10 +121,11 @@ describe("AgentPluginInstallService install methods", () => {
       extensions: { mux: { generatedFrom: { kind: "skills" } } },
     });
 
-    // The generated name collides like any plugin name: the preview names the collision, and
-    // install refuses it.
+    // The generated name collides like any plugin name, but only the managed install: the
+    // preview still lists the method and the Skills CLI names (the CLI creates no plugin).
     const again = await service.preview({ input: remoteDir });
     expect(again.methods).toEqual([{ kind: "skills" }]);
+    expect(again.skillsCliSkills).toEqual(["alpha", "beta"]);
     expect(again.installBlockedReason).toBe(
       "A managed plugin named 'acme-skills' is already installed. Uninstall it first."
     );
@@ -135,6 +137,40 @@ describe("AgentPluginInstallService install methods", () => {
         expectedConsentDigest: again.consentDigest,
       })
     ).rejects.toThrow("A managed plugin named 'acme-skills' is already installed");
+  });
+
+  test("the Skills CLI choice names each skill by its frontmatter name, also a root skill", async () => {
+    // The CLI matches --skill against the frontmatter name, not the repository or folder name.
+    await fsPromises.rm(path.join(remoteDir, "skills"), { recursive: true });
+    await write({ "SKILL.md": skillMd("pdf") });
+    await commit("root skill");
+    expect((await service.preview({ input: remoteDir })).skillsCliSkills).toEqual(["pdf"]);
+
+    // A name that is not a valid skill name cannot be passed safely: no CLI choice for it.
+    await write({ "SKILL.md": skillMd("PDF Tools") });
+    await commit("display name");
+    expect((await service.preview({ input: remoteDir })).skillsCliSkills).toEqual([]);
+  });
+
+  test("two skill folders with one SKILL.md name are both left out of the Skills CLI choice", async () => {
+    // --skill alpha would install both copies under one name: a later one could replace alpha.
+    await write({ ".agents/skills/alpha-copy/SKILL.md": skillMd("alpha") });
+    await commit("second alpha");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.skillsCliSkills).toEqual(["beta"]);
+    expect(preview.warnings).toContain(
+      "Skills CLI: more than one skill folder has the SKILL.md name 'alpha', so the Skills CLI choice leaves it out"
+    );
+  });
+
+  test("one skill folder found twice counts once for the Skills CLI choice", async () => {
+    // skills/SKILL.md is both a root child folder and the skills container itself.
+    await fsPromises.rm(path.join(remoteDir, "skills"), { recursive: true });
+    await write({ "skills/SKILL.md": skillMd("skills") });
+    await commit("one skill at skills/SKILL.md");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.skillsCliSkills).toEqual(["skills"]);
+    expect(preview.warnings.join("\n")).not.toContain("more than one skill folder");
   });
 
   test("install refuses a method that does not fit its clone", async () => {
@@ -172,6 +208,8 @@ describe("AgentPluginInstallService install methods", () => {
     await commit("own manifest");
     const own = await service.preview({ input: remoteDir });
     expect(own.methods).toEqual([{ kind: "agent-plugin" }]);
+    // The Skills CLI choice still gets the skill names.
+    expect(own.skillsCliSkills).toEqual(["alpha", "beta"]);
   });
 
   test("a preview without a method skips an invalid Claude manifest and names it", async () => {

@@ -81,6 +81,7 @@ import {
   type AgentPluginDiagnostic,
   type AgentPluginInfo,
   listPluginSkillFolders,
+  resolveDeclaredSkillsRoots,
   type PluginSkillsRoot,
 } from "./discovery";
 import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
@@ -91,8 +92,10 @@ import {
   installMethodRequest,
   noInstallMethodMessage,
   readInstalledGeneratedFrom,
+  skillsCliSkillNames,
   writeGeneratedManifest,
   type InstallMethodRequest,
+  type SkillsPackageRoot,
 } from "./installMethods";
 import { pluginSkillMarkdown } from "./claudeCommands";
 import { listPluginAgentFiles, type PluginAgentFile } from "./agentFiles";
@@ -850,7 +853,11 @@ interface ResolvedRemoteRef {
   sha: string;
 }
 
-function gitEnv(): Record<string, string> {
+/**
+ * The Git environment of every staging clone, fetch and checkout. `ambient` is the environment
+ * the Git process inherits: its GIT_SSH_COMMAND (a custom identity, proxy or wrapper) is kept.
+ */
+function gitEnv(ambient: NodeJS.ProcessEnv = process.env): Record<string, string> {
   // Fail fast instead of hanging on credential prompts: installs run from the
   // UI with no terminal attached (acceptance: "private repo without auth" must
   // fail cleanly).
@@ -883,9 +890,8 @@ function gitEnv(): Record<string, string> {
     GIT_CONFIG_SYSTEM: os.devNull,
     ...GIT_NO_HOOKS_ENV,
   };
-  if (process.env.GIT_SSH_COMMAND === undefined) {
-    env.GIT_SSH_COMMAND = "ssh -oBatchMode=yes";
-  }
+  const sshCommand = ambient.GIT_SSH_COMMAND;
+  env.GIT_SSH_COMMAND = sshCommand ?? "ssh -oBatchMode=yes";
   return env;
 }
 
@@ -2537,6 +2543,7 @@ export class AgentPluginInstallService {
     warnings: string[];
     method: AgentPluginInstallMethod;
     methods: AgentPluginInstallMethod[];
+    skillsCliSkills: string[];
   }> {
     // Every manifest candidate, and the generated plugin.json, lives in the staged tree the
     // consent receipt hashes.
@@ -2610,12 +2617,50 @@ export class AgentPluginInstallService {
       }
       throw new Error(problem);
     }
+    const cli = await skillsCliSkillNames(stagedDir, detected.skillsRoots);
     return {
       plugin,
-      warnings: [...generatedWarnings, ...diagnostics.map((d) => d.message)],
+      warnings: [...generatedWarnings, ...diagnostics.map((d) => d.message), ...cli.warnings],
       method,
       methods: detected.methods,
+      skillsCliSkills: await this.acceptedSkillsCliNames(
+        stagedDir,
+        detected.skillsRoots,
+        cli.names
+      ),
     };
+  }
+
+  /**
+   * The Skills CLI names whose SKILL.md the preview accepts (collectSkills): the CLI would copy
+   * a rejected skill, for example one with a description over the limit, but Xum never loads it.
+   */
+  private async acceptedSkillsCliNames(
+    stagedDir: string,
+    roots: SkillsPackageRoot[],
+    names: string[]
+  ): Promise<string[]> {
+    if (names.length === 0) return names;
+    // A root SKILL.md makes the repository one skill, and its frontmatter name
+    // (skillsCliSkillNames) is then the only name. The other roots never use pluginName. A skill
+    // whose frontmatter name is not its folder name drops out here: Xum knows it by the folder.
+    const accepted = await this.acceptedSkillNames(stagedDir, {
+      declared: roots.map((root) => root.root),
+      pluginName: names[0],
+    });
+    return names.filter((name) => accepted.has(name));
+  }
+
+  /** The skills that the preview accepts from a manifest `skills` value in `pluginDir`. */
+  private async acceptedSkillNames(
+    pluginDir: string,
+    skills: { declared: string | string[] | undefined; pluginName: string }
+  ): Promise<Set<string>> {
+    const rootPath = await fsPromises.realpath(pluginDir);
+    const skillsDirs = await resolveDeclaredSkillsRoots({ pluginDir: rootPath, ...skills });
+    // Warnings belong to a preview of these skills, not to this count.
+    const collected = await this.collectSkillsFromRoots({ rootPath, skillsDirs }, []);
+    return new Set(collected.map((skill) => skill.name));
   }
 
   /**
@@ -3276,14 +3321,14 @@ export class AgentPluginInstallService {
     const resolved = await this.resolveRemoteRef(parsed.url, ref);
     const { dir: stagedDir, sha } = await this.cloneResolved(parsed.url, resolved, subpath);
     try {
-      const { plugin, warnings, method, methods } = await this.validateStagedClone(
+      const { plugin, warnings, method, methods, skillsCliSkills } = await this.validateStagedClone(
         stagedDir,
         { url: parsed.url, subpath },
         installMethodRequest(args.method)
       );
       const targetPath = this.targetPathFor(plugin.name);
-      // A name collision blocks only the install of this method: the preview still lists the
-      // other methods.
+      // A name collision blocks only the managed install of this method: the preview still lists
+      // the other methods and the Skills CLI choice, which creates no managed plugin.
       const installBlockedReason = await this.collisionReason(plugin.name);
 
       const skills = await this.collectSkillsFromRoots(plugin, warnings);
@@ -3344,6 +3389,7 @@ export class AgentPluginInstallService {
         source,
         method,
         methods,
+        skillsCliSkills,
         installBlockedReason,
         lockedSha: sha,
         manifest: {

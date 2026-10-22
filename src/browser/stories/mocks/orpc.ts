@@ -1438,6 +1438,19 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
               error: "No preview configured in this story",
             });
       },
+      // Like the backend's command, from the typed source (the backend normalizes it first).
+      skillsCliCommand: (input: { source: string; skills: string[] }) =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            command: [
+              "npx --yes skills@1.7.4 add",
+              input.source,
+              ...input.skills.map((skill) => `--skill ${skill}`),
+              "--global --agent codex --copy",
+            ].join(" "),
+          },
+        }),
       install: (input: { source: AgentPluginInstallPreview["source"]; expectedSha: string }) =>
         Promise.resolve({
           success: true,

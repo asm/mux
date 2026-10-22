@@ -17,6 +17,7 @@ import YAML from "yaml";
 
 import { AGENT_PLUGIN_INSTALL_METHOD_LABELS } from "@/common/constants/agentPluginInstallMethods";
 import type { AgentPluginGitSource } from "@/common/config/schemas/agentPluginInstalls";
+import { SkillNameSchema } from "@/common/orpc/schemas";
 import type { AgentPluginInstallMethod } from "@/common/orpc/schemas/agentPlugins";
 import {
   AGENT_PLUGIN_NAME_MAX_LENGTH,
@@ -266,6 +267,8 @@ async function entryExists(dir: string, relative: string): Promise<boolean> {
 export interface DetectedInstallMethods {
   /** Every method that fits, in order: agent-plugin, claude-plugin, skills. */
   methods: AgentPluginInstallMethod[];
+  /** The skills CLI view of the tree (empty without SKILL.md), for the "Skills CLI" choice. */
+  skillsRoots: SkillsPackageRoot[];
 }
 
 /** The install methods that fit a staged tree (see the module comment for the rules). */
@@ -274,13 +277,14 @@ export async function detectInstallMethods(stagedDir: string): Promise<DetectedI
   const ownManifest =
     (await entryExists(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH)) ||
     (await entryExists(stagedDir, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH));
-  if (ownManifest) return { methods: [{ kind: "agent-plugin" }] };
+  const skillsRoots = await findSkillsPackageRoots(stagedDir);
+  if (ownManifest) return { methods: [{ kind: "agent-plugin" }], skillsRoots };
   const methods: AgentPluginInstallMethod[] = [];
   if (await entryExists(stagedDir, CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH)) {
     methods.push({ kind: "claude-plugin" });
   }
-  if ((await findSkillsPackageRoots(stagedDir)).length > 0) methods.push({ kind: "skills" });
-  return { methods };
+  if (skillsRoots.length > 0) methods.push({ kind: "skills" });
+  return { methods, skillsRoots };
 }
 
 /** Which method a staged clone must use. */
@@ -387,6 +391,48 @@ export function generatedPluginName(source: Pick<AgentPluginGitSource, "url" | "
   return toPluginName(
     source.subpath !== undefined ? path.posix.basename(source.subpath) : repositoryName(source.url)
   );
+}
+
+/**
+ * Skill names for the skills CLI's `--skill` (valid skill names only, no repeats). The CLI names
+ * a skill by its SKILL.md frontmatter `name` (skills@1.7.4 parseSkillMd, filterSkills), so these
+ * are the frontmatter names, also for a root SKILL.md (not the repository name). A name that is
+ * not a valid skill name cannot be passed safely, so that skill is not offered. Two folders with
+ * the same name are both left out, with a warning: `--skill` would install every copy under that
+ * one name, so a later copy could replace the reviewed one.
+ */
+export async function skillsCliSkillNames(
+  stagedDir: string,
+  roots: SkillsPackageRoot[]
+): Promise<{ names: string[]; warnings: string[] }> {
+  const rootReal = await fsPromises.realpath(stagedDir);
+  const names: string[] = [];
+  // One folder can be listed twice (`skills/SKILL.md` is a root child and the `skills`
+  // container), so each canonical folder counts once before the shared-name check below.
+  const seen = new Set<string>();
+  const add = async (dir: string): Promise<boolean> => {
+    const name = await readSkillsCliName(rootReal, dir);
+    if (name === undefined) return false;
+    const real = await fsPromises.realpath(dir);
+    if (!seen.has(real)) names.push(name);
+    seen.add(real);
+    return true;
+  };
+  for (const root of roots) {
+    const rootDir = path.join(rootReal, root.root);
+    // A root that holds SKILL.md is one skill (the repository root, or a container path).
+    if (await add(rootDir)) continue;
+    for (const skill of root.skills) await add(path.join(rootDir, skill));
+  }
+  const valid = names.filter((name) => SkillNameSchema.safeParse(name).success);
+  const shared = new Set(valid.filter((name, index) => valid.indexOf(name) !== index));
+  return {
+    names: valid.filter((name) => !shared.has(name)),
+    warnings: [...shared].map(
+      (name) =>
+        `Skills CLI: more than one skill folder has the SKILL.md name '${name}', so the Skills CLI choice leaves it out`
+    ),
+  };
 }
 
 /**

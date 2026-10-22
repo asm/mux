@@ -184,6 +184,7 @@ import {
   AgentIdSchema,
 } from "./agentDefinition";
 import { PluginSlashCommandDescriptorSchema, WorkspaceCompositionSchema } from "./agentPlugins";
+import { SkillsCliCommandInputSchema, SkillsCliCommandSchema } from "./skillsCli";
 import {
   MCPAddGlobalParamsSchema,
   MCPAddParamsSchema,
@@ -1299,6 +1300,14 @@ export const agentPlugins = {
       method: AgentPluginInstallMethodSchema.nullish(),
     }),
     output: ResultSchema(AgentPluginInstallPreviewSchema, z.string()),
+  },
+  /**
+   * The pinned skills CLI command for the "Skills CLI" method, for the user to run in a terminal
+   * (Xum does not run it). The error branch is invalid input.
+   */
+  skillsCliCommand: {
+    input: SkillsCliCommandInputSchema,
+    output: ResultSchema(SkillsCliCommandSchema, z.string()),
   },
   /** Fetch the consented SHA, promote into ~/.mux/plugins, write the registry entry. */
   install: {
