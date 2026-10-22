@@ -361,6 +361,7 @@ function resolvedAgentResultFor(
       shouldDisableTaskToolsForDepth: false,
       effectiveToolPolicy: undefined,
       switchableAgents: undefined,
+      projectPluginsTrusted: false,
     },
   };
 }
