@@ -110,6 +110,7 @@ import {
   ToolPolicySchema,
   UpdateStatusSchema,
   WorkspaceChatMessageSchema,
+  OnChatEventSchema,
 } from "./stream";
 import {
   TimelineListInputSchema,
@@ -118,7 +119,6 @@ import {
   TimelinePreviewSchema,
   TimelineSubscriptionEventSchema,
 } from "./timeline";
-import { LayoutPresetsConfigSchema } from "./uiLayouts";
 import {
   TerminalCreateParamsSchema,
   TerminalResizeParamsSchema,
@@ -185,6 +185,7 @@ import {
   AgentIdSchema,
 } from "./agentDefinition";
 import { PluginSlashCommandDescriptorSchema, WorkspaceCompositionSchema } from "./agentPlugins";
+import { SkillsCliCommandInputSchema, SkillsCliCommandSchema } from "./skillsCli";
 import {
   MCPAddGlobalParamsSchema,
   MCPAddParamsSchema,
@@ -213,6 +214,7 @@ import {
 import {
   AgentPluginGitSourceSchema,
   AgentPluginInstallEntrySchema,
+  AgentPluginInstallMethodSchema,
   AgentPluginInstallPreviewSchema,
   AgentPluginComponentsSchema,
   AgentPluginComponentRefSchema,
@@ -419,6 +421,8 @@ export const ProviderConfigInfoSchema = z.object({
   baseUrlSource: z.enum(["config", "env"]).nullish(),
   /** Active base URL for display only. Env values must not be persisted from this field. */
   baseUrlResolved: z.string().nullish(),
+  /** Header name that carries the workspace id on chat requests (see sessionHeader.ts). */
+  sessionHeader: z.string().optional(),
   providerType: z.enum(CUSTOM_PROVIDER_TYPES).optional(),
   displayName: z.string().optional(),
   isCustom: z.boolean().optional(),
@@ -1293,13 +1297,25 @@ export const agentPlugins = {
       input: z.string(),
       ref: z.string().nullish(),
       subpath: z.string().nullish(),
+      /** Absent: the first method that fits (see AgentPluginInstallMethodSchema). */
+      method: AgentPluginInstallMethodSchema.nullish(),
     }),
     output: ResultSchema(AgentPluginInstallPreviewSchema, z.string()),
+  },
+  /**
+   * The pinned skills CLI command for the "Skills CLI" method, for the user to run in a terminal
+   * (Xum does not run it). The error branch is invalid input.
+   */
+  skillsCliCommand: {
+    input: SkillsCliCommandInputSchema,
+    output: ResultSchema(SkillsCliCommandSchema, z.string()),
   },
   /** Fetch the consented SHA, promote into ~/.mux/plugins, write the registry entry. */
   install: {
     input: z.object({
       source: AgentPluginGitSourceSchema,
+      /** The preview's `method`: install refuses a clone that this method does not fit. */
+      method: AgentPluginInstallMethodSchema,
       /** SHA from the preview the user consented to. */
       expectedSha: z.string(),
       /** `consentDigest` of that preview: install refuses other components (#6777). */
@@ -2028,6 +2044,15 @@ export const workspace = {
       }),
       output: ResultSchema(z.void(), z.string()),
     },
+    // Milliseconds until the next heartbeat slot opens; null while the scheduler does not track
+    // the workspace (see HeartbeatService.getMsUntilNextHeartbeat).
+    next: {
+      // Not blank: the service asserts on it, and client input must fail validation instead.
+      input: z.object({
+        workspaceId: z.string().refine((id) => id.trim().length > 0, "workspaceId is blank"),
+      }),
+      output: z.number().nullable(),
+    },
   },
   goalDefaults: {
     // Per-workspace override of the global `goalDefaults` block. `get`
@@ -2591,7 +2616,7 @@ export const workspace = {
       // do not send it get the whole active epoch, as before.
       replayWindow: z.boolean().optional(),
     }),
-    output: eventIterator(WorkspaceChatMessageSchema), // Stream event
+    output: eventIterator(OnChatEventSchema), // Stream event (with onChat-only batches)
   },
   onMetadata: {
     // `archived` selects the snapshot list exactly like `workspace.list`.
@@ -3936,22 +3961,6 @@ export const drafts = {
   subscribe: {
     input: z.void(),
     output: eventIterator(DraftEventSchema),
-  },
-};
-
-// UI Layouts (global settings)
-export const uiLayouts = {
-  getAll: {
-    input: z.void(),
-    output: LayoutPresetsConfigSchema,
-  },
-  saveAll: {
-    input: z
-      .object({
-        layoutPresets: LayoutPresetsConfigSchema,
-      })
-      .strict(),
-    output: z.void(),
   },
 };
 

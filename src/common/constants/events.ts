@@ -150,11 +150,11 @@ export const CUSTOM_EVENTS = {
   OPEN_NEW_SIDEBAR_TAB: "mux:openNewSidebarTab",
 
   /**
-   * Expand the collapsed right sidebar on its focused tab, the same path as the overview card's
-   * Expand button. Sent by the header's stand-in for the card where the card would cover the
-   * transcript. Detail: { workspaceId: string }
+   * Move keyboard focus to a right-sidebar tab that the command palette just showed (its
+   * "Split Horizontally/Vertically" and "Add Tool…" change the stored layout, then send this).
+   * Detail: { workspaceId: string, tabsetId: string, tab: string }
    */
-  EXPAND_RIGHT_SIDEBAR: "mux:expandRightSidebar",
+  FOCUS_SIDEBAR_TAB: "mux:focusSidebarTab",
 
   /**
    * Start a new chat the way the left sidebar's "New chat" button does. Sent by the app shell's
@@ -293,8 +293,12 @@ export interface CustomEventPayloads {
   [CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB]: {
     workspaceId: string;
   };
-  [CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR]: {
+  [CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB]: {
     workspaceId: string;
+    /** The pane that shows the tab. */
+    tabsetId: string;
+    /** A TabType (a browser type); the sidebar ignores anything else. */
+    tab: string;
   };
   [CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB]: {
     /** The main chat whose right sidebar shows the tab. */

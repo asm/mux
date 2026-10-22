@@ -1294,13 +1294,42 @@ test("U2: a bound miss in the MCP Apps probe is a proxy fault (exit 5), before t
     };
   });
   try {
-    const { code, logged } = await mcpLaunch({ RUN: "proxycall" });
+    const { code, logged, records } = await mcpLaunch({ RUN: "proxycall" });
     expect(code).toBe(5);
     expect(logged.join("\n")).toContain("cost more than their reserved bound: the job stops");
     expect(calls()).not.toMatch(/^run /m);
+    // The probe's call is still in the proxy record and the spend file, though its proxy's
+    // close() rejected (Codex review of #7051).
+    const outcomes = fs
+      .readFileSync(records, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => (JSON.parse(line) as { outcome: string }).outcome);
+    expect(outcomes).toEqual(["settled"]);
+    const spendFile = records.replace(/\.proxy\.jsonl$/, ".spend.json");
+    const spend = JSON.parse(fs.readFileSync(spendFile, "utf8")) as Record<string, unknown>;
+    expect(spend).toMatchObject({ settled: 1, kept: 0, refused: 0, released: 0 });
   } finally {
     start.mockRestore();
   }
+  expectNothingLeft();
+});
+
+test("#7023: a probe that the budget refuses names its refusal in the spend file", async () => {
+  // Positive, but too small to reserve even the probe call: the probe's proxy answers 402.
+  const { code, records } = await mcpLaunch({ RUN: "proxycall" }, { BUGBASH_BUDGET_USD: "0.0001" });
+  expect(code).toBeInstanceOf(Refusal);
+  expect(calls()).not.toMatch(/^run /m);
+  const spendFile = records.replace(/\.proxy\.jsonl$/, ".spend.json");
+  const spend = JSON.parse(fs.readFileSync(spendFile, "utf8")) as Record<string, unknown>;
+  expect(spend).toMatchObject({
+    spentUsd: 0,
+    settled: 0,
+    kept: 0,
+    refused: 1,
+    released: 0,
+    refusedBy: { "budget: call does not fit the remaining budget": 1 },
+  });
   expectNothingLeft();
 });
 
@@ -1335,6 +1364,14 @@ test.each(["401", "401html"])(
     expect(message).not.toMatch(/\/v1|sk-host/);
     expect(calls()).not.toMatch(/^run /m);
     expect(fs.existsSync(records)).toBe(true); // the probe's record stays
+    // The probe charged the job's own ledger, so its spend file is written too, with no job
+    // proxy (#7023).
+    const spendFile = records.replace(/\.proxy\.jsonl$/, ".spend.json");
+    expect(fs.statSync(spendFile).mode & 0o777).toBe(0o600);
+    const spend = JSON.parse(fs.readFileSync(spendFile, "utf8")) as Record<string, unknown>;
+    // The probe's one call, kept in full: the 401 answer carries no usage to settle it with.
+    expect(spend).toMatchObject({ capUsd: 1, settled: 0, kept: 1, refused: 0, released: 0 });
+    expect(spend.spentUsd).toBeGreaterThan(0);
     expectNothingLeft();
   }
 );

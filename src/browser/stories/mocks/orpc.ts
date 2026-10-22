@@ -41,11 +41,6 @@ import type {
   WorkspaceActivitySnapshot,
 } from "@/common/types/workspace";
 import type { ProjectConfig } from "@/node/config";
-import {
-  DEFAULT_LAYOUT_PRESETS_CONFIG,
-  normalizeLayoutPresetsConfig,
-  type LayoutPresetsConfig,
-} from "@/common/types/uiLayouts";
 import type {
   ModelCatalogSearchInput,
   WorkspaceChatMessage,
@@ -63,6 +58,7 @@ import type { NameGenerationError } from "@/common/types/errors";
 import type { Secret } from "@/common/types/secrets";
 import type { MCPHttpServerInfo, MCPServerIdentity, MCPServerInfo } from "@/common/types/mcp";
 import type {
+  AgentPluginInstallMethod,
   AgentPluginInstallPreview,
   AgentPluginListItem,
   AgentPluginUpdateCheck,
@@ -159,14 +155,14 @@ type MockBackupData<Route extends Exclude<MockBackupRoute, "getSettings">> = Ext
 type MockBackupSettings = NonNullable<MockBackupRouteOutput<"getSettings">>;
 
 export interface MockORPCClientOptions {
-  /** Layout presets config for Settings → Layouts stories */
-  layoutPresets?: LayoutPresetsConfig;
   /** Agent Plugin installer mock data (Settings → Plugins). */
   agentPlugins?: {
     items?: AgentPluginListItem[];
     updateChecks?: AgentPluginUpdateCheck[];
     /** Returned by agentPlugins.preview; omit to make preview fail. */
     preview?: AgentPluginInstallPreview;
+    /** Returned by agentPlugins.preview for an "Install as" method; others get `preview`. */
+    previewsByMethod?: Partial<Record<AgentPluginInstallMethod["kind"], AgentPluginInstallPreview>>;
     /** Returned by agentPlugins.previewUpdate for the named plugin; omit to make it fail. */
     updateReview?: AgentPluginUpdateReview;
     /** agentPlugins.getHooks data by plugin name; setHookTrust updates it in memory. */
@@ -589,7 +585,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     coderTemplatesResult,
     coderPresetsResult = new Map<string, CoderListPresetsResult>(),
     coderWorkspacesResult,
-    layoutPresets: initialLayoutPresets,
     agentSkills = [],
     invalidAgentSkills = [],
     unavailableAgentSkillSources = [],
@@ -843,7 +838,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     unapprovedProjectImports: [],
   };
 
-  let layoutPresets = initialLayoutPresets ?? DEFAULT_LAYOUT_PRESETS_CONFIG;
   let modelClasses: Record<string, string> | undefined = initialModelClasses;
 
   const mockStats: ChatStats = {
@@ -954,18 +948,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       restore: (_input: Parameters<APIClient["backup"]["restore"]>[0]) =>
         Promise.resolve({ success: true as const, data: backupRestoreResult }),
     },
-    // Settings → Layouts (layout presets)
-    // Stored in-memory for Storybook only.
-    // Frontend code normalizes the response defensively, but we normalize here too so
-    // stories remain stable even if they mutate the config.
     drafts: createMockDraftsApi(),
-    uiLayouts: {
-      getAll: () => Promise.resolve(layoutPresets),
-      saveAll: (input: { layoutPresets: unknown }) => {
-        layoutPresets = normalizeLayoutPresetsConfig(input.layoutPresets);
-        return Promise.resolve(undefined);
-      },
-    },
     experiments: {
       set: (input: { experimentId: ExperimentId; enabled?: boolean | null }) => {
         experiments = { ...experiments, [input.experimentId]: input.enabled === true };
@@ -1461,10 +1444,30 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       checkUpdates: () =>
         Promise.resolve({ success: true, data: agentPluginsMock?.updateChecks ?? [] }),
-      preview: () =>
-        agentPluginsMock?.preview
-          ? Promise.resolve({ success: true, data: agentPluginsMock.preview })
-          : Promise.resolve({ success: false, error: "No preview configured in this story" }),
+      preview: (input: { method?: AgentPluginInstallMethod | null }) => {
+        const preview =
+          (input.method != null ? agentPluginsMock?.previewsByMethod?.[input.method.kind] : null) ??
+          agentPluginsMock?.preview;
+        return preview
+          ? Promise.resolve({ success: true as const, data: preview })
+          : Promise.resolve({
+              success: false as const,
+              error: "No preview configured in this story",
+            });
+      },
+      // Like the backend's command, from the typed source (the backend normalizes it first).
+      skillsCliCommand: (input: { source: string; skills: string[] }) =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            command: [
+              "npx --yes skills@1.7.4 add",
+              input.source,
+              ...input.skills.map((skill) => `--skill ${skill}`),
+              "--global --agent codex --copy",
+            ].join(" "),
+          },
+        }),
       install: (input: { source: AgentPluginInstallPreview["source"]; expectedSha: string }) =>
         Promise.resolve({
           success: true,
@@ -2727,14 +2730,36 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       set: (limits: AgentResourceLimits) => {
         agentResourceLimitsState = mockAgentResourceLimitsState(
           agentResourceLimitsState.enabled,
-          limits
+          limits,
+          agentResourceLimitsState.projects
         );
         return Promise.resolve(agentResourceLimitsState);
       },
       setEnabled: ({ enabled }: { enabled: boolean }) => {
         agentResourceLimitsState = mockAgentResourceLimitsState(
           enabled,
-          agentResourceLimitsState.limits
+          agentResourceLimitsState.limits,
+          agentResourceLimitsState.projects
+        );
+        return Promise.resolve(agentResourceLimitsState);
+      },
+      setProject: ({
+        projectPath,
+        limits,
+      }: {
+        projectPath: string;
+        limits: AgentResourceLimits;
+      }) => {
+        const projects = { ...agentResourceLimitsState.projects };
+        if (limits.cpuCores === undefined && limits.memoryGiB === undefined) {
+          delete projects[projectPath];
+        } else {
+          projects[projectPath] = { limits };
+        }
+        agentResourceLimitsState = mockAgentResourceLimitsState(
+          agentResourceLimitsState.enabled,
+          agentResourceLimitsState.limits,
+          projects
         );
         return Promise.resolve(agentResourceLimitsState);
       },
@@ -2807,12 +2832,25 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
 function mockAgentResourceLimitsState(
   enabled: boolean,
-  limits: AgentResourceLimits
+  limits: AgentResourceLimits,
+  savedProjects: AgentResourceLimitsState["projects"] = {}
 ): AgentResourceLimitsState {
-  const limited = enabled && (limits.cpuCores !== undefined || limits.memoryGiB !== undefined);
+  const limited =
+    enabled &&
+    (limits.cpuCores !== undefined ||
+      limits.memoryGiB !== undefined ||
+      Object.keys(savedProjects).length > 0);
+  // Like the backend: a project's cgroup shows only while the limits are active.
+  const projects: AgentResourceLimitsState["projects"] = {};
+  for (const [projectPath, project] of Object.entries(savedProjects)) {
+    projects[projectPath] = limited
+      ? { limits: project.limits, cgroup: `/xum/xum-agents/p-${projectPath.length}` }
+      : { limits: project.limits };
+  }
   return {
     enabled,
     limits,
+    projects,
     status: limited ? { state: "active", cgroup: "/xum/xum-agents" } : { state: "off" },
     support: { state: "ready", cgroup: "/xum" },
   };

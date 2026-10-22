@@ -53,6 +53,29 @@ describe("Config", () => {
     expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
   });
 
+  // Layout presets were removed: an old config that still has them must load, and the next
+  // save drops only that key (the user chose this over keeping it for downgrades).
+  it("loads a config with legacy layoutPresets and drops only that key on save", async () => {
+    const configFile = path.join(tempDir, "config.json");
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        projects: [],
+        defaultProjectDir: "/home/user/code",
+        layoutPresets: { version: 2, slots: [{ slot: 1, preset: { id: "p1", name: "Old" } }] },
+      })
+    );
+
+    expect(config.loadConfigOrDefault().defaultProjectDir).toBe("/home/user/code");
+    expect(config.getConfigLoadError()).toBeNull();
+
+    await config.setUpdateChannel("npm");
+
+    const persisted = JSON.parse(fs.readFileSync(configFile, "utf-8")) as Record<string, unknown>;
+    expect(persisted.layoutPresets).toBeUndefined();
+    expect(persisted.defaultProjectDir).toBe("/home/user/code");
+  });
+
   describe("hidden-model preferences", () => {
     const unrelated = "openrouter:openai/gpt-5";
 
@@ -2425,6 +2448,34 @@ describe("Config", () => {
       expect(loaded.projects.get("/home/user/valid")?.codeWorkspaceSyncPath).toBe(
         "a.code-workspace"
       );
+    });
+
+    it("discards a malformed project agentResourceLimits and keeps a valid one", () => {
+      const configFile = path.join(tempDir, "config.json");
+      fs.writeFileSync(
+        configFile,
+        JSON.stringify({
+          projects: [
+            ["/home/user/zero", { workspaces: [], agentResourceLimits: { cpuCores: 0 } }],
+            ["/home/user/text", { workspaces: [], agentResourceLimits: "14 cores" }],
+            ["/home/user/empty", { workspaces: [], agentResourceLimits: {} }],
+            [
+              "/home/user/valid",
+              { workspaces: [], agentResourceLimits: { cpuCores: 14, memoryGiB: 32 } },
+            ],
+          ],
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+
+      expect(loaded.projects.get("/home/user/zero")?.agentResourceLimits).toBeUndefined();
+      expect(loaded.projects.get("/home/user/text")?.agentResourceLimits).toBeUndefined();
+      expect(loaded.projects.get("/home/user/empty")?.agentResourceLimits).toBeUndefined();
+      expect(loaded.projects.get("/home/user/valid")?.agentResourceLimits).toEqual({
+        cpuCores: 14,
+        memoryGiB: 32,
+      });
     });
 
     it("discards malformed icons and keeps any icon name string", () => {
@@ -6406,6 +6457,54 @@ describe("Config", () => {
         title: "Renamed",
         taskReservationTombstones: ["child01", "child02"],
       });
+    });
+
+    it("stamps fixed-interval heartbeats that follow the default when the default changes (#5741)", async () => {
+      // Restart anchoring uses max(last firing, scheduleUpdatedAt): without a stamp, a heartbeat
+      // that fired under the old default could bypass the new one once.
+      const projectPath = "/fake/project";
+      const oldStamp = 1_700_000_000_000;
+      const heartbeats = {
+        follows: { enabled: true, trigger: "interval" },
+        ownInterval: { enabled: true, trigger: "interval", intervalMs: 30 * 60_000 },
+        idle: { enabled: true, trigger: "idle" },
+        disabled: { enabled: false, trigger: "interval" },
+      } as const;
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: Object.entries(heartbeats).map(([name, heartbeat]) => ({
+            path: path.join(config.srcDir, "project", name),
+            id: `workspace-${name}`,
+            name,
+            createdAt: "2025-01-01T00:00:00.000Z",
+            runtimeConfig: { type: "local" as const },
+            heartbeat: { ...heartbeat, scheduleUpdatedAt: oldStamp },
+          })),
+        });
+        return cfg;
+      });
+      const stamps = () => {
+        const byName: Record<string, number | null | undefined> = {};
+        const project = new Config(tempDir).loadConfigOrDefault().projects.get(projectPath);
+        for (const workspace of project?.workspaces ?? []) {
+          byName[workspace.name ?? workspace.path] = workspace.heartbeat?.scheduleUpdatedAt;
+        }
+        return byName;
+      };
+
+      const before = Date.now();
+      await config.updateHeartbeatDefaultIntervalMs(45 * 60_000);
+      const afterChange = stamps();
+      expect(afterChange.follows).toBeGreaterThanOrEqual(before);
+      expect([afterChange.ownInterval, afterChange.idle, afterChange.disabled]).toEqual([
+        oldStamp,
+        oldStamp,
+        oldStamp,
+      ]);
+
+      // The same value again is no schedule change, so nothing is stamped.
+      await config.updateHeartbeatDefaultIntervalMs(45 * 60_000);
+      expect(stamps()).toEqual(afterChange);
     });
 
     it("defaults sparse persisted heartbeat intervals in workspace metadata", async () => {

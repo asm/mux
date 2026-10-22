@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { KEYBINDS } from "@/browser/utils/ui/keybinds";
+import { isMac, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { Keybind } from "@/common/types/keybind";
 import {
   ARTIFACT_ANNOTATION_CONTEXT_CHARS,
@@ -23,6 +23,10 @@ import {
  *   frame (focus then sits in it) made unreachable from the keyboard. It can turn annotate mode
  *   on, so the host honours it only during a live user gesture in this frame
  *   (hasLiveUserGesture, SandboxedArtifactFrame.tsx).
+ * - Frame -> host: `{ type: "sidebarKey", ctrlKey, metaKey }`, the right-sidebar chord
+ *   (KEYBINDS.TOGGLE_RIGHT_SIDEBAR), which a click into the frame also made unreachable: keys in
+ *   the frame never reach the app's window listener. The host honours it only while the frame
+ *   holds focus (SandboxedArtifactFrame.tsx).
  * - Frame -> host (M5b): `{ type: "send", text, data? }` (window.xum.send) only fills the
  *   host-owned confirm strip, never sends by itself; `{ type: "setState", state }`
  *   (window.xum.setState) is persisted per artifact, for all its versions. Text and JSON sizes
@@ -118,6 +122,20 @@ const ArtifactAnnotateMessageSchema = z
   })
   .strict();
 
+/**
+ * The right-sidebar chord (KEYBINDS.TOGGLE_RIGHT_SIDEBAR) pressed inside the frame, with the
+ * modifiers the host needs to match the keybind exactly (matchesKeybind). See the host side in
+ * SandboxedArtifactFrame.tsx.
+ */
+const ArtifactSidebarKeyMessageSchema = z
+  .object({
+    ...bridgeEnvelope,
+    type: z.literal("sidebarKey"),
+    ctrlKey: z.boolean(),
+    metaKey: z.boolean(),
+  })
+  .strict();
+
 const ArtifactOpenWorkspaceMessageSchema = z
   .object({
     ...bridgeEnvelope,
@@ -128,6 +146,7 @@ const ArtifactOpenWorkspaceMessageSchema = z
 
 export const ArtifactFrameToHostMessageSchema = z.discriminatedUnion("type", [
   ArtifactKeyMessageSchema,
+  ArtifactSidebarKeyMessageSchema,
   ArtifactOpenWorkspaceMessageSchema,
   ArtifactSendMessageSchema,
   ArtifactSetStateMessageSchema,
@@ -271,9 +290,11 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
  *
  * So a plain left click on a link for this document (`href`, or SVG `xlink:href`, no `download`,
  * no `target` other than `_self`) whose raw value starts with `#` is cancelled, and the script does the browser's fragment steps itself: the target is an id or
- * an `<a name>`, raw first and then percent-decoded, else the top for `#` and `#top`. It is
- * scrolled into view and focused, or, when it cannot take focus, given `tabindex="-1"` until it
- * loses focus, so the next Tab continues after it. A native fragment navigation
+ * an `<a name>`, for the parsed URL's (percent-encoded) fragment first and then its UTF-8
+ * decoding, else the top for `#` and `#top`. Closed `<details>` and `hidden="until-found"`
+ * ancestors are revealed (#6219). The target is scrolled into view and focused, or, when it
+ * cannot take focus, given `tabindex="-1"` until it loses focus, so the next Tab continues
+ * after it. A native fragment navigation
  * (`location.replace("about:srcdoc#x")`, `location.hash`, `<base href="about:srcdoc">`) would
  * do this for free, but WebKit fires the iframe's `load` event for it, which the navigation
  * guard must treat as leaving the document.
@@ -282,12 +303,12 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
  * and document handlers, so one of those that calls preventDefault keeps the click. Window
  * listeners the artifact adds itself run after this one, so they see the click already handled. The link is found through
  * composedPath, so links in open shadow roots count too. Annotate mode stops the click in the
- * capture phase first. Known limits (#6219), where the click still leaves the document as
- * before: a handler that stops the click's propagation hides it from window, and a target
- * inside a closed <details> is not revealed first.
+ * capture phase first. Known limit (#6219), where the click still leaves the document as
+ * before: a handler that stops the click's propagation hides it from window.
  *
- * SECURITY AUDIT: it only cancels a navigation and scrolls or focuses inside the document; it
- * never navigates, so both navigation guards stay as they are.
+ * SECURITY AUDIT: it only cancels a navigation and scrolls, focuses or reveals (opens a
+ * `<details>`, removes `hidden`) inside the document; it never navigates, so both navigation
+ * guards stay as they are.
  */
 export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
     var XLINK = "http://www.w3.org/1999/xlink";
@@ -306,9 +327,61 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
         if (href === null) href = node.getAttributeNS(XLINK, "href");
         if (href === null) return null;
         href = href.trim();
-        return href.charAt(0) === "#" ? href.slice(1) : null;
+        if (href.charAt(0) !== "#") return null;
+        // The parsed URL's fragment, as HTML uses: it is percent-encoded ("#a b" -> "a%20b").
+        try {
+          return new URL(href, "about:srcdoc").hash.slice(1);
+        } catch (error) {
+          return href.slice(1);
+        }
       }
       return null;
+    }
+    // URL percent-decoding, then UTF-8 decoding with replacement characters, as HTML decodes a
+    // fragment. A "%" without two hex digits stays as it is.
+    function percentDecode(text) {
+      var bytes = new TextEncoder().encode(text);
+      var out = [];
+      for (var i = 0; i < bytes.length; i++) {
+        var pair = bytes[i] === 0x25 && i + 2 < bytes.length ? String.fromCharCode(bytes[i + 1], bytes[i + 2]) : "";
+        if (/^[0-9A-Fa-f]{2}$/.test(pair)) {
+          out.push(parseInt(pair, 16));
+          i += 2;
+        } else {
+          out.push(bytes[i]);
+        }
+      }
+      return new TextDecoder("utf-8", { ignoreBOM: true }).decode(new Uint8Array(out));
+    }
+    // The parent in the flat tree, where a slotted node renders: its slot, or a shadow root's host.
+    function flatParent(node) {
+      if (node.assignedSlot) return node.assignedSlot;
+      var parent = node.parentNode;
+      return parent && parent.nodeType === 11 ? parent.host : parent;
+    }
+    // HTML's ancestor revealing steps: open each closed <details> the target sits in (outside
+    // its summary, which shows anyway) and reveal each hidden="until-found" ancestor. Like HTML,
+    // it stops when a beforematch handler kept the element hidden or removed it.
+    function reveal(target) {
+      for (var node = target; node && node.nodeType === 1; node = flatParent(node)) {
+        if (isUntilFound(node)) {
+          node.dispatchEvent(new window.Event("beforematch", { bubbles: true }));
+          if (!node.isConnected || !isUntilFound(node)) return;
+          node.removeAttribute("hidden");
+        }
+        var parent = node.parentElement;
+        if (parent && parent.localName === "details" && !parent.hasAttribute("open")) {
+          var summary = null;
+          for (var i = 0; i < parent.children.length && !summary; i++) {
+            if (parent.children[i].localName === "summary") summary = parent.children[i];
+          }
+          if (node !== summary) parent.setAttribute("open", "");
+        }
+      }
+    }
+    function isUntilFound(node) {
+      var hidden = node.getAttribute("hidden");
+      return hidden !== null && hidden.toLowerCase() === "until-found";
     }
     // HTML's "find a potential indicated element": an id first, then an <a name>.
     function findTarget(fragment) {
@@ -320,10 +393,7 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
       return null;
     }
     function jump(raw) {
-      // Like URL percent-decoding: a "%" without two hex digits stays as it is.
-      var decoded = raw.replace(/(?:%[0-9A-Fa-f]{2})+/g, function (run) {
-        try { return decodeURIComponent(run); } catch (error) { return run; }
-      });
+      var decoded = percentDecode(raw);
       var target = findTarget(raw) || findTarget(decoded);
       if (!target) {
         if (raw !== "" && decoded.toLowerCase() !== "top") return;
@@ -331,6 +401,7 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
         window.scrollTo(0, 0);
         return;
       }
+      reveal(target);
       target.scrollIntoView();
       target.focus({ preventScroll: true });
       // tabIndex cannot tell (an <a> without href reports 0), so check whether focus moved.
@@ -396,6 +467,45 @@ const ANNOTATE_KEY_LISTENER =
       host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "key", key: "C", shiftKey: false }, "*");
     }, 0);
   });`;
+
+/**
+ * The right-sidebar key the frame forwards, lowercased, from KEYBINDS.TOGGLE_RIGHT_SIDEBAR. The
+ * shim checks only a Ctrl (Cmd on macOS) plus Shift chord of one key, so another keybind shape
+ * turns forwarding off (null), like plainSingleKey. The shim tests send the keybind's key.
+ */
+function ctrlShiftKey(keybind: Keybind): string | null {
+  const chord =
+    keybind.key.length === 1 &&
+    keybind.code == null &&
+    keybind.ctrl === true &&
+    keybind.shift === true &&
+    keybind.macCtrlBehavior === "command" &&
+    !keybind.alt &&
+    !keybind.meta;
+  return chord ? keybind.key.toLowerCase() : null;
+}
+const SIDEBAR_FRAME_KEY = ctrlShiftKey(KEYBINDS.TOGGLE_RIGHT_SIDEBAR);
+
+/**
+ * The right-sidebar chord, with this platform's modifier as matchesKeybind reads the keybind: on
+ * macOS only Cmd (Ctrl may be held too), elsewhere only Ctrl. The shim claims nothing else, so the
+ * other form of the chord stays the artifact's. The host matches the keybind again (it decides).
+ * No editable exclusion: the chord types nothing, and the host's own handler works from the chat
+ * input too. Built per frame: isMac() needs the window.
+ */
+function sidebarKeyListener(): string {
+  if (SIDEBAR_FRAME_KEY == null) return "";
+  const modifier = isMac() ? "event.metaKey" : "event.ctrlKey && !event.metaKey";
+  return `
+  window.addEventListener("keydown", function (event) {
+    // A held key would flip the sidebar on every repeat and spend the frame's message budget.
+    if (event.repeat || event.altKey || !event.shiftKey || !(${modifier})) return;
+    if (typeof event.key !== "string" || event.key.toLowerCase() !== ${JSON.stringify(SIDEBAR_FRAME_KEY)}) return;
+    // Claimed like the host claims it: in a browser, Chrome binds the chord to its bookmarks bar.
+    event.preventDefault();
+    host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "sidebarKey", ctrlKey: event.ctrlKey, metaKey: event.metaKey }, "*");
+  }, true);`;
+}
 
 export function buildArtifactBridgeScript(
   initialTheme: ArtifactTheme,
@@ -545,6 +655,7 @@ export function buildArtifactBridgeScript(
     host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "key", key: key, shiftKey: event.shiftKey }, "*");
   }, true);
   ${ANNOTATE_KEY_LISTENER}
+  ${sidebarKeyListener()}
   ${ARTIFACT_IN_PAGE_LINK_SCRIPT}
 })();`;
 }

@@ -28,13 +28,11 @@ export async function openAnalyticsDialog(container: HTMLElement): Promise<HTMLE
 }
 
 /**
- * Open (or show) the New tab of the right sidebar pane inside `scope`: its strip offers it only
- * as the last row of the All tabs menu, which renders in a portal outside `scope`.
+ * Open (or show) the New tab of the right sidebar pane inside `scope` with the "+" button after
+ * its tabs.
  */
 export async function openSidebarNewTab(scope: HTMLElement): Promise<void> {
-  fireEvent.click(await within(scope).findByRole("button", { name: "All tabs" }));
-  const menu = await within(scope.ownerDocument.body).findByRole("dialog", { name: "All tabs" });
-  fireEvent.click(within(menu).getByRole("button", { name: "New tab" }));
+  fireEvent.click(await within(scope).findByRole("button", { name: "New tab" }));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -365,11 +363,18 @@ export function setupTestDom(options?: { enableTutorial?: boolean }): () => void
   const { installDom } = require("./dom") as typeof import("./dom");
   const cleanupDom = installDom();
 
-  if (!options?.enableTutorial) {
-    disableTutorial();
+  if (options?.enableTutorial) {
+    return cleanupDom;
   }
-
-  return cleanupDom;
+  // The workspace tutorial opens 300 ms after a workspace view mounts and moves focus into its
+  // bubble, so focus and blur assertions would race it (#7120). Cleanup restores the flag, so later
+  // renders in the same test file keep their own tutorial setting.
+  const previousTutorialOptIn = globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__;
+  disableTutorial();
+  return () => {
+    cleanupDom();
+    globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = previousTutorialOptIn;
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

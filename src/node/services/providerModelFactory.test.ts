@@ -32,6 +32,7 @@ import { PROVIDER_REGISTRY } from "@/common/constants/providers";
 import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
 import {
   buildProviderOptions,
+  buildRequestHeaders,
   resolveProviderOptionsNamespaceKey,
 } from "@/common/utils/ai/providerOptions";
 import { Ok } from "@/common/types/result";
@@ -430,6 +431,53 @@ describe("ProviderModelFactory.createModel", () => {
           );
         }
       });
+    }
+  });
+
+  // #4231: a gateway such as OpenCode Go names a header that must carry one
+  // stable id per conversation. The header must reach the wire on every
+  // custom provider adapter, with the workspace id as its value.
+  it("sends the configured session header with the workspace id on every adapter", async () => {
+    const seen: Array<string | null> = [];
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req) {
+        seen.push(req.headers.get("x-opencode-session"));
+        return Response.json({ error: { message: "stop here" } }, { status: 400 });
+      },
+    });
+    try {
+      for (const providerType of CUSTOM_PROVIDER_TYPES) {
+        await withTempConfig(async (config, factory) => {
+          saveLocalVllmConfig(config, {
+            providerType,
+            baseUrl: `${server.url.origin}/v1`,
+            sessionHeader: "x-opencode-session",
+          });
+          const result = await factory.createModelWithPinnedOptions(
+            `local-vllm:${LOCAL_VLLM_MODEL}`,
+            {}
+          );
+          if (!result.success) throw new Error(result.error.type);
+          const before = seen.length;
+          await generateText({
+            model: result.data.model,
+            prompt: "hello",
+            maxRetries: 0,
+            headers: buildRequestHeaders(
+              result.data.optionsModelString,
+              result.data.optionsMuxProviderOptions,
+              "ws-4231",
+              result.data.optionsProvidersConfig,
+              result.data.optionsRouteProvider
+            ),
+          }).catch(() => undefined);
+          expect(seen.slice(before)).toEqual(["ws-4231"]);
+        });
+      }
+    } finally {
+      await server.stop(true);
     }
   });
 
@@ -6159,6 +6207,77 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
   });
 });
 
+// #5372: ollama-ai-provider-v2 4.x is the release whose peer range accepts ai 7. Generation and
+// streaming must still decode Ollama's /api/chat replies through the factory's model.
+describe("ProviderModelFactory Ollama generate and stream", () => {
+  const chatReply = (content: string, done: boolean) => ({
+    model: "qwen3:8b",
+    created_at: "2026-10-20T00:00:00Z",
+    message: { role: "assistant", content },
+    done,
+    ...(done ? { done_reason: "stop", prompt_eval_count: 7, eval_count: 3 } : {}),
+  });
+  const withOllama = async (
+    reply: (body: Record<string, unknown>) => Response,
+    run: (model: LanguageModel) => Promise<void>
+  ) => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ ollama: { baseUrl: "http://127.0.0.1:11434/api" } });
+      const urls: string[] = [];
+      const fakeFetch = Object.assign((input: RequestInfo | URL, init?: RequestInit) => {
+        urls.push(
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url
+        );
+        return Promise.resolve(reply(JSON.parse(init?.body as string) as Record<string, unknown>));
+      }, fetch) as typeof fetch;
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel("ollama:qwen3:8b");
+        if (!result.success) throw new Error(result.error.type);
+        await run(result.data);
+        expect(urls).toEqual(["http://127.0.0.1:11434/api/chat"]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  };
+
+  it("generates text with token usage", async () => {
+    await withOllama(
+      (body) => {
+        expect(body.stream).toBe(false);
+        return Response.json(chatReply("Hello from Ollama", true));
+      },
+      async (model) => {
+        const result = await generateText({ model, prompt: "hi", maxRetries: 0 });
+        expect(result.text).toBe("Hello from Ollama");
+        expect(result.finishReason).toBe("stop");
+        expect(result.usage).toMatchObject({ inputTokens: 7, outputTokens: 3 });
+      }
+    );
+  });
+
+  it("streams text deltas from newline-delimited chunks", async () => {
+    await withOllama(
+      (body) => {
+        expect(body.stream).toBe(true);
+        const lines = [chatReply("Hel", false), chatReply("lo", false), chatReply("", true)];
+        return new Response(lines.map((line) => JSON.stringify(line) + "\n").join(""), {
+          headers: { "content-type": "application/x-ndjson" },
+        });
+      },
+      async (model) => {
+        const result = streamText({ model, prompt: "hi", maxRetries: 0 });
+        const deltas: string[] = [];
+        for await (const delta of result.textStream) deltas.push(delta);
+        expect(deltas.join("")).toBe("Hello");
+        expect(await result.finishReason).toBe("stop");
+        expect(await result.usage).toMatchObject({ inputTokens: 7, outputTokens: 3 });
+      }
+    );
+  });
+});
+
 describe("ProviderModelFactory Ollama tool schemas", () => {
   // Ollama servers before v0.6.6 parse a tool schema `type` only as a string, so one `type`
   // array fails the whole tool request. zod >= 4.5 emits nullable fields as type arrays, and
@@ -6228,6 +6347,27 @@ describe("ProviderModelFactory Ollama tool schemas", () => {
           allOf: [{ anyOf: [{ type: "string" }, { type: "null" }] }],
         },
       },
+    });
+  });
+
+  // #6083: a draft-07 `dependencies` entry is a schema when it is an object and a list of
+  // property names when it is an array. Only the schema needs the rewrite.
+  it("rewrites type arrays in draft-07 schema dependencies and keeps property lists", async () => {
+    const sent = await sendTools({
+      mcp_tool: rawTool({
+        type: "object",
+        properties: { a: { type: "string" }, b: { type: "string" } },
+        dependencies: {
+          a: { properties: { c: { type: ["string", "null"] } } },
+          b: ["a"],
+        },
+      }),
+    });
+
+    expect(typeArrayPaths(sent.mcp_tool)).toEqual([]);
+    expect((sent.mcp_tool as { dependencies: unknown }).dependencies).toEqual({
+      a: { properties: { c: { anyOf: [{ type: "string" }, { type: "null" }] } } },
+      b: ["a"],
     });
   });
 

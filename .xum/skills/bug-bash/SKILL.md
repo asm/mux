@@ -144,7 +144,7 @@ launcher refuses an Electron job without `node_modules/electron/dist/electron`. 
 the mock AI, agent tools, terminals and project automation off, no HTTP API server, and never
 `XUM_ALLOW_MULTIPLE_INSTANCES`. It refuses to start Electron when a switch is missing. In Electron
 the seeded project starts collapsed, and every attempt shares the one seeded root, so a story
-sees the UI state that an earlier one left: use `tests/stories/electron/helpers.ts`
+sees the UI state that an earlier one left: use `tests/stories/helpers.ts`
 (`openPlayground`), which works from either state. `app.clearState()`,
 extra headers and locale overrides do not work on this target (one fresh app per attempt).
 The first run, with one smoke story and no agent repro, spent $0.09 at list price and took about
@@ -154,21 +154,37 @@ The first run, with one smoke story and no agent repro, spent $0.09 at list pric
 `.spend.json` (the job's spend at list price, its cap and its proxy call counts).
 Replay cache (`tests/bugbash/sandbox/cacheSeed.ts`): each story job records its verified
 `agent.act` steps (e2e read-write mode) into `<output>/cache/`, which comes back with the output.
-To replay them on the next run without model calls, copy those files of both story jobs into
-`tests/stories/.e2e-cache-seed/`: `mkdir -p tests/stories/.e2e-cache-seed && cp tests/stories/.e2e/stories-<time>-<pid>/cache/*.json tests/stories/.e2e-cache-seed/` (and the same for `stories-electron-<time>-<pid>`).
+To replay them on the next run, make them the seed: `bun tests/stories/summary.ts --next-seed
+tests/stories/.e2e-cache-seed` replaces that folder with the caches of the newest web and Electron
+story jobs, as CI does. Do not copy new entries into an old seed: it only grows until the launcher
+refuses it. A replayed `agent.act` step makes no model call. Each model-driven job still makes one
+probe call before its container starts, and `agent.assert` and `agent.extract` always call the model.
 The folder is git-ignored so that no `git add -A` commits it. The launcher stages it into the
 job (a story job only) and refuses any entry that is not a regular `<sha256>.json` file of 1 MiB
 or less, more than 1000 entries, or more than 128 MiB in all. Each run
 summary counts the outcomes (`Cache N replayed`). An empty or missing seed is a cold run.
 CI: the `Stories` workflow (`.github/workflows/stories.yml`) runs one `make test-stories` with
-`BUGBASH_BUDGET_USD=3` (the cap per job) once for each PR in the merge queue, nightly on main
-and on demand (Actions > Stories > Run workflow, on any branch). It is not part of `Required`, so
-the queue does not wait for it and a failure blocks no merge. It restores the seed with actions/cache
-(this ref's newest, else main's), writes a table of the tests, their cache outcomes and each
-job's spend to the job summary, and, except in the merge queue, saves the next seed: `bun
+Sonnet 5.5 and `BUGBASH_BUDGET_USD=3` (the cap per job) once for each PR in the merge queue
+(pr.yml's `Test / Stories` job calls it), nightly on main and on demand (Actions > Stories > Run
+workflow, on any branch). `Required` waits for it in the queue but counts its result only when the
+repo variable `STORIES_MODE` is `block`. Unset is warn mode: a failure shows but blocks no merge.
+On each push to a PR that is not a draft, pr.yml's `Test / Stories (Haiku)` job runs it with
+Haiku 5.5 and a $1 cap per job (its `model` and `budget_usd` inputs): Haiku on PRs, Sonnet in the
+queue. Fork and Dependabot PRs skip it. `Required` counts that result only when the repo variable
+`STORIES_PR_MODE` is `block`: warn until 50 PR runs with less than 5% failures. When
+every failed job's proxy record holds a provider 5xx (`bun tests/stories/summary.ts
+--upstream-fault`), the workflow runs `make test-stories` once more. It restores the seed with actions/cache
+(this ref's newest, else main's), writes e2e's page of each job with its spend to the job
+summary (`bun tests/stories/summary.ts`), uploads each job's `report.json` and `.spend.json` as the
+artifact `stories-reports-<attempt>` and, on a failure, the `results/` folders as
+`stories-evidence-<attempt>` (both kept 7 days), and, except in the merge queue, saves the next seed: `bun
 tests/stories/summary.ts --next-seed <dir>` (the caches of the newest web and Electron story
 jobs, less the seed entries either one deleted, at most 1000 entries and 128 MiB). GitHub scopes a saved cache to its ref, and a queue ref is temporary, so a
 merge-queue run saves none. Only the nightly and on-demand runs on main change what main replays. A PR that changes the sandbox image inputs fails there until main publishes the image.
+After the PR lane, pr.yml's `Test / Stories (Haiku) comment` job posts the same page as one PR
+comment, which each push edits (`tests/stories/prComment.ts`; `--dry-run` prints the body). It
+runs the base commit's copy with no install scripts, writes only while the run's commit is still
+the PR head, and is not in `Required`.
 To check state across a server restart, a story imports `test` from `tests/stories/fixtures.ts`
 and calls `xum.restartServer()` (same port and XUM_ROOT), then `app.open()`: e2e's
 `app.restart()` only opens a new page.
@@ -236,3 +252,10 @@ Xum rules:
 Report confirmed bugs first (title, expected vs actual, root cause `file:line`, steps, video path,
 repro test), then unverified risks, then rejected findings by reason, then the charters run and
 their cost.
+
+When the `artifact` tool is available, attach the latest report as an artifact. Xum offers that
+tool only when the Artifacts experiment is on and `$XUM_SCRATCH_DIR` is set. Write the report to
+`$XUM_SCRATCH_DIR/artifacts/bug-bash-report.md` and publish it with the `artifact` tool. After each
+new round, update that same file and publish it again, so the Artifacts tab keeps one report with a
+version per round. The run folder is git-ignored and local, so the artifact is the copy the user
+can open. Without the tool, give the report in the chat reply only.

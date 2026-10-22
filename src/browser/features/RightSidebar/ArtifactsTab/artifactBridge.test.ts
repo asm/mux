@@ -76,6 +76,8 @@ function runBridgeScript() {
   const posted: unknown[] = [];
   // window.setTimeout callbacks, run once a key press has gone through every listener.
   const timers: Array<() => void> = [];
+  // preventDefault calls by the bridge's own listeners.
+  let prevented = 0;
   const fakeWindow: { xum?: { openWorkspace: (id: unknown) => void } } & Record<string, unknown> = {
     parent: { postMessage: (message: unknown) => posted.push(message) },
     addEventListener: (type: string, listener: (event: unknown) => void) => {
@@ -106,6 +108,8 @@ function runBridgeScript() {
     shiftKey = false,
     extra: {
       ctrlKey?: boolean;
+      metaKey?: boolean;
+      altKey?: boolean;
       repeat?: boolean;
       defaultPrevented?: boolean;
       composedPath?: unknown[];
@@ -117,16 +121,19 @@ function runBridgeScript() {
       shiftKey,
       ctrlKey: extra.ctrlKey ?? false,
       repeat: extra.repeat ?? false,
-      metaKey: false,
-      altKey: false,
+      metaKey: extra.metaKey ?? false,
+      altKey: extra.altKey ?? false,
       defaultPrevented: false,
+      preventDefault: () => {
+        prevented += 1;
+      },
       ...(extra.composedPath ? { composedPath: () => extra.composedPath } : {}),
     };
     for (const entry of listeners) if (entry.type === "keydown") entry.listener(event);
     event.defaultPrevented = extra.defaultPrevented ?? false;
     for (const timer of timers.splice(0)) timer();
   };
-  return { keydown, posted, xum: fakeWindow.xum };
+  return { keydown, posted, xum: fakeWindow.xum, prevented: () => prevented };
 }
 
 describe("bridge script keys", () => {
@@ -166,6 +173,69 @@ describe("bridge script keys", () => {
     bridge.keydown(key.toUpperCase(), div);
     const c = { xumArtifact: 1, type: "key", key: "C", shiftKey: false };
     expect(bridge.posted).toEqual([c, c]);
+  });
+
+  test("the right-sidebar chord is posted with Ctrl, even from an input, and claimed", () => {
+    // The keybind's own key: a keybind the shim cannot forward fails here, not at startup.
+    const key = KEYBINDS.TOGGLE_RIGHT_SIDEBAR.key;
+    const bridge = runBridgeScript();
+    bridge.keydown(key, div, false, { ctrlKey: true });
+    bridge.keydown(key, div, true);
+    bridge.keydown(key, div, true, { ctrlKey: true, altKey: true });
+    bridge.keydown(key, div, true, { ctrlKey: true, repeat: true });
+    // Off macOS the keybind takes Ctrl only, so the Meta form stays the artifact's.
+    bridge.keydown(key, div, true, { metaKey: true });
+    bridge.keydown(key, div, true, { ctrlKey: true, metaKey: true });
+    expect(bridge.posted).toEqual([]);
+    expect(bridge.prevented()).toBe(0);
+    bridge.keydown(key, input, true, { ctrlKey: true });
+    bridge.keydown(key.toLowerCase(), div, true, { ctrlKey: true });
+    const posted = { xumArtifact: 1, type: "sidebarKey", ctrlKey: true, metaKey: false };
+    expect(bridge.posted).toEqual([posted, posted]);
+    // Claimed in the frame, as the host claims it (Chrome binds the chord to its bookmarks bar).
+    expect(bridge.prevented()).toBe(2);
+  });
+
+  test("on macOS the right-sidebar chord is Cmd, and Ctrl stays the artifact's", () => {
+    // isMac() reads the Electron preload's platform first.
+    const global = globalThis as { window?: unknown };
+    const saved = global.window;
+    global.window = { api: { platform: "darwin" } };
+    try {
+      const key = KEYBINDS.TOGGLE_RIGHT_SIDEBAR.key;
+      const bridge = runBridgeScript();
+      bridge.keydown(key, div, true, { ctrlKey: true });
+      expect(bridge.posted).toEqual([]);
+      expect(bridge.prevented()).toBe(0);
+      bridge.keydown(key, div, true, { metaKey: true });
+      expect(bridge.posted).toEqual([
+        { xumArtifact: 1, type: "sidebarKey", ctrlKey: false, metaKey: true },
+      ]);
+      expect(bridge.prevented()).toBe(1);
+    } finally {
+      global.window = saved;
+    }
+  });
+});
+
+describe("sidebarKey messages", () => {
+  test("accepts the two modifier flags only", () => {
+    const accept = (data: unknown) =>
+      acceptArtifactFrameMessage({ source: frame, data }, frame, () => true);
+    const sidebarKey = {
+      xumArtifact: 1,
+      type: "sidebarKey",
+      ctrlKey: true,
+      metaKey: false,
+    } as const;
+    expect(accept(sidebarKey)).toEqual(sidebarKey);
+    for (const data of [
+      { xumArtifact: 1, type: "sidebarKey", ctrlKey: true },
+      { ...sidebarKey, metaKey: "yes" },
+      { ...sidebarKey, key: "Delete" },
+    ]) {
+      expect(accept(data)).toBeNull();
+    }
   });
 });
 
@@ -535,6 +605,90 @@ describe("in-page links", () => {
     expect(click("plain", { button: 1 })).toEqual(untouched);
     // The artifact's own preventDefault wins: the shim does not jump on top of it.
     expect(click("own")).toEqual({ prevented: true, scrolled: [], focused: null });
+    await win.happyDOM.close();
+  });
+
+  // #6219: the browser's fragment steps that the shim skipped. A target inside a closed
+  // <details> or a hidden="until-found" ancestor is revealed before the scroll. The fragment is
+  // the parsed URL's, so its percent-encoded form is tried first, and it is percent-decoded as
+  // UTF-8 with replacement characters. <area> links count like <a>.
+  test.each([
+    ["HTML artifact bridge", buildArtifactBridgeScript("light")],
+    ["MCP App preamble", mcpAppPreambleScript("00")],
+  ])("%s reveals hidden targets and parses the fragment like a browser", async (_name, script) => {
+    const win = new HappyWindow({ url: "http://localhost/workspace/abc" });
+    const doc = win.document;
+    doc.body.innerHTML = `
+      <a id="to-details" href="#in-details">Details</a>
+      <a id="to-summary" href="#summary">Summary</a>
+      <a id="to-found" href="#found">Found</a>
+      <a id="space" href="#a b">Space</a>
+      <a id="bad-utf8" href="#%E9t%C3%A9">Bad UTF-8</a>
+      <map name="m"><area id="area" href="#intro" shape="rect" coords="0,0,1,1"></map>
+      <h3 id="intro">Intro</h3>
+      <details id="closed"><summary>Closed</summary><div><h3 id="in-details">Inside</h3></div></details>
+      <details id="summary-only"><summary id="summary">Summary</summary><p>Body</p></details>
+      <div id="until-found" hidden="until-found"><h3 id="found">Found it</h3></div>
+      <a id="to-kept" href="#kept">Kept</a>
+      <details id="outer-kept"><div id="keeps" hidden="until-found"><h3 id="kept">Kept</h3></div></details>
+      <a id="to-slotted" href="#slotted">Slotted</a>
+      <div id="host"><h3 id="slotted">In slot</h3></div>
+      <h3 id="a%20b">Encoded</h3><h3 id="a b">Spaced</h3><h3 id="\uFFFDt\u00e9">Replaced</h3>`;
+    const scrolled: string[] = [];
+    for (const element of Array.from(doc.querySelectorAll("h3, summary"))) {
+      element.scrollIntoView = () => scrolled.push(element.textContent);
+    }
+    // A shadow tree that renders the light-DOM target in a slot under a closed <details>.
+    const shadow = doc.getElementById("host")!.attachShadow({ mode: "open" });
+    shadow.innerHTML = `<details id="shadow-details"><summary>S</summary><slot></slot></details>`;
+    // Happy DOM has no assignedSlot; a browser reports the slot the node renders in.
+    Object.defineProperty(doc.getElementById("slotted")!, "assignedSlot", {
+      value: shadow.querySelector("slot"),
+    });
+    const beforematch: string[] = [];
+    doc.body.addEventListener("beforematch", (event) => {
+      if (event.target instanceof win.HTMLElement) beforematch.push(event.target.id);
+      // An artifact that keeps this one hidden: plain hidden, so no reveal goes on.
+      if (event.target instanceof win.HTMLElement && event.target.id === "keeps") {
+        event.target.setAttribute("hidden", "");
+      }
+    });
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
+    const run = new Function("window", "document", "CustomEvent", script) as (
+      window: unknown,
+      document: unknown,
+      customEvent: unknown
+    ) => void;
+    run(win, doc, win.CustomEvent);
+    win.addEventListener("click", (event) => event.preventDefault());
+    const click = (id: string): string[] => {
+      scrolled.length = 0;
+      doc
+        .getElementById(id)!
+        .dispatchEvent(new win.MouseEvent("click", { bubbles: true, cancelable: true }));
+      return [...scrolled];
+    };
+
+    expect(click("to-details")).toEqual(["Inside"]);
+    expect(doc.getElementById("closed")!.hasAttribute("open")).toBe(true);
+    // A summary shows while its <details> is closed, so nothing opens.
+    expect(click("to-summary")).toEqual(["Summary"]);
+    expect(doc.getElementById("summary-only")!.hasAttribute("open")).toBe(false);
+    expect(click("to-found")).toEqual(["Found it"]);
+    expect(doc.getElementById("until-found")!.hasAttribute("hidden")).toBe(false);
+    expect(beforematch).toEqual(["until-found"]);
+    // The handler kept it hidden: the reveal stops there, and no outer <details> opens.
+    click("to-kept");
+    expect(doc.getElementById("keeps")!.getAttribute("hidden")).toBe("");
+    expect(doc.getElementById("outer-kept")!.hasAttribute("open")).toBe(false);
+    // The flat tree: the slotted target's rendered <details> is in the shadow tree.
+    expect(click("to-slotted")).toEqual(["In slot"]);
+    expect(shadow.getElementById("shadow-details")!.hasAttribute("open")).toBe(true);
+    // "#a b" parses to "a%20b", which HTML tries before the decoded "a b".
+    expect(click("space")).toEqual(["Encoded"]);
+    // %E9 alone is not UTF-8: it decodes to U+FFFD, as in a browser.
+    expect(click("bad-utf8")).toEqual(["Replaced"]);
+    expect(click("area")).toEqual(["Intro"]);
     await win.happyDOM.close();
   });
 });

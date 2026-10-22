@@ -5,7 +5,7 @@ import { Button } from "../Button/Button";
 import { LazyFeature } from "../LazyFeature/LazyFeature";
 import {
   LEFT_SIDEBAR_WIDTH_KEY,
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  getRightSidebarCollapsedKey,
   RIGHT_SIDEBAR_WIDTH_KEY,
   getReviewImmersiveKey,
 } from "@/common/constants/storage";
@@ -13,14 +13,24 @@ import { useResizableSidebar } from "@/browser/hooks/useResizableSidebar";
 import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { useOpenTerminal } from "@/browser/hooks/useOpenTerminal";
 import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFullWidth";
-import {
-  readPersistedState,
-  updatePersistedState,
-  usePersistedState,
-} from "@/browser/hooks/usePersistedState";
+import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
 import { guardSidebarKeys, holdSidebarInput, type HeldSidebarInput } from "./deferredSidebarInput";
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
-import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
+import {
+  isBrowserViewportFocused,
+  isCommandPaletteTarget,
+  isDesktopViewportFocused,
+  isDialogOpen,
+  isTerminalFocused,
+  KEYBINDS,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
+
+import {
+  focusRightSidebarToggle,
+  isWorkspaceRightSidebarHidden,
+  toggleRightSidebarCollapsed,
+} from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { PopoverError } from "../PopoverError/PopoverError";
@@ -43,6 +53,10 @@ import {
   RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
 } from "@/constants/layout";
 import { ChatPane } from "../ChatPane/ChatPane";
+import {
+  RightSidebarToggle,
+  RightSidebarToggleHole,
+} from "../SidebarCollapseButton/SidebarCollapseButton";
 
 // ChatPane uses tailwind `min-w-96`.
 const CHAT_PANE_MIN_WIDTH_PX = 384;
@@ -198,19 +212,25 @@ function FullscreenSidebarClose(props: { onClose?: () => void }) {
  * loading and failure states stay visible.
  */
 function LazyRightSidebar(
-  props: React.ComponentProps<typeof RightSidebar> & { held: HeldSidebarInput[] }
+  props: React.ComponentProps<typeof RightSidebar> & {
+    held: HeldSidebarInput[];
+    /**
+     * The shell's state, not a read of the persisted key: React Compiler reuses the shell's
+     * element for this component while its props stay the same, so a toggle while the chunk
+     * loads would leave the loading box at its old width under the header.
+     */
+    collapsed: boolean;
+  }
 ) {
-  const { held, ...sidebarProps } = props;
+  const { held, collapsed, ...sidebarProps } = props;
   // Per workspace: the shell keys this component by workspace.
   const [workflowRunBaseline, setWorkflowRunBaseline] = useState<number | null>(null);
-  const collapsed = readPersistedState(
-    RIGHT_SIDEBAR_COLLAPSED_KEY,
-    RIGHT_SIDEBAR_DEFAULT_COLLAPSED
-  );
+  const [collapsedBeforeLoad] = useState(collapsed);
   // The failure state takes the expanded width even when collapsed: it needs room for its Reload
-  // button, and the card's expand control is part of the sidebar that failed to load. The empty
-  // loading box keeps its element (not display:none), so shortcut routing still sees a sidebar
-  // the layout shows (isWorkspaceRightSidebarHidden).
+  // button, and the card is part of the sidebar that failed to load (globals.css hides the toggle
+  // then, since there is no sidebar to toggle). The empty loading box keeps its element (not
+  // display:none), so shortcut routing still sees a sidebar the layout shows
+  // (isWorkspaceRightSidebarHidden).
   const frame = (state: React.ReactNode, kind: "loading" | "failed") => {
     const empty = collapsed && kind === "loading";
     return (
@@ -247,9 +267,37 @@ function LazyRightSidebar(
   );
   return (
     <LazyFeature name="Sidebar" frame={frame} fallback={pending}>
-      <RightSidebar {...sidebarProps} workflowRunBaseline={workflowRunBaseline} />
+      <RightSidebar
+        {...sidebarProps}
+        workflowRunBaseline={workflowRunBaseline}
+        collapsedBeforeLoad={collapsedBeforeLoad}
+      />
       <SidebarInput held={held} mode="replay" />
     </LazyFeature>
+  );
+}
+
+/**
+ * The right sidebar's toggle. Outside the lazy sidebar, so it works while the sidebar chunk loads
+ * (RightSidebar listens to the same persisted key). Immersive review covers the sidebar it
+ * toggles, so it is not there then.
+ */
+function ShellRightSidebarToggle(props: {
+  workspaceId: string;
+  collapsed: boolean;
+  immersive: boolean;
+}) {
+  if (props.immersive) return null;
+  return (
+    <RightSidebarToggle
+      collapsed={props.collapsed}
+      onToggle={() =>
+        updatePersistedState<boolean>(
+          getRightSidebarCollapsedKey(props.workspaceId),
+          !props.collapsed
+        )
+      }
+    />
   );
 }
 
@@ -288,6 +336,71 @@ const WorkspacePlaceholder: React.FC<{
   </main>
 );
 
+/**
+ * True for the TOGGLE_RIGHT_SIDEBAR chord outside terminals, browser and desktop viewports, which
+ * own their keystrokes.
+ */
+function isRightSidebarToggleChord(e: KeyboardEvent): boolean {
+  return (
+    matchesKeybind(e, KEYBINDS.TOGGLE_RIGHT_SIDEBAR) &&
+    !isTerminalFocused(e.target) &&
+    !isBrowserViewportFocused(e.target) &&
+    !isDesktopViewportFocused(e.target)
+  );
+}
+
+/**
+ * True when an overlay blocks the right sidebar toggle: a modal dialog, the command palette (not a
+ * modal dialog, bug bash RS1), or a focused popover or menu (Radix portals them out of the sidebar,
+ * so a collapse would unmount the control with focus and leave focus on <body>). A held key also
+ * blocks it, or it would flip the sidebar on every repeat.
+ */
+function isRightSidebarToggleBlocked(e: KeyboardEvent): boolean {
+  return (
+    e.repeat ||
+    isDialogOpen() ||
+    isCommandPaletteTarget(e.target) ||
+    (e.target instanceof Element && e.target.closest("[data-radix-popper-content-wrapper]") != null)
+  );
+}
+
+/**
+ * Toggles the right sidebar for its hotkey. A collapse unmounts the focused control, and focus then
+ * fell to <body> (bug bash RS3), so focus moves to the header toggle.
+ */
+function toggleRightSidebarFromKey(workspaceId: string, shell: HTMLElement | null): void {
+  const sidebar = shell?.querySelector(".mobile-hide-right-sidebar");
+  const focusWasInSidebar = sidebar?.contains(document.activeElement) === true;
+  if (toggleRightSidebarCollapsed(workspaceId, shell) && focusWasInSidebar) {
+    focusRightSidebarToggle(shell);
+  }
+}
+
+/**
+ * The right sidebar had no hotkey (user request). It lives in WorkspaceShell, outside the lazy
+ * sidebar, so it works while the sidebar chunk loads, like the header toggle. It also works from
+ * the chat input, where the chord types nothing, like TOGGLE_SIDEBAR for the left sidebar.
+ */
+function useRightSidebarToggleKey(
+  workspaceId: string,
+  shellRef: React.RefObject<HTMLDivElement | null>
+) {
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!isRightSidebarToggleChord(e)) return;
+      // Claim the chord even when an overlay blocks the toggle: in a browser, Chrome binds it to
+      // its bookmarks bar.
+      e.preventDefault();
+      if (isRightSidebarToggleBlocked(e)) return;
+      toggleRightSidebarFromKey(workspaceId, shellRef.current);
+    };
+    // Capture phase: some modal controls stop keydown propagation (stopKeyboardPropagation),
+    // which would hide the chord from a bubble-phase listener before it is claimed.
+    window.addEventListener("keydown", handler, { capture: true });
+    return () => window.removeEventListener("keydown", handler, { capture: true });
+  }, [workspaceId, shellRef]);
+}
+
 export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   const shellRef = useRef<HTMLDivElement>(null);
   const shellSize = useResizeObserver(shellRef);
@@ -296,7 +409,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   // from the first paint, read from state rather than from the card element: the sidebar chunk
   // loads lazily, and keying on the card would shift the transcript once it mounts.
   const [rightSidebarCollapsed] = usePersistedState<boolean>(
-    RIGHT_SIDEBAR_COLLAPSED_KEY,
+    getRightSidebarCollapsedKey(props.workspaceId),
     RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
     {
       listener: true,
@@ -348,7 +461,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
     // Like Codex desktop: dragging the handle far enough right collapses the sidebar into its
     // overview card (and back out reopens it). RightSidebar listens to the same persisted key.
     onDragCollapseChange: (collapsed) => {
-      updatePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, collapsed);
+      updatePersistedState<boolean>(getRightSidebarCollapsedKey(props.workspaceId), collapsed);
     },
   });
 
@@ -418,7 +531,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
     fullscreenReturnFocusRef.current = returnFocusTo;
     // Opening the sidebar expands it, like every other way to open it (tab shortcuts, "Open in
     // Artifacts"). A collapsed sidebar would unmount its panels each time the view closes.
-    updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+    updatePersistedState(getRightSidebarCollapsedKey(props.workspaceId), false);
     setFullscreenSidebarWorkspaceId(props.workspaceId);
   };
   const handleRequestSidebarFullscreen = () => {
@@ -430,6 +543,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   // Layer 1: the full-screen sidebar is drawn above the narrow-screen drawer (layer 0), so it
   // answers Escape first when both are open.
   useEscapeToDismiss(sidebarFullscreen, closeSidebarFullscreen, 1);
+  useRightSidebarToggleKey(props.workspaceId, shellRef);
   // The Timeline's "Reveal in transcript" scrolls to and highlights a message in the chat behind
   // the view, so close the view to show it (the phone Timeline dialog did the same).
   useEffect(() => {
@@ -492,7 +606,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
       // owns the right-sidebar container query without prop-drilling layout state.
       data-workspace-shell=""
       // A full-width transcript has no centered column for the collapsed right sidebar's overview
-      // card to sit beside, so globals.css keeps the card hidden (the header button stands in).
+      // card to sit beside, so globals.css keeps the card hidden.
       data-transcript-full-width={chatTranscriptFullWidth || undefined}
       data-right-sidebar-collapsed={rightSidebarCollapsed || undefined}
       className={cn(
@@ -520,8 +634,16 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
         sidebarFullscreen={sidebarFullscreen}
       />
 
+      {/* Between the chat and the sidebar, for Tab order. */}
+      <ShellRightSidebarToggle
+        workspaceId={props.workspaceId}
+        collapsed={rightSidebarCollapsed}
+        immersive={isReviewImmersive}
+      />
+
       <LazyRightSidebar
         held={heldSidebarInput}
+        collapsed={rightSidebarCollapsed}
         key={props.workspaceId}
         workspaceId={props.workspaceId}
         workspacePath={props.namedWorkspacePath}
@@ -537,6 +659,9 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
         onCloseFullscreen={closeSidebarFullscreen}
         onRequestFullscreen={handleRequestSidebarFullscreen}
       />
+
+      {/* After the sidebar in DOM order: see RightSidebarToggleHole. */}
+      <RightSidebarToggleHole />
 
       {/* Portal target for immersive review mode overlay */}
       <div

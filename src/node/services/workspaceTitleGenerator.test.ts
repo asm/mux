@@ -87,7 +87,8 @@ function pinnedOptionsFor(
   modelString: string,
   model: LanguageModel,
   _opts?: { thinkingLevel?: ThinkingLevel; agentInitiated?: boolean },
-  muxProviderOptions: MuxProviderOptions = {}
+  muxProviderOptions: MuxProviderOptions = {},
+  optionsRouteProvider?: "bedrock" | "openrouter"
 ) {
   return Ok({
     model,
@@ -97,6 +98,7 @@ function pinnedOptionsFor(
     optionsModelString: modelString,
     optionsProvidersConfig: {},
     optionsMuxProviderOptions: muxProviderOptions,
+    ...(optionsRouteProvider && { optionsRouteProvider }),
   });
 }
 
@@ -473,6 +475,29 @@ describe("generateWorkspaceIdentity candidate settings", () => {
       expect(streamTextSpy.mock.calls[0]?.[0].toolChoice).toEqual(
         forced ? forcedProposeName : undefined
       );
+    }
+  );
+
+  // #5954: Bedrock and OpenRouter spell "thinking off" in their own namespaces.
+  test.each([{ route: "bedrock" as const }, { route: "openrouter" as const }])(
+    "forces propose_name when the $route route serializes thinking off",
+    async ({ route }) => {
+      const model = "anthropic:claude-haiku-5-5";
+      const aiService = titleAIService((modelString) =>
+        Promise.resolve(
+          pinnedOptionsFor(modelString, createTitleModel(modelString), undefined, {}, route)
+        )
+      );
+      const streamTextSpy = spyOn(aiSdk, "streamText").mockReturnValue(proposeNameStream);
+
+      const result = await generateWorkspaceIdentity(
+        "Add setting",
+        [{ model, thinkingLevel: "off" }],
+        aiService
+      );
+
+      expect(result.success).toBe(true);
+      expect(streamTextSpy.mock.calls[0]?.[0].toolChoice).toEqual(forcedProposeName);
     }
   );
 

@@ -6,7 +6,6 @@ import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { ProviderOptionsProvider } from "@/browser/contexts/ProviderOptionsContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
-import { UILayoutsProvider } from "@/browser/contexts/UILayoutsContext";
 import { WorkspaceProvider } from "@/browser/contexts/WorkspaceContext";
 import { selectWorkspace } from "@/browser/stories/helpers/uiState";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
@@ -21,7 +20,6 @@ import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ProjectConfig } from "@/common/types/project";
 import type { TaskSettings } from "@/common/types/tasks";
 import type { GoalDefaults } from "@/constants/goals";
-import type { LayoutPresetsConfig } from "@/common/types/uiLayouts";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 
 interface SettingsSectionStoryProps {
@@ -89,13 +87,11 @@ export function SettingsSectionStory(props: SettingsSectionStoryProps) {
       <RouterProvider>
         <ProjectProvider>
           <WorkspaceProvider>
-            <UILayoutsProvider>
-              <SettingsProvider>
-                <ProviderOptionsProvider>
-                  <ConfirmDialogProvider>{props.children}</ConfirmDialogProvider>
-                </ProviderOptionsProvider>
-              </SettingsProvider>
-            </UILayoutsProvider>
+            <SettingsProvider>
+              <ProviderOptionsProvider>
+                <ConfirmDialogProvider>{props.children}</ConfirmDialogProvider>
+              </ProviderOptionsProvider>
+            </SettingsProvider>
           </WorkspaceProvider>
         </ProjectProvider>
       </RouterProvider>
@@ -104,7 +100,6 @@ export function SettingsSectionStory(props: SettingsSectionStoryProps) {
 }
 
 interface SetupSettingsStoryOptions {
-  layoutPresets?: LayoutPresetsConfig;
   /** Initial model classes for Settings → Models → Model Classes. */
   modelClasses?: Record<string, string>;
   providersConfig?: ProvidersConfigMap;
@@ -144,7 +139,6 @@ export function setupSettingsStory(options: SetupSettingsStoryOptions): APIClien
     taskSettings: options.taskSettings,
     serverAuthSessions: options.serverAuthSessions,
     experiments: options.experiments,
-    layoutPresets: options.layoutPresets,
     modelClasses: options.modelClasses,
     userPreferences: options.userPreferences,
   });

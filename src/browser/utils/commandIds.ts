@@ -45,6 +45,7 @@ export const CommandIds = {
   navToggleHideSubAgents: () => "nav:toggle-hide-subagents" as const,
   navToggleFlatChatList: () => "nav:toggle-flat-chat-list" as const,
   navToggleTerminalBadge: () => "nav:toggle-terminal-badge" as const,
+  navRightSidebarToggle: () => "nav:rightSidebar:toggle" as const,
   navRightSidebarFocusTerminal: () => "nav:rightSidebar:focusTerminal" as const,
   navRightSidebarSplitHorizontal: () => "nav:rightSidebar:splitHorizontal" as const,
   navRightSidebarSplitVertical: () => "nav:rightSidebar:splitVertical" as const,
@@ -103,9 +104,6 @@ export const CommandIds = {
   // Analytics commands
   analyticsRebuildDatabase: () => "analytics:rebuild-database" as const,
 
-  // Layout commands
-  layoutApplySlot: (slot: number) => `layout:apply-slot:${slot}` as const,
-  layoutCaptureSlot: (slot: number) => `layout:capture-slot:${slot}` as const,
   // Settings commands
   settingsOpen: () => "settings:open" as const,
   settingsOpenSection: (section: string) => `settings:open:${section}` as const,

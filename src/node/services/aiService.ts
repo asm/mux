@@ -693,6 +693,7 @@ export class AIService extends EventEmitter {
     this.mockAiStreamPlayer ??= new MockAiStreamPlayer({
       aiService: this,
       historyService: this.historyService,
+      sessionsDir: this.config.sessionsDir,
     });
     this.streamManager.setMockStreamLifecycle(this.mockAiStreamPlayer);
   }

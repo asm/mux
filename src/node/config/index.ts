@@ -55,11 +55,6 @@ import {
 import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { SettingsBackupSchema } from "@/common/config/schemas/settingsBackup";
 import {
-  isLayoutPresetsConfigEmpty,
-  normalizeLayoutPresetsConfig,
-  type LayoutPresetsConfig,
-} from "@/common/types/uiLayouts";
-import {
   deriveLegacySubagentAiDefaultsProjection,
   mergeLegacySubagentAiDefaults,
   normalizeAgentAiDefaults,
@@ -113,6 +108,7 @@ import {
   isHeartbeatTrigger,
   isHeartbeatWhenBusy,
   isValidHeartbeatScheduleUpdatedAt,
+  resolveHeartbeatSchedulePolicy,
 } from "@/constants/heartbeat";
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults } from "@/constants/goals";
 import {
@@ -928,6 +924,13 @@ const HAND_EDITABLE_STRING_PROJECT_FIELDS = [
   "icon",
 ] as const;
 
+/** Store the valid limits in `value` on the project, or remove its limits when there are none. */
+function setProjectAgentResourceLimits(project: ProjectConfig, value: unknown): void {
+  const normalized = normalizeAgentResourceLimits(value);
+  if (normalized) project.agentResourceLimits = normalized;
+  else delete project.agentResourceLimits;
+}
+
 function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectConfig {
   // Per-project runtime overrides are optional; keep config.json sparse by persisting only explicit
   // overrides (false enablement + explicit default runtime selections).
@@ -993,6 +996,9 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
       delete next[field];
     }
   }
+
+  // Hand-editable too: an out-of-range limit is dropped instead of failing projects.list.
+  setProjectAgentResourceLimits(next, record.agentResourceLimits);
 
   // Legacy named workflow schedules are intentionally dropped while workflow
   // scheduling is disabled during the explicit script_path migration.
@@ -3136,11 +3142,6 @@ export class Config {
     );
     const migrations = normalizeConfigMigrations(parsed.migrations);
 
-    const layoutPresetsRaw = normalizeLayoutPresetsConfig(parsed.layoutPresets);
-    const layoutPresets = isLayoutPresetsConfigEmpty(layoutPresetsRaw)
-      ? undefined
-      : layoutPresetsRaw;
-
     const config: LegacyAdvisorProjectsConfig = {
       projects: projectsMap,
       apiServerBindHost: parseOptionalNonEmptyString(parsed.apiServerBindHost),
@@ -3153,7 +3154,6 @@ export class Config {
       defaultProjectDir: parseOptionalNonEmptyString(parsed.defaultProjectDir),
       viewedSplashScreens: parsed.viewedSplashScreens,
       userPreferences,
-      layoutPresets,
       taskSettings,
       chatTranscriptFullWidth: parseOptionalBoolean(parsed.chatTranscriptFullWidth),
       muxGatewayEnabled,
@@ -3444,12 +3444,6 @@ export class Config {
         data.userPreferences = userPreferences;
       }
 
-      if (config.layoutPresets) {
-        const normalized = normalizeLayoutPresetsConfig(config.layoutPresets);
-        if (!isLayoutPresetsConfigEmpty(normalized)) {
-          data.layoutPresets = normalized;
-        }
-      }
       if (config.viewedSplashScreens) {
         data.viewedSplashScreens = config.viewedSplashScreens;
       }
@@ -3829,8 +3823,29 @@ export class Config {
 
   async updateHeartbeatDefaultIntervalMs(intervalMs: number | null | undefined): Promise<void> {
     await this.editConfig((config) => {
+      const resolveDefault = (value: unknown) =>
+        isValidHeartbeatIntervalMs(value) ? value : HEARTBEAT_DEFAULT_INTERVAL_MS;
+      const before = resolveDefault(config.heartbeatDefaultIntervalMs);
       if (intervalMs != null) config.heartbeatDefaultIntervalMs = intervalMs;
       else delete config.heartbeatDefaultIntervalMs;
+      // A fixed-interval heartbeat that follows the default anchors its first deadline
+      // after a restart on max(last firing, scheduleUpdatedAt), so a default change must
+      // stamp it like a cadence edit does (#5741). In this same edit: no extra read or write.
+      if (resolveDefault(config.heartbeatDefaultIntervalMs) !== before) {
+        const now = Date.now();
+        for (const project of config.projects.values()) {
+          for (const workspace of project.workspaces) {
+            const heartbeat = workspace.heartbeat;
+            if (
+              heartbeat?.enabled === true &&
+              !isValidHeartbeatIntervalMs(heartbeat.intervalMs) &&
+              resolveHeartbeatSchedulePolicy(heartbeat).trigger === "interval"
+            ) {
+              heartbeat.scheduleUpdatedAt = now;
+            }
+          }
+        }
+      }
       return config;
     });
   }
@@ -3848,6 +3863,28 @@ export class Config {
     await this.editConfig((config) => {
       if (enabled) config.agentResourceLimitsEnabled = true;
       else delete config.agentResourceLimitsEnabled;
+      return config;
+    });
+  }
+
+  /** Replaces both limits of one project: an omitted field removes that limit. */
+  async updateProjectAgentResourceLimits(
+    projectPath: string,
+    limits: AgentResourceLimits
+  ): Promise<void> {
+    await this.editConfig((config) => {
+      const project = config.projects.get(projectPath);
+      if (!project) {
+        throw new Error(`Project not found: ${projectPath}`);
+      }
+      // Sub-project workspaces belong to the parent's checkout, and their commands join the
+      // parent's cgroup, so a limit of its own would never apply. Clearing one is still allowed.
+      if (project.parentProjectPath && normalizeAgentResourceLimits(limits)) {
+        throw new Error(
+          `Sub-project ${projectPath} shares the resource limits of its parent project ${project.parentProjectPath}.`
+        );
+      }
+      setProjectAgentResourceLimits(project, limits);
       return config;
     });
   }
@@ -3886,16 +3923,6 @@ export class Config {
       const viewed = config.viewedSplashScreens ?? [];
       if (!viewed.includes(splashId)) viewed.push(splashId);
       return { ...config, viewedSplashScreens: viewed };
-    });
-  }
-
-  async saveLayoutPresets(layoutPresets: LayoutPresetsConfig): Promise<void> {
-    await this.editConfig((config) => {
-      const normalized = normalizeLayoutPresetsConfig(layoutPresets);
-      return {
-        ...config,
-        layoutPresets: isLayoutPresetsConfigEmpty(normalized) ? undefined : normalized,
-      };
     });
   }
 

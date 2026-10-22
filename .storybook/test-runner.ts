@@ -155,7 +155,8 @@ const config: TestRunnerConfig = {
       // the controls must size themselves to the 24px minimum. Plays cannot emulate the pointer.
       const client = await page.context().newCDPSession(page);
       const viewport = page.viewportSize();
-      const strip = page.getByRole("tablist").locator("..");
+      // The row sits in a wrapper that holds its desktop no-drag region.
+      const strip = page.getByRole("tablist").locator("../..");
       try {
         await page.setViewportSize({ width: 1200, height: 900 });
         const desktop = await strip.boundingBox();
@@ -166,12 +167,9 @@ const config: TestRunnerConfig = {
         const tablet = await strip.boundingBox();
         if (!desktop || !tablet) throw new Error("Tab strip is missing");
         assert.equal(tablet.height, desktop.height, "Touch must not grow the tablet tab strip");
-        for (const name of [
-          "Close New tab",
-          "Close Instructions",
-          "All tabs",
-          "Collapse sidebar",
-        ]) {
+        // The strip's room for the right sidebar toggle is inert; the toggle itself (in
+        // WorkspaceShell) is a fixed 24px button.
+        for (const name of ["Close New tab", "Close Instructions", "New tab", "All tabs"]) {
           const box = await page.getByRole("button", { name, exact: true }).boundingBox();
           if (!box) throw new Error(`${name} button is missing`);
           assert(
@@ -304,6 +302,23 @@ const config: TestRunnerConfig = {
           );
         },
         [initialOrder[1], initialOrder[0], ...initialOrder.slice(2)],
+        { timeout: 5000 }
+      );
+      // dnd-kit's PointerSensor stops every click on the page (a capture listener on document)
+      // from drag start until 50 ms after the drag ends (setTimeout in
+      // @dnd-kit/core/dist/core.esm.js:1476-1479, v6.3.1). The next story in this file
+      // (SingleTab) clicks All tabs about 15 ms after it renders, so that click was lost (#6999).
+      // Wait until a probe click on the body reaches the body again.
+      await page.waitForFunction(
+        () => {
+          let reached = false;
+          const mark = () => (reached = true);
+          document.body.addEventListener("click", mark, { once: true });
+          document.body.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+          document.body.removeEventListener("click", mark);
+          return reached;
+        },
+        undefined,
         { timeout: 5000 }
       );
     } finally {

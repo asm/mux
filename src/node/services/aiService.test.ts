@@ -3179,7 +3179,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     modelString: string,
     toolSearch: boolean,
     muxProviderOptions?: MuxProviderOptions,
-    routeProvider?: ProviderName
+    routeProvider?: ProviderName,
+    ptc?: { activeAgentDeniesCodeExecution?: boolean }
   ) {
     using xumHome = new DisposableTempDir("ai-tool-search-cache");
     const metadata = createLocalWorkspaceMetadata("tool-search-cache", xumHome.path);
@@ -3188,11 +3189,28 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const mcpTools: Record<string, Tool> = {
       tracker_list_issues: { ...stubTool, description: NATIVE_DEFERRAL_DESCRIPTION },
     };
+    let experimentsService: ExperimentsService | undefined;
+    if (ptc) {
+      experimentsService = new ExperimentsService({
+        telemetryService: new TelemetryService(xumHome.path),
+        xumHome: xumHome.path,
+      });
+      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+        (id) => id === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING
+      );
+    }
     const harness = createHarness(xumHome.path, metadata, {
       useRequestedModelString: true,
       routeProvider,
+      experimentsService,
     });
     if (!toolSearch) await harness.config.updateToolSearchEnabled(false);
+    if (ptc?.activeAgentDeniesCodeExecution) {
+      const agent = resolvedAgentResultFor(metadata);
+      if (!agent.success) throw new Error("Expected resolved agent");
+      agent.data.effectiveToolPolicy = [{ regex_match: "code_execution", action: "disable" }];
+      spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(agent);
+    }
     // Mirror getToolsForModel: the search tool exists only with a tool-search runtime.
     harness.getToolsForModelSpy.mockImplementation((_model, config) =>
       Promise.resolve({
@@ -3301,6 +3319,21 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(on.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
     expect(on.toolNames).toContain("tool_catalog_search");
     expect(on.deferLoadingNames).toEqual([]);
+  });
+
+  // #7028: a policy that denies code_execution stops PTC, so the MCP tools are
+  // flat again and tool search must defer them as it does without PTC.
+  it("defers MCP tools when a policy turns PTC off", async () => {
+    const withPtc = await startToolSearchStream("openai:gpt-5.2", true, undefined, undefined, {});
+    expect(withPtc.toolNames).toContain("code_execution");
+    expect(withPtc.toolNames).not.toContain("tool_catalog_search");
+
+    const denied = await startToolSearchStream("openai:gpt-5.2", true, undefined, undefined, {
+      activeAgentDeniesCodeExecution: true,
+    });
+    expect(denied.toolNames).not.toContain("code_execution");
+    expect(denied.toolNames).toContain("tool_catalog_search");
+    expect(denied.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
   });
 
   it("disables tool-search deferral when the user setting is off", async () => {
@@ -4007,6 +4040,42 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       });
     });
 
+    // A per-turn caller policy (SendMessageOptions.toolPolicy) must not change
+    // the advertised block, or every such turn misses the prompt cache. The
+    // denied tool stays advertised and refuses at execution time instead.
+    it("keeps the tool block byte-identical under a caller disable policy", async () => {
+      using xumHome = new DisposableTempDir("ai-service-caller-policy-tools");
+      const { toolsByAgent, projectPath, harness } = await streamWithRealAgentTools(
+        xumHome.path,
+        {},
+        ["exec"]
+      );
+      const plain = toolsByAgent.exec;
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("latest-user", "user", "hello")],
+        workspaceId: "workspace-stable-agent-tools",
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+        agentId: "exec",
+        toolPolicy: [{ regex_match: "bash", action: "disable" }],
+      });
+      expect(result.success).toBe(true);
+      const restricted = harness.startStreamCalls.at(-1)?.tools ?? {};
+
+      expect(plain.bash).toBeDefined();
+      expect(Object.keys(restricted).sort()).toEqual(Object.keys(plain).sort());
+      expect(shape(restricted)).toBe(shape(plain));
+
+      const target = path.join(projectPath, "created-by-denied-bash.txt");
+      expect(
+        await restricted.bash.execute!(
+          { script: `touch ${target}`, timeout_secs: 5, display_name: "t" },
+          callOptions
+        )
+      ).toEqual({ success: false, error: "Tool 'bash' is disabled for this turn." });
+      expect(await fs.stat(target).catch(() => null)).toBeNull();
+    });
+
     // Read-only agents may own research goals: neither explore's tool policy
     // nor the goal handlers may refuse creating or completing one.
     it("lets the read-only explore agent create and complete a goal", async () => {
@@ -4542,6 +4611,38 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const initialMetadata = initialMetadataFromStartStreamCall(startStreamCall);
     expect(initialMetadata.routeProvider).toBe("openrouter");
   });
+
+  it.each([
+    // An explicit base URL: a host ANTHROPIC_BASE_URL would otherwise decide the route.
+    ["the first-party API", "https://api.anthropic.com/v1", true],
+    ["a proxy base URL", "https://litellm.example.com/v1", false],
+  ] as const)(
+    "offers Anthropic native web_fetch only on the first-party route: %s (#2922)",
+    async (_label, baseUrl, expected) => {
+      using xumHome = new DisposableTempDir("ai-service-native-web-fetch");
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const metadata = createLocalWorkspaceMetadata("workspace-native-web-fetch", projectPath);
+      const harness = createHarness(xumHome.path, metadata, { routeProvider: "anthropic" });
+      new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
+        anthropic: { apiKey: "test-anthropic-key", baseUrl },
+      });
+
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("latest-user", "user", "fetch a page")],
+        workspaceId: metadata.id,
+        modelString: "anthropic:claude-opus-4-6",
+        thinkingLevel: "off",
+      });
+
+      expect(result.success).toBe(true);
+      const configs = harness.getToolsForModelSpy.mock.calls.map((call) => call[1]);
+      expect(configs.length).toBeGreaterThan(0);
+      expect(configs.map((config) => config.anthropicNativeWebFetchEnabled)).toEqual(
+        configs.map(() => expected)
+      );
+    }
+  );
 
   it("passes muxMetadata into initial stream metadata", async () => {
     using xumHome = new DisposableTempDir("ai-service-mux-metadata");

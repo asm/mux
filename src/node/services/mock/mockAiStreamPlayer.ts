@@ -21,6 +21,9 @@ import type {
   MockStreamStartEvent,
 } from "./mockAiEventTypes";
 import { MockAiRouter } from "./mockAiRouter";
+import { setTodosForSessionDir } from "@/node/services/tools/todo";
+import type { TodoItem } from "@/common/types/tools";
+import * as path from "node:path";
 import { buildMockStreamEventsFromReply } from "./mockAiStreamAdapter";
 import type {
   CompletedMessagePart,
@@ -40,6 +43,25 @@ const MOCK_TOKENIZER_MODEL = KNOWN_MODELS.GPT.id;
 const TOKENIZE_TIMEOUT_MS = 150;
 let tokenizerFallbackLogged = false;
 let tokenizerUnavailableLogged = false;
+/**
+ * A tokenizer call that missed TOKENIZE_TIMEOUT_MS and is still running (cold tokenizer load or
+ * a busy worker). Until it settles, deltas use the approximate count at once: waiting the full
+ * timeout per delta held the event queue for 150 ms per 25 ms delta, and the throttled partial
+ * write queued behind that backlog (partial.json appeared ~1.9 s into a stream, #7065).
+ */
+let slowTokenizeInFlight: Promise<unknown> | null = null;
+
+function trackSlowTokenize(pending: Promise<unknown>): void {
+  const inFlight = pending.finally(() => {
+    if (slowTokenizeInFlight === inFlight) slowTokenizeInFlight = null;
+  });
+  slowTokenizeInFlight = inFlight;
+}
+
+async function countMockTokens(text: string, context: string): Promise<number> {
+  if (slowTokenizeInFlight !== null) return approximateTokenCount(text);
+  return tokenizeWithMockModel(text, context);
+}
 
 function approximateTokenCount(text: string): number {
   const normalizedLength = text.trim().length;
@@ -63,6 +85,7 @@ async function tokenizeWithMockModel(text: string, context: string): Promise<num
   const fallbackPromise = new Promise<number>((resolve) => {
     timeoutId = setTimeout(() => {
       fallbackUsed = true;
+      trackSlowTokenize(actualPromise);
       resolve(approximateTokens);
     }, TOKENIZE_TIMEOUT_MS);
   });
@@ -118,9 +141,27 @@ async function tokenizeWithMockModel(text: string, context: string): Promise<num
 
 const MOCK_PARTIAL_WRITE_THROTTLE_MS = 100;
 
+/** The list a successful canned todo_write wrote, from its tool-start input; null for any other call. */
+function writtenTodoList(
+  parts: MuxMessage["parts"],
+  event: Extract<MockAssistantEvent, { kind: "tool-end" }>
+): TodoItem[] | null {
+  if (event.toolName !== "todo_write") return null;
+  if ((event.result as { success?: unknown } | undefined)?.success !== true) return null;
+  const part = parts.find(
+    (candidate) => candidate.type === "dynamic-tool" && candidate.toolCallId === event.toolCallId
+  );
+  const input = part?.type === "dynamic-tool" ? part.input : undefined;
+  const todos = (input as { todos?: TodoItem[] } | undefined)?.todos;
+  assert(Array.isArray(todos), "mock todo_write call needs args.todos");
+  return todos;
+}
+
 interface MockPlayerDeps {
   aiService: AIService;
   historyService: HistoryService;
+  /** Where the canned todo_write side effect writes (see applyToolSideEffects); unit tests omit it. */
+  sessionsDir?: string;
 }
 
 interface StreamStartGate {
@@ -238,6 +279,25 @@ export class MockAiStreamPlayer {
     const gate = { promise, resolve };
     this.streamStartGates.set(workspaceId, gate);
     return gate;
+  }
+
+  /**
+   * Canned tool calls never run, but a successful todo_write must leave the list on disk as the
+   * real tool does: AgentSession's turn-end TODO nudge reads it there (needsTodoTurnEndNudge).
+   * Runs in the call's tool-end handler, before its tool-call-end event: a stream stopped before
+   * that point writes nothing, as with a real tool. The queue awaits each handler in order, so
+   * stream-end always sees the new list.
+   */
+  private async applyTodoWriteSideEffect(
+    workspaceId: string,
+    active: ActiveStream,
+    event: Extract<MockAssistantEvent, { kind: "tool-end" }>
+  ): Promise<void> {
+    const sessionsDir = this.deps.sessionsDir;
+    if (sessionsDir === undefined) return;
+    const todos = writtenTodoList(active.parts, event);
+    if (todos === null) return;
+    await setTodosForSessionDir(workspaceId, path.join(sessionsDir, workspaceId), todos);
   }
 
   private async waitForStreamStartGate(
@@ -873,6 +933,31 @@ export class MockAiStreamPlayer {
     return nextParts;
   }
 
+  /** A canned tool call's completion: its side effect first, then the tool-call-end event. */
+  private async dispatchToolEnd(
+    workspaceId: string,
+    active: ActiveStream,
+    event: Extract<MockAssistantEvent, { kind: "tool-end" }>,
+    messageId: string
+  ): Promise<void> {
+    await this.applyTodoWriteSideEffect(workspaceId, active, event);
+    // A Stop during the write cancels the stream: emit no completion into the aborted turn.
+    if (active.cancelled) return;
+    const payload: ToolCallEndEvent = {
+      type: "tool-call-end",
+      workspaceId,
+      messageId,
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      result: event.result,
+      timestamp: this.nextEventTimestamp(active),
+    };
+    this.setToolPartOutput(active, event, payload.timestamp);
+    this.schedulePartialWrite(workspaceId, active);
+    this.deps.aiService.emit("tool-call-end", payload);
+    this.recordReplayableEvent(active, payload);
+  }
+
   private async dispatchEvent(
     workspaceId: string,
     event: MockAssistantEvent,
@@ -908,7 +993,7 @@ export class MockAiStreamPlayer {
       }
       case "reasoning-delta": {
         // Mock streams use the same tokenization logic as real streams for consistency
-        const tokens = await tokenizeWithMockModel(event.text, "reasoning-delta text");
+        const tokens = await countMockTokens(event.text, "reasoning-delta text");
         if (active.cancelled) return;
         const payload: ReasoningDeltaEvent = {
           type: "reasoning-delta",
@@ -933,7 +1018,7 @@ export class MockAiStreamPlayer {
         }
         // Mock streams use the same tokenization logic as real streams for consistency
         const inputText = JSON.stringify(event.args);
-        const tokens = await tokenizeWithMockModel(inputText, "tool-call args");
+        const tokens = await countMockTokens(inputText, "tool-call args");
         if (active.cancelled) return;
         const payload: ToolCallStartEvent = {
           type: "tool-call-start",
@@ -966,26 +1051,14 @@ export class MockAiStreamPlayer {
         break;
       }
       case "tool-end": {
-        const payload: ToolCallEndEvent = {
-          type: "tool-call-end",
-          workspaceId,
-          messageId,
-          toolCallId: event.toolCallId,
-          toolName: event.toolName,
-          result: event.result,
-          timestamp: this.nextEventTimestamp(active),
-        };
-        this.setToolPartOutput(active, event, payload.timestamp);
-        this.schedulePartialWrite(workspaceId, active);
-        this.deps.aiService.emit("tool-call-end", payload);
-        this.recordReplayableEvent(active, payload);
+        await this.dispatchToolEnd(workspaceId, active, event, messageId);
         break;
       }
       case "stream-delta": {
         // Mock streams use the same tokenization logic as real streams for consistency
         let tokens: number;
         try {
-          tokens = await tokenizeWithMockModel(event.text, "stream-delta text");
+          tokens = await countMockTokens(event.text, "stream-delta text");
         } catch (error) {
           log.error("tokenize failed for stream-delta", error);
           throw error;

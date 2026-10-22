@@ -22,6 +22,7 @@ import {
   resolveProviderOptionsNamespaceKey,
   ANTHROPIC_1M_CONTEXT_HEADER,
   MUX_WORKSPACE_ID_HEADER,
+  anthropicNativeWebFetchRouteAvailable,
 } from "./providerOptions";
 
 // Mock the log module to avoid console noise. The stub covers only what this file
@@ -1370,6 +1371,75 @@ describe("Coder gateway-scoped models (wire-canonical option building)", () => {
     // The string is the custom provider's identity; it must not be rewritten
     // to anthropic:<model> by name convention or gateway metadata.
     expect(options).not.toHaveProperty("anthropic");
+  });
+});
+
+// #2922: Anthropic's native web_fetch is a server tool that only the first-party API runs.
+// Vertex, Bedrock and Anthropic-compatible proxies reject the whole request when it is sent.
+describe("anthropicNativeWebFetchRouteAvailable", () => {
+  const opus = "anthropic:claude-opus-4-6";
+  const anthropic = (
+    overrides: Partial<NonNullable<ProvidersConfigMap["anthropic"]>> = {}
+  ): ProvidersConfigMap => ({
+    anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true, ...overrides },
+  });
+  const coderInstance = (type: string): ProvidersConfigMap => ({
+    coder: {
+      apiKeySet: false,
+      isEnabled: true,
+      isConfigured: true,
+      discoveredProviders: [{ name: "anthropic", type }],
+    },
+  });
+
+  test("offers it on the first-party API and gateways that forward to it", () => {
+    expect(anthropicNativeWebFetchRouteAvailable(opus, "anthropic", anthropic())).toBe(true);
+    expect(
+      anthropicNativeWebFetchRouteAvailable(
+        opus,
+        "anthropic",
+        anthropic({ baseUrl: "https://api.anthropic.com/v1" })
+      )
+    ).toBe(true);
+    expect(anthropicNativeWebFetchRouteAvailable(opus, "mux-gateway", anthropic())).toBe(true);
+    expect(
+      anthropicNativeWebFetchRouteAvailable(
+        "coder:anthropic/claude-opus-4-6",
+        "coder",
+        coderInstance("anthropic")
+      )
+    ).toBe(true);
+  });
+
+  test("withholds it from proxies, Bedrock-backed instances and custom providers", () => {
+    const proxied = [
+      anthropic({ baseUrl: "https://litellm.example.com/v1" }),
+      // An env base URL shows up only as the resolved value.
+      anthropic({ baseUrlResolved: "https://vertex-proxy.example.com", baseUrlSource: "env" }),
+    ];
+    for (const config of proxied) {
+      expect(anthropicNativeWebFetchRouteAvailable(opus, "anthropic", config)).toBe(false);
+    }
+    expect(
+      anthropicNativeWebFetchRouteAvailable(
+        "coder:anthropic/claude-opus-4-6",
+        "coder",
+        coderInstance("bedrock")
+      )
+    ).toBe(false);
+    const custom: ProvidersConfigMap = {
+      litellm: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        isCustom: true,
+        providerType: "anthropic-messages",
+        baseUrl: "https://litellm.example.com",
+      },
+    };
+    expect(
+      anthropicNativeWebFetchRouteAvailable("litellm:claude-opus-4-6", undefined, custom)
+    ).toBe(false);
   });
 });
 
@@ -3819,6 +3889,62 @@ describe("buildRequestHeaders", () => {
     });
   }
 
+  describe("per-provider session header", () => {
+    const zen = (sessionHeader?: string): ProvidersConfigMap => ({
+      zen: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        isCustom: true,
+        providerType: "openai-compatible",
+        ...(sessionHeader != null ? { sessionHeader } : {}),
+      },
+    });
+
+    test("encodes non-header-safe workspace ids the same way", () => {
+      const headers = buildRequestHeaders(
+        "zen:kimi-k3",
+        undefined,
+        "workspace-😀",
+        zen("x-opencode-session")
+      );
+      expect(headers?.["x-opencode-session"]).toBe(headers?.[MUX_WORKSPACE_ID_HEADER]);
+    });
+
+    test("applies only to custom providers", () => {
+      const config: ProvidersConfigMap = {
+        openrouter: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          sessionHeader: "x-router-session",
+        },
+      };
+      expect(
+        buildRequestHeaders("openrouter:openai/gpt-5.2", undefined, "ws-1", config, "openrouter")
+      ).toEqual({ [MUX_WORKSPACE_ID_HEADER]: "ws-1" });
+    });
+
+    test("skips the header without a workspace id or a setting", () => {
+      expect(
+        buildRequestHeaders("zen:kimi-k3", undefined, undefined, zen("x-opencode-session"))
+      ).toBeUndefined();
+      expect(buildRequestHeaders("zen:kimi-k3", undefined, "ws-1", zen())).toEqual({
+        [MUX_WORKSPACE_ID_HEADER]: "ws-1",
+      });
+    });
+
+    // providers.jsonc is hand-editable: an invalid or reserved name must not
+    // overwrite credentials or make fetch reject the request.
+    test("ignores an invalid or reserved name from a hand-edited config", () => {
+      for (const name of ["Authorization", "x-api-key", "bad header"]) {
+        expect(buildRequestHeaders("zen:kimi-k3", undefined, "ws-1", zen(name))).toEqual({
+          [MUX_WORKSPACE_ID_HEADER]: "ws-1",
+        });
+      }
+    });
+  });
+
   test("workspace correlation header uses the mux wire name, not Xum", () => {
     expect(MUX_WORKSPACE_ID_HEADER).toBe("X-Mux-Workspace-Id");
     const headers = buildRequestHeaders("openai:gpt-5.2", undefined, "ws-id");
@@ -3952,15 +4078,16 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
       "bedrock"
     );
 
-  // Haiku 5.5 thinks adaptively when `thinking` is omitted, so "off" (the `haiku`
-  // alias default and the workspace-naming fallback level) must be explicit. The real
-  // Bedrock provider drops `reasoningConfig: { type: "disabled" }` for Claude, so this
-  // checks the bytes it actually sends.
-  test.each([
-    ["the canonical alias routed to Bedrock", "anthropic:claude-haiku-5-5"],
-    ["an explicit Bedrock model", "bedrock:anthropic.claude-haiku-5-5"],
-  ])("Haiku 5.5 off disables thinking for %s", async (_label, model) => {
-    const options = bedrockOptions(model, "off");
+  /**
+   * Sends one request through the real Bedrock Converse provider and returns the
+   * JSON body it put on the wire, so these tests check the bytes Bedrock gets,
+   * not Xum's option object (the SDK rewrites reasoningConfig into raw fields).
+   */
+  async function sentBedrockBody(
+    bedrockModelId: string,
+    options: ReturnType<typeof buildProviderOptions>,
+    callSettings: { maxOutputTokens?: number; temperature?: number } = {}
+  ): Promise<{ path: string; body: Record<string, unknown> }> {
     const captured: Array<{ path: string; body: Record<string, unknown> }> = [];
     const captureFetch = Object.assign(
       (
@@ -3997,25 +4124,150 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
     });
 
     await generateText({
-      model: bedrock("anthropic.claude-haiku-5-5"),
+      model: bedrock(bedrockModelId),
       prompt: "Return ok.",
       providerOptions: options as Parameters<typeof generateText>[0]["providerOptions"],
       maxRetries: 0,
+      ...callSettings,
     });
 
     expect(captured).toHaveLength(1);
-    expect(captured[0].path).toBe("/model/anthropic.claude-haiku-5-5/converse");
-    expect(captured[0].body.additionalModelRequestFields).toEqual({
+    return captured[0];
+  }
+
+  // Haiku 5.5 thinks adaptively when `thinking` is omitted, so "off" (the `haiku`
+  // alias default and the workspace-naming fallback level) must be explicit. The real
+  // Bedrock provider drops `reasoningConfig: { type: "disabled" }` for Claude, so this
+  // checks the bytes it actually sends.
+  test.each([
+    ["the canonical alias routed to Bedrock", "anthropic:claude-haiku-5-5"],
+    ["an explicit Bedrock model", "bedrock:anthropic.claude-haiku-5-5"],
+  ])("Haiku 5.5 off disables thinking for %s", async (_label, model) => {
+    const sent = await sentBedrockBody("anthropic.claude-haiku-5-5", bedrockOptions(model, "off"));
+    expect(sent.path).toBe("/model/anthropic.claude-haiku-5-5/converse");
+    expect(sent.body.additionalModelRequestFields).toEqual({
       thinking: { type: "disabled" },
       output_config: { effort: "low" },
     });
   });
 
-  test("leaves other levels and older Claude models on the Bedrock defaults", () => {
-    // The Bedrock route sends no thinking options for these yet (#5839). Haiku 4.5
-    // does not think unless asked, so omitting `thinking` already means "off".
-    expect(bedrockOptions("anthropic:claude-haiku-5-5", "low")).toEqual({});
-    expect(bedrockOptions("anthropic:claude-haiku-4-5", "off")).toEqual({});
-    expect(bedrockOptions("anthropic:claude-sonnet-5-5", "off")).toEqual({});
+  // #5839: the selected level must reach Bedrock adaptive models with the same
+  // per-model shape as the direct Anthropic route: adaptive thinking plus effort
+  // (native-xhigh models also ask for summarized thinking).
+  test.each([
+    [
+      "anthropic:claude-sonnet-5-5",
+      "low",
+      { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "low" } },
+    ],
+    [
+      "bedrock:anthropic.claude-sonnet-5-5",
+      "medium",
+      {
+        thinking: { type: "adaptive", display: "summarized" },
+        output_config: { effort: "medium" },
+      },
+    ],
+    [
+      "bedrock:anthropic.claude-sonnet-5-5",
+      "high",
+      { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "high" } },
+    ],
+    [
+      "bedrock:anthropic.claude-opus-5-5",
+      "xhigh",
+      {
+        thinking: { type: "adaptive", display: "summarized" },
+        output_config: { effort: "xhigh" },
+      },
+    ],
+    // Opus 4.6 has no native xhigh (it maps to "max") and must not get `display`.
+    [
+      "bedrock:anthropic.claude-opus-4-6",
+      "xhigh",
+      { thinking: { type: "adaptive" }, output_config: { effort: "max" } },
+    ],
+    [
+      "bedrock:anthropic.claude-sonnet-5",
+      "off",
+      { thinking: { type: "disabled" }, output_config: { effort: "low" } },
+    ],
+    // Sonnet 5.5 rejects disabled thinking and its `between_tools` needs the
+    // Anthropic payload, so "off" runs as low adaptive on Bedrock.
+    [
+      "bedrock:anthropic.claude-sonnet-5-5",
+      "off",
+      { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "low" } },
+    ],
+  ] as const)("%s at %s sends the matching reasoning fields", async (model, level, expected) => {
+    const bedrockModelId = `anthropic.${model.slice(model.indexOf("claude-"))}`;
+    const sent = await sentBedrockBody(bedrockModelId, bedrockOptions(model, level));
+    expect(sent.body.additionalModelRequestFields).toEqual(expected);
+  });
+
+  // Cross-region inference profiles keep the `bedrock:` origin, and Bedrock ids
+  // carry a -vN[:M] suffix that the capability matchers do not expect. A missed
+  // match must not send `disabled` to a model that rejects it (a 400).
+  test.each([
+    [
+      "bedrock:us.anthropic.claude-sonnet-5-5",
+      "high",
+      { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "high" } },
+    ],
+    [
+      "bedrock:global.anthropic.claude-opus-4-6-v1",
+      "xhigh",
+      { thinking: { type: "adaptive" }, output_config: { effort: "max" } },
+    ],
+    // Like the unversioned id: Sonnet 5.5 "off" runs as low adaptive on Bedrock.
+    [
+      "bedrock:us.anthropic.claude-sonnet-5-5-v1:0",
+      "off",
+      { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "low" } },
+    ],
+    [
+      "bedrock:eu.anthropic.claude-haiku-5-5-v1:0",
+      "off",
+      { thinking: { type: "disabled" }, output_config: { effort: "low" } },
+    ],
+  ] as const)(
+    "Bedrock profile id %s at %s sends the matching fields",
+    async (model, level, expected) => {
+      const sent = await sentBedrockBody(
+        model.slice("bedrock:".length),
+        bedrockOptions(model, level)
+      );
+      expect(sent.body.additionalModelRequestFields).toEqual(expected);
+    }
+  );
+
+  test("non-Claude Bedrock models get no Claude thinking fields", () => {
+    expect(bedrockOptions("bedrock:amazon.nova-pro-v1:0", "high")).toEqual({});
+  });
+
+  // Budget-thinking models keep main's Bedrock request exactly, at every level
+  // (#7180): no thinking or effort field, and the caller's output ceiling and
+  // sampling settings untouched.
+  test.each([
+    "bedrock:anthropic.claude-opus-4-5",
+    "anthropic:claude-sonnet-4-5",
+    "bedrock:us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "bedrock:anthropic.claude-haiku-4-5",
+    "bedrock:anthropic.claude-opus-4-1",
+    "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0",
+  ])("budget-thinking model %s keeps the Bedrock default at every level", async (model) => {
+    const bedrockModelId = model.startsWith("bedrock:")
+      ? model.slice("bedrock:".length)
+      : `anthropic.${model.slice(model.indexOf("claude-"))}`;
+    for (const level of ["off", "low", "medium", "high", "xhigh", "max"] as const) {
+      const options = bedrockOptions(model, level);
+      expect(options).toEqual({});
+      const sent = await sentBedrockBody(bedrockModelId, options, {
+        maxOutputTokens: 64000,
+        temperature: 0.5,
+      });
+      expect(sent.body.additionalModelRequestFields).toBeUndefined();
+      expect(sent.body.inferenceConfig).toEqual({ maxTokens: 64000, temperature: 0.5 });
+    }
   });
 });

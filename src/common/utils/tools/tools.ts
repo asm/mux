@@ -176,6 +176,11 @@ export interface ToolConfiguration {
   openaiWireFormat?: "responses" | "chatCompletions";
   /** Whether the resolved route supports xAI Responses-native tools. */
   xaiNativeToolsEnabled?: boolean;
+  /**
+   * Whether the resolved route runs Anthropic's native web_fetch (first-party API only, #2922).
+   * false gives the model Xum's own web_fetch; unset keeps the model-based default.
+   */
+  anthropicNativeWebFetchEnabled?: boolean;
   /** Legacy xAI Live Search settings translated to Responses native search tools. */
   xaiSearchParameters?: NonNullable<NonNullable<MuxProviderOptions["xai"]>["searchParameters"]>;
   /** Overflow policy for bash tool output (optional, not exposed to AI) */
@@ -775,6 +780,22 @@ export function supportsAnthropicNativeWebFetch(modelId: string): boolean {
   return isClaudeAtLeast(modelId, 4, 6);
 }
 
+/**
+ * Whether this request gets Anthropic's native web_fetch instead of Xum's: Claude 4.6+, no
+ * tool hooks that must gate each fetch (#5840), and a route that runs it (#2922).
+ */
+function offersAnthropicNativeWebFetch(
+  capabilityModelId: string,
+  hooksCanRun: boolean,
+  config: Pick<ToolConfiguration, "anthropicNativeWebFetchEnabled">
+): boolean {
+  return (
+    supportsAnthropicNativeWebFetch(capabilityModelId) &&
+    !hooksCanRun &&
+    config.anthropicNativeWebFetchEnabled !== false
+  );
+}
+
 /** Returns true when an Anthropic model accepts `defer_loading` and `tool_reference` (Claude 4.5+). */
 export function supportsAnthropicToolSearch(modelId: string): boolean {
   return isClaudeAtLeast(modelId, 4, 5);
@@ -1153,7 +1174,9 @@ export async function getToolsForModel(
         // - Cannot reach private/localhost URLs (Anthropic's servers can't see workspace network).
         // - Not bridgeable in the PTC sandbox because provider-native tools have no execute().
         // - Tool hooks are skipped (no execute()), so it is used only where hooks cannot run.
-        if (supportsAnthropicNativeWebFetch(capabilityModelId) && !hooksCanRun) {
+        // - Only the first-party API runs it: proxies and Vertex/Bedrock reject the whole
+        //   request on the unknown tool type, so those routes keep the client web_fetch.
+        if (offersAnthropicNativeWebFetch(capabilityModelId, hooksCanRun, config)) {
           allTools = {
             ...baseTools,
             ...(mcpTools ?? {}),

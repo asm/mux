@@ -144,16 +144,7 @@ function boundPersistenceCriticalResult(toolName: string, result: unknown): unkn
   }
 
   if (toolName === "agent_skill_read") {
-    const skill = (result as { skill?: unknown }).skill;
-    // The re-injected snapshot names the skill directory from these fields
-    // (#6704); without them kernel-mode reads lose it after compaction. They
-    // are optional: when they leave no body budget, keep the skill
-    // instructions without them rather than lose the whole package.
-    const location = retainSkillLocationFields(result);
-    return (
-      boundSkillReadPackage(skill, { ...success, ...error, ...location }) ??
-      boundSkillReadPackage(skill, { ...success, ...error })
-    );
+    return boundSkillReadResult(result, { ...success, ...error });
   }
 
   const rawDiff = (result as { diff?: unknown }).diff;
@@ -164,6 +155,35 @@ function boundPersistenceCriticalResult(toolName: string, result: unknown): unkn
     ...error,
     ...(typeof diff === "string" ? boundRetainedEditDiff(diff) : {}),
   };
+}
+
+/**
+ * The retained agent_skill_read record. The re-injected snapshot names the
+ * skill directory from the location fields (#6704); without them kernel-mode
+ * reads lose it after compaction. They are optional: when they leave no body
+ * budget, keep the skill instructions without them rather than lose the whole
+ * package. skillDir alone is tried first: it is the line the snapshot needs
+ * most (#6854). Not when skillDirUnavailable is set too (corrupted input): the
+ * snapshot then trusts the reason over the path, so the path alone must not
+ * survive.
+ */
+function boundSkillReadResult(
+  result: { skill?: unknown } & Partial<Record<(typeof SKILL_LOCATION_FIELDS)[number], unknown>>,
+  fields: Record<string, unknown>
+): unknown {
+  const skill = result.skill;
+  const location = retainSkillLocationFields(result);
+  // The raw marker, not the retained one: an oversized reason is dropped from
+  // `location` but still marks the record as corrupted, so the path goes in
+  // every attempt below.
+  if (typeof result.skillDirUnavailable === "string") delete location.skillDir;
+  const withLocation = boundSkillReadPackage(skill, { ...fields, ...location });
+  if (withLocation !== undefined) return withLocation;
+  if (location.skillDir !== undefined) {
+    const withSkillDir = boundSkillReadPackage(skill, { ...fields, skillDir: location.skillDir });
+    if (withSkillDir !== undefined) return withSkillDir;
+  }
+  return boundSkillReadPackage(skill, fields);
 }
 
 /**

@@ -21,7 +21,11 @@ import {
   writeProjectSkill,
 } from "@/node/services/tools/testHelpers";
 import { discoverWorkflowScripts } from "./workflowScriptDiscovery";
-import { resolveWorkflowScript } from "./workflowScriptResolver";
+import { RuntimeError } from "@/node/runtime/Runtime";
+import {
+  assertStoredPluginWorkflowReviewed,
+  resolveWorkflowScript,
+} from "./workflowScriptResolver";
 
 async function writeWorkflowFile(
   root: string,
@@ -378,6 +382,44 @@ describe("resolveWorkflowScript", () => {
       };
     }
 
+    test("a skills-only plugin's skill runs no workflow script", async () => {
+      using tempDir = new TestTempDir("workflow-script-skills-only");
+      const container = path.join(tempDir.path, ".mux", "plugins");
+      for (const [name, skillsOnly] of [
+        ["plain-skills", false],
+        ["generated-skills", true],
+      ] as const) {
+        const pluginDir = path.join(container, name);
+        await fs.mkdir(pluginDir, { recursive: true });
+        await fs.writeFile(
+          path.join(pluginDir, "plugin.json"),
+          JSON.stringify({
+            $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+            name,
+            ...(skillsOnly ? { extensions: { mux: { generatedFrom: { kind: "skills" } } } } : {}),
+          })
+        );
+        const skill = `${name}-flow`;
+        await writeWorkflowFile(
+          path.join(pluginDir, "skills", skill),
+          "SKILL.md",
+          `---\nname: ${skill}\ndescription: d\n---\nBody\n`
+        );
+        await writeWorkflowFile(path.join(pluginDir, "skills", skill), "workflow.js");
+      }
+      const resolve = (skill: string) =>
+        resolveWorkflowScript({
+          scriptPath: `skill://${skill}/workflow.js`,
+          runtime: new LocalRuntime(tempDir.path),
+          workspacePath: tempDir.path,
+          projectTrusted: true,
+          roots: pluginRoots(tempDir, container),
+        });
+
+      expect((await resolve("plain-skills-flow")).sourceKind).toBe("skill");
+      await expect(resolve("generated-skills-flow")).rejects.toThrow("skills-only plugin");
+    });
+
     test("resolves a plugin workflow", async () => {
       using tempDir = new TestTempDir("workflow-script-plugin");
       const container = path.join(tempDir.path, ".mux", "plugins");
@@ -396,6 +438,40 @@ describe("resolveWorkflowScript", () => {
       expect(resolved.scope).toBe("project");
       expect(resolved.canonicalScriptPath).toBe("plugin://my-plugin/release.js");
       expect(resolved.source).toContain("plugin-flow");
+    });
+
+    test("a Claude package runs no workflow code: no workflows/, command or skill script", async () => {
+      using tempDir = new TestTempDir("workflow-script-claude-plugin");
+      const container = path.join(tempDir.path, ".mux", "plugins");
+      const pluginDir = path.join(container, "kit");
+      await fs.mkdir(path.join(pluginDir, ".claude-plugin"), { recursive: true });
+      await fs.writeFile(
+        path.join(pluginDir, ".claude-plugin", "plugin.json"),
+        JSON.stringify({ name: "kit" })
+      );
+      await writeWorkflowFile(path.join(pluginDir, "workflows"), "release.js");
+      // A script next to the command: the command's skill directory is the commands folder.
+      await writeWorkflowFile(path.join(pluginDir, "commands"), "workflow.js");
+      await fs.writeFile(path.join(pluginDir, "commands", "review.md"), "Review\n");
+      const skillDir = path.join(pluginDir, "skills", "flow");
+      await writeWorkflowFile(skillDir, "SKILL.md", "---\nname: flow\ndescription: d\n---\nBody\n");
+      await writeWorkflowFile(skillDir, "workflow.js");
+      const input = {
+        runtime: new LocalRuntime(tempDir.path),
+        workspacePath: tempDir.path,
+        projectTrusted: true,
+        roots: pluginRoots(tempDir, container),
+      };
+
+      await expect(
+        resolveWorkflowScript({ ...input, scriptPath: "plugin://kit/release.js" })
+      ).rejects.toThrow("not found");
+      await expect(
+        resolveWorkflowScript({ ...input, scriptPath: "skill://review/workflow.js" })
+      ).rejects.toThrow("is a Claude command");
+      await expect(
+        resolveWorkflowScript({ ...input, scriptPath: "skill://flow/workflow.js" })
+      ).rejects.toThrow("comes from a Claude Code plugin");
     });
 
     test("plugin workflows retain a global fallback after rejecting an outward project alias", async () => {
@@ -572,6 +648,52 @@ describe("resolveWorkflowScript", () => {
       await expect(
         resolveWorkflowScript({ ...input, scriptPath: "plugin://my-plugin/private/hidden.js" })
       ).rejects.toThrow("top-level");
+    });
+  });
+
+  // #6826: the stored-run gate of a skill:// run (resume, checkpoint retry, crash recovery).
+  describe("assertStoredPluginWorkflowReviewed for skill:// runs", () => {
+    const source = "export default function workflow() { return {}; }\n";
+    const storedRun = (tempDir: TestTempDir, runtime = new LocalRuntime(tempDir.path)) => ({
+      scriptPath: "skill://research/workflow.js",
+      source,
+      scope: "project" as const,
+      runtime,
+      workspacePath: tempDir.path,
+      projectTrusted: true,
+    });
+
+    test("a plain (non-plugin) skill's run resumes: no consent record applies", async () => {
+      using tempDir = new TestTempDir("stored-skill-run-plain");
+      await writeProjectSkill(tempDir.path, "research", { files: { "workflow.js": source } });
+
+      await expect(assertStoredPluginWorkflowReviewed(storedRun(tempDir))).resolves.toBeUndefined();
+    });
+
+    test("a deleted skill's run refuses to resume", async () => {
+      using tempDir = new TestTempDir("stored-skill-run-deleted");
+
+      await expect(assertStoredPluginWorkflowReviewed(storedRun(tempDir))).rejects.toThrow(
+        "Skill 'research' is no longer available in its project scope"
+      );
+    });
+
+    test("a transient read failure refuses as retryable, not as a missing skill", async () => {
+      using tempDir = new TestTempDir("stored-skill-run-transport");
+      await writeProjectSkill(tempDir.path, "research", { files: { "workflow.js": source } });
+      const runtime = new LocalRuntime(tempDir.path);
+      spyOn(runtime, "stat").mockRejectedValue(
+        new RuntimeError("ssh: connect to host example port 22: Connection refused", "network")
+      );
+
+      const refusal = await assertStoredPluginWorkflowReviewed(storedRun(tempDir, runtime)).then(
+        () => "resumed",
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
+
+      expect(refusal).toContain("could not be read");
+      expect(refusal).toContain("Connection refused");
+      expect(refusal).not.toContain("no longer available");
     });
   });
 });

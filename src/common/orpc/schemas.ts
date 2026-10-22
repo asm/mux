@@ -157,6 +157,7 @@ export {
   UpdateStatusSchema,
   UsageDeltaEventSchema,
   WorkspaceChatMessageSchema,
+  OnChatEventSchema,
   WorkspaceInitEventSchema,
 } from "./schemas/stream";
 
@@ -170,7 +171,6 @@ export {
   browser,
   devtools,
   drafts,
-  uiLayouts,
   desktop,
   general,
   menu,

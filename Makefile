@@ -252,9 +252,18 @@ bug-bash-sandbox-check: build-main build-renderer build-static ## Check the bug-
 	@cd tests/bugbash && bun sandbox/selfCheckRun.ts
 
 # The repros of fixed bugs through the sandbox launcher, all on the mock app AI (the launcher gives
-# exact-step runs no model). CI's bugbash-sandbox job runs this.
+# exact-step runs no model). CI's bugbash-sandbox job runs this. The second phase selects the
+# `tools-on` repros: BUGBASH_SCENARIO=scripted-tools runs the app with agent tools on against a
+# loopback script (tests/bugbash/scriptedModel.ts), and startApp.ts refuses it outside this job.
+# Its own tag filter comes after BUGBASH_REPRO_ARGS: e2e keeps the last --tag-mode, so `all`
+# makes an extra --tag narrow the phase, and every test it selects carries `tools-on`. Like
+# test-bugbash-repros, a BUGBASH_REPRO_ARGS filter can select tests of one phase only, so each
+# phase passes --pass-with-no-tests and the last step fails when neither selected a test.
 test-bugbash-repros-sandbox: build-main build-renderer build-static ## Bug-bash repros of fixed bugs in the bug-bash sandbox, mock app AI (no key, no model)
-	@cd tests/bugbash && BUGBASH_AI=mock BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="sandbox repros" bun sandbox/launch.ts -- run --config e2e.config.ts --exclude-tag known-failure --exclude-tag agent --output .e2e/repros-sandbox-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(BUGBASH_REPRO_ARGS)
+	@cd tests/bugbash && out=.e2e/repros-sandbox-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ && \
+	  BUGBASH_AI=mock BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="sandbox repros" bun sandbox/launch.ts -- run --config e2e.config.ts --exclude-tag known-failure --exclude-tag agent --exclude-tag tools-on --pass-with-no-tests --output $$out $(BUGBASH_REPRO_ARGS) && \
+	  BUGBASH_SCENARIO=scripted-tools BUGBASH_AI=mock BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="scripted-tools repros" bun sandbox/launch.ts -- run --config e2e.config.ts --exclude-tag known-failure --exclude-tag agent --pass-with-no-tests --output $$out-tools-on $(BUGBASH_REPRO_ARGS) --tag tools-on --tag-mode all && \
+	  bun reproSelection.ts $$out/report.json $$out-tools-on/report.json
 
 # Every sandbox launch lists the job containers that crashed launches of this checkout left
 # (#5882). This removes the ones whose launcher is gone, by ID, and lists the rest.
@@ -275,9 +284,9 @@ test-bugbash-repros: build-main build-renderer build-static ## Bug-bash repro te
 	@rm -rf tests/bugbash/.e2e/repros-mock tests/bugbash/.e2e/repros
 	@# [mock:...] prompts and terminals only work against the mock AI, so repros tagged mock-only pin it. Export
 	@# it: a `VAR=x cd ... && e2e` prefix would set it for `cd` only.
-	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="mock-only repros"; $(BUGBASH_REPRO_RUN) --tag mock-only --exclude-tag known-failure --exclude-tag agent --pass-with-no-tests --output .e2e/repros-mock $(BUGBASH_REPRO_ARGS)
+	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="mock-only repros"; $(BUGBASH_REPRO_RUN) --tag mock-only --exclude-tag known-failure --exclude-tag agent --exclude-tag tools-on --pass-with-no-tests --output .e2e/repros-mock $(BUGBASH_REPRO_ARGS)
 	@# The other repros run on the app AI that BUGBASH_AI picks (default auto: real with a working key).
-	@ai="$$(bun tests/bugbash/aiMode.ts)" || exit 2; eval "$$ai"; $(BUGBASH_REPRO_RUN) --exclude-tag mock-only --exclude-tag known-failure --exclude-tag agent --pass-with-no-tests --output .e2e/repros $(BUGBASH_REPRO_ARGS)
+	@ai="$$(bun tests/bugbash/aiMode.ts)" || exit 2; eval "$$ai"; $(BUGBASH_REPRO_RUN) --exclude-tag mock-only --exclude-tag known-failure --exclude-tag agent --exclude-tag tools-on --pass-with-no-tests --output .e2e/repros $(BUGBASH_REPRO_ARGS)
 	@bun tests/bugbash/reproSelection.ts tests/bugbash/.e2e/repros-mock/report.json tests/bugbash/.e2e/repros/report.json
 
 test-bugbash-known-failures: build-main build-renderer build-static ## Bug-bash repros of open bugs: each fails until its issue is fixed
