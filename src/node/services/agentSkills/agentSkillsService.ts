@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
+import os from "node:os";
 
 import {
   isRuntimeReadFailure,
@@ -53,7 +54,11 @@ import {
 import { log } from "@/node/services/log";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 import { ensureRuntimePathWithinWorkspace } from "@/node/services/tools/runtimeSkillPathUtils";
-import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import {
+  ensurePathContained,
+  hasErrorCode,
+  isSameHostDirectory,
+} from "@/node/services/tools/skillFileUtils";
 import { AgentSkillParseError, parseSkillMarkdown } from "./parseSkillMarkdown";
 import { getBuiltInSkillByName, getBuiltInSkillDescriptors } from "./builtInSkillDefinitions";
 import type { ProjectSkillContainment } from "./skillStorageContext";
@@ -75,6 +80,7 @@ import {
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import {
   getCanonicalProjectMetadataRelativePath,
+  LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR,
   listProjectMetadataRelativePaths,
 } from "@/common/compat/legacyMux";
 
@@ -101,6 +107,11 @@ export interface AgentSkillsRoots {
   projectSearchRoot?: string;
   globalRoot: string;
   universalRoot?: string;
+  /**
+   * ~/.mux/skills, where the skills CLI writes for `--agent mux` (read-only). Discovery skips it
+   * when it is the Xum home's own skills dir (globalRoot).
+   */
+  legacyMuxGlobalRoot?: string;
   /** ~/.claude/skills (claude-skills-compat experiment; read-only). */
   globalClaudeRoot?: string;
   /** Agent Plugins container dirs, e.g. <projectRoot>/.xum/plugins (read-only). */
@@ -195,6 +206,7 @@ export function getDefaultAgentSkillsRoots(
     }),
     globalRoot: `${runtime.getXumHome()}/skills`,
     universalRoot: UNIVERSAL_SKILLS_ROOT,
+    legacyMuxGlobalRoot: getLegacyMuxGlobalSkillsRoot(runtime, workspacePath),
     // Claude roots are added only when the experiment is enabled so the default
     // (off) behavior stays byte-identical to the pre-experiment scan order.
     ...(options?.includeClaudeSkills ? { globalClaudeRoot: CLAUDE_SKILLS_ROOT } : {}),
@@ -226,11 +238,58 @@ export function getProjectSkillRoots(roots: AgentSkillsRoots): string[] {
   return Array.from(new Set(roots.projectRoots ?? [roots.projectRoot]));
 }
 
-function getGlobalSkillRoots(roots: AgentSkillsRoots): string[] {
-  // Precedence within global scope: ~/.xum > ~/.agents > ~/.claude.
-  const orderedRoots = [roots.globalRoot, roots.universalRoot, roots.globalClaudeRoot].filter(
-    (root): root is string => root != null && root.length > 0
-  );
+/**
+ * ~/.mux/skills as the global runtime reads it, like universalRoot: on the Xum host (local, SSH)
+ * or in the runtime's own home (Docker). The host needs the absolute path because expandTilde
+ * maps a `~/.mux` path to the Xum home.
+ */
+export function getLegacyMuxGlobalSkillsRoot(runtime: Runtime, workspacePath: string): string {
+  return resolveGlobalRuntime(runtime, workspacePath) instanceof RemoteRuntime
+    ? `~/${LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR}`
+    : path.join(os.homedir(), LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR);
+}
+
+/** True when ~/.mux/skills is the Xum home's own skills dir (the home is ~/.mux, or links to it). */
+async function isLegacyMuxRootTheGlobalRoot(
+  globalRuntime: Runtime,
+  globalRoot: string,
+  legacyMuxRoot: string
+): Promise<boolean> {
+  try {
+    const [resolvedGlobal, resolvedLegacy] = await Promise.all(
+      [globalRoot, legacyMuxRoot].map((root) => globalRuntime.resolvePath(root))
+    );
+    if (resolvedGlobal === resolvedLegacy) return true;
+    return (
+      !(globalRuntime instanceof RemoteRuntime) &&
+      (await isSameHostDirectory(resolvedGlobal, resolvedLegacy))
+    );
+  } catch {
+    // Unresolvable: keep the root, so its scan reports why it is unavailable.
+    return false;
+  }
+}
+
+async function getGlobalSkillRoots(
+  roots: AgentSkillsRoots,
+  globalRuntime: Runtime
+): Promise<string[]> {
+  const legacyMuxRoot =
+    roots.legacyMuxGlobalRoot != null &&
+    !(await isLegacyMuxRootTheGlobalRoot(
+      globalRuntime,
+      roots.globalRoot,
+      roots.legacyMuxGlobalRoot
+    ))
+      ? roots.legacyMuxGlobalRoot
+      : undefined;
+  // Precedence within global scope: ~/.xum > ~/.agents > ~/.mux (skills CLI) > ~/.claude.
+  const orderedRoots = [
+    roots.globalRoot,
+    roots.universalRoot,
+    legacyMuxRoot,
+    roots.globalClaudeRoot,
+  ].filter((root): root is string => root != null && root.length > 0);
 
   return Array.from(new Set(orderedRoots));
 }
@@ -246,6 +305,11 @@ interface AgentSkillScanCandidate {
   pluginRoot?: string;
   /** Agent Plugins only: contributing plugin name for descriptor attribution. */
   pluginName?: string;
+  /**
+   * Agent Plugins only: `root` holds SKILL.md itself and is this one skill
+   * (PluginSkillsRoot `single`), instead of a folder of skill folders.
+   */
+  singleSkillName?: string;
   importedSkills?: string[];
   /** Managed plugins only: the reviewed skill fingerprints (#6498). */
   skillConsent?: PluginSkillConsentGate;
@@ -317,10 +381,11 @@ async function buildPluginScanCandidates(args: {
     candidates.push(
       ...plugin.skillsDirs.map((root) => ({
         scope: args.scope,
-        root,
+        root: root.dir,
         runtime: localRuntime,
         pluginRoot: plugin.rootPath,
         pluginName: plugin.name,
+        singleSkillName: root.name,
         importedSkills,
         skillConsent,
         pluginConsent: plugin.componentConsent,
@@ -373,7 +438,7 @@ async function buildScanCandidates(
   return [
     ...getProjectSkillRoots(roots).map((root) => ({ scope: "project" as const, root, runtime })),
     ...projectPluginCandidates,
-    ...getGlobalSkillRoots(roots).map((root) => ({
+    ...(await getGlobalSkillRoots(roots, globalRuntime)).map((root) => ({
       scope: "global" as const,
       root,
       runtime: globalRuntime,
@@ -561,6 +626,29 @@ class ShadowedPluginSkills {
       ),
     };
   }
+}
+
+/** The folder of skill `name` in a scan root: the root itself when it is a single skill. */
+function candidateSkillDir(
+  candidate: Pick<AgentSkillScanCandidate, "runtime" | "singleSkillName">,
+  resolvedRoot: string,
+  name: SkillName
+): string {
+  return candidate.singleSkillName != null
+    ? resolvedRoot
+    : candidate.runtime.normalizePath(name, resolvedRoot);
+}
+
+/** The skill folder names of a scan root: its own name when it is a single skill. */
+async function listCandidateSkillNames(
+  candidate: Pick<AgentSkillScanCandidate, "runtime" | "singleSkillName">,
+  resolvedRoot: string,
+  workspacePath: string
+): Promise<string[]> {
+  if (candidate.singleSkillName != null) return [candidate.singleSkillName];
+  return candidate.runtime instanceof RemoteRuntime
+    ? listSkillDirectoriesFromRuntime(candidate.runtime, resolvedRoot, { cwd: workspacePath })
+    : listSkillDirectoriesFromLocalFs(resolvedRoot);
 }
 
 async function listSkillDirectoriesFromLocalFs(root: string): Promise<string[]> {
@@ -871,10 +959,7 @@ export async function discoverAgentSkills(
 
   const scanRoot = async (scan: AgentSkillScanCandidate): Promise<void> => {
     const resolvedRoot = await scan.runtime.resolvePath(scan.root);
-    const directoryNames =
-      scan.runtime instanceof RemoteRuntime
-        ? await listSkillDirectoriesFromRuntime(scan.runtime, resolvedRoot, { cwd: workspacePath })
-        : await listSkillDirectoriesFromLocalFs(resolvedRoot);
+    const directoryNames = await listCandidateSkillNames(scan, resolvedRoot, workspacePath);
 
     for (const directoryNameRaw of directoryNames) {
       const nameParsed = SkillNameSchema.safeParse(directoryNameRaw);
@@ -901,7 +986,7 @@ export async function discoverAgentSkills(
       const diagnostics: { invalidSkills: AgentSkillIssue[]; skillWarnings: AgentSkillIssue[] } =
         shadowed ? { invalidSkills: [], skillWarnings: [] } : { invalidSkills, skillWarnings };
 
-      const skillDir = scan.runtime.normalizePath(directoryName, resolvedRoot);
+      const skillDir = candidateSkillDir(scan, resolvedRoot, directoryName);
       const skillFilePath = scan.runtime.normalizePath("SKILL.md", skillDir);
       const pushInvalidSkill = (message: string, hint: string): void => {
         diagnostics.invalidSkills.push({
@@ -1168,7 +1253,9 @@ async function readCandidateSkill(
     return null;
   }
 
-  const skillDir = candidate.runtime.normalizePath(name, resolvedRoot);
+  // A single-skill root serves only its own name.
+  if (candidate.singleSkillName != null && candidate.singleSkillName !== name) return null;
+  const skillDir = candidateSkillDir(candidate, resolvedRoot, name);
   const skillFilePath = candidate.runtime.normalizePath("SKILL.md", skillDir);
 
   const contained = await isCandidateSkillContained({

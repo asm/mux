@@ -3,7 +3,10 @@ import os from "node:os";
 import * as path from "path";
 import { tool } from "ai";
 
-import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
+import {
+  LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR,
+  listProjectMetadataRelativePaths,
+} from "@/common/compat/legacyMux";
 import {
   AgentSkillDescriptorSchema,
   SkillNameSchema,
@@ -34,7 +37,7 @@ import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdo
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { log } from "@/node/services/log";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
-import { ensurePathContained, hasErrorCode } from "./skillFileUtils";
+import { ensurePathContained, hasErrorCode, isSameHostDirectory } from "./skillFileUtils";
 
 interface AgentSkillListToolArgs {
   includeUnadvertised?: boolean | null;
@@ -55,6 +58,59 @@ async function listSkillDirectories(skillsRoot: string): Promise<string[]> {
     );
     return [];
   }
+}
+
+interface ListedSkillsRoot {
+  skillsRoot: string;
+  containmentRoot: string;
+  scope: "global" | "project";
+  importedSkills?: readonly string[];
+  skillConsent?: PluginSkillConsentGate;
+  /** Plugin roots only: the root is this one skill (PluginSkillsRoot `single`). */
+  singleSkillName?: string;
+}
+
+/**
+ * Host global skills roots in precedence order: ~/.xum > ~/.agents > ~/.mux > ~/.claude, the same
+ * order as getDefaultAgentSkillsRoots. All but the Xum home's are read-only.
+ */
+async function getHostGlobalSkillsRoots(
+  xumHome: string,
+  userHome: string,
+  includeClaudeSkills: boolean
+): Promise<ListedSkillsRoot[]> {
+  const xumSkillsRoot = path.join(xumHome, "skills");
+  // The skills CLI writes ~/.mux/skills for `--agent mux`; skip it when it is the Xum home's.
+  const legacyMuxSkillsRoot = path.join(userHome, LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR);
+  const userHomeRoots = [
+    path.join(userHome, ".agents", "skills"),
+    ...((await isSameHostDirectory(xumSkillsRoot, legacyMuxSkillsRoot))
+      ? []
+      : [legacyMuxSkillsRoot]),
+    // claude-skills-compat: lowest-precedence global root.
+    ...(includeClaudeSkills ? [path.join(userHome, ".claude", "skills")] : []),
+  ];
+  return [
+    { skillsRoot: xumSkillsRoot, containmentRoot: xumHome, scope: "global" },
+    // Contained at the user home, like ~/.agents/skills.
+    ...userHomeRoots.map((skillsRoot) => ({
+      skillsRoot,
+      containmentRoot: userHome,
+      scope: "global" as const,
+    })),
+  ];
+}
+
+/** The skill folders of a skills root: the root itself for a single-skill plugin root. */
+async function listSkillFolders(
+  skillsRoot: string,
+  singleSkillName: string | undefined
+): Promise<Array<{ name: string; dir: string }>> {
+  if (singleSkillName != null) return [{ name: singleSkillName, dir: skillsRoot }];
+  return (await listSkillDirectories(skillsRoot)).map((name) => ({
+    name,
+    dir: path.join(skillsRoot, name),
+  }));
 }
 
 /** Read `skillDir`'s SKILL.md when it is a contained regular file of allowed size; else log and null. */
@@ -121,7 +177,7 @@ async function readContainedSkillFile(
 }
 
 async function readSkillDescriptor(
-  skillsRoot: string,
+  skillDir: string,
   directoryNameRaw: string,
   scope: "global" | "project",
   containmentRoot: string,
@@ -129,14 +185,11 @@ async function readSkillDescriptor(
 ): Promise<AgentSkillDescriptor | null> {
   const parsedDirectoryName = SkillNameSchema.safeParse(directoryNameRaw);
   if (!parsedDirectoryName.success) {
-    log.warn(
-      `Skipping invalid ${scope} skill directory name '${directoryNameRaw}' in ${skillsRoot}`
-    );
+    log.warn(`Skipping invalid ${scope} skill directory name '${directoryNameRaw}' at ${skillDir}`);
     return null;
   }
 
   const directoryName = parsedDirectoryName.data;
-  const skillDir = path.join(skillsRoot, directoryName);
   const file = await readContainedSkillFile(skillDir, directoryName, scope, containmentRoot);
   if (file === null) return null;
 
@@ -257,33 +310,11 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
         const userHome = os.homedir();
 
         // Always list global skills; also list project skills when in a project workspace.
-        const roots: Array<{
-          skillsRoot: string;
-          containmentRoot: string;
-          scope: "global" | "project";
-          importedSkills?: readonly string[];
-          skillConsent?: PluginSkillConsentGate;
-        }> = [
-          {
-            skillsRoot: path.join(xumScope.xumHome, "skills"),
-            containmentRoot: xumScope.xumHome,
-            scope: "global",
-          },
-          {
-            skillsRoot: path.join(userHome, ".agents", "skills"),
-            containmentRoot: userHome,
-            scope: "global",
-          },
-        ];
-        if (includeClaudeSkills) {
-          // claude-skills-compat: lowest-precedence global root, contained at the user home
-          // exactly like ~/.agents/skills.
-          roots.push({
-            skillsRoot: path.join(userHome, ".claude", "skills"),
-            containmentRoot: userHome,
-            scope: "global",
-          });
-        }
+        const roots: ListedSkillsRoot[] = await getHostGlobalSkillsRoots(
+          xumScope.xumHome,
+          userHome,
+          includeClaudeSkills
+        );
         if (xumScope.type === "project") {
           if (skillCtx.roots == null) {
             throw new Error("Project-local skill context requires explicit roots");
@@ -348,18 +379,26 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           const skillConsent = pluginSkillConsentGate(plugin);
           roots.push(
             ...plugin.skillsDirs.map((skillsRoot) => ({
-              skillsRoot,
+              skillsRoot: skillsRoot.dir,
               containmentRoot: plugin.rootPath,
               scope: plugin.scope,
               importedSkills,
               skillConsent,
+              singleSkillName: skillsRoot.name,
             }))
           );
         }
 
         const skills: AgentSkillDescriptor[] = [];
         const seenByScope = new Set<string>();
-        for (const { skillsRoot, containmentRoot, scope, importedSkills, skillConsent } of roots) {
+        for (const {
+          skillsRoot,
+          containmentRoot,
+          scope,
+          importedSkills,
+          skillConsent,
+          singleSkillName,
+        } of roots) {
           let skillsRootReal: string;
           try {
             skillsRootReal = await fsPromises.realpath(skillsRoot);
@@ -379,8 +418,10 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
             continue;
           }
 
-          const directoryNames = await listSkillDirectories(skillsRootReal);
-          for (const directoryName of directoryNames) {
+          for (const { name: directoryName, dir: skillDir } of await listSkillFolders(
+            skillsRootReal,
+            singleSkillName
+          )) {
             // Skipped plugin skills must not claim a same-named fallback in this manual scan.
             if (importedSkills != null && !importedSkills.includes(directoryName)) continue;
             // SECURITY: symlinked skill directories are allowed only through
@@ -388,7 +429,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
             // entries resolving outside the containment root. This matches the
             // posture of stream discovery and plugin roots.
             const descriptor = await readSkillDescriptor(
-              skillsRootReal,
+              skillDir,
               directoryName,
               scope,
               containmentRoot,

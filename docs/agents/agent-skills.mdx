@@ -34,6 +34,7 @@ Xum discovers skills from these locations:
 - **Project (cross-tool)**: `.agents/skills/<skill-name>/SKILL.md`
 - **Global (Xum-specific)**: `~/.xum/skills/<skill-name>/SKILL.md`
 - **Universal (cross-tool)**: `~/.agents/skills/<skill-name>/SKILL.md`
+- **Skills CLI (`npx skills add -g --agent mux`)**: `~/.mux/skills/<skill-name>/SKILL.md`, read-only, after `~/.agents/skills`
 - **Built-in**: shipped with Xum
 
 For a workspace that executes in a subproject, Xum checks the working directory and each parent directory through the checkout root. It never searches above the checkout. A nearer project definition wins over a farther one; within the same directory, `.xum/skills` wins over `.agents/skills`.
@@ -64,6 +65,8 @@ Xum also discovers skills packaged in [Agent Plugins 1.0.0](https://agent-plugin
 - **Global**: `~/.xum/plugins/<plugin>/` and `~/.agents/plugins/<plugin>/`
 
 Xum reads plugins from the Xum host only. SSH, Docker, and devcontainer workspaces load the global plugins (their skills, agents, and workflows) from the Xum host. Xum does not load project plugins inside an SSH or Docker checkout, because that checkout is not on the Xum host.
+
+As in Claude Code, a skills path (`contributes.skills`) that holds a `SKILL.md` itself is one skill. Its name is the folder name, or the plugin name when the path is the plugin root (`.`). The default `skills/` folder always holds skill folders.
 
 Plugin skills have the lowest precedence within their scope and are read-only. A broken plugin (or a broken skill inside one) never affects other plugins or skills. Plugins can also ship MCP servers; see [MCP servers](/config/mcp-servers#agent-plugins-servers).
 
