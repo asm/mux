@@ -2929,6 +2929,119 @@ describe("AgentPluginInstallService", () => {
     }
   });
 
+  test("a Claude Code plugin repo installs with its skills, agents and MCP, and no Xum executables", async () => {
+    // Claude layout: .claude-plugin/plugin.json and .mcp.json, no root plugin.json.
+    await fsPromises.rm(path.join(remoteDir, "plugin.json"));
+    await fsPromises.rm(path.join(remoteDir, "mcp.json"));
+    const files: Record<string, string> = {
+      ".claude-plugin/plugin.json": JSON.stringify({
+        name: "demo-plugin",
+        version: "1.4.0",
+        lspServers: "./.lsp.json",
+      }),
+      ".mcp.json": JSON.stringify({
+        mcpServers: { echo: { command: "node", args: ["${CLAUDE_PLUGIN_ROOT}/server.js"] } },
+      }),
+      "agents/reviewer.md": "---\nname: Reviewer\n---\nReview the diff.\n",
+      "hooks/hooks.json": JSON.stringify({
+        hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "x.sh" }] }] },
+      }),
+      // Present, but a Claude package never loads them.
+      "hooks.js": "export default {};\n",
+      "workflows/release.js": "// wf\n",
+      "skills/greet/workflow.js": "// skill wf\n",
+    };
+    for (const [relative, content] of Object.entries(files)) {
+      await fsPromises.mkdir(path.dirname(path.join(remoteDir, relative)), { recursive: true });
+      await fsPromises.writeFile(path.join(remoteDir, relative), content);
+    }
+    await commitAll(remoteDir, "claude layout");
+
+    const preview = await service.preview({ input: remoteDir });
+
+    expect(preview.manifest).toMatchObject({ name: "demo-plugin", version: "1.4.0" });
+    expect(preview.skills.map((skill) => skill.name)).toEqual(["greet"]);
+    expect(preview.mcpServers.map((server) => server.serverName)).toEqual(["echo"]);
+    expect(preview.agents).toEqual(["reviewer.md"]);
+    expect(preview.hook).toBeUndefined();
+    expect(preview.workflows).toEqual([]);
+    // A skill's workflow.js is not offered for review: a Claude package runs no Xum code.
+    expect(preview.reviewedComponents.map((row) => row.name)).not.toContain(
+      "skills/greet/workflow.js"
+    );
+    expect(preview.codexHooks.map((hook) => [hook.event, hook.status])).toEqual([
+      ["PreToolUse", "claude-plugin"],
+    ]);
+    expect(preview.warnings.join("\n")).toContain("'lspServers'");
+
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const { plugins } = await discoverAgentPlugins([
+      { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+    ]);
+    expect(plugins.map((plugin) => [plugin.name, plugin.claudeFallback])).toEqual([
+      ["demo-plugin", true],
+    ]);
+    const { servers } = await loadPluginMcpServers(plugins[0], { xumHome: muxRoot });
+    const echo = Object.values(servers)[0];
+    assert(echo?.transport === "stdio", "the Claude MCP server loads as stdio");
+    expect(echo.args).toEqual([path.join(plugins[0].rootPath, "server.js")]);
+  });
+
+  test("a Claude command installs as a reviewed skill, and a changed command needs a new review", async () => {
+    await fsPromises.rm(path.join(remoteDir, "plugin.json"));
+    await fsPromises.mkdir(path.join(remoteDir, ".claude-plugin"));
+    await fsPromises.writeFile(
+      path.join(remoteDir, ".claude-plugin", "plugin.json"),
+      JSON.stringify({ name: "demo-plugin" })
+    );
+    await fsPromises.mkdir(path.join(remoteDir, "commands"));
+    const writeCommand = (description: string) =>
+      fsPromises.writeFile(
+        path.join(remoteDir, "commands", "review.md"),
+        `---\ndescription: ${description}\n---\nReview $ARGUMENTS.\n`
+      );
+    await writeCommand("Review a diff");
+    await commitAll(remoteDir, "claude command");
+    const loaded = async () => {
+      const { skills } = await discoverAgentSkills(new LocalRuntime(muxRoot), muxRoot, {
+        roots: {
+          projectRoot: "",
+          globalRoot: path.join(muxRoot, "skills"),
+          universalRoot: "",
+          globalPluginRoots: [pluginsDir()],
+        },
+      });
+      return skills
+        .filter((skill) => skill.pluginName === "demo-plugin")
+        .map((skill) => [skill.name, skill.description, skill.advertise]);
+    };
+
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.skills.map((skill) => skill.name)).toEqual(["greet", "review"]);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect(await loaded()).toEqual([
+      ["greet", "Greets people", undefined],
+      ["review", "Review a diff", false],
+    ]);
+
+    await writeCommand("Review a diff and push it");
+    await commitAll(remoteDir, "change the command");
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const changed = review.changes.flatMap((change) =>
+      change.component ? [change.component] : []
+    );
+    expect(changed.map((component) => [component.kind, component.name])).toEqual([
+      ["skills", "review"],
+    ]);
+    await service.update({
+      name: "demo-plugin",
+      consent: { fromSha: review.fromSha, toSha: review.toSha, reviewed: [] },
+    });
+    // The unreviewed command serves the copy the user approved.
+    expect((await service.list())[0].reviewRequiredCount).toBe(1);
+    expect(await loaded()).toContainEqual(["review", "Review a diff", false]);
+  });
+
   test("never overwrites: registry and directory collisions are clear errors", async () => {
     const preview = await service.preview({ input: remoteDir });
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
@@ -7939,11 +8052,13 @@ describe("AgentPluginInstallService", () => {
       await commitAll(notPlugin, "init");
       await expect(service.preview({ input: notPlugin })).rejects.toThrow(/No plugin\.json/);
 
-      // Claude Code collection → clear message naming the limitation.
+      // A Claude Code marketplace without a plugin manifest → clear message naming the limitation.
       await fsPromises.mkdir(path.join(notPlugin, ".claude-plugin"), { recursive: true });
-      await fsPromises.writeFile(path.join(notPlugin, ".claude-plugin", "plugin.json"), "{}");
-      await commitAll(notPlugin, "claude");
-      await expect(service.preview({ input: notPlugin })).rejects.toThrow(/Claude Code/);
+      await fsPromises.writeFile(path.join(notPlugin, ".claude-plugin", "marketplace.json"), "{}");
+      await commitAll(notPlugin, "claude marketplace");
+      await expect(service.preview({ input: notPlugin })).rejects.toThrow(
+        /Claude Code plugin marketplace .* does not install marketplaces/
+      );
     } finally {
       await fsPromises.rm(notPlugin, { recursive: true, force: true });
     }

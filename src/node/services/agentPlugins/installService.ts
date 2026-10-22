@@ -69,6 +69,7 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
+  CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
   CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
   readPluginFileWithinRootCapped,
   discoverAgentPluginAt,
@@ -85,6 +86,7 @@ import {
   type PluginSkillsRoot,
 } from "./discovery";
 import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
+import { pluginSkillMarkdown } from "./claudeCommands";
 import { listPluginAgentFiles, type PluginAgentFile } from "./agentFiles";
 import { checkLogoImage } from "./imageHeader";
 import {
@@ -1187,7 +1189,9 @@ function displayNameWarnings(
 /** A preview warning's plugin-relative name for skill `name` of `skillsRoot`. */
 function skillReviewLabel(pluginRoot: string, skillsRoot: PluginSkillsRoot, name: string): string {
   const relativeRoot = path.relative(pluginRoot, skillsRoot.dir);
-  // A single skill folder is the skill itself; at the plugin root it has no relative path.
+  // A command is its file; a single skill folder is the skill itself, and at the plugin root it
+  // has no relative path.
+  if (skillsRoot.command) return path.join(relativeRoot, `${name}.md`);
   if (skillsRoot.single) return relativeRoot === "" ? "." : relativeRoot;
   return `${relativeRoot}/${name}`;
 }
@@ -2513,7 +2517,7 @@ export class AgentPluginInstallService {
   /**
    * Run the exact runtime validation (manifest + component discovery) against
    * a staged clone. Throws user-facing errors for non-plugins, including a
-   * clear message for Claude Code plugin/marketplace repos (explicit non-goal).
+   * clear message for a Claude Code marketplace repo (not installable yet).
    */
   private async validateStagedClone(
     stagedDir: string,
@@ -2522,24 +2526,26 @@ export class AgentPluginInstallService {
     plugin: AgentPluginInfo;
     warnings: string[];
   }> {
-    // Discovery reads `.codex-plugin/plugin.json` when the root manifest is
-    // absent; both live in the staged tree the consent receipt hashes.
-    const hasManifest =
-      (await pathExists(path.join(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH))) ||
-      (await pathExists(path.join(stagedDir, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH)));
+    // Discovery reads `.codex-plugin/plugin.json`, then `.claude-plugin/plugin.json`, when the
+    // root manifest is absent; all of them live in the staged tree the consent receipt hashes.
+    let hasManifest = false;
+    for (const manifest of [
+      PLUGIN_MANIFEST_RELATIVE_PATH,
+      CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
+      CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
+    ]) {
+      if (await pathExists(path.join(stagedDir, manifest))) hasManifest = true;
+    }
     if (!hasManifest) {
-      if (
-        (await pathExists(path.join(stagedDir, ".claude-plugin", "plugin.json"))) ||
-        (await pathExists(path.join(stagedDir, ".claude-plugin", "marketplace.json")))
-      ) {
+      if (await pathExists(path.join(stagedDir, ".claude-plugin", "marketplace.json"))) {
         throw new Error(
-          "This repository is a Claude Code plugin or marketplace (found .claude-plugin/). Mux implements the vendor-neutral Agent Plugins 1.0.0 format and cannot install Claude Code collections. If an Agent Plugin lives in one of its folders, install it as owner/repo/path/to/plugin."
+          "This repository is a Claude Code plugin marketplace (found .claude-plugin/marketplace.json). Xum does not install marketplaces yet. Install one of its plugins by its folder, as owner/repo/path/to/plugin."
         );
       }
       throw new Error(
         subpath === undefined
-          ? "No plugin.json (or .codex-plugin/plugin.json) found at the repository root. The repo is not an Agent Plugin — if the plugin lives in a subdirectory, install it as owner/repo/path/to/plugin."
-          : `No plugin.json (or .codex-plugin/plugin.json) found in '${subpath}'. The folder is not an Agent Plugin.`
+          ? "No plugin.json (or .codex-plugin/plugin.json or .claude-plugin/plugin.json) found at the repository root. The repo is not a plugin — if the plugin lives in a subdirectory, install it as owner/repo/path/to/plugin."
+          : `No plugin.json (or .codex-plugin/plugin.json or .claude-plugin/plugin.json) found in '${subpath}'. The folder is not a plugin.`
       );
     }
 
@@ -2946,9 +2952,10 @@ export class AgentPluginInstallService {
     const skills: CollectedPluginSkill[] = [];
     // Includes symlinked skill dirs, matching runtime discovery: a symlinked
     // skill activates after install, so it MUST appear in the consent preview.
-    for (const { name: dirName, dir: skillDir } of await listPluginSkillFolders(skillsRoot)) {
+    for (const { name: dirName, dir: skillDir, file: skillPath } of await listPluginSkillFolders(
+      skillsRoot
+    )) {
       const label = skillReviewLabel(pluginRoot, skillsRoot, dirName);
-      const skillPath = path.join(skillDir, "SKILL.md");
       // Spec §4.1 containment anchored at the plugin root, mirroring runtime
       // component checks: a symlink escaping the plugin is surfaced as a
       // warning instead of silently ignored.
@@ -2997,7 +3004,13 @@ export class AgentPluginInstallService {
         continue;
       }
       try {
-        const content = await fsPromises.readFile(containedSkillPath, "utf8");
+        // A Claude command becomes SKILL.md text first, so its review, fingerprint and approved
+        // copy are a skill's (the copy is that text, which the runtime check parses as is).
+        const content = pluginSkillMarkdown(
+          dirName,
+          await fsPromises.readFile(containedSkillPath, "utf8"),
+          skillsRoot.command
+        );
         const parsed = parseSkillMarkdown({
           content,
           byteSize: stat.size,
