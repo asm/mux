@@ -145,7 +145,7 @@ export const CUSTOM_EVENTS = {
 
   /**
    * Event to open the right-sidebar Plan tab ("/plan open", the Stats tab's plan row).
-   * Detail: { workspaceId: string }
+   * Detail: { workspaceId: string; focus: boolean }
    */
   OPEN_PLAN_TAB: "mux:openPlanTab",
 
@@ -298,6 +298,8 @@ export interface CustomEventPayloads {
   };
   [CUSTOM_EVENTS.OPEN_PLAN_TAB]: {
     workspaceId: string;
+    /** The panel takes focus once it renders (see openPlanTab). */
+    focus: boolean;
   };
   [CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB]: {
     workspaceId: string;
