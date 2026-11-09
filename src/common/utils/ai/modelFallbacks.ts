@@ -23,7 +23,8 @@ export const MODEL_FALLBACK_CHAIN_LIMIT = 3;
  *
  * Seeded into the config exactly once, guarded by
  * migrations.defaultModelFallbacksSeeded (plus the one-shot
- * defaultModelFallbacksSeededFable51 re-seed for the key move to Fable 5.1)
+ * defaultModelFallbacksSeededFable51 and defaultModelFallbacksSeededFable52 re-seeds
+ * for the key moves to Fable 5.1 and Fable 5.2)
  * — on versions that know the flag,
  * user edits or deletions of these chains are never overridden by updates.
  * (Versions predating the flag strip it on save, so a downgrade→save→
@@ -60,6 +61,15 @@ export const DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
 export const LEGACY_DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
   "anthropic:claude-fable-5": { models: ["anthropic:claude-opus-5"] },
 };
+
+/**
+ * Default chain for the Fable 5.1 id, which the fable alias named until it moved to
+ * Fable 5.2. Seeded by the pass that claims defaultModelFallbacksSeededFable51: a
+ * downgraded 5.1 build trusts that flag for its own key, so it keeps refusal fallback.
+ */
+export const FABLE_51_DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
+  "anthropic:claude-fable-5-1": { models: ["anthropic:claude-opus-5"] },
+};
 // Deep-freeze: entries are spread by reference into live configs (fresh-install
 // defaults, seed merge). Accidental in-place mutation must crash fast instead
 // of silently corrupting the process-wide default.
@@ -67,6 +77,7 @@ for (const entry of [
   ...Object.values(Object.freeze(SEEDED_MODEL_FALLBACKS)),
   ...Object.values(Object.freeze(DEFAULT_MODEL_FALLBACKS)),
   ...Object.values(Object.freeze(LEGACY_DEFAULT_MODEL_FALLBACKS)),
+  ...Object.values(Object.freeze(FABLE_51_DEFAULT_MODEL_FALLBACKS)),
 ]) {
   Object.freeze(entry);
   Object.freeze(entry.models);

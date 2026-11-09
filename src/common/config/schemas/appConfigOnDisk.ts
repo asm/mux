@@ -141,6 +141,8 @@ export const AppConfigMigrationsSchema = z
      * source key.
      */
     defaultModelFallbacksSeededFable51: z.boolean().optional(),
+    /** The same one-time re-run after the fable alias moved to Fable 5.2. */
+    defaultModelFallbacksSeededFable52: z.boolean().optional(),
     /** One-time migration from the legacy auto-delete default to persistent sub-agents. */
     persistentSubagentsDefaulted: z.boolean().optional(),
     /** One-time move of task limits still at PREVIOUS_TASK_SETTINGS_DEFAULTS to the new defaults. */

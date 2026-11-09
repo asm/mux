@@ -157,6 +157,27 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_pdf_input: true,
   },
 
+  // Claude Fable 5.2 - successor to Fable 5.1 at a lower price: $8/M input, $40/M output,
+  // 5-minute cache write $10/M (1.25x input), cache read $0.20/M (0.025x input). The 1-hour
+  // cache write tier ($16/M, 2x input) has no field and fast mode ($16/$80) has no entry,
+  // as for Opus 5.5. Native 1M context, 128K max output, native xhigh effort level.
+  // https://platform.claude.com/docs/en/models/fable-5-2/overview
+  "claude-fable-5-2": {
+    max_input_tokens: 1000000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.000008, // $8 per million input tokens
+    output_cost_per_token: 0.00004, // $40 per million output tokens
+    cache_creation_input_token_cost: 0.00001, // $10 per million tokens (1.25× input)
+    cache_read_input_token_cost: 0.0000002, // $0.20 per million tokens (0.025× input)
+    litellm_provider: "anthropic",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
   // Claude Fable 5.1 - successor to Fable 5 in the Mythos-class tier at the same
   // input/output pricing: $10/M input, $50/M output, cache write 1.25x input. Cache
   // reads are cheaper than Fable 5 at $0.25/M (0.025x input, a quarter of the old

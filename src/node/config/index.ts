@@ -34,6 +34,7 @@ import type {
 } from "@/common/config/schemas";
 import {
   DEFAULT_MODEL_FALLBACKS,
+  FABLE_51_DEFAULT_MODEL_FALLBACKS,
   LEGACY_DEFAULT_MODEL_FALLBACKS,
   SEEDED_MODEL_FALLBACKS,
   sanitizeModelFallbacks,
@@ -2677,13 +2678,18 @@ export class Config {
       // Fresh installs get the default refusal-fallback chains immediately; the
       // migration flag rides along so the first save locks in seed-once
       // semantics (later loads never re-apply the defaults).
-      modelFallbacks: { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...DEFAULT_MODEL_FALLBACKS },
+      modelFallbacks: {
+        ...LEGACY_DEFAULT_MODEL_FALLBACKS,
+        ...FABLE_51_DEFAULT_MODEL_FALLBACKS,
+        ...DEFAULT_MODEL_FALLBACKS,
+      },
       ...(readLegacyWorkspaceHeartbeatsExperiment(this.rootDir)
         ? { agentHeartbeatsEnabled: true }
         : {}),
       migrations: {
         defaultModelFallbacksSeeded: true,
         defaultModelFallbacksSeededFable51: true,
+        defaultModelFallbacksSeededFable52: true,
         persistentSubagentsDefaulted: true,
         agentHeartbeatsSeeded: true,
         taskSettingsDefaultsRaised: true,
@@ -3004,11 +3010,13 @@ export class Config {
     // the fable alias moved to Fable 5.1: pre-5.1 configs only have a
     // chain for the old source key, and the new key is a new default that
     // deserves one seed of its own (still never overwriting an existing
-    // 5.1 chain).
+    // 5.1 chain). defaultModelFallbacksSeededFable52 does the same for the
+    // move to Fable 5.2.
     const migrationsBeforeSeed = normalizeConfigMigrations(parsed.migrations);
     if (
       migrationsBeforeSeed.defaultModelFallbacksSeeded !== true ||
-      migrationsBeforeSeed.defaultModelFallbacksSeededFable51 !== true
+      migrationsBeforeSeed.defaultModelFallbacksSeededFable51 !== true ||
+      migrationsBeforeSeed.defaultModelFallbacksSeededFable52 !== true
     ) {
       // Gap-check against the RAW on-disk map with canonicalized keys, not
       // the sanitized map: a hand-edited entry whose chain sanitizes away
@@ -3029,10 +3037,17 @@ export class Config {
       // seed those legacy chains too so a downgrade keeps refusal fallback.
       // SEEDED_MODEL_FALLBACKS, not DEFAULT_MODEL_FALLBACKS: chains added
       // after these flags shipped reach fresh installs only (#5087).
-      const seedDefaults =
-        migrationsBeforeSeed.defaultModelFallbacksSeeded !== true
-          ? { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...SEEDED_MODEL_FALLBACKS }
-          : SEEDED_MODEL_FALLBACKS;
+      // Each era's chain rides with the flag that era's build trusts, so a pass that
+      // claims a flag also writes its chain.
+      const seedDefaults = {
+        ...(migrationsBeforeSeed.defaultModelFallbacksSeeded !== true
+          ? LEGACY_DEFAULT_MODEL_FALLBACKS
+          : {}),
+        ...(migrationsBeforeSeed.defaultModelFallbacksSeededFable51 !== true
+          ? FABLE_51_DEFAULT_MODEL_FALLBACKS
+          : {}),
+        ...SEEDED_MODEL_FALLBACKS,
+      };
       const missingDefaults = Object.fromEntries(
         Object.entries(seedDefaults).filter(
           ([sourceModel]) => !existingCanonicalKeys.has(sourceModel)
@@ -3049,6 +3064,7 @@ export class Config {
         ...migrationsBeforeSeed,
         defaultModelFallbacksSeeded: true,
         defaultModelFallbacksSeededFable51: true,
+        defaultModelFallbacksSeededFable52: true,
       };
       configModified = true;
     }

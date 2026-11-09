@@ -525,6 +525,7 @@ describe("buildProviderOptions - Anthropic", () => {
         "claude-sonnet-5-5",
         "claude-haiku-5-5",
         "claude-fable-5-1",
+        "claude-fable-5-2",
       ]) {
         expect(thinkingFor(`anthropic:${model}`)).toEqual({
           type: "adaptive",
