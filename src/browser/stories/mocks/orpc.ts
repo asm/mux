@@ -213,6 +213,8 @@ export interface MockORPCClientOptions {
   agentDefinitions?: AgentDefinitionDescriptor[];
   /** Initial telemetry opt-in state for config.getConfig (Settings → Behavior → Privacy) */
   telemetryEnabled?: boolean;
+  /** Initial model classes for config.getConfig (Settings → Models → Model Classes) */
+  modelClasses?: Record<string, string>;
   /** Coder lifecycle preferences for config.getConfig (e.g., Settings → Coder section) */
   coderWorkspaceArchiveBehavior?: CoderWorkspaceArchiveBehavior;
   /** What to do with xum-managed worktrees when archiving a chat. */
@@ -570,6 +572,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     taskSettings: initialTaskSettings,
     agentAiDefaults: initialAgentAiDefaults,
     telemetryEnabled: initialTelemetryEnabled,
+    modelClasses: initialModelClasses,
     coderWorkspaceArchiveBehavior: initialCoderWorkspaceArchiveBehavior = "stop",
     worktreeArchiveBehavior: initialWorktreeArchiveBehavior = "keep",
     chatTranscriptFullWidth: initialChatTranscriptFullWidth = false,
@@ -874,6 +877,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
   let telemetryEnabled = initialTelemetryEnabled ?? true;
 
+  let modelClasses: Record<string, string> | undefined = initialModelClasses;
+
   const mockStats: ChatStats = {
     consumers: [],
     totalTokens: 0,
@@ -1002,6 +1007,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           runtimeEnablement,
           defaultIsolation,
           agentAiDefaults,
+          modelClasses,
           heartbeatDefaultPrompt,
           heartbeatDefaultIntervalMs,
           goalDefaults,
@@ -1058,6 +1064,17 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       updateAgentAiDefaults: (input: { agentAiDefaults: unknown }) => {
         agentAiDefaults = normalizeAgentAiDefaults(input.agentAiDefaults);
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateModelClass: (input: { className: string; model: string | null }) => {
+        const merged = { ...modelClasses };
+        if (input.model == null) {
+          delete merged[input.className];
+        } else {
+          merged[input.className] = input.model;
+        }
+        modelClasses = Object.keys(merged).length > 0 ? merged : undefined;
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
